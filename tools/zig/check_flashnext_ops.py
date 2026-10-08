@@ -114,6 +114,17 @@ def main():
                              hidden * size, dst.stride(0) * size, hidden * size, handle)
             check(f"slot-copy/{str(dtype)[6:]}/r{rows}", got, want, status)
 
+    # index_select(0, idx) of rows (b.pss / b.streams ends): cuda_torch_ops.gatherRows, a bad index flagged
+    gather = bind(lib, "tf_gather_rows", [P, P, P, U, U, U, P, P])
+    for rows, source_rows in ((1, 8), (5, 8), (16, 16)):
+        src = torch.randn((source_rows, hidden), device="cuda").to(torch.bfloat16)
+        idx = torch.randint(0, source_rows, (rows,), device="cuda", dtype=torch.int64)
+        got = torch.empty((rows, hidden), device="cuda", dtype=torch.bfloat16)
+        invalid = torch.zeros(1, device="cuda", dtype=torch.int32)
+        status = gather(pointer(src), pointer(got), pointer(idx), rows, source_rows, hidden * 2, pointer(invalid), handle)
+        check(f"gather-rows/r{rows}", got, src.index_select(0, idx), status)
+        check(f"gather-rows/r{rows}/valid", invalid, torch.zeros_like(invalid))
+
     # Tensor.fill_ of the conv-state pointer (int64)
     word = torch.zeros((1,), device="cuda", dtype=torch.int64)
     want = torch.empty_like(word).fill_(0x7F1234567890)
