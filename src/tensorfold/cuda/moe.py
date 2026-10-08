@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from . import experts as grouped
+from . import hip_tune
 
 
 def _tile(m: int) -> int:
@@ -51,7 +52,8 @@ def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None)
     else:
         be, bk, stages = 64, 64, 3               # Smaller K tiles keep prefill within shared-memory limits.
     grid = (triton.cdiv(m, bm), triton.cdiv(ne, be))
-    _router[grid](x, rows, out, m, x.stride(0), D=d, NE=ne, BM=bm, BLOCK_E=be, BK=bk, num_warps=4, num_stages=stages)
+    _router[grid](x, rows, out, m, x.stride(0), D=d, NE=ne, BM=bm, BLOCK_E=be, BK=bk,
+                  **hip_tune.launch("_router", {"BM": bm}, num_warps=4, num_stages=stages))
     return out
 
 
