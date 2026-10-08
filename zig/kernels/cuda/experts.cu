@@ -3,10 +3,13 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
+#if !defined(__HIP_PLATFORM_AMD__)
 #include "experts.cuh"
+#endif
 
 namespace tf_experts {
 
+#if !defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ uint4 ld_w(const uint4* p) {
   uint4 r;
   asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
@@ -147,6 +150,7 @@ __global__ void __launch_bounds__(WARPS * 32)
     epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
   }
 }
+#endif
 
 constexpr int PLAN_THREADS = 1024;
 constexpr int EMAX = 1024;
@@ -276,7 +280,9 @@ __global__ void plan_scatter(const int* __restrict__ picks, int P, int E, const 
 } // namespace tf_experts
 
 // Decode form for groups of 64: up with relu^2 (epilogue 1), down to fp32 (epilogue 0).
+#if !defined(__HIP_PLATFORM_AMD__)
 #define TF_EXPERT(EPI) template __global__ void tf_experts::expert_kernel<64, 1, EPI, 2, 4>(const __nv_bfloat16*, \
     int, int, const uint4*, int, int, const int*, const int*, const int*, void*, int, float);
 TF_EXPERT(1)
 TF_EXPERT(0)
+#endif

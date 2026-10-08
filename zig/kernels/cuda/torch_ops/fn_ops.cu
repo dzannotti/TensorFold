@@ -95,6 +95,8 @@ extern "C" __global__ void tf_fn_nucleus_mass_kernel(const __nv_bfloat16* logits
     atomicAdd(&sums[r], (unsigned long long)m);
 }
 
+// ---- fp4_serial (owned by the FP4 port): CUDA mma.sync + cp.async; a HIP build leaves it out until ported ----
+#if !defined(__HIP_PLATFORM_AMD__)
 // nvfp4.matmul with one K slice (SK 1: the shared expert's gate/up, K 2560) and bf16-pattern tables (PACKED 0), the
 // same bits as Triton's `_fp4mm` there: for each 16-input block b in order, p = HMMA.16816.F32.BF16(x rows, the
 // block's 16 x 8 weights, C = 0) and acc = fma(p, S[b, n], acc) (the cubins' HMMA with RZ, then FFMA), the bf16 store
@@ -181,6 +183,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_fn_fp4_serial_kernel(
         }
     }
 }
+
+#endif  // fp4_serial
 
 // C launchers for the development parity checks (tools/zig/check_flashnext_ops.py); Zig loads the fatbin.
 extern "C" cudaError_t tf_fn_shared_swiglu(const void* g, void* out, uint64_t rows, uint64_t ni, uint64_t out_stride,
