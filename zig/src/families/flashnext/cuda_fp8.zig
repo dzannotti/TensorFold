@@ -5,7 +5,8 @@
 //! row's bits independent of every other row and of M. zig/kernels/cuda/fn_qmmf.cu is the device code copied by
 //! zig/tests/cuda/copies.py (SASS-equal to the Python extension tensorfold_nvfp4_v3); `matmul` is linear._matmul and
 //! qmmf_cuda's host logic. The host layout helpers make the loader's buffers byte for byte as from_checkpoint does.
-//! HIP (gfx1151): zig/kernels/hip/fn_qmmf{,_ld}.hip, the same layouts and arguments, slices added in the block.
+//! HIP (gfx1151): zig/kernels/hip/fn_qmmf{,_ld}.hip, the same layouts and arguments, slices added in the block;
+//! from `wide_rows` rows the LDS-staged wide tile (qmmw_kernel), each row's arithmetic unchanged: the same bits.
 //!
 //! Python source (TensorFold, https://github.com/ashhart/TensorFold, cuda/nvfp4/linear.py and qmmf.cu, authored by
 //! Ash Hart (ashhart)).
@@ -42,6 +43,14 @@ pub const hip_slices: usize = 4;
 /// K slices on HIP: split_k capped at the slices a block holds; still a function of the shape alone.
 pub fn splitKHip(n: usize, k: usize) usize {
     return @min(splitK(n, k), hip_slices);
+}
+
+/// HIP: rows from which the wide tile (64 or 128 rows, 128 columns or 64 with K slices) replaces the 16/32-row tiles.
+pub const wide_rows: usize = 33;
+
+/// HIP's wide tile for `m` rows and `sk` slices: (rows, columns); rows 64 up to 64, else 128.
+pub fn wideTile(m: usize, sk: usize) [2]usize {
+    return .{ if (m <= 64) 64 else 128, if (sk > 1) 64 else 128 };
 }
 
 /// qmm.bucket: the row tile.
@@ -86,6 +95,22 @@ pub const sym = struct {
         break :blk out;
     };
     pub const ld_fused = ldName(64, false, true);
+    /// fn_qmmf.hip's wide tile, [F32][64x128, 64x64, 128x128, 128x64] (HIP builds only)
+    fn wideName(comptime ns: []const u8, comptime bm: u32, comptime bn: u32, comptime f32_out: bool, comptime tail: []const u8) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN{s}11qmmw_kernelILi{d}ELi{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii{s}", .{ ns, bm, bn, @intFromBool(f32_out), tail });
+    }
+    pub const wide = blk: {
+        var out: [2][4][:0]const u8 = undefined;
+        for (0..2) |f| for (0..4) |i| {
+            out[f][i] = wideName("10tf_fn_qmmf", 64 << (i / 2), 128 >> (i % 2), f == 1, "");
+        };
+        break :blk out;
+    };
+    pub const ld_wide = blk: {
+        var out: [4][:0]const u8 = undefined;
+        for (0..4) |i| out[i] = wideName("13tf_fn_qmmf_ld", 64 << (i / 2), 128 >> (i % 2), false, "i");
+        break :blk out;
+    };
 };
 
 pub const Kernels = struct {
@@ -96,6 +121,9 @@ pub const Kernels = struct {
     ld_module: cuda.Module,
     ld_tiled: [2][3]cuda.Function,
     ld_fused: cuda.Function,
+    /// HIP: the wide tile, [bf16, fp32][wideIndex] and its `ldo` form
+    wide: [2][4]cuda.Function = undefined,
+    ld_wide: [4]cuda.Function = undefined,
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -120,6 +148,10 @@ pub const Kernels = struct {
         };
         k.ld_fused = try k.ld_module.function(sym.ld_fused);
         if (!hip_build) try k.ld_fused.allowDynamicShared(smem(64));
+        if (hip_build) for (0..4) |i| {
+            for (0..2) |f| k.wide[f][i] = try k.module.function(sym.wide[f][i]);
+            k.ld_wide[i] = try k.ld_module.function(sym.ld_wide[i]);
+        };
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
     }
@@ -158,6 +190,7 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     const kk: usize = l.k;
     if (kk % 64 != 0 or l.npad < n) return error.Invalid;
     const sk = if (hip_build) splitKHip(n, kk) else splitK(n, kk);
+    if (hip_build and m >= wide_rows and l.npad % 128 == 0) return wide(k, s, x, x_stride, l, out, f32_out, m, ldo, sk);
     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
     const fused = bm == 0;
     const cluster = !hip_build and !fused and sk > 1 and sk <= 8 and k.major >= 9;
@@ -183,6 +216,26 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
         .block = .{ .x = if (hip_build and !fused) @intCast(128 * sk) else 128 },
         .shared = if (hip_build) 0 else smem(tile),
         .cluster = if (cluster) .{ .x = 1, .y = 1, .z = @intCast(sk) } else null,
+    }, s, &a);
+}
+
+/// HIP's wide tile: a block of 2 * rows threads, static LDS, the L2 band over its row tiles.
+fn wide(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, out: u64, f32_out: bool, m: usize, ldo: ?usize, sk: usize) !void {
+    const t = wideTile(m, sk);
+    const i = @as(usize, if (t[0] == 128) 2 else 0) + @intFromBool(t[1] == 64);
+    const rows_t = (m + t[0] - 1) / t[0];
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(l.w8);
+    a.add(l.bs);
+    a.add(@as(f32, 1.0));
+    a.add(out);
+    a.add(@as(u64, 0));
+    for ([_]usize{ m, l.n, l.k, sk, l.npad, x_stride, l2Group(rows_t, t[0], l.k) }) |v| a.add(@as(c_int, @intCast(v)));
+    if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
+    try cuda.launch.launch(if (ldo != null) k.ld_wide[i] else k.wide[@intFromBool(f32_out)][i], .{
+        .grid = .{ .x = @intCast(rows_t * ((l.n + t[1] - 1) / t[1])), .y = 1, .z = 1 },
+        .block = .{ .x = @intCast(2 * t[0]) },
     }, s, &a);
 }
 
@@ -246,6 +299,10 @@ test "split_k, buckets and shared memory follow qmm.py and qmmf.cu" {
     try std.testing.expectEqual(@as(usize, 64), bucket(33));
     try std.testing.expectEqual(@as(usize, 1), l2Group(1, 16, 2560));
     try std.testing.expectEqual(@as(usize, 38), l2Group(64, 64, 2560));
+    try std.testing.expectEqual([2]usize{ 64, 128 }, wideTile(33, 1));
+    try std.testing.expectEqual([2]usize{ 128, 64 }, wideTile(65, 4));
+    try std.testing.expectEqualStrings("_ZN10tf_fn_qmmf11qmmw_kernelILi128ELi64ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", sym.wide[1][3]);
+    try std.testing.expectEqualStrings("_ZN13tf_fn_qmmf_ld11qmmw_kernelILi64ELi128ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", sym.ld_wide[0]);
     try std.testing.expectEqualStrings("_ZN10tf_fn_qmmf11qmmf_kernelILi3ELi32ELi64ELi1ELi4ELi4ELb1ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", sym.tiled[1][1][1]);
     try std.testing.expectEqualStrings("_ZN10tf_fn_qmmf11qmmf_kernelILi3ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", sym.fused[0]);
 }
