@@ -179,13 +179,14 @@ fn symbol(comptime gs: usize, comptime nt: usize, comptime mt: usize, comptime m
 /// The plan tile of prompt calls (items of up to 64 pairs, two 16-row tiles a pass) and the pairs from which it is
 /// taken; smaller calls take kern.plan_tile (16) and one tile a pass.
 pub const prompt_tile: usize = 64;
-pub const prompt_pairs: usize = 2048;
+/// HIP: two row tiles a pass pay off once experts hold ~16 rows (gfx1151, top 5 of 512: 512 prompt rows 5.5 ms on
+/// 16-pair items vs 6.3 ms, 2048 rows 10.1 vs 7.1 ms), from about 1024 rows.
+pub const prompt_pairs: usize = if (hip_layout) 6144 else 2048;
 
 /// Measured on GB10 (int4-check, 4096 rows, top 5 of 512): 64-pair items with two row tiles a pass are slower
 /// (gate/up 8.4 vs 6.0 ms, down 3.8 vs 3.2 ms: a third of the warps), so every call takes 16-pair items for now;
 /// TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile (the same bits either way, int4-check).
-/// HIP takes the prompt tile by default (gfx1151, 2048 rows top 5 of 512: gate/up 6.9 -> 4.1 ms, down 3.7 -> 2.3 ms;
-/// TF_FLASHNEXT_INT4_TILE=16 turns it off).
+/// HIP takes the prompt tile by default from `prompt_pairs` (TF_FLASHNEXT_INT4_TILE=16 turns it off).
 pub fn tileFor(pairs: usize) usize {
     const default: usize = if (hip_layout) prompt_tile else kern.plan_tile;
     const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch default else default;

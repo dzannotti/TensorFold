@@ -4,8 +4,10 @@
 //
 // Arithmetic: a weight (q - 8) * scale, q - 8 exact in bf16. Per group of GS inputs one output's products run in one
 // fp32 WMMA chain (v_wmma_f32_16x16x16_bf16, the group's k16 steps in order, C = 0 at the first), then
-// acc = fmaf(group sum, scale, acc) in group order. A WMMA's output (m, n) reads row m of A and column n of B only,
-// so a row's bits never depend on the other rows, the row count, the plan's items, NT, MT or the grid.
+// acc = fmaf(group sum, scale, acc) in group order. gfx11's WMMA sum is not IEEE (a product next to zero ones can
+// round off by an ulp, int4_check.py check_order), but a WMMA's output (m, n) reads row m of A and column n of B only
+// (rows of 2^-30 .. 2^30 beside it change no bit), so a row's bits never depend on the other rows, the row count,
+// the plan's items, NT, MT or the grid.
 //
 // Packed layout (cuda_int4.zig packWords): words uint32 [N/16/ST][K/GS][ST][GS/32][16 columns][4]: super tile of ST
 // n16 tiles (ST = gcd(N/16, 16)), group, tile, k32 chunk, column c, then the chunk's 32 inputs of column c as 4 words
@@ -124,10 +126,10 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
     v16s a[MT];
 #pragma unroll
     for (int r = 0; r < MT; ++r) {
-        const u4v* p = reinterpret_cast<const u4v*>(xs + (16 * r + c) * RS + 16 * k);
-        const u4v lo = p[0], hi = p[1];
-        a[r] = (v16s)u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
-      }
+      const u4v* p = reinterpret_cast<const u4v*>(xs + (16 * r + c) * RS + 16 * k);
+      const u4v lo = p[0], hi = p[1];
+      a[r] = (v16s)u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+    }
 #pragma unroll
     for (int m = 0; m < MATS; ++m)
 #pragma unroll
@@ -147,7 +149,6 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[r][m][j][i] = fmaf(d[r][m][j][i], (float)cur.s[m][j], acc[r][m][j][i]);
 }
-
 
 // A block a unit: (item, WAVES x NT n16 tiles of every matrix), a wave NT of them. Items (expert, first member, count)
 // from the experts plan, or, with `items` null, the dense rows [16 i, 16 i + 16) of `rows` (the head). `slots`: member
@@ -217,8 +218,7 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
         for (int j = 0; j < NT; ++j) acc[r][0][j] = v8f{};
       Stage<GS, NT, 1, XN> st[DS];
 #pragma unroll
-      for (int b = 0; b < DS - 1; ++b)
-        if (b < KG) load_stage<GS, NT, 1, XN>(st[b], w, s, xp, min(b, KG - 1), ST);
+      for (int b = 0; b < DS - 1; ++b) load_stage<GS, NT, 1, XN>(st[b], w, s, xp, min(b, KG - 1), ST);
       lds_barrier();   // the previous pass no longer reads the buffers
       if (threadIdx.x < BR) orow[threadIdx.x] = po;   // read after the group loop's barriers
       for (int g0 = 0; g0 < KG; g0 += DS) {
