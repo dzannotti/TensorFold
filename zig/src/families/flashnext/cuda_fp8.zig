@@ -32,9 +32,8 @@ pub fn splitK(n: usize, k: usize) usize {
     return sk;
 }
 
-/// PLACEHOLDER(rocm): until the HIP build's device capability flag lands (cuda.has_clusters or the like), a HIP
-/// build is recognised by `cuda.is_hip`; replace both uses with that flag.
-const hip_build = @hasDecl(cuda, "is_hip") and cuda.is_hip;
+/// A HIP build (the runtime's `cuda.hip`): fn_qmmf.hip's launch shapes, no clusters.
+const hip_build = cuda.hip;
 
 /// zig/kernels/hip/fn_qmmf.hip on gfx1151: no clusters; a block holds up to 4 K slices side by side (512 threads)
 /// and adds them in LDS in slice order (the cluster's sum without the cluster).

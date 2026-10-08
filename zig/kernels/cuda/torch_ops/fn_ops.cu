@@ -95,8 +95,10 @@ extern "C" __global__ void tf_fn_nucleus_mass_kernel(const __nv_bfloat16* logits
     atomicAdd(&sums[r], (unsigned long long)m);
 }
 
-// ---- fp4_serial (owned by the FP4 port): CUDA mma.sync + cp.async; a HIP build leaves it out until ported ----
-#if !defined(__HIP_PLATFORM_AMD__)
+// ---- fp4_serial: CUDA mma.sync + cp.async here; a HIP build takes the gfx11 WMMA rewrite (same name and launch) ----
+#if defined(__HIP_PLATFORM_AMD__)
+#include "../../hip/fp4_serial.hip"
+#else
 // nvfp4.matmul with one K slice (SK 1: the shared expert's gate/up, K 2560) and bf16-pattern tables (PACKED 0), the
 // same bits as Triton's `_fp4mm` there: for each 16-input block b in order, p = HMMA.16816.F32.BF16(x rows, the
 // block's 16 x 8 weights, C = 0) and acc = fma(p, S[b, n], acc) (the cubins' HMMA with RZ, then FFMA), the bf16 store

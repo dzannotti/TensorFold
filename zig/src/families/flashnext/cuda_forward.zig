@@ -243,7 +243,8 @@ pub const Scratch = struct {
 /// out/w6-i-fp4: N 640 2.1x at 36-64 rows, 1.2x at 113-128, slower past; N 1280 1.7x at 36-48, slower from 113; both
 /// slower at 1-8 rows, which keep `_fp4mm`).
 pub fn fp4SerialRows(n: usize) usize {
-    return if (n <= 640) 128 else if (n <= 1280) 64 else 0;
+    // HIP: fp4_serial.hip beats `_fp4mm` up to 128 rows at N 1280 too (the same bits either way)
+    return if (n <= 640) 128 else if (n <= 1280) (if (cuda.hip) 128 else 64) else 0;
 }
 
 /// attn_multi.PTRS: a stream's pointers a layer (keys, values, key scales, value scales, index keys, pooled).

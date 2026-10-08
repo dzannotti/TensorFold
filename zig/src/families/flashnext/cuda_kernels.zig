@@ -16,8 +16,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
-/// A HIP build (the runtime's `cuda.hip`; false when it does not say): no feature is read off a compute capability.
-const hip = @hasDecl(cuda, "hip") and cuda.hip;
+/// A HIP build (the runtime's `cuda.hip`): no feature is read off a compute capability.
+const hip = cuda.hip;
 
 /// Mangled names of every entry point resolved here (cuobjdump -symbols of each fatbin).
 pub const sym = struct {
@@ -213,7 +213,9 @@ const n_mods = 10;
 
 pub const Kernels = struct {
     d: *const cuda.Driver,
-    mods: [n_mods]cuda.Module,
+    mods: [n_mods]?cuda.Module,
+    /// fn_qmm, fn_qmm_prefill and fn_qmm_cluster loaded (q4Built); without them qmm32* refuse
+    q4: bool,
     chain: [2][2]cuda.Function, // [48, 24 value heads][AHEAD false, true]
     replay: [2]cuda.Function,
     front: [2]cuda.Function,
@@ -238,44 +240,49 @@ pub const Kernels = struct {
     sms: c_int,
     wide_gpu: bool, // wideGpu
 
-    /// Loads every module and resolves every entry point; dynamic shared memory opted in as the wrappers do.
+    /// Loads every module and resolves every entry point; dynamic shared memory opted in as the wrappers do. The
+    /// groups-of-32 4-bit matmuls (fn_qmm, fn_qmm_prefill, fn_qmm_cluster: the draft vocabulary's head and the opt-in
+    /// MTP Q4 head) are optional: a build without them (HIP: no port yet) loads the rest and `q4` says false.
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const kk = cuda.kernels;
         var k: Kernels = undefined;
         k.d = ctx.d;
+        k.q4 = q4Built();
         const images = [n_mods][]const u8{ kk.fn_gdn, kk.fn_gdn_io, kk.fn_gdn_prefill, kk.fn_gdn_tree, kk.fn_nvfp4_experts, kk.fn_qmm, kk.fn_qmm_prefill, kk.experts, kk.fn_nvfp4_shape, kk.fn_qmm_cluster };
         var loaded: usize = 0;
-        errdefer for (k.mods[0..loaded]) |*m| m.unload();
+        errdefer for (k.mods[0..loaded]) |*m| if (m.*) |*x| x.unload();
         for (images, 0..) |img, i| {
-            k.mods[i] = try cuda.Module.load(ctx.d, img);
+            k.mods[i] = if (!k.q4 and isQ4(i)) null else try cuda.Module.load(ctx.d, img);
             loaded += 1;
         }
         const m = k.mods;
         for (0..2) |h| {
-            for (0..2) |a| k.chain[h][a] = try m[0].function(sym.chain[h][a]);
-            k.replay[h] = try m[0].function(sym.replay[h]);
-            k.front[h] = try m[1].function(sym.front[h]);
-            k.back[h] = try m[1].function(sym.back[h]);
-            for (0..2) |r| k.prefill[h][r] = try m[2].function(sym.prefill[h][r]);
-            k.qmm_prefill[h] = try m[6].function(sym.qmm_prefill[h]);
-            for (0..3) |b| k.qmm[h][b] = try m[5].function(sym.qmm[h][b]);
-            for (0..3) |b| k.qmm_cluster[h][b] = try m[9].function(sym.qmm_cluster[h][b]);
+            for (0..2) |a| k.chain[h][a] = try m[0].?.function(sym.chain[h][a]);
+            k.replay[h] = try m[0].?.function(sym.replay[h]);
+            k.front[h] = try m[1].?.function(sym.front[h]);
+            k.back[h] = try m[1].?.function(sym.back[h]);
+            for (0..2) |r| k.prefill[h][r] = try m[2].?.function(sym.prefill[h][r]);
+            if (k.q4) {
+                k.qmm_prefill[h] = try m[6].?.function(sym.qmm_prefill[h]);
+                for (0..3) |b| k.qmm[h][b] = try m[5].?.function(sym.qmm[h][b]);
+                for (0..3) |b| k.qmm_cluster[h][b] = try m[9].?.function(sym.qmm_cluster[h][b]);
+            }
         }
-        for (tree_symbols, &k.tree) |s, *f| f.* = try m[3].function(s);
-        k.tree_replay = try m[3].function(sym.tree_replay);
-        for (sym.nvfp4, &k.nvfp4) |s, *f| f.* = try m[4].function(s);
-        k.plan_small = try m[7].function(sym.plan);
-        k.plan_rank = try m[7].function(sym.plan_rank);
-        k.plan_offsets = try m[7].function(sym.plan_offsets);
-        k.plan_scatter = try m[7].function(sym.plan_scatter);
-        k.nvfp4_nt = try m[8].function(sym.nvfp4_nt);
+        for (tree_symbols, &k.tree) |s, *f| f.* = try m[3].?.function(s);
+        k.tree_replay = try m[3].?.function(sym.tree_replay);
+        for (sym.nvfp4, &k.nvfp4) |s, *f| f.* = try m[4].?.function(s);
+        k.plan_small = try m[7].?.function(sym.plan);
+        k.plan_rank = try m[7].?.function(sym.plan_rank);
+        k.plan_offsets = try m[7].?.function(sym.plan_offsets);
+        k.plan_scatter = try m[7].?.function(sym.plan_scatter);
+        k.nvfp4_nt = try m[8].?.function(sym.nvfp4_nt);
         // qmm.cu and qmm_prefill.cu's launch: cudaFuncSetAttribute(SMEM) once per kernel, whatever its size
-        for (0..2) |h| {
+        if (k.q4) for (0..2) |h| {
             for (0..3) |b| try k.qmm[h][b].allowDynamicShared(qmmShared(@as(usize, 16) << @intCast(b)));
             for (0..3) |b| try k.qmm_cluster[h][b].allowDynamicShared(qmmShared(@as(usize, 16) << @intCast(b)));
             try k.qmm_prefill[h].allowDynamicShared(qmm_prefill_smem);
-        }
+        };
         k.sms = try ctx.attribute(.multiprocessor_count);
         k.wide_gpu = wideGpu(hip, try ctx.attribute(.compute_capability_major), try ctx.attribute(.compute_capability_minor), k.sms);
         // nvfp4/experts.cu launch: cudaOccupancyMaxActiveBlocksPerMultiprocessor(128 threads, 0 bytes), at least 1
@@ -286,9 +293,20 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
-        for (&k.mods) |*m| m.unload();
+        for (&k.mods) |*m| if (m.*) |*x| x.unload();
     }
 };
+
+/// The optional groups-of-32 4-bit modules' indices in Kernels.mods.
+fn isQ4(i: usize) bool {
+    return i == 5 or i == 6 or i == 9;
+}
+
+/// Whether this binary holds the groups-of-32 4-bit matmuls (no GPU needed: the weights loader asks before loading).
+pub fn q4Built() bool {
+    const kk = cuda.kernels;
+    return kk.available and cuda.Module.built(kk.fn_qmm) and cuda.Module.built(kk.fn_qmm_prefill) and cuda.Module.built(kk.fn_qmm_cluster);
+}
 
 /// The largest gate/up launch (plan units) that takes the one-tile-a-warp shape: 230 = one row at TP=1 (20 column
 /// blocks x 11 items), one or two rows at TP=2 (10 x 11, 10 x 23), where experts_shape_test.cu measured it faster
@@ -512,6 +530,7 @@ pub const Ops = struct {
     /// qmm.matmul for groups of 32 (qmm_cuda, one K slice): x (m, k) bf16 rows `x_stride` apart with group sums xs
     /// (m, k/32) -> out (m, n) bf16 or fp32. The draft head's shapes take one slice; more are refused.
     pub fn qmm32(o: Ops, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, m: usize, f32_out: bool) !void {
+        if (!o.k.q4) return error.KernelNotBuilt;
         if (m < 1) return error.Invalid;
         if (splitK32(q.n, q.k) != 1) return error.SplitKUnsupported;
         const bm = bucket(m);
@@ -525,6 +544,7 @@ pub const Ops = struct {
     /// qmm.matmul for groups of 32 at any K-slice count qmm.split_k gives (decode D5, the MTP head's matrices):
     /// one slice as qmm32, else up to 8 slices summed in slice order inside a cluster (qmm_cuda on sm_90+).
     pub fn qmm32Split(o: Ops, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, m: usize, f32_out: bool) !void {
+        if (!o.k.q4) return error.KernelNotBuilt;
         if (m < 1) return error.Invalid;
         const sk = splitK32(q.n, q.k);
         if (sk == 1) return o.qmm32(x, x_stride, xs, q, out, m, f32_out);
@@ -544,6 +564,7 @@ pub const Ops = struct {
     /// qmm.prefill_matmul for groups of 32 (qmm_prefill_cuda, tile 0): weights rounded once to bf16, one fp32 chain
     /// over K; any chunking gives the same bits.
     pub fn qmmPrefill32(o: Ops, x: u64, x_stride: usize, q: Q4, out: u64, m: usize, f32_out: bool) !void {
+        if (!o.k.q4) return error.KernelNotBuilt;
         if (m < 1) return error.Invalid;
         const rows_t = (m + 127) / 128;
         var a: cuda.Args = .{};

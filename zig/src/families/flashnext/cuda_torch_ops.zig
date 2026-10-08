@@ -20,8 +20,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 const kk = cuda.kernels;
 
-/// A HIP build (the runtime's `cuda.hip`; false when it does not say): ATen-ROCm's orders where they differ.
-const hip = @hasDecl(cuda, "hip") and cuda.hip;
+/// A HIP build (the runtime's `cuda.hip`): ATen-ROCm's orders where they differ.
+const hip = cuda.hip;
 
 /// topk.cu's column tile and threads; its workspace is four 8-bit digit passes, then ordered compaction.
 const topk_tile = 4096;
@@ -81,7 +81,7 @@ pub const Functions = struct {
     draft_pack: cuda.Function,
     candidates: cuda.Function,
     nucleus_mass: cuda.Function,
-    /// null in a HIP build until fn_ops.cu's fp4_serial is ported (its #if block)
+    /// null when the build's fn_ops has no K-serial kernel (the forward then keeps `_fp4mm`)
     fp4_serial: ?cuda.Function,
     lse: Lse,
 

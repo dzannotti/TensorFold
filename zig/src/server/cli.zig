@@ -21,7 +21,9 @@ pub const Flag = struct {
     native_values: ?[]const []const u8 = null,
 };
 
-const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else &.{ "auto", "cuda" };
+/// A HIP build (native/cuda.zig's backends: "hip", "rocm") serves `hip` and its `rocm` alias in place of `cuda`.
+const hip_build = std.mem.eql(u8, @import("native_engines").backends[0], "hip");
+const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (hip_build) &.{ "auto", "hip", "rocm" } else &.{ "auto", "cuda" };
 
 /// Every Python serve flag (``cli_args.build_parser``), the ones this binary serves marked native.
 pub const flags = [_]Flag{
@@ -71,7 +73,7 @@ pub const flags = [_]Flag{
     .{ .name = "--ssd-experts" },
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
-    .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda" }, .native = true, .native_values = backend_values },
+    .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "hip", "rocm" }, .native = true, .native_values = backend_values },
     .{ .name = "--tp", .choices = &.{ "1", "2" }, .native = true },
     .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = true },
     .{ .name = "--master", .native = true },

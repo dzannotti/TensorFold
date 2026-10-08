@@ -1332,7 +1332,7 @@ fn qsaCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []con
     defer set.deinit();
     var stream = try cuda.Stream.init(ctx.d, true);
     defer stream.deinit();
-    var fast = try flashnext.prompt.QsaScores.init(ctx.d);
+    var fast = try flashnext.prompt.QsaScores.init(ctx);
     defer fast.deinit();
     const ok = try flashnext.prompt.qsaCheck(gpa, ctx.d, .{ .set = &set, .s = stream }, &fast);
     // timing: Python's _scores against fn_qsa_scores on 256 rows at 128k and 1M-like key counts

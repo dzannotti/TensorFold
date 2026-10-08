@@ -11,7 +11,8 @@ const Allocator = std.mem.Allocator;
 /// The CUDA families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step` and `open`.
 const registry = .{ nemotron.native, flashnext.native };
 
-pub const backends: []const []const u8 = &.{if (cuda.hip) "hip" else "cuda"};
+/// HIP builds answer to `rocm` too (the server's --backend alias).
+pub const backends: []const []const u8 = if (cuda.hip) &.{ "hip", "rocm" } else &.{"cuda"};
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };

@@ -14,6 +14,12 @@ pub const Module = struct {
     d: *const Driver,
     handle: abi.Module,
 
+    /// Whether `image` holds GPU code (not empty, not a failed HIP build's marker): callers whose kernel is optional
+    /// check this and skip the module instead of failing to load it.
+    pub fn built(image: []const u8) bool {
+        return image.len > 0 and !std.mem.startsWith(u8, image, failed_marker);
+    }
+
     /// A cubin or fatbin image (8-byte aligned); the driver picks the SASS for this device and copies what it needs.
     pub fn load(d: *const Driver, image: []const u8) Error!Module {
         if (image.len == 0) {

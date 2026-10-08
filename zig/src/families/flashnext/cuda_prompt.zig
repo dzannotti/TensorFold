@@ -371,7 +371,7 @@ pub fn qsaScoresRows(t: tri.Tri, iq: u64, pooled: u64, pos0: u64, sc: tri.AttnSc
 /// fn_qsa_scores.cu: `_scores`' bits from 32-row x 64-block tiles (the prompt indexer's scoring).
 pub const QsaScores = struct {
     mod: cuda.Module,
-    fs: [4]cuda.Function, // (rows, blocks) a thread: (2, 4), (4, 4), (2, 8), (4, 8)
+    fs: [4]?cuda.Function, // (rows, blocks) a thread: (2, 4), (4, 4), (2, 8), (4, 8); null past the device's LDS
     pick: usize = 0,
 
     const tiles = [4][2]usize{ .{ 2, 4 }, .{ 4, 4 }, .{ 2, 8 }, .{ 4, 8 } };
@@ -382,16 +382,25 @@ pub const QsaScores = struct {
         return (16 * tiles[i][1] * @as(usize, if (i == 1) 2 else 1) + 16 * tiles[i][0] * 4) * 128 * 2;
     }
 
-    pub fn init(d: *const cuda.Driver) !QsaScores {
+    /// Loads the tiles whose shared memory fits a block on this device (gfx1151's 64 KiB: tiles 0 and 2); a
+    /// TF_FLASHNEXT_QSA_TILE that does not fit falls back to tile 0 (every tile has the same bits).
+    pub fn init(ctx: *const cuda.Context) !QsaScores {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
-        var m = try cuda.Module.load(d, cuda.kernels.fn_qsa_scores);
+        var m = try cuda.Module.load(ctx.d, cuda.kernels.fn_qsa_scores);
         errdefer m.unload();
-        var q: QsaScores = .{ .mod = m, .fs = undefined };
-        for (&q.fs, names, 0..) |*f, n, i| {
-            f.* = try m.function(n);
-            try f.allowDynamicShared(@intCast(shared(i)));
-        }
+        const limit: usize = @intCast(try ctx.attribute(.max_shared_memory_per_block_optin));
+        var q: QsaScores = .{ .mod = m, .fs = @splat(null) };
+        for (&q.fs, names, 0..) |*f, n, i| if (shared(i) <= limit) {
+            const fun = try m.function(n);
+            try fun.allowDynamicShared(@intCast(shared(i)));
+            f.* = fun;
+        };
+        if (q.fs[0] == null) return error.SharedMemoryTooSmall;
         if (std.c.getenv("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0);
+        if (q.fs[q.pick] == null) {
+            std.log.warn("TF_FLASHNEXT_QSA_TILE {d} needs {d} bytes of shared memory a block (device: {d}): tile 0", .{ q.pick, shared(q.pick), limit });
+            q.pick = 0;
+        }
         return q;
     }
 
@@ -405,7 +414,7 @@ pub const QsaScores = struct {
         for ([_]u64{ iq, pooled, pos0, sc.scores }) |v| a.add(v);
         for ([_]usize{ g.nb, rows, g.ratio, g.budget / g.ratio }) |v| a.add(@as(c_int, @intCast(v)));
         const t = tiles[q.pick];
-        try cuda.launch.launch(q.fs[q.pick], .{ .grid = .{ .x = @intCast(cdiv(rows, 16 * t[0])), .y = @intCast(cdiv(blocks, 16 * t[1])), .z = 1 }, .block = .{ .x = 256 }, .shared = @intCast(shared(q.pick)) }, s, &a);
+        try cuda.launch.launch(q.fs[q.pick] orelse return error.Invalid, .{ .grid = .{ .x = @intCast(cdiv(rows, 16 * t[0])), .y = @intCast(cdiv(blocks, 16 * t[1])), .z = 1 }, .block = .{ .x = 256 }, .shared = @intCast(shared(q.pick)) }, s, &a);
     }
 };
 
@@ -471,6 +480,7 @@ pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast:
                 try bufs[1][0].fill8(0xA7, t.s.handle);
                 if (rt < 4) {
                     const q = fast orelse continue;
+                    if (q.fs[rt] == null) continue;
                     var qq = q.*;
                     qq.pick = rt;
                     try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends);
@@ -534,6 +544,7 @@ pub fn qsaBench(d: *const cuda.Driver, t: tri.Tri, fast: *const QsaScores) !void
         }
         const a = try cuda.Event.elapsedMs(e0, e1) / 5;
         for (0..4) |pk| {
+            if (fast.fs[pk] == null) continue;
             var qq = fast.*;
             qq.pick = pk;
             try e1.record(t.s);

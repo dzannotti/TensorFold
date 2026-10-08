@@ -61,6 +61,14 @@ pub const Prompt4 = struct {
         p.up2 = try p.fnOf("fn_prompt4_up_t2o");
         p.gu2 = if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_GU2")) |v| v[0] == '1' else false;
         p.sms = @intCast(try ctx.attribute(.multiprocessor_count));
+        // HIP (fn_experts_prompt.hip, A/B on gfx1151): 64-pair items, T 2 gate/up and T 4 down, from 256 rows; the
+        // rewrite's bits are row, item and T invariant, so these move speed only
+        if (cuda.hip) {
+            p.tile = 64;
+            p.t_down = 4;
+            p.gu_rows = 256;
+            p.down_rows = 256;
+        }
         if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_CFG")) |v| {
             var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
             if (it.next()) |x| p.tile = std.fmt.parseInt(usize, x, 10) catch default_tile;

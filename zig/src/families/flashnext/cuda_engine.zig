@@ -395,7 +395,9 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
+        // the draft vocabulary's 4-bit head needs fn_qmm*: a build without them drafts over the full head (same output)
+        if (o.mtp and !e.k.q4) std.log.warn("no groups-of-32 4-bit kernels in this build: MTP drafts use the full head", .{});
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp and e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
         errdefer e.w.deinit();
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
@@ -445,7 +447,7 @@ pub const Engine = struct {
         e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
         // the shared expert's single-slice gate/up on fn_ops' K-serial kernel where it is faster (the same bits,
         // fp4-check; TF_FLASHNEXT_FP4_SERIAL=0 off)
-        e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
+        e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL") and e.torch.f.fp4_serial != null;
         e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
         if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
         if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
@@ -486,7 +488,7 @@ pub const Engine = struct {
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         if (!envOff("TF_FLASHNEXT_QSA_FAST")) {
-            e.qsa_fast = try prompt_mm.QsaScores.init(d);
+            e.qsa_fast = try prompt_mm.QsaScores.init(ctx);
             e.f.qsa_fast = &e.qsa_fast.?;
         }
         errdefer if (e.qsa_fast) |*q| q.deinit();
@@ -522,7 +524,7 @@ pub const Engine = struct {
         }
         errdefer if (e.prof) |p| p.deinit(gpa);
         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
-        if (e.w.mtp != null) if (std.c.getenv("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
+        if (e.w.mtp != null and e.k.q4) if (std.c.getenv("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
             const mse = if (std.c.getenv("TF_FLASHNEXT_MTP_Q4_MSE")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
             e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, std.mem.span(v), mse);
             e.f.mtp_q4 = &e.mtpq.?;
@@ -565,8 +567,10 @@ pub const Engine = struct {
         if (std.c.getenv("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadMemoryReserve;
         const reserve: usize = @intFromFloat(reserve_gib * (1 << 30));
         // MemAvailable counts the mapped n-gram table's reclaimable pages (they then page from disk, as Python's
-        // admission accepts); the device's own count of free memory leaves them out
-        const free = memAvailable(io) orelse (try ctx.memInfo()).free;
+        // admission accepts); the device's own count of free memory leaves them out. HIP on an APU: allocations come
+        // from GTT, whose free count (limit less GTT in use) is below MemAvailable, so the smaller of the two
+        const dev_free = (try ctx.memInfo()).free;
+        const free = if (memAvailable(io)) |m| (if (cuda.hip) @min(m, dev_free) else m) else dev_free;
         e.budget = .{ .limit = o.kv_budget orelse (free -| reserve -| o.vision_reserve) };
         if (o.vision_reserve > 0) std.log.info("vision: {d:.2} GiB kept free for the image tower's workspace", .{@as(f64, @floatFromInt(o.vision_reserve)) / (1 << 30)});
         // two ranks decide growth together: both take the smaller budget
