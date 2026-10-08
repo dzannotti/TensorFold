@@ -411,7 +411,11 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
                 try stream.synchronize();
                 try dy.download(0, host[0 .. m * n * es]);
                 total += 1;
-                if (std.mem.eql(u8, &hex(host[0 .. m * n * es]), kv.value_ptr.string)) {
+                // "" (a ROCm generator run: no CUDA qmmf there): no reference bits; layouts, invariance and Ld still
+                // count, the numerics are tools/rocm/fp8_check.py's
+                if (kv.value_ptr.string.len == 0) {
+                    total -= 1;
+                } else if (std.mem.eql(u8, &hex(host[0 .. m * n * es]), kv.value_ptr.string)) {
                     equal += 1;
                 } else {
                     ok = false;
@@ -477,7 +481,7 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
         const wbytes: f64 = @floatFromInt(npad * kk + npad * (kk / 64) * 4);
         const flops: f64 = 2.0 * @as(f64, @floatFromInt(max_m * n * kk));
         std.debug.print("{s} {s}: n {d} k {d} split_k {d}: layouts w8 {s} bs {s}, outputs {d}/{d} equal, rows {s} one-row calls; 1 row {d:.1} us ({d:.0} GB/s weights), {d} rows {d:.0} us ({d:.1} TFLOP/s)\n", .{
-            if (w8_ok and bs_ok and equal == total and inv_ok) "PASS" else "FAIL", name, n, kk, splitK(n, kk),
+            if (w8_ok and bs_ok and equal == total and inv_ok) "PASS" else "FAIL", name, n, kk, if (hip_build) splitKHip(n, kk) else splitK(n, kk),
             if (w8_ok) "equal" else "DIFFER", if (bs_ok) "equal" else "DIFFER", equal, total, if (inv_ok) "equal" else "DIFFER",
             us[0], wbytes / us[0] / 1000.0, max_m, us[1], flops / us[1] / 1e6,
         });

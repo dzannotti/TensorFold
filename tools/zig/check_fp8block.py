@@ -59,6 +59,11 @@ def main() -> int:
         case = {"name": name, "n": n, "k": k, "npad": lin.npad, "w8": sha(lin.w8), "bs": sha(lin.bs), "bf16": {},
                 "fp32": {}}
         for m in ROWS:
+            if torch.version.hip:                       # ROCm: layouts only (qmmf is CUDA PTX); "" = no reference bits
+                case["bf16"][str(m)] = ""
+                if f32:
+                    case["fp32"][str(m)] = ""
+                continue
             case["bf16"][str(m)] = sha(lin(xd[:m]))
             if f32:                                     # _matmul with an fp32 output (the f32 flag of qmmf)
                 sk = qmm.split_k(n, k)
