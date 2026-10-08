@@ -38,6 +38,9 @@ class Ptr:
     def data_ptr(self):
         return self.addr
 
+    def ptr_range(self):          # under 2 GiB: the JIT adds tt.pointer_range 32 (buffer ops)
+        return 1 << 20
+
 
 def jit_kwargs(k: dict):
     import triton.language as tl
@@ -183,6 +186,9 @@ def interceptor(hip: Hip, jit):
     import torch
 
     class Run:
+        def __init__(self):
+            self.jit = jit
+
         def __getitem__(self, grid):
             def call(*a, **kw):
                 names = jit.arg_names
@@ -251,14 +257,18 @@ def A_const(v):
     return None
 
 
-def run_check(aot: Path, cases: str, n_bench: int) -> int:
+HIP = None
+
+
+def run_check(aot: Path, cases: str, n_bench: int, specs: list[Path]) -> int:
     import torch
 
     import flashnext_triton_fixtures as F
 
     global TYPES
     TYPES = F.TYPES | {torch.float8_e4m3fn: "*fp8e4nv"}
-    hip = Hip(aot)
+    global HIP
+    hip = HIP = Hip(aot)
     BENCH["n"] = n_bench
     gen = torch.Generator(device="cuda").manual_seed(0)
 
@@ -269,14 +279,15 @@ def run_check(aot: Path, cases: str, n_bench: int) -> int:
 
     F.z = z
     F.e = z                                      # real storage: the kernels read every row
-    F.ROWS = (1, 3, 16)
+    F.ROWS = ROWS
     real_scratch = F.attn_mod.AttnScratch
     F.attn_mod.AttnScratch = lambda *a, **kw: real_scratch(*a[:4], "cuda", **kw)
     keep = cases.split(",")
     real_case = F.case
 
     def case(store, name, fn):
-        if any(name.startswith(c) for c in keep) and "c1048576" not in name and "c262151" not in name:
+        if any(name.startswith(c) for c in keep) and "c1048576" not in name and "c262151" not in name \
+                and ("/head/" not in name or name.startswith("b16/head/r1/tp1")):
             real_case(store, name, fn)
 
     F.case = case
@@ -296,6 +307,8 @@ def run_check(aot: Path, cases: str, n_bench: int) -> int:
     F.build()
     if "kv8" in keep:
         kv8_cases(F, z)
+    if "direct" in keep:
+        direct_cases(z, specs)
     print(json.dumps({k: v for k, v in STATS.items() if k != "fns"}))
     for fn, (eq, df, nv) in sorted(STATS["fns"].items()):
         print(f"  {fn:16s} equal {eq:4d} differ {df:3d} no variant {nv:3d}")
@@ -332,6 +345,90 @@ def kv8_cases(F, z) -> None:
             kv8.attention(q, kc, vc, pos0, sc, r, HD ** -0.5, context=8192 if sc.qsa else None)
 
 
+ROWS = (1, 3, 16, 17, 129, 161, 2049)
+
+
+def direct_cases(z, specs: list[Path]) -> None:
+    """Kernels the Python wrappers never launch (prompt_mm's, _select_tiles): every spec entry's constexprs and warps,
+    at each row count whose int form it was built for, on buffers sized from its source."""
+
+    import torch
+    import triton
+
+    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod, prompt_mm as pm
+
+    names = ("_b16mm_ks", "_fp4mm_ks", "_hc_up_mix", "_hc_wb_norm", "_scores_rows")
+    mods = {n: pm for n in names} | {"_select_tiles": attn_mod}
+    wrapped = {n: getattr(m, n) if hasattr(getattr(m, n), "jit") else interceptor(HIP, getattr(m, n))
+               for n, m in mods.items()}
+    dt = {"*bf16": torch.bfloat16, "*fp32": torch.float32, "*u16": torch.uint16, "*u8": torch.uint8,
+          "*i32": torch.int32, "*fp16": torch.float16}
+    seen = set()
+    for spec in specs:
+        for k in json.loads(spec.read_text())["kernels"]:
+            if k["name"] not in mods:
+                continue
+            key = json.dumps([k["name"], k["constexprs"], k["signature"], k["attrs"], k["options"]["num_warps"]])
+            if key in seen:
+                continue
+            seen.add(key)
+            c = {n: (v.get("int") if "int" in v else v.get("bool")) for n, v in k["constexprs"].items()}
+            sig = k["signature"]
+            t = lambda n, shape: z(shape, dt[sig[n]]) if sig[n] != "*u16" else z(shape).view(torch.uint16)  # noqa
+            row_int = {"_hc_wb_norm": "RS", "_scores_rows": "ROWS", "_select_tiles": "NB"}.get(k["name"], "M")
+            div = bool(k["attrs"].get(row_int))
+            for m in ROWS:
+                if k["name"] in ("_hc_wb_norm", "_select_tiles", "_scores_rows") and m > 161:
+                    continue
+                kw = {}
+                if k["name"] == "_b16mm_ks":
+                    if (m % 16 == 0) != div:
+                        continue
+                    n, kk = c["N"], c["K"]
+                    kw = dict(X=t("X", (m, kk)), W=t("W", (n, kk)), OUT=t("OUT", (m, n)), M=m, x_stride=kk)
+                    grid = (triton.cdiv(m, c["BM"]) * triton.cdiv(n, c["BLOCK_N"]),)
+                elif k["name"] == "_fp4mm_ks":
+                    if (m % 16 == 0) != div:
+                        continue
+                    n, kk = c["N"], c["K"]
+                    kw = dict(X=t("X", (m, kk)), W=t("W", ((n // c["SBN"]) * (kk // 64) * 64 * c["SBN"],)),
+                              S=t("S", ((kk // 16) * n,)), S2=t("S2", (n,)), OUT=t("OUT", (m, n)), M=m, x_stride=kk)
+                    grid = (triton.cdiv(m, c["BM"]), triton.cdiv(n, c["BLOCK_N"]))
+                elif k["name"] == "_hc_up_mix":
+                    if (m % 16 == 0) != div:
+                        continue
+                    d, st, kk = c["D"], c["S"], c["K"]
+                    kw = dict(ACT=t("ACT", (m, kk)), W=t("W", (st * d, kk)), NORMED=t("NORMED", (m, st * d)),
+                              MIXED=t("MIXED", (m, d)), M=m)
+                    grid = (triton.cdiv(m, c["BM"]), d // c["BD"])
+                elif k["name"] == "_hc_wb_norm":
+                    d, st, sl = c["D"], c["S"], c["SLOTS"]
+                    kw = dict(H=t("H", (m, st * d)), HOUT=t("HOUT", (m, st * d)), PSS=t("PSS", (m, d // c["BLOCK"], st)),
+                              BR=t("BR", (c["WORLD"], m, d)), INJ=t("INJ", (m, st)), Y=t("Y", (m, sl, d)),
+                              WTS=t("WTS", (m, sl)), RS=m * d, SCALE=t("SCALE", (st * d,)),
+                              NORMED=t("NORMED", (m, st * d)), eps=1e-6)
+                    grid = (m,)
+                elif k["name"] == "_scores_rows":
+                    nb = 1008 if div else 1001
+                    if (m % 16 == 0) != bool(k["attrs"].get("ROWS")) or m == 1:
+                        continue
+                    pos0 = torch.full((1,), 4 * nb - m - 3, dtype=torch.int32, device="cuda")
+                    kw = dict(IQ=t("IQ", (m, c["HI"], c["DI"])), POOLED=t("POOLED", (nb, c["DI"])), POS0=pos0,
+                              SC=t("SC", (m, nb)), NB=nb, ROWS=m)
+                    if bool(k["attrs"].get("NB")) != (nb % 16 == 0):
+                        continue
+                    grid = (triton.cdiv(m, c["RT"]), triton.cdiv(nb, c["BB"]))
+                else:                                        # _select_tiles: a row's blocks past _select's registers
+                    nb = 40000 if div else 40001
+                    pos0 = torch.full((1,), 4 * nb - m - 5, dtype=torch.int32, device="cuda")
+                    kw = dict(SC=t("SC", (m, nb)), POS0=pos0, IDS=t("IDS", (m, c["IDW"])), NKR=t("NKR", (m,)),
+                              SPR=t("SPR", (m,)), NB=nb)
+                    grid = (m,)
+                consts = {n: A.value(v, __import__("triton.language", fromlist=["x"]), None)
+                          for n, v in k["constexprs"].items() if n not in kw}
+                wrapped[k["name"]][grid](**kw, **consts, **A.hip_options(k))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -340,15 +437,17 @@ def main() -> int:
     h.add_argument("--spec", action="append", required=True)
     r = sub.add_parser("run")
     r.add_argument("--aot", required=True)
+    r.add_argument("--spec", action="append", default=[str(ROOT / "zig/tests/cuda/flashnext/kernels.json"),
+                                                        str(ROOT / "zig/tests/cuda/flashnext/kernels_int4ar.json")])
     r.add_argument("--bench", type=int, default=0, help="1: time each variant's first launch (AOT vs JIT binary)")
-    r.add_argument("--cases", default="embed/r1/,hc_,rmsnorm/r3,add_streams,ple_,moe_partial,moe/,attn_prep/r3,"
-                   "attn_gate/r3,fp4/,b16/hc_down/r3,b16/fc/,b16/o_proj/r16,b16/gdn_out,attention/tp1/c1024/r3/p100,"
-                   "attention/tp1/c262144/r3/p3000/x8192,attention_prefill/tp1/c1024/s0/n30,"
-                   "attention_prefill/tp1/c262144/s4096/n19,attention/tp1/c262144/r3/p140000/x16384,shift/,kv8")
+    r.add_argument("--cases", default="embed/,hc_,rmsnorm/,add_streams,ple_,moe_partial,moe/,attn_prep/,attn_gate/,"
+                   "fp4/,b16/,attention/tp1/c1024/r3/p100,attention/tp1/c262144/r3/p3000/x8192,"
+                   "attention/tp2/c262144/r16/p3000/x16384,attention_prefill/tp1/c1024/s0/n30,"
+                   "attention_prefill/tp1/c262144/s4096/n19,attention_prefill/tp1/c262144/s2048/n974,shift/,kv8,direct")
     a = ap.parse_args()
     if a.cmd == "hash":
         return hash_check(Path(a.aot), [Path(s) for s in a.spec])
-    return run_check(Path(a.aot), a.cases, a.bench)
+    return run_check(Path(a.aot), a.cases, a.bench, [Path(x) for x in a.spec])
 
 
 if __name__ == "__main__":
