@@ -138,6 +138,28 @@ pub fn packScales(src: Source, sl: Slice, out: []u16) !void {
     };
 }
 
+/// Columns `cols` of `src` (any order, repeats allowed), all inputs at groups of `gs`, packed as packWords /
+/// packScales pack a contiguous slice: column j of the result is column cols[j] of `src`, bit for bit.
+pub fn packColumns(gpa: std.mem.Allocator, src: Source, cols: []const u32, gs: usize, words: []u32, scales: []u16) !void {
+    const n = cols.len;
+    const kw = src.k_full / 8;
+    const kg = src.k_full / checkpoint_group;
+    if (src.qweight.len != kw * src.n_full * 4 or src.scales.len != kg * src.n_full * 2) return error.BadLength;
+    const qw = try gpa.alloc(u8, kw * n * 4);
+    defer gpa.free(qw);
+    const sc = try gpa.alloc(u8, kg * n * 2);
+    defer gpa.free(sc);
+    for (cols, 0..) |c, j| {
+        if (c >= src.n_full) return error.BadSlice;
+        for (0..kw) |r| @memcpy(qw[(r * n + j) * 4 ..][0..4], src.qweight[(r * src.n_full + c) * 4 ..][0..4]);
+        for (0..kg) |r| @memcpy(sc[(r * n + j) * 2 ..][0..2], src.scales[(r * src.n_full + c) * 2 ..][0..2]);
+    }
+    const g: Source = .{ .qweight = qw, .scales = sc, .n_full = n, .k_full = src.k_full };
+    const sl: Slice = .{ .n0 = 0, .n = n, .k0 = 0, .k = src.k_full, .gs = gs };
+    try packWords(g, sl, words);
+    try packScales(g, sl, scales);
+}
+
 /// AutoGPTQ v1 symmetric zero points: every nibble of qzeros [k_full / 128, n_full / 8] is 7 (8 minus one).
 pub fn zerosAreSymmetric(qzeros: []const u8) bool {
     var i: usize = 0;
@@ -474,6 +496,46 @@ test "packWords: a lane's word of a block holds its column's inputs 8 t .. 8 t +
             try std.testing.expectEqual(@as(u16, @intCast(((sl.k0 + g * gs) / 128) * n_full + sl.n0 + col)), scl[at]);
         };
     }
+}
+
+test "packColumns: contiguous columns pack as packWords, gathered ones hold their source column" {
+    const gpa = std.testing.allocator;
+    const n_full = 96;
+    const k_full = 256;
+    const qw = try gpa.alloc(u8, k_full / 8 * n_full * 4);
+    defer gpa.free(qw);
+    var prng = std.Random.DefaultPrng.init(11);
+    prng.random().bytes(qw);
+    const sc = try gpa.alloc(u8, k_full / 128 * n_full * 2);
+    defer gpa.free(sc);
+    for (0..sc.len / 2) |i| std.mem.writeInt(u16, sc[2 * i ..][0..2], @intCast(i), .little);
+    const src: Source = .{ .qweight = qw, .scales = sc, .n_full = n_full, .k_full = k_full };
+    const n = 4 * tile_n;
+    var cols: [n]u32 = undefined;
+    for (&cols, 0..) |*c, j| c.* = @intCast(tile_n + j);
+    const a = try gpa.alloc(u32, wordsOf(n, k_full));
+    defer gpa.free(a);
+    const b = try gpa.alloc(u32, wordsOf(n, k_full));
+    defer gpa.free(b);
+    const as = try gpa.alloc(u16, scalesOf(n, k_full, 128));
+    defer gpa.free(as);
+    const bs = try gpa.alloc(u16, scalesOf(n, k_full, 128));
+    defer gpa.free(bs);
+    try packColumns(gpa, src, &cols, 128, a, as);
+    try packWords(src, .{ .n0 = tile_n, .n = n, .k0 = 0, .k = k_full, .gs = 128 }, b);
+    try packScales(src, .{ .n0 = tile_n, .n = n, .k0 = 0, .k = k_full, .gs = 128 }, bs);
+    try std.testing.expectEqualSlices(u32, b, a);
+    try std.testing.expectEqualSlices(u16, bs, as);
+    // reversed with a repeat: column j's scales are column cols[j]'s
+    for (&cols, 0..) |*c, j| c.* = @intCast(n_full - 1 - j);
+    cols[n - 1] = cols[0];
+    try packColumns(gpa, src, &cols, 128, a, as);
+    const st = if (hip_layout) superTiles(n) else 1;
+    for (0..n) |col| for (0..k_full / 128) |g| {
+        const t = col / tile_n;
+        const at = ((t / st * (k_full / 128) + g) * st + t % st) * tile_n + col % tile_n;
+        try std.testing.expectEqual(@as(u16, @intCast(g * n_full + cols[col])), as[at]);
+    };
 }
 
 test "symmetric zero points and the kernel symbols" {

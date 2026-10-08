@@ -59,3 +59,13 @@ Did not help: deeper prefetch (4, 8 groups), waves_per_eu hints, wider super til
 - `tools/rocm/int4_regs.sh`: VGPRs / spills per entry point. `tools/rocm/int4_zig.sh`: cuda_int4.zig host tests at
   both layouts plus a type-check of its HIP paths against `int4_cuda_stub.zig`.
 - `tools/rocm/int4_probe.{hip,py}`: WMMA layout, stream / access-pattern / WMMA-rate probes.
+
+## Draft head without fn_qmm (branch rocm-drafthead)
+
+HIP has no fn_qmm, so the CUDA draft head (the draft rows dequantized and re-quantized affine 4-bit, groups of 32)
+cannot run. `Options.draft_q4 = false` (the engine passes `e.k.q4`) makes `cuda_weights.zig draftInt4` slice the int4
+lm_head's 79,591 draft columns into their own matrix (`Weights.draft4`, `int4.packColumns`, padded with the last id
+to 79,616 = whole 128-column units, 105.1 MB) run by `int4.dense` like the full head; `cuda_mtp.computeSegs` packs
+several streams' rows to `draft_count` apart (one slotCopy). Draws are unchanged (`Draws.ids` maps columns to ids;
+probabilities over the draft vocabulary, as on CUDA). Its logits are the full head's at the draft ids bit for bit:
+`python tools/rocm/drafthead_check.py` (1/2/8/16 rows, and the argmax), plus a best-of-N timing of one call each.

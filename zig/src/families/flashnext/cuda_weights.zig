@@ -44,6 +44,9 @@ pub const Options = struct {
     mtp: bool = true,
     /// the MTP drafts' head over the default draft vocabulary (Python engine draft_vocab "default")
     draft_head: bool = true,
+    /// the groups-of-32 4-bit kernels (fn_qmm) run that head; without them an int4 lm_head's draft columns, sliced
+    /// as they are (int4.dense, `Weights.draft4`), are the draft head, and a bf16 lm_head has none
+    draft_q4: bool = true,
     /// the n-gram table's rows on the GPU (a rank's heads); null: on the GPU at two ranks, host-mapped at one
     ngram_on_gpu: ?bool = null,
     mode: Mode = .device,
@@ -220,6 +223,9 @@ pub const Weights = struct {
     inv_freq: u64 = 0,
     mtp: ?Mtp = null,
     draft_head: ?Q4 = null,
+    /// the int4 lm_head's draft columns (no fn_qmm: Options.draft_q4 false), `draft_count` of them then padding
+    /// columns up to whole 128-column units (never read)
+    draft4: ?int4.Mat = null,
     /// int64 draft ids (this rank's share), in draft-head row order
     draft_ids: u64 = 0,
     draft_count: u32 = 0,
@@ -496,6 +502,36 @@ const Loader = struct {
         w.head = .{ .weight = 0, .n = @intCast(vl), .k = @intCast(d) };
         w.head4 = m;
         return src;
+    }
+
+    /// The int4 lm_head's columns `ids` as their own int4 matrix (Weights.draft4), its logits the full head's at those
+    /// ids bit for bit (same kernel, same K order); padded to 128-column units with the last id.
+    fn draftInt4(L: *Loader, w: *Weights, src: int4.Source, ids: []const u32) !void {
+        const d: usize = L.c.hidden;
+        const n = ids.len;
+        if (n == 0) return error.NoDraftIds;
+        const npad = (n + 127) / 128 * 128;
+        const cols = try L.gpa.alloc(u32, npad);
+        defer L.gpa.free(cols);
+        @memcpy(cols[0..n], ids);
+        @memset(cols[n..], ids[n - 1]);
+        const words = try L.gpa.alloc(u32, int4.wordsOf(npad, d));
+        defer L.gpa.free(words);
+        const scales = try L.gpa.alloc(u16, int4.scalesOf(npad, d, 128));
+        defer L.gpa.free(scales);
+        try int4.packColumns(L.gpa, src, cols, 128, words, scales);
+        var m: int4.Mat = .{ .n = @intCast(npad), .k = @intCast(d), .gs = 128 };
+        m.w = try L.out.whole("draft4.weight", "int32", &.{words.len}, std.mem.sliceAsBytes(words));
+        L.out.ours();
+        m.s = try L.out.whole("draft4.scales", "float16", &.{scales.len}, std.mem.sliceAsBytes(scales));
+        L.out.ours();
+        w.draft4 = m;
+        const wide = try L.gpa.alloc(i64, n);
+        defer L.gpa.free(wide);
+        for (ids, wide) |id, *x| x.* = id;
+        w.draft_ids = try L.out.whole("draft_ids", "int64", &.{n}, std.mem.sliceAsBytes(wide));
+        w.draft_count = @intCast(n);
+        std.log.info("MTP draft head: the int4 lm_head's {d} draft columns ({d:.1} MB)", .{ n, @as(f64, @floatFromInt(words.len * 4 + scales.len * 2)) / 1e6 });
     }
 
     fn staging(L: *Loader, bytes: usize) ![]u8 {
@@ -1529,7 +1565,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
     }
 
     // the draft head: the lm_head's draft rows quantized 4-bit (groups of 32), packed for the lane matmul
-    if (o.draft_head) {
+    if (o.draft_head and !o.draft_q4) if (head_src) |src| {
+        const ids = try draftIds(gpa, draft_vocab, c.vocab, o.rank, o.world);
+        defer gpa.free(ids);
+        try L.draftInt4(&w, src, ids);
+    };
+    if (o.draft_head and o.draft_q4) {
         const ids = try draftIds(gpa, draft_vocab, c.vocab, o.rank, o.world);
         defer gpa.free(ids);
         const k = c.hidden;
