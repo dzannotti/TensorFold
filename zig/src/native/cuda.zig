@@ -11,7 +11,7 @@ const Allocator = std.mem.Allocator;
 /// The CUDA families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step` and `open`.
 const registry = .{ nemotron.native, flashnext.native };
 
-pub const backends: []const []const u8 = &.{"cuda"};
+pub const backends: []const []const u8 = &.{if (cuda.hip) "hip" else "cuda"};
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
@@ -19,17 +19,30 @@ pub const families: []const api.Family = blk: {
     break :blk &final;
 };
 
-/// The chip class gate entries name ("nvidia-sm121" for a GB10); null without a CUDA device.
+/// The chip class gate entries name ("nvidia-sm121" for a GB10, "amd-gfx1151" under HIP); null without a device.
 pub fn chip(a: Allocator) ?[]const u8 {
     var driver = cuda.Driver.open() catch return null;
     defer driver.close();
     var ctx = cuda.Context.init(&driver, deviceOrdinal()) catch return null;
     defer ctx.deinit();
+    if (cuda.hip) {
+        const f = ctx.features() catch return null;
+        return std.fmt.allocPrint(a, "amd-{s}", .{f.arch()}) catch null;
+    }
     return chipClass(a, ctx.capability() catch return null);
 }
 
 fn chipClass(a: Allocator, capability: u32) ?[]const u8 {
     return std.fmt.allocPrint(a, "nvidia-sm{d}", .{capability}) catch null;
+}
+
+/// The kernel set's directory name for this device: sm<capability> on CUDA, the AMDGPU target under HIP.
+fn archDir(a: Allocator, ctx: *const cuda.Context) ![]const u8 {
+    if (cuda.hip) {
+        const f = try ctx.features();
+        return a.dupe(u8, f.arch());
+    }
+    return std.fmt.allocPrint(a, "sm{d}", .{try ctx.capability()});
 }
 
 /// The GPU ordinal TF_CUDA_DEVICE picks, as `tensorfold run` reads it; unset or empty means 0.
@@ -49,11 +62,11 @@ fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
     return if (limit == .integer and limit.integer > 0) limit.integer else 0;
 }
 
-/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
-fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
+/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/<archDir> beside the binary.
+fn kernelDir(a: Allocator, io: std.Io, ctx: *const cuda.Context) ![]const u8 {
     if (std.c.getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, std.mem.span(dir));
     const exe = try std.process.executableDirPathAlloc(io, a);
-    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try archDir(a, ctx) });
 }
 
 /// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
@@ -244,7 +257,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.ctx = try cuda.Context.init(&h.driver, deviceOrdinal());
     errdefer h.ctx.deinit();
     bound = &h.ctx;
-    const kernels = try kernelDir(a, io, try h.ctx.capability());
+    const kernels = try kernelDir(a, io, &h.ctx);
     // two ranks only for families whose options take them
     const two_rank = @hasField(F.Options, "tp");
     if (o.tp > 1 and !two_rank) {

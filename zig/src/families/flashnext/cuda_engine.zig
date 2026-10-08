@@ -245,13 +245,7 @@ fn aligned(sizes: []const usize) usize {
 /// A non-blocking stream at `priority` (lower is higher; the driver clamps to its range).
 fn streamWithPriority(d: *const cuda.Driver, priority: c_int) !cuda.Stream {
     if (priority == 0) return cuda.Stream.init(d, true);
-    var lib = std.DynLib.open("libcuda.so.1") catch return cuda.Stream.init(d, true);
-    defer lib.close();
-    const F = *const fn (*cuda.abi.Stream, c_uint, c_int) callconv(.c) cuda.abi.Result;
-    const f = lib.lookup(F, "cuStreamCreateWithPriority") orelse return cuda.Stream.init(d, true);
-    var s: cuda.abi.Stream = null;
-    try d.check(f(&s, cuda.abi.stream_non_blocking, priority), "cuStreamCreateWithPriority");
-    return .{ .d = d, .handle = s };
+    return cuda.Stream.initPriority(d, priority);
 }
 
 fn envGet(name: [:0]const u8) ?[]const u8 {

@@ -1,7 +1,12 @@
-//! The CUDA driver opened at run time: libcuda.so.1's versioned entry points in one table, and checked calls.
+//! The GPU driver opened at run time: libcuda.so.1's versioned entry points in one table (or HIP's, bound to the same
+//! table by hip.zig in -Dgpu=hip builds), and checked calls.
 
 const std = @import("std");
 const abi = @import("abi.zig");
+const hip_api = @import("hip.zig");
+
+/// True in -Dgpu=hip builds: the table is libamdhip64's and kernel images are AMDGPU code objects.
+pub const hip = @import("kernel_options").gpu == .hip;
 
 pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
 
@@ -10,7 +15,20 @@ pub const Driver = struct {
     api: abi.Api,
 
     pub fn open() Error!Driver {
-        return openPath("libcuda.so.1");
+        if (!hip) return openPath("libcuda.so.1");
+        for (hip_api.paths) |path| {
+            var lib = std.DynLib.open(path) catch continue;
+            errdefer lib.close();
+            var api: abi.Api = undefined;
+            if (hip_api.bind(&lib, &api)) |missing| {
+                std.log.err("{s} has no {s}", .{ path, missing });
+                return error.MissingSymbol;
+            }
+            const d: Driver = .{ .lib = lib, .api = api };
+            try d.check(api.cuInit(0), "hipInit");
+            return d;
+        }
+        return error.DriverUnavailable;
     }
 
     /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver.
@@ -58,7 +76,7 @@ pub const Driver = struct {
         return if (s) |p| std.mem.span(p) else "";
     }
 
-    /// The driver's CUDA version as 1000 * major + 10 * minor.
+    /// The driver's CUDA version as 1000 * major + 10 * minor (HIP: 10^7 * major + 10^5 * minor + patch).
     pub fn version(self: *const Driver) Error!c_int {
         var v: c_int = 0;
         try self.check(self.api.cuDriverGetVersion(&v), "cuDriverGetVersion");

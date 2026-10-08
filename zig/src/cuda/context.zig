@@ -4,6 +4,8 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
+const hip = @import("driver.zig").hip;
+const hip_api = @import("hip.zig");
 
 pub const Context = struct {
     d: *const Driver,
@@ -42,7 +44,46 @@ pub const Context = struct {
         return v;
     }
 
-    /// Compute capability as 10 * major + minor (GB10: 121).
+    /// What the device can do, named, so callers stop reading features off the compute capability.
+    pub const Features = struct {
+        hip: bool,
+        /// "sm_121" on CUDA, the AMDGPU target ("gfx1151") on HIP
+        arch_buf: [32]u8 = @splat(0),
+        arch_len: usize = 0,
+        /// thread-block clusters and distributed shared memory (CUDA sm_90+; none on AMD)
+        clusters: bool,
+        /// programmatic dependent launch, griddepcontrol (CUDA sm_90+; none on AMD)
+        pdl: bool,
+        /// threads a warp (wave32 on RDNA)
+        warp: u32,
+        /// SMs on CUDA; what HIP reports as multiprocessors on AMD (gfx1151: 20, its WGPs, of 40 CUs)
+        sms: u32,
+
+        pub fn arch(f: *const Features) []const u8 {
+            return f.arch_buf[0..f.arch_len];
+        }
+    };
+
+    pub fn features(self: *const Context) Error!Features {
+        var f: Features = .{
+            .hip = hip,
+            .clusters = false,
+            .pdl = false,
+            .warp = @intCast(try self.attribute(.warp_size)),
+            .sms = @intCast(try self.attribute(.multiprocessor_count)),
+        };
+        if (hip) {
+            f.arch_len = hip_api.archName(self.device, &f.arch_buf).len;
+        } else {
+            const cap = try self.capability();
+            f.clusters = cap >= 90;
+            f.pdl = cap >= 90;
+            f.arch_len = (std.fmt.bufPrint(&f.arch_buf, "sm_{d}", .{cap}) catch unreachable).len;
+        }
+        return f;
+    }
+
+    /// Compute capability as 10 * major + minor (GB10: 121; HIP reports gfx1151 as 115, so use `features`).
     pub fn capability(self: *const Context) Error!u32 {
         const major = try self.attribute(.compute_capability_major);
         const minor = try self.attribute(.compute_capability_minor);

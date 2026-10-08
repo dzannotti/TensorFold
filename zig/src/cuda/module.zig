@@ -1,9 +1,14 @@
-//! Loaded GPU code: cubin, fatbin or PTX images, their kernels by symbol name and their device globals.
+//! Loaded GPU code: cubin, fatbin, PTX or AMDGPU code-object images, their kernels by symbol name and their device globals.
 
 const std = @import("std");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
+const hip = @import("driver.zig").hip;
+const mangle = @import("mangle.zig");
+
+/// What zig/build/hip.zig embeds for a kernel that hipcc could not build: this, its name and the compiler's errors.
+pub const failed_marker = "TF_HIP_BUILD_FAILED ";
 
 pub const Module = struct {
     d: *const Driver,
@@ -13,6 +18,10 @@ pub const Module = struct {
     pub fn load(d: *const Driver, image: []const u8) Error!Module {
         if (image.len == 0) {
             std.log.err("empty GPU image: this binary was built without kernels (-Dnvcc or -Dfatbins)", .{});
+            return error.Invalid;
+        }
+        if (std.mem.startsWith(u8, image, failed_marker)) {
+            std.log.err("GPU module not built for HIP (hipcc failed at build time): {s}", .{image[failed_marker.len..@min(image.len, 2048)]});
             return error.Invalid;
         }
         if (@intFromPtr(image.ptr) % 8 != 0) return error.Invalid;
@@ -36,9 +45,18 @@ pub const Module = struct {
         self.* = undefined;
     }
 
-    /// A kernel by its exact (mangled or extern "C") symbol; the function lives as long as the module.
+    /// A kernel by its exact (mangled or extern "C") symbol; the function lives as long as the module. HIP builds
+    /// look up the CUDA C++ name as hipcc mangles it (mangle.zig), then as given.
     pub fn function(self: Module, name: [:0]const u8) Error!Function {
         var f: abi.Function = null;
+        if (hip) {
+            var buf: [2048]u8 = undefined;
+            const h = mangle.toHip(name, buf[0 .. buf.len - 1]);
+            if (h.ptr != name.ptr) {
+                buf[h.len] = 0;
+                if (self.d.api.cuModuleGetFunction(&f, self.handle, buf[0..h.len :0].ptr) == abi.success) return .{ .d = self.d, .handle = f };
+            }
+        }
         self.d.check(self.d.api.cuModuleGetFunction(&f, self.handle, name.ptr), "cuModuleGetFunction") catch |e| {
             std.log.err("kernel symbol not in module: {s}", .{name});
             return e;
