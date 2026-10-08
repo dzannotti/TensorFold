@@ -22,10 +22,13 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 constexpr int GS = 64;                                    // inputs a group (one fp32 scale a column)
 constexpr int MAX_SLICES = 4;                             // the host's split_k on gfx1151 (<= 512 threads)
 
-// two e4m3 codes (the low 16 bits of `w`) -> two bf16 in one word, exactly (fp32 denormals kept for e4m3 subnormals)
+// two e4m3 codes (the low 16 bits of `w`) -> two bf16 in one word, exactly: as fp16 (bias 15 against 7, e4m3
+// subnormals fp16 subnormals), to fp32 and times 2^8; fp32 denormals never occur, so their flush mode does not matter
 __device__ __forceinline__ uint32_t fp8pair(uint32_t w) {
-    const float lo = __uint_as_float(((w & 0x7Fu) << 20) | ((w & 0x80u) << 24)) * 0x1p120f;
-    const float hi = __uint_as_float(((w & 0x7F00u) << 12) | ((w & 0x8000u) << 16)) * 0x1p120f;
+    const uint32_t x = __builtin_amdgcn_perm(0u, w, 0x010c000cu);   // byte 0 -> bits 8-15, byte 1 -> bits 24-31
+    union { uint32_t u; _Float16 h[2]; } t;
+    t.u = ((x >> 1) & 0x3F803F80u) | (x & 0x80008000u);
+    const float lo = static_cast<float>(t.h[0]) * 256.0f, hi = static_cast<float>(t.h[1]) * 256.0f;
     return __builtin_amdgcn_perm(__float_as_uint(hi), __float_as_uint(lo), 0x07060302u);
 }
 
