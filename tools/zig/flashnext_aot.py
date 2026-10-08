@@ -9,7 +9,8 @@
   cover:   every launch in W5's replay fixtures must find a variant; missing ones are added from a template of the
            same kernel (argument types, int forms, constexprs, warps as the fixture gives them)
   build:   the spec list -> <out>/aot.json + <out>/cubins/<hash>.cubin; --check <manifest.json> compares the TP=1
-           entries' cubin sha256 (and Triton's kernel hash) with a capture's
+           entries' cubin sha256 (and Triton's kernel hash) with a capture's; --target hip writes <out>/hsaco/<hash>.hsaco
+           for gfx1151 with the options the ROCm JIT would resolve (``hip_options``)
 
 A spec entry is exactly what Triton's JIT hands ``compile``: the function (module + qualname), the signature by
 parameter name, the constexpr values by name (typed: int, bool, float64 bits, dtype, None, str, a JIT function), the
@@ -27,6 +28,10 @@ import sys
 from pathlib import Path
 
 TARGET = ("cuda", 121, 32)
+HIP_TARGET = ("hip", "gfx1151", 32)
+# kernels whose Python wrapper passes num_stages (kept on HIP); every other launch takes the backend's default, as the
+# ROCm JIT does (the spec's options are what the CUDA JIT resolved: its defaults, tf32, CUDA's fp8 list and libdevice)
+HIP_STAGES = {"_b16mm", "_router", "_chunks", "_chunks8", "_chunks_multi"}
 OPTION_KEYS = ("num_warps", "num_ctas", "num_stages", "warp_size", "maxnreg", "ptx_version", "ptx_options",
                "ir_override", "enable_fp_fusion", "enable_reflect_ftz", "launch_cooperative_grid", "launch_pdl",
                "supported_fp8_dtypes", "deprecated_fp8_dot_operand_dtypes", "default_dot_input_precision",
@@ -487,7 +492,16 @@ def path_of(name: str, params: list[str]) -> tuple:
     return (params.index(head), *map(int, rest))
 
 
-def compile_one(k: dict, cache_dir: Path | None):
+def hip_options(k: dict) -> dict:
+    """The kwargs the ROCm JIT's parse_options sees for this launch: num_warps, and num_stages where the wrapper sets it."""
+
+    o = {"num_warps": k["options"]["num_warps"]}
+    if k["name"] in HIP_STAGES:
+        o["num_stages"] = k["options"]["num_stages"]
+    return o
+
+
+def compile_one(k: dict, cache_dir: Path | None, target: tuple = TARGET):
     import triton.language as tl
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource, compile
@@ -497,23 +511,45 @@ def compile_one(k: dict, cache_dir: Path | None):
     registry = lambda key: resolve(key.replace(":", "."))       # noqa: E731
     constexprs = {path_of(n, params): value(v, tl, registry) for n, v in k["constexprs"].items()}
     attrs = {path_of(n, params): v for n, v in k["attrs"].items()}
-    options = {n: tuple(v) if isinstance(v, list) else v for n, v in k["options"].items()}
+    if target[0] == "hip":
+        options = hip_options(k)
+        # Triton 3.6's JIT keys attributes by pointer and int parameters only (3.7, which captured the spec, keys all)
+        attrs = {path_of(n, params): v for n, v in k["attrs"].items()
+                 if k["signature"].get(n) != "constexpr" and not k["signature"].get(n, "").startswith("fp")}
+    else:
+        options = {n: tuple(v) if isinstance(v, list) else v for n, v in k["options"].items()}
     src = ASTSource(fn, dict(k["signature"]), constexprs, attrs)
-    return compile(src, target=GPUTarget(*TARGET), options=options)
+    return compile(src, target=GPUTarget(*target), options=options)
+
+
+def _amd_count(asm: str, key: str):
+    """A count from the AMDGPU metadata in the assembly (``.vgpr_count: 251``)."""
+
+    for line in asm.splitlines():
+        if line.strip().startswith(f".{key}:"):
+            return int(line.split(":")[1])
+    return None
 
 
 class Compiled:
     """What a worker sends back: the kernel hash, its cubin and metadata (picklable)."""
 
     def __init__(self, ck) -> None:
-        self.hash, self.cubin = ck.hash, ck.asm["cubin"]
         self.metadata = {k: v for k, v in ck.metadata._asdict().items() if isinstance(v, (int, str, bool, float))}
-        self.n_regs, self.n_spills = getattr(ck, "n_regs", None), getattr(ck, "n_spills", None)
+        if "hsaco" in ck.asm:      # AMD: registers from the code object's metadata (n_regs would load it on a GPU)
+            self.hash, self.cubin = ck.hash, ck.asm["hsaco"]
+            self.n_regs, self.n_spills = _amd_count(ck.asm["amdgcn"], "vgpr_count"), _amd_count(ck.asm["amdgcn"], "vgpr_spill_count")
+            self.scratch = _amd_count(ck.asm["amdgcn"], "private_segment_fixed_size")
+        else:
+            self.hash, self.cubin = ck.hash, ck.asm["cubin"]
+            self.n_regs, self.n_spills = getattr(ck, "n_regs", None), getattr(ck, "n_spills", None)
+            self.scratch = None
 
 
-def _compile_job(k: dict):
+def _compile_job(job):
+    k, target = job
     try:
-        return Compiled(compile_one(k, None))
+        return Compiled(compile_one(k, None, target))
     except Exception as exc:                                      # noqa: BLE001  (listed, then the run fails)
         return f"{type(exc).__name__}: {str(exc)[:300]}"
 
@@ -530,18 +566,21 @@ def zig_const(v):
     return {"str": json.dumps(v)}
 
 
-def build(spec: Path, out: Path, tps: set[int], check: list[Path], jit: Path | None, only: str, jobs: int = 8) -> int:
-    data = json.loads(spec.read_text())
-    kernels = data["kernels"]
+def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: Path | None, only: str, jobs: int = 8,
+          target: tuple = TARGET) -> int:
+    data = json.loads(specs[0].read_text())
+    kernels = [k for s in specs for k in json.loads(s.read_text())["kernels"]]
     root = data.get("source_root")
     import tensorfold
 
     here = str(Path(tensorfold.__file__).parent.parent)
-    if root and here != root:     # Triton's line info names the source file: another path, other cubin bytes
+    hip = target[0] == "hip"
+    bin_dir, ext = ("hsaco", "hsaco") if hip else ("cubins", "cubin")
+    if root and here != root and not hip:     # Triton's line info names the source file: another path, other cubin bytes
         raise SystemExit(f"the spec was captured with the Python source at {root}, this run imports it from {here}: "
                          f"mount the tree so that {root}/tensorfold is the package (the cubins embed the path)")
     nospec = json.loads(jit.read_text()) if jit else {}
-    (out / "cubins").mkdir(parents=True, exist_ok=True)
+    (out / bin_dir).mkdir(parents=True, exist_ok=True)
     captured = {}
     for m in check:
         for k in json.loads(m.read_text())["kernels"]:
@@ -552,7 +591,7 @@ def build(spec: Path, out: Path, tps: set[int], check: list[Path], jit: Path | N
     from concurrent.futures import ProcessPoolExecutor
 
     with ProcessPoolExecutor(max_workers=max(1, jobs)) as pool:
-        done = list(pool.map(_compile_job, todo, chunksize=1))
+        done = list(pool.map(_compile_job, [(k, target) for k in todo], chunksize=1))
     for k, got in zip(todo, done):
         if isinstance(got, str):
             problems.append(f"{k['function']} {k.get('hash', '?')[:12]}: {got}")
@@ -560,7 +599,7 @@ def build(spec: Path, out: Path, tps: set[int], check: list[Path], jit: Path | N
         ck = got
         cubin = ck.cubin
         sha = hashlib.sha256(cubin).hexdigest()
-        if k.get("hash"):
+        if k.get("hash") and not hip:
             want = k.get("cubin_sha256") or captured.get(k["hash"])
             if ck.hash != k["hash"]:
                 problems.append(f"{k['function']}: Triton hash {ck.hash[:12]} != captured {k['hash'][:12]}")
@@ -571,27 +610,30 @@ def build(spec: Path, out: Path, tps: set[int], check: list[Path], jit: Path | N
         if ck.hash in seen:
             continue
         seen.add(ck.hash)
-        (out / "cubins" / f"{ck.hash}.cubin").write_bytes(cubin)
+        (out / bin_dir / f"{ck.hash}.{ext}").write_bytes(cubin)
         md = ck.metadata
         runtime = [n for n in k["params"] if k["signature"].get(n) != "constexpr"]
         div = {n for n, v in k["attrs"].items() if v}
         dns = set(nospec.get(k["function"], {}).get("do_not_specialize", []))
         rows.append({
             "fn": md["name"], "hash": ck.hash, "name": md["name"], "num_warps": md["num_warps"],
-            "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
+            "warp_size": md.get("warp_size", 32), "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
             "global_scratch": md.get("global_scratch_size", 0), "global_align": md.get("global_scratch_align", 1),
             "profile_scratch": md.get("profile_scratch_size", 0), "pdl": bool(md.get("launch_pdl", False)),
             "params": [{"name": n, "type": k["signature"][n], "div16": n in div, "nospec": n in dns} for n in runtime],
             "consts": {n: zig_const(v) for n, v in k["constexprs"].items()},
             "function": k["function"], "tp": k.get("tp", [1]), "cubin_sha256": sha,
-            "n_regs": ck.n_regs, "n_spills": ck.n_spills,
+            "n_regs": ck.n_regs, "n_spills": ck.n_spills, **({"options": hip_options(k), "private_segment": ck.scratch}
+                                                             if hip else {}),
         })
     rows.sort(key=lambda x: (x["fn"], x["hash"]))
-    (out / "aot.json").write_text(json.dumps({"generator": "tools/zig/flashnext_aot.py", "target": list(TARGET),
-                                              "tp": sorted(tps), "kernels": rows}, indent=1) + "\n")
+    head = {"generator": "tools/zig/flashnext_aot.py", "target": list(target), "tp": sorted(tps)}
+    if hip:
+        head.update(bin_dir=bin_dir, bin_ext=ext, source_root=here)
+    (out / "aot.json").write_text(json.dumps({**head, "kernels": rows}, indent=1) + "\n")
     for p in problems:
         print("PROBLEM", p)
-    print(f"{len(rows)} kernels -> {out}; {same} cubins equal to the capture's" +
+    print(f"{len(rows)} kernels -> {out}; {same} {ext}s equal to the capture's" +
           (f"; {len(problems)} problems" if problems else ""))
     return 1 if problems else 0
 
@@ -614,13 +656,14 @@ def main() -> int:
     v.add_argument("--fixtures", required=True, help="W5's zig/src/families/flashnext/fixtures_cuda_triton.json")
     v.add_argument("--out", required=True)
     b = sub.add_parser("build")
-    b.add_argument("--spec", required=True)
+    b.add_argument("--spec", required=True, action="append", help="a spec list (repeatable: the sets are joined)")
     b.add_argument("--out", required=True)
     b.add_argument("--tp", default="1,2")
     b.add_argument("--check", action="append", default=[], help="a capture's manifest.json (repeatable)")
     b.add_argument("--jit", help="a capture's jit.json (do-not-specialize lists for aot.json)")
     b.add_argument("--only", default="", help="substring of the function names to build")
     b.add_argument("--jobs", type=int, default=8, help="compiles in parallel")
+    b.add_argument("--target", default="cuda", help="cuda (sm_121 cubins) or hip[:gfxNNNN] (code objects, default gfx1151)")
     a = ap.parse_args()
     if a.cmd == "extract":
         return extract(Path(a.launches), Path(a.cache), a.mount, Path(a.out),
@@ -629,8 +672,9 @@ def main() -> int:
         return cover(Path(a.spec), Path(a.fixtures), Path(a.out))
     if a.cmd == "derive":
         return derive(Path(a.spec), Path(a.out))
-    return build(Path(a.spec), Path(a.out), {int(t) for t in a.tp.split(",")}, [Path(c) for c in a.check],
-                 Path(a.jit) if a.jit else None, a.only, a.jobs)
+    return build([Path(x) for x in a.spec], Path(a.out), {int(t) for t in a.tp.split(",")}, [Path(c) for c in a.check],
+                 Path(a.jit) if a.jit else None, a.only, a.jobs,
+                 TARGET if a.target == "cuda" else (HIP_TARGET[0], a.target.partition(":")[2] or HIP_TARGET[1], 32))
 
 
 if __name__ == "__main__":

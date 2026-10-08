@@ -1,4 +1,5 @@
-//! Triton kernels compiled ahead of time: a cubin plus its metadata, launched the way Triton 3.7's own launcher does.
+//! Triton kernels compiled ahead of time: a cubin (or AMD code object) plus its metadata, launched the way Triton's own
+//! launcher does (3.7 CUDA and 3.6 AMD alike: runtime args, then null global and profile scratch pointers).
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -13,6 +14,7 @@ const launch = @import("launch.zig");
 pub const Meta = struct {
     name: []const u8,
     num_warps: u32,
+    warp_size: u32 = 32,
     num_ctas: u32 = 1,
     shared: u32 = 0,
     global_scratch_size: u32 = 0,
@@ -55,12 +57,12 @@ pub const Kernel = struct {
         self.* = undefined;
     }
 
-    /// The launch geometry Triton uses for a grid: x times num_ctas, 32 * num_warps threads, metadata shared bytes.
+    /// The launch geometry Triton uses for a grid: x times num_ctas, warp_size * num_warps threads, metadata shared bytes.
     pub fn config(self: Kernel, grid: launch.Dim3) launch.Config {
         const m = self.meta;
         return .{
             .grid = .{ .x = grid.x * m.num_ctas, .y = grid.y, .z = grid.z },
-            .block = .{ .x = 32 * m.num_warps },
+            .block = .{ .x = m.warp_size * m.num_warps },
             .shared = m.shared,
             .cluster = if (m.num_ctas != 1) .{ .x = m.num_ctas } else null,
             .cluster_spread = m.num_ctas != 1,
