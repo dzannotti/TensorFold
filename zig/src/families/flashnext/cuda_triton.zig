@@ -256,9 +256,11 @@ pub const Memo = struct {
         m.map.deinit(m.gpa);
     }
 
-    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const) u64 {
+    /// `small`: aot.allSmall (the buffer-op pointer form `find` picks by).
+    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const, small: bool) u64 {
         var h = std.hash.Wyhash.init(0x7472693a);
         h.update(name);
+        h.update(&.{@intFromBool(small)});
         for (consts) |c| {
             h.update(&.{0xc0});
             h.update(c.name);
@@ -296,7 +298,7 @@ pub const Tri = struct {
         if (t.rec) |r| return r.add(name, g, args, consts);
         const set = t.set.?;
         const m = t.memo orelse return set.run(t.s, name, g, args, consts);
-        const k = Memo.key(name, args, consts);
+        const k = Memo.key(name, args, consts, aot.allSmall(set, args));
         const at = m.map.get(k) orelse blk: {
             const v = try set.find(name, args, consts);
             const i = (@intFromPtr(v) - @intFromPtr(set.variants.ptr)) / @sizeOf(@TypeOf(set.variants[0]));

@@ -1,0 +1,156 @@
+_router M=1                        w4 s4 pr0                              vgpr 256 spill  174     73.2 us  ref
+_router M=1                        w4 s4 pr1                              vgpr 256 spill  188     35.4 us  same
+_router M=1                        w2 s1 pr1                              vgpr 233 spill    0     11.3 us  same
+_router M=1                        w2 s1 pr0                              vgpr 256 spill    0     14.7 us  same
+_router M=3                        w4 s4 pr0                              vgpr 256 spill  174     74.1 us  ref
+_router M=3                        w4 s4 pr1                              vgpr 256 spill  188     36.5 us  same
+_router M=3                        w2 s1 pr1                              vgpr 233 spill    0     11.7 us  same
+_router M=3                        w2 s1 pr0                              vgpr 256 spill    0     15.4 us  same
+_router M=16                       w4 s4 pr0                              vgpr 256 spill  174     78.3 us  ref
+_router M=16                       w4 s4 pr1                              vgpr 256 spill  188     37.1 us  same
+_router M=16                       w2 s1 pr1                              vgpr 233 spill    0     11.9 us  same
+_router M=16                       w2 s1 pr0                              vgpr 256 spill    0     15.9 us  same
+_router M=32                       w4 s3 pr0                              vgpr 204 spill    0     27.1 us  ref
+_router M=32                       w4 s3 pr1                              vgpr 135 spill    0     27.4 us  same
+_router M=32                       w8 s2 pr1                              vgpr 106 spill    0     20.6 us  same
+_router M=32                       w8 s2 pr0                              vgpr 124 spill    0     26.8 us  same
+_router M=256                      w4 s3 pr0                              vgpr 256 spill  370    526.7 us  ref
+_router M=256                      w4 s3 pr1                              vgpr 256 spill   51    120.1 us  same
+_router M=256                      w4 s1 pr1                              vgpr 192 spill    0     47.8 us  same
+_router M=256                      w4 s1 pr0                              vgpr 215 spill    0     51.0 us  same
+_router M=2048                     w4 s3 pr0                              vgpr 256 spill  370    975.5 us  ref
+_router M=2048                     w4 s3 pr1                              vgpr 256 spill   51    462.4 us  same
+_router M=2048                     w4 s1 pr1                              vgpr 192 spill    0    206.7 us  same
+_router M=2048                     w4 s1 pr0                              vgpr 215 spill    0    239.5 us  same
+_b16mm N324 K10240 SK32 M1         w4 s3 pr0                              vgpr 254 spill    0     13.4 us  ref
+_b16mm N324 K10240 SK32 M1         w4 s3 pr1                              vgpr 122 spill    0     11.9 us  same
+_b16mm N324 K10240 SK32 M1         w2 s1 pr1                              vgpr 112 spill    0     10.9 us  same
+_b16mm N324 K10240 SK32 M1         w2 s1 pr0                              vgpr 156 spill    0     12.5 us  same
+_b16mm N324 K10240 SK32 M16        w4 s3 pr0                              vgpr 254 spill    0     15.2 us  ref
+_b16mm N324 K10240 SK32 M16        w4 s3 pr1                              vgpr 121 spill    0     12.7 us  same
+_b16mm N324 K10240 SK32 M16        w2 s1 pr1                              vgpr 112 spill    0     13.1 us  same
+_b16mm N324 K10240 SK32 M16        w2 s1 pr0                              vgpr 156 spill    0     14.0 us  same
+_b16mm N640 K2560 SK8 M3           w4 s3 pr0                              vgpr 251 spill   88     14.5 us  ref
+_b16mm N640 K2560 SK8 M3           w4 s3 pr1                              vgpr 120 spill    0      9.4 us  same
+_b16mm N640 K2560 SK8 M3           w2 s1 pr1                              vgpr 112 spill    0      9.3 us  same
+_b16mm N640 K2560 SK8 M3           w2 s1 pr0                              vgpr 156 spill    0      9.3 us  same
+_b16mm N96 K2560 SK8 M3            w4 s3 pr0                              vgpr 251 spill   88     12.4 us  ref
+_b16mm N96 K2560 SK8 M3            w4 s3 pr1                              vgpr 120 spill    0      9.6 us  same
+_b16mm N96 K2560 SK8 M3            w2 s1 pr1                              vgpr 112 spill    0      9.4 us  same
+_b16mm N96 K2560 SK8 M3            w2 s1 pr0                              vgpr 156 spill    0      9.4 us  same
+_b16mm N2560 K2560 SK4 M3          w4 s3 pr0                              vgpr 159 spill    0     18.6 us  ref
+_b16mm N2560 K2560 SK4 M3          w4 s3 pr1                              vgpr 174 spill    0     17.8 us  same
+_b16mm N2560 K2560 SK4 M3          w2 s1 pr1                              vgpr 112 spill    0     17.2 us  same
+_b16mm N2560 K2560 SK4 M3          w2 s1 pr0                              vgpr 156 spill    0     18.8 us  same
+_b16mm N2560 K2560 SK4 M32         w4 s3 pr0                              vgpr 159 spill    0    135.7 us  ref
+_b16mm N2560 K2560 SK4 M32         w4 s3 pr1                              vgpr 174 spill    0    117.2 us  same
+_b16mm N2560 K2560 SK4 M32         w2 s1 pr1                              vgpr 112 spill    0     32.2 us  same
+_b16mm N2560 K2560 SK4 M32         w2 s1 pr0                              vgpr 156 spill    0     91.7 us  same
+_b16mm N10240 K320 SK1 M3          w4 s3 pr0                              vgpr 250 spill   88     35.8 us  ref
+_b16mm N10240 K320 SK1 M3          w4 s3 pr1                              vgpr 122 spill    0     12.1 us  same
+_b16mm N10240 K320 SK1 M3          w2 s1 pr1                              vgpr 112 spill    0     11.7 us  same
+_b16mm N10240 K320 SK1 M3          w2 s1 pr0                              vgpr 156 spill    0     12.7 us  same
+_b16mm N2560 K2560 SK4 M256        w4 s3 pr0                              vgpr 256 spill  297    386.4 us  ref
+_b16mm N2560 K2560 SK4 M256        w4 s3 pr1                              vgpr 256 spill   36    231.7 us  same
+_b16mm N2560 K2560 SK4 M256        w4 s1 pr1                              vgpr 191 spill    0    140.9 us  same
+_b16mm N2560 K2560 SK4 M256        w4 s1 pr0                              vgpr 239 spill    0    130.6 us  same
+_b16mm N10240 K320 SK1 M2048       w4 s3 pr0                              vgpr 256 spill  290   3002.5 us  ref
+_b16mm N10240 K320 SK1 M2048       w4 s3 pr1                              vgpr 256 spill   36   2482.1 us  same
+_b16mm N10240 K320 SK1 M2048       w4 s1 pr1                              vgpr 191 spill    0   1046.4 us  same
+_b16mm N10240 K320 SK1 M2048       w4 s1 pr0                              vgpr 239 spill    0   1026.8 us  same
+_b16mm N8240 K2560 SK2 M2048       w4 s3 pr0                              vgpr 256 spill  289   9845.6 us  ref
+_b16mm N8240 K2560 SK2 M2048       w4 s3 pr1                              vgpr 256 spill   70   5355.0 us  same
+_b16mm N8240 K2560 SK2 M2048       w4 s1 pr1                              vgpr 191 spill    0   2808.4 us  same
+_b16mm N8240 K2560 SK2 M2048       w4 s1 pr0                              vgpr 239 spill    0   3210.3 us  same
+_b16mm_ks N324 K10240 SK32 M256    w4 s2 pr0                              vgpr 256 spill  195   2097.0 us  ref
+_b16mm_ks N324 K10240 SK32 M256    w4 s2 pr1                              vgpr 256 spill  152   1776.5 us  same
+_b16mm_ks N324 K10240 SK32 M256    w8 s1 pr1                              vgpr 187 spill    0    366.6 us  same
+_b16mm_ks N324 K10240 SK32 M256    w8 s1 pr0                              vgpr 218 spill    0    472.2 us  same
+_b16mm_ks N324 K10240 SK32 M256    w4 s1 pr1                              vgpr 255 spill    0    452.4 us  same
+_b16mm_ks N2560 K2560 SK4 M256     w4 s2 pr0                              vgpr 256 spill  211    493.1 us  ref
+_b16mm_ks N2560 K2560 SK4 M256     w4 s2 pr1                              vgpr 256 spill  152    418.5 us  same
+_b16mm_ks N2560 K2560 SK4 M256     w8 s1 pr1                              vgpr 187 spill    0    305.6 us  same
+_b16mm_ks N2560 K2560 SK4 M256     w8 s1 pr0                              vgpr 226 spill    0    343.5 us  same
+_b16mm_ks N2560 K2560 SK4 M256     w4 s1 pr1                              vgpr 255 spill    0    300.7 us  same
+_b16mm_ks N640 K2560 SK8 M2048     w4 s2 pr0                              vgpr 256 spill  211    818.9 us  ref
+_b16mm_ks N640 K2560 SK8 M2048     w4 s2 pr1                              vgpr 256 spill  152    733.8 us  same
+_b16mm_ks N640 K2560 SK8 M2048     w8 s1 pr1                              vgpr 187 spill    0    468.7 us  same
+_b16mm_ks N640 K2560 SK8 M2048     w8 s1 pr0                              vgpr 226 spill    0    514.2 us  same
+_b16mm_ks N640 K2560 SK8 M2048     w4 s1 pr1                              vgpr 255 spill    0    424.6 us  same
+_b16mm_ks N96 K2560 SK8 M2048      w4 s2 pr0                              vgpr 256 spill  211    491.1 us  ref
+_b16mm_ks N96 K2560 SK8 M2048      w4 s2 pr1                              vgpr 256 spill  152    372.8 us  same
+_b16mm_ks N96 K2560 SK8 M2048      w8 s1 pr1                              vgpr 187 spill    0    188.3 us  same
+_b16mm_ks N96 K2560 SK8 M2048      w8 s1 pr0                              vgpr 226 spill    0    212.4 us  same
+_b16mm_ks N96 K2560 SK8 M2048      w4 s1 pr1                              vgpr 255 spill    0    197.6 us  same
+_b16mm_ks N2560 K6144 SK4 M2048    w4 s2 pr0                              vgpr 256 spill  211   5811.5 us  ref
+_b16mm_ks N2560 K6144 SK4 M2048    w4 s2 pr1                              vgpr 256 spill  152   5314.0 us  same
+_b16mm_ks N2560 K6144 SK4 M2048    w8 s1 pr1                              vgpr 187 spill    0   3106.1 us  same
+_b16mm_ks N2560 K6144 SK4 M2048    w8 s1 pr0                              vgpr 226 spill    0   3555.4 us  same
+_b16mm_ks N2560 K6144 SK4 M2048    w4 s1 pr1                              vgpr 255 spill    0   2771.7 us  same
+_b16mm_ks N4 K10240 SK32 M2048     w4 s2 pr0                              vgpr 256 spill  195   2047.5 us  ref
+_b16mm_ks N4 K10240 SK32 M2048     w4 s2 pr1                              vgpr 256 spill  152   3581.1 us  same
+_b16mm_ks N4 K10240 SK32 M2048     w8 s1 pr1                              vgpr 187 spill    0    631.8 us  same
+_b16mm_ks N4 K10240 SK32 M2048     w8 s1 pr0                              vgpr 218 spill    0    758.6 us  same
+_b16mm_ks N4 K10240 SK32 M2048     w4 s1 pr1                              vgpr 255 spill    0    652.4 us  same
+_hc_up_mix BM32 M256               w4 s2 pr0                              vgpr 256 spill  893   1053.8 us  ref
+_hc_up_mix BM32 M256               w4 s2 pr1                              vgpr 194 spill    0    230.0 us  same
+_hc_up_mix BM32 M256               w4 s1 pr1                              vgpr 212 spill    0    245.7 us  same
+_hc_up_mix BM32 M256               w4 s1 pr0                              vgpr 256 spill 1367   1672.5 us  same
+_hc_up_mix BM32 M256               w8 s1 pr1                              vgpr 256 spill  468   1203.2 us  same
+_hc_up_mix BM64 M256               w4 s2 pr0                              vgpr 256 spill 2089   1675.9 us  ref
+_hc_up_mix BM64 M256               w4 s2 pr1                              vgpr 256 spill  521    520.3 us  same
+_hc_up_mix BM64 M256               w4 s1 pr1                              vgpr 256 spill   32    263.3 us  same
+_hc_up_mix BM64 M256               w4 s1 pr0                              vgpr 256 spill   53    274.3 us  same
+_hc_up_mix BM64 M256               w8 s1 pr1                              vgpr 200 spill    0    246.3 us  same
+_hc_up_mix BM32 M2048              w4 s2 pr0                              vgpr 256 spill  893   6779.8 us  ref
+_hc_up_mix BM32 M2048              w4 s2 pr1                              vgpr 194 spill    0   2200.4 us  same
+_hc_up_mix BM32 M2048              w4 s1 pr1                              vgpr 212 spill    0   1713.1 us  same
+_hc_up_mix BM32 M2048              w4 s1 pr0                              vgpr 256 spill 1367  12871.4 us  same
+_hc_up_mix BM32 M2048              w8 s1 pr1                              vgpr 256 spill  468   8247.8 us  same
+_hc_up_mix BM64 M2048              w4 s2 pr0                              vgpr 256 spill 2089  14536.4 us  ref
+_hc_up_mix BM64 M2048              w4 s2 pr1                              vgpr 256 spill  521   3340.8 us  same
+_hc_up_mix BM64 M2048              w4 s1 pr1                              vgpr 256 spill   32   2038.1 us  same
+_hc_up_mix BM64 M2048              w4 s1 pr0                              vgpr 256 spill   53   1876.4 us  same
+_hc_up_mix BM64 M2048              w8 s1 pr1                              vgpr 200 spill    0   1934.2 us  same
+_chunks8 r1 c262144 p140000              w4 s1 pr0 spills  678    652.1 us ref
+_chunks8 r1 c262144 p140000              w4 s1 pr1 spills  612    600.9 us same
+_chunks8 r1 c262144 p140000              w8 s1 pr0 spills  462    474.7 us same
+_chunks8 r1 c262144 p140000              w2 s1 pr0 spills  865    578.0 us same
+_chunks8 r1 c262144 p140000              w2 s2 pr0 spills 2078    909.7 us same
+_chunks8 r3 c262144 p140000              w4 s1 pr0 spills  678    705.2 us ref
+_chunks8 r3 c262144 p140000              w4 s1 pr1 spills  612    703.9 us same
+_chunks8 r3 c262144 p140000              w8 s1 pr0 spills  462    563.7 us same
+_chunks8 r3 c262144 p140000              w2 s1 pr0 spills  865    777.7 us same
+_chunks8 r3 c262144 p140000              w2 s2 pr0 spills 2078   1028.2 us same
+_chunks8 r16 c262144 p140000             w4 s1 pr0 spills  678   2261.8 us ref
+_chunks8 r16 c262144 p140000             w4 s1 pr1 spills  612   1877.0 us same
+_chunks8 r16 c262144 p140000             w8 s1 pr0 spills  462   2385.0 us same
+_chunks8 r16 c262144 p140000             w2 s1 pr0 spills  865   1313.8 us same
+_chunks8 r16 c262144 p140000             w2 s2 pr0 spills 2078   3824.8 us same
+_chunks8 r256 c262144 p140000            w4 s1 pr0 spills  678  28547.0 us ref
+_chunks8 r256 c262144 p140000            w4 s1 pr1 spills  612  23712.9 us same
+_chunks8 r256 c262144 p140000            w8 s1 pr0 spills  462  34202.6 us same
+_chunks8 r256 c262144 p140000            w2 s1 pr0 spills  865  26103.7 us same
+_chunks8 r256 c262144 p140000            w2 s2 pr0 spills 2078  49848.2 us same
+_chunks r3 c262144 p140000               w4 s1 pr0 spills  553    183.6 us ref
+_chunks r3 c262144 p140000               w4 s1 pr1 spills  396    127.5 us same
+_chunks r3 c262144 p140000               w8 s1 pr0 spills  495    205.3 us same
+_chunks r3 c262144 p140000               w2 s1 pr0 spills  663    218.3 us same
+_chunks r3 c262144 p140000               w2 s2 pr0 spills 1641    350.8 us same
+_chunks r256 c262144 p140000             w4 s1 pr0 spills  553  11995.5 us ref
+_chunks r256 c262144 p140000             w4 s1 pr1 spills  396  10183.6 us same
+_chunks r256 c262144 p140000             w8 s1 pr0 spills  495  21465.1 us same
+_chunks r256 c262144 p140000             w2 s1 pr0 spills  663  10398.9 us same
+_chunks r256 c262144 p140000             w2 s2 pr0 spills 1641  22812.8 us same
+_select r3 BLOCK4096                     w16 s3 pr0 spills    0     12.7 us ref
+_select r3 BLOCK4096                     w16 s3 pr1 spills    0     12.5 us same
+_select r3 BLOCK4096                     w8 s3 pr0 spills    0     12.4 us same
+_select r3 BLOCK4096                     w8 s1 pr1 spills    0     11.9 us same
+_select r3 BLOCK32768                    w16 s3 pr0 spills  832    112.8 us ref
+_select r3 BLOCK32768                    w16 s3 pr1 spills    0     44.6 us same
+_select r3 BLOCK32768                    w8 s3 pr0 spills 1074    302.8 us same
+_select r3 BLOCK32768                    w8 s1 pr1 spills  171     96.5 us same
+_select r16 BLOCK32768                   w16 s3 pr0 spills  832    155.2 us ref
+_select r16 BLOCK32768                   w16 s3 pr1 spills    0     56.9 us same
+_select r16 BLOCK32768                   w8 s3 pr0 spills 1074    341.5 us same
+_select r16 BLOCK32768                   w8 s1 pr1 spills  171    130.2 us same

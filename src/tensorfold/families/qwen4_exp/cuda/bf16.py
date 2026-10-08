@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ....cuda import hip_tune
+
 HAS_TRITON = True
 try:
     import triton
@@ -108,7 +110,8 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
     bm = 128 if m > 128 else 16
     grid = (triton.cdiv(m, bm), -(-b.n // block_n), sk)
     _b16mm[grid](x, b.weight, out, part, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm,
-                 BLOCK_N=block_n, BK=bk, F32=f32, num_warps=num_warps, num_stages=num_stages)
+                 BLOCK_N=block_n, BK=bk, F32=f32,
+                 **hip_tune.launch("_b16mm", {"BM": bm}, num_warps=num_warps, num_stages=num_stages))
     if sk > 1:
         total = m * b.n
         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)

@@ -3,6 +3,8 @@
 
   hash: every spec entry is warmed up through the JIT (MockTensor pointers: nothing allocated, nothing launched); its
         kernel hash must be in aot.json and its hsaco byte-equal to the AOT one.
+  tiles: every row-tiled matmul variant (_b16mm, _b16mm_ks, _router, _hc_up_mix; both pointer forms) on a partial
+        last row tile against whole tiles: each row's bits must not depend on M.
   run:  the Python wrappers (tools/zig/flashnext_triton_fixtures.py's calls, small rows) on random GPU tensors; each
         Triton launch runs through the JIT, then again from aot.json's hsaco with the Zig launcher's ABI (variant by
         aot.zig's matching rules, runtime args + two null scratch pointers, 32 * num_warps threads, metadata shared
@@ -30,16 +32,17 @@ import flashnext_aot as A  # noqa: E402
 # ------------------------------------------------------------------------------------------------------------- hash
 
 class Ptr:
-    """A MockTensor whose address is 16-aligned or not, as the spec's divisibility says."""
+    """A MockTensor whose address is 16-aligned or not, as the spec's divisibility says, within 2 GiB (Triton's
+    ``is_within_2gb``: the JIT then specializes it to buffer ops) or not."""
 
-    def __init__(self, dtype, aligned: bool) -> None:
-        self.dtype, self.addr = dtype, 0 if aligned else 8
+    def __init__(self, dtype, aligned: bool, small: bool = False) -> None:
+        self.dtype, self.addr, self.small = dtype, 0 if aligned else 8, small
 
     def data_ptr(self):
         return self.addr
 
-    def ptr_range(self):          # under 2 GiB: the JIT adds tt.pointer_range 32 (buffer ops)
-        return 1 << 20
+    def ptr_range(self):
+        return 1024 if self.small else 1 << 40
 
 
 def jit_kwargs(k: dict):
@@ -49,13 +52,13 @@ def jit_kwargs(k: dict):
     kw = {}
     for p in k["params"]:
         t = k["signature"][p]
-        div = bool(k["attrs"].get(p))
+        div = ["tt.divisibility", 16] in k["attrs"].get(p, [])
         if t == "constexpr":
             kw[p] = A.value(k["constexprs"][p], tl, reg)
         elif t.startswith("*"):
             short = t[1:]
             name = {"i": "int", "u": "uint"}.get(short[0], "") + short[1:] if short[0] in "iu" else short
-            kw[p] = Ptr(tl.dtype(name), div)
+            kw[p] = Ptr(tl.dtype(name), div, bool(k.get("range32")))
         elif t in ("i32", "i64", "u32", "u64"):
             kw[p] = 32 if div else 7
         elif t == "fp32":
@@ -70,7 +73,7 @@ def hash_check(aot: Path, specs: list[Path]) -> int:
     bad = 0
     n = 0
     for spec in specs:
-        for k in json.loads(spec.read_text())["kernels"]:
+        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in (e, A.ranged(e))):
             fn = A.resolve(k["function"])
             opts = A.hip_options(k)
             ck = fn.warmup(grid=(1,), **jit_kwargs(k), **opts)
@@ -87,8 +90,9 @@ def hash_check(aot: Path, specs: list[Path]) -> int:
 
 # -------------------------------------------------------------------------------------------------------------- run
 
-def zig_match(row: dict, args: list[tuple], consts: dict) -> bool:
-    """aot.zig's ``matches``: args are (name, kind, value, type) with kind ptr / i32 / f32."""
+def zig_match(row: dict, args: list[tuple], consts: dict, small: bool) -> bool:
+    """aot.zig's ``matches``: args are (name, kind, value, type) with kind ptr / i32 / f32; ``small``: every pointer's
+    storage within 2 GiB (aot.zig's allSmall, as the JIT decides it)."""
 
     for n, c in consts.items():
         got = row["consts"].get(n)
@@ -108,7 +112,7 @@ def zig_match(row: dict, args: list[tuple], consts: dict) -> bool:
             if p["div16"] != (not p["nospec"] and v % 16 == 0):
                 return False
         elif kind == "ptr":
-            if p is None or p["type"] != ty or p["div16"] != (v % 16 == 0):
+            if p is None or p["type"] != ty or p["div16"] != (v % 16 == 0) or p.get("range32", False) != small:
                 return False
         elif p is None or p["type"] != "fp32":
             return False
@@ -217,7 +221,8 @@ def interceptor(hip: Hip, jit):
                 after = [t.clone() for t in tensors]
                 fn = jit.fn.__name__
                 STATS["launches"] += 1
-                rows = [r for r in hip.rows if r["fn"] == fn and zig_match(r, args, zc)]
+                small = all(t.untyped_storage().size() <= A.MAX_RANGE for t in tensors)
+                rows = [r for r in hip.rows if r["fn"] == fn and zig_match(r, args, zc, small)]
                 st = STATS["fns"].setdefault(fn, [0, 0, 0])
                 if not rows:
                     STATS["novariant"] += 1
@@ -428,6 +433,83 @@ def direct_cases(z, specs: list[Path]) -> None:
                           for n, v in k["constexprs"].items() if n not in kw}
                 wrapped[k["name"]][grid](**kw, **consts, **A.hip_options(k))
 
+# ------------------------------------------------------------------------------------------------------------ tiles
+
+def _tile_args(row: dict, m: int, base: dict | None = None):
+    """Inputs for a row-tiled matmul at ``m`` rows (random, or the first ``m`` rows of ``base``'s), zeroed outputs:
+    tensors by name, grid, the compared output (its rows axis) and the strides."""
+
+    import torch
+
+    c = {n: v.get("int") for n, v in row["consts"].items()}
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    bf = lambda *s: (torch.randn(s, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)   # noqa: E731
+    zero = lambda *s, dt=torch.float32: torch.zeros(s, device="cuda", dtype=dt)               # noqa: E731
+    rows = lambda name, x: base[name][:m].contiguous() if base else x                         # noqa: E731
+    fn = row["fn"]
+    if fn in ("_b16mm", "_b16mm_ks"):
+        n, k, sk = c["N"], c["K"], c["SK"]
+        out = zero(m, n, dt=torch.float32 if c["F32"] else torch.bfloat16)
+        t = {"X": rows("X", bf(m, k)), "W": base["W"] if base else bf(n, k), "OUT": out}
+        if fn == "_b16mm_ks":
+            return t, (-(-m // c["BM"]) * -(-n // 64), 1, 1), ("OUT", 0), {"x_stride": k}
+        t["PART"] = zero(sk, m, n) if sk > 1 else out
+        return t, (-(-m // c["BM"]), -(-n // 64), sk), ("PART", 1) if sk > 1 else ("OUT", 0), {"x_stride": k}
+    if fn == "_router":
+        d, ne = c["D"], c["NE"]
+        t = {"X": rows("X", bf(m, d)), "W": base["W"] if base else bf(ne, d), "OUT": zero(m, ne)}
+        return t, (-(-m // c["BM"]), -(-ne // c["BLOCK_E"]), 1), ("OUT", 0), {"x_stride": d}
+    d, s_, k = c["D"], c["S"], c["K"]                                   # _hc_up_mix
+    t = {"ACT": rows("ACT", bf(m, k)), "W": base["W"] if base else bf(s_ * d, k),
+         "NORMED": rows("NORMED", bf(m, s_ * d)), "MIXED": zero(m, d, dt=torch.bfloat16)}
+    return t, (-(-m // c["BM"]), d // c["BD"], 1), ("MIXED", 0), {}
+
+
+def tiles_check(aot: Path) -> int:
+    """Every row-tiled matmul variant with M a runtime int (both pointer forms): a launch whose last row tile is
+    partial gives each row the bits a launch of whole tiles gives it (the gfx1151 miscompile of heavily spilled
+    masked loads broke exactly this), and the two pointer forms of one specialization give the same bits."""
+
+    import torch
+
+    hip = Hip(aot)
+    stream = torch.cuda.current_stream().cuda_stream
+    bad = n = 0
+    forms: dict = {}
+    u8 = lambda x: x.contiguous().view(torch.uint8)                     # noqa: E731
+    for row in hip.rows:
+        if row["fn"] not in ("_b16mm", "_b16mm_ks", "_router", "_hc_up_mix"):
+            continue
+        c = {k: v.get("int") for k, v in row["consts"].items()}
+        mp = next((p for p in row["params"] if p["name"] == "M"), None)
+        if mp is None or c.get("N", 0) * c.get("K", 0) > 1 << 26:      # one row only, or a head-sized weight
+            continue
+        bm = c["BM"]
+        full = 2 * bm if bm >= 64 else 64
+        ms = [x for x in ((bm + 16, full - 16) if mp["div16"] else (bm + 1, full - 3)) if x % bm]
+        pr = any(p.get("range32") for p in row["params"])
+
+        def launch(t, grid, ints, m):
+            args = [(p["name"], "ptr", t[p["name"]].data_ptr(), p["type"]) if p["type"].startswith("*") else
+                    (p["name"], "i32", m if p["name"] == "M" else ints[p["name"]], "i32") for p in row["params"]]
+            hip.launch(row, grid, args, stream)
+            torch.cuda.synchronize()
+
+        whole, grid, (o, ax), ints = _tile_args(row, full)
+        launch(whole, grid, ints, full)
+        for m in ms:
+            t, grid, _, _ = _tile_args(row, m, whole)
+            launch(t, grid, ints, m)
+            n += 1
+            want = whole[o][:m] if ax == 0 else whole[o][:, :m]
+            key = (row["fn"], json.dumps(row["consts"], sort_keys=True), mp["div16"], m)
+            prev = forms.setdefault(key, t[o])
+            if not torch.equal(u8(want), u8(t[o])) or not torch.equal(u8(prev), u8(t[o])):
+                bad += 1
+                print(f"DIFFER {row['fn']} {row['hash'][:10]} {c} range32 {pr} M {m}")
+    print(f"{n} partial-tile launches against whole tiles and the other pointer form, {bad} differ")
+    return 1 if bad else 0
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -444,7 +526,11 @@ def main() -> int:
                    "fp4/,b16/,attention/tp1/c1024/r3/p100,attention/tp1/c262144/r3/p3000/x8192,"
                    "attention/tp2/c262144/r16/p3000/x16384,attention_prefill/tp1/c1024/s0/n30,"
                    "attention_prefill/tp1/c262144/s4096/n19,attention_prefill/tp1/c262144/s2048/n974,shift/,kv8,direct")
+    t = sub.add_parser("tiles")
+    t.add_argument("--aot", required=True)
     a = ap.parse_args()
+    if a.cmd == "tiles":
+        return tiles_check(Path(a.aot))
     if a.cmd == "hash":
         return hash_check(Path(a.aot), [Path(s) for s in a.spec])
     return run_check(Path(a.aot), a.cases, a.bench, [Path(x) for x in a.spec])
