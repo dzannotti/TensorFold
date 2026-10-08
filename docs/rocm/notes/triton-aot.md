@@ -6,7 +6,7 @@ Build (dev image, no GPU needed): `PYTHONPATH=src python -B tools/zig/flashnext_
 
 Checks: `tools/rocm/triton_parity.py hash` (454/454 JIT hashes in aot.json, hsaco byte-equal);
 `tools/rocm/triton_parity.py run --bench 1` (175 wrapper launches, all bit-equal; timings below);
-`tools/rocm/fp8_check.py` (fp8e4nv encode/decode == torch.float8_e4m3fn).
+`tools/rocm/fp8kv_check.py` (fp8e4nv encode/decode == torch.float8_e4m3fn).
 
 ## Per function (vgpr / spills from the code object metadata)
 
