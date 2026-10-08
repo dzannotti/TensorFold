@@ -513,6 +513,9 @@ def compile_one(k: dict, cache_dir: Path | None, target: tuple = TARGET):
     attrs = {path_of(n, params): v for n, v in k["attrs"].items()}
     if target[0] == "hip":
         options = hip_options(k)
+        # Triton 3.6's JIT keys attributes by pointer and int parameters only (3.7, which captured the spec, keys all)
+        attrs = {path_of(n, params): v for n, v in k["attrs"].items()
+                 if k["signature"].get(n) != "constexpr" and not k["signature"].get(n, "").startswith("fp")}
     else:
         options = {n: tuple(v) if isinstance(v, list) else v for n, v in k["options"].items()}
     src = ASTSource(fn, dict(k["signature"]), constexprs, attrs)
@@ -614,7 +617,7 @@ def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: P
         dns = set(nospec.get(k["function"], {}).get("do_not_specialize", []))
         rows.append({
             "fn": md["name"], "hash": ck.hash, "name": md["name"], "num_warps": md["num_warps"],
-            "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
+            "warp_size": md.get("warp_size", 32), "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
             "global_scratch": md.get("global_scratch_size", 0), "global_align": md.get("global_scratch_align", 1),
             "profile_scratch": md.get("profile_scratch_size", 0), "pdl": bool(md.get("launch_pdl", False)),
             "params": [{"name": n, "type": k["signature"][n], "div16": n in div, "nospec": n in dns} for n in runtime],
