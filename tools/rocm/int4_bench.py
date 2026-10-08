@@ -52,7 +52,7 @@ def decode(ex, nts, rounds):
             res = []
             for nu in nts:
                 for nd in nts:
-                    if NI % (16 * nu):
+                    if NI % (8 * nu * c.WAVES) or D % (16 * nd * c.WAVES):
                         continue
                     tu = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 0), 20, rounds)
                     td = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 1), 20, rounds)
@@ -117,9 +117,8 @@ def main():
     ap.add_argument("--nt", default="1,2,4")
     ap.add_argument("--cases", default="stream,decode,head,prompt")
     ap.add_argument("--rounds", type=int, default=7)
-    ap.add_argument("--abl", type=int, default=0, help="fn_int4.hip TF_INT4_ABL (1 no dequant, 2 no WMMA, 3 no x loads)")
     a = ap.parse_args()
-    c.M = c.load(a.abl)
+    c.M = c.load()
     nts = [int(v) for v in a.nt.split(",")]
     cases = a.cases.split(",")
     if "stream" in cases:

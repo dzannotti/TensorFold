@@ -42,3 +42,39 @@ __device__ void stream_u(const u32x4* __restrict__ p, size_t n, uint32_t* out) {
 }
 extern "C" __global__ void probe_stream4(const u32x4* __restrict__ p, size_t n, uint32_t* out) { stream_u<4>(p, n, out); }
 extern "C" __global__ void probe_stream8(const u32x4* __restrict__ p, size_t n, uint32_t* out) { stream_u<8>(p, n, out); }
+
+// WMMA rate: CH independent accumulator chains a wave, `n` steps each (CH = 1: the dependent chain's latency).
+template <int CH>
+__device__ void wmma_rate(int n, float* out) {
+  v16s a, b;
+  for (int i = 0; i < 16; ++i) { a[i] = (short)(threadIdx.x + i); b[i] = (short)(threadIdx.x * 3 + i); }
+  v8f c[CH];
+  for (int j = 0; j < CH; ++j) c[j] = v8f{};
+  for (int s = 0; s < n; ++s)
+#pragma unroll
+    for (int j = 0; j < CH; ++j) c[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c[j]);
+  float t = 0.f;
+  for (int j = 0; j < CH; ++j) t += c[j][0];
+  out[blockIdx.x * blockDim.x + threadIdx.x] = t;
+}
+extern "C" __global__ void probe_wmma1(int n, float* out) { wmma_rate<1>(n, out); }
+extern "C" __global__ void probe_wmma4(int n, float* out) { wmma_rate<4>(n, out); }
+extern "C" __global__ void probe_wmma8(int n, float* out) { wmma_rate<8>(n, out); }
+
+// Our weights' access pattern: wave w streams its own region of `steps` KiB, a KiB a step (2 loads of 512 bytes),
+// waves grid-strided over `regions`.
+extern "C" __global__ void probe_regions(const u32x4* __restrict__ p, int regions, int steps, uint32_t* out) {
+  const int lane = threadIdx.x & 31;
+  uint32_t s = 0;
+  for (int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < regions; r += gridDim.x * (blockDim.x / 32)) {
+    const u32x4* q = p + (size_t)r * steps * 64;
+    for (int i = 0; i < steps; i += 2) {
+      u32x4 v[4];
+#pragma unroll
+      for (int u = 0; u < 4; ++u) v[u] = __builtin_nontemporal_load(q + i * 64 + u * 32 + lane);
+#pragma unroll
+      for (int u = 0; u < 4; ++u) s ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
+    }
+  }
+  out[blockIdx.x * blockDim.x + threadIdx.x] = s;
+}

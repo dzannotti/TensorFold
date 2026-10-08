@@ -75,17 +75,27 @@ fn checkSlice(src: Source, sl: Slice) !void {
     if (src.qweight.len != src.k_full / 8 * src.n_full * 4 or src.scales.len != src.k_full / checkpoint_group * src.n_full * 2) return error.BadLength;
 }
 
+/// HIP: n16 tiles a super tile of an [n, k] matrix, gcd(n / 16, 16) (fn_int4.hip super_tiles): a group's tiles of a
+/// super tile lie side by side, so a launch's waves read DRAM in long runs.
+pub fn superTiles(n: usize) usize {
+    const t = n / 16;
+    return @min(t & (~t +% 1), 16);
+}
+
 /// Columns [n0, n0 + n) and inputs [k0, k0 + k) of `src` in the kernel's word order: [n/8][k/gs][32][gs/32]; HIP:
-/// [n/16][k/gs][gs/32][16][4], column c's GPTQ words for the k32 chunk with every nibble xor 8 (q - 8, two's complement).
+/// [n/16/st][k/gs][st][gs/32][16][4] (st = superTiles(n)), column c's GPTQ words for the k32 chunk with every nibble
+/// xor 8 (q - 8, two's complement).
 pub fn packWords(src: Source, sl: Slice, out: []u32) !void {
     try checkSlice(src, sl);
     if (out.len != wordsOf(sl.n, sl.k)) return error.BadLength;
     const kg = sl.k / sl.gs;
     if (hip_layout) {
+        const st = superTiles(sl.n);
         var i: usize = 0;
-        for (0..sl.n / 16) |nt| for (0..kg) |g| for (0..sl.gs / 32) |ch| for (0..16) |c| for (0..4) |wi| {
+        for (0..sl.n / 16 / st) |sp| for (0..kg) |g| for (0..st) |t| for (0..sl.gs / 32) |ch| for (0..16) |c| for (0..4) |wi| {
             const kp = (sl.k0 + g * sl.gs + ch * 32 + wi * 8) / 8;
-            out[i] = std.mem.readInt(u32, src.qweight[(kp * src.n_full + sl.n0 + nt * 16 + c) * 4 ..][0..4], .little) ^ 0x88888888;
+            const col = sl.n0 + (sp * st + t) * 16 + c;
+            out[i] = std.mem.readInt(u32, src.qweight[(kp * src.n_full + col) * 4 ..][0..4], .little) ^ 0x88888888;
             i += 1;
         };
         return;
@@ -103,12 +113,23 @@ pub fn packWords(src: Source, sl: Slice, out: []u32) !void {
     };
 }
 
-/// The scales of the same slice: fp16 bits [n/tile_n][k/gs][tile_n] (a group of 64 repeats its group of 128's scale).
+/// The scales of the same slice: fp16 bits [n/8][k/gs][8] (a group of 64 repeats its group of 128's scale); HIP:
+/// [n/16/st][k/gs][st][16].
 pub fn packScales(src: Source, sl: Slice, out: []u16) !void {
     try checkSlice(src, sl);
     const kg = sl.k / sl.gs;
     if (out.len != scalesOf(sl.n, sl.k, sl.gs)) return error.BadLength;
     var at: usize = 0;
+    if (hip_layout) {
+        const st = superTiles(sl.n);
+        for (0..sl.n / 16 / st) |sp| for (0..kg) |g| for (0..st) |t| for (0..16) |c| {
+            const col = sl.n0 + (sp * st + t) * 16 + c;
+            const row = (sl.k0 + g * sl.gs) / checkpoint_group;
+            out[at] = std.mem.readInt(u16, src.scales[(row * src.n_full + col) * 2 ..][0..2], .little);
+            at += 1;
+        };
+        return;
+    }
     for (0..sl.n / tile_n) |nt| for (0..kg) |g| for (0..tile_n) |c| {
         const col = sl.n0 + nt * tile_n + c;
         const row = (sl.k0 + g * sl.gs) / checkpoint_group;
@@ -225,7 +246,7 @@ pub const Kernels = struct {
             k.fns[i][j][q] = try k.module.function(s);
             k.blocks[i][j][q] = @as(usize, @max(1, try k.fns[i][j][q].occupancy(warps * 32, 0))) * sms;
         };
-        if (hip_layout) return k;   // prompt calls take int4_kernel's 4 row tiles (downPrompt)
+        if (hip_layout) return k; // prompt calls take int4_kernel's 4 row tiles (downPrompt)
         for (0..2) |g| for (0..2) |o| {
             const sm = promptSmem(if (g == 0) 128 else 64, prompt_stages[g]);
             k.pdown[g][o] = try k.module.function(prompt_symbols[g][o]);
@@ -249,20 +270,28 @@ fn pickNt(k: *const Kernels, kind: usize, max_items: usize, n: usize, q: usize) 
     var j: usize = nts.len;
     while (j > 1) {
         j -= 1;
-        const units = max_items * (n / (tile_n * nts[j]));
-        if (n % (tile_n * nts[j]) == 0 and units >= 2 * k.blocks[kind][j][q] * warps) return j;
+        const units = max_items * (n / unitCols(kind, nts[j]));
+        if (n % unitCols(kind, nts[j]) == 0 and units >= 2 * k.blocks[kind][j][q] * unit_blocks) return j;
     }
     return 0;
 }
+
+/// Output columns of one unit: a warp's NT n8 tiles (CUDA) or a block's (HIP: its 4 waves split over the matrices).
+fn unitCols(kind: usize, nt: usize) usize {
+    return if (hip_layout) 16 * nt * (warps / kinds[kind].mats) else 8 * nt;
+}
+
+/// Units a block takes at once (CUDA: a warp each).
+const unit_blocks: usize = if (hip_layout) 1 else warps;
 
 fn launch(k: *const Kernels, s: cuda.Stream, kind: usize, max_items: usize, x: u64, x_stride: usize, slots: usize, w: u64, sc: u64, kk: usize, n: usize, p: ?kern.Plan, rows: usize, out: u64, out_stride: usize, skip: c_int, force_nt: ?usize, mt: usize) !void {
     // uint4 loads of the input rows, uint4/uint2 weight words, half2 scales, float2/bf16x2 stores
     if (n % tile_n != 0 or kk % kinds[kind].gs != 0 or x_stride % 8 != 0 or x % 16 != 0 or w % 16 != 0 or sc % 4 != 0 or out % 8 != 0) return error.Invalid;
     const q = std.mem.indexOfScalar(usize, &mts, mt) orelse return error.Invalid;
     const j = if (force_nt) |f| (std.mem.indexOfScalar(usize, &nts, f) orelse return error.Invalid) else pickNt(k, kind, max_items, n, q);
-    if (n % (tile_n * nts[j]) != 0) return error.Invalid;
-    const units = max_items * (n / (tile_n * nts[j]));
-    const grid = @min((units + warps - 1) / warps, k.blocks[kind][j][q]);
+    if (n % unitCols(kind, nts[j]) != 0) return error.Invalid;
+    const units = max_items * (n / unitCols(kind, nts[j]));
+    const grid = @min((units + unit_blocks - 1) / unit_blocks, k.blocks[kind][j][q]);
     if (grid < 1) return;
     var a: cuda.Args = .{};
     a.add(x);
@@ -388,7 +417,7 @@ test "shuffle puts input 2i at nibble i and 2i + 1 at nibble i + 4" {
 
 test "packWords: a lane's word of a block holds its column's inputs 8 t .. 8 t + 7" {
     const gpa = std.testing.allocator;
-    const n_full = 32;
+    const n_full = 96;
     const k_full = 256;
     const qw = try gpa.alloc(u8, k_full / 8 * n_full * 4);
     defer gpa.free(qw);
@@ -399,18 +428,22 @@ test "packWords: a lane's word of a block holds its column's inputs 8 t .. 8 t +
     for (0..sc.len / 2) |i| std.mem.writeInt(u16, sc[2 * i ..][0..2], @intCast(i), .little);
     const src: Source = .{ .qweight = qw, .scales = sc, .n_full = n_full, .k_full = k_full };
     for ([_]usize{ 128, 64 }) |gs| {
-        const sl: Slice = .{ .n0 = tile_n, .n = tile_n, .k0 = 128, .k = 128, .gs = gs };
+        const sl: Slice = .{ .n0 = tile_n, .n = 4 * tile_n, .k0 = 128, .k = 128, .gs = gs };
         const out = try gpa.alloc(u32, wordsOf(sl.n, sl.k));
         defer gpa.free(out);
         try packWords(src, sl, out);
         const kg = sl.k / gs;
-        if (hip_layout) for (0..kg) |g| for (0..gs / 32) |ch| for (0..16) |c| for (0..4) |wi| {
-            // the word of column c, chunk ch holds inputs 8 wi .. 8 wi + 7 of the chunk, input i at nibble i, xor 8
-            const word = out[(((g * (gs / 32) + ch) * 16 + c) * 4) + wi];
-            for (0..8) |i| {
-                const got: u4 = @intCast(((word >> @intCast(4 * i)) & 0xF) ^ 8);
-                try std.testing.expectEqual(code(src, sl.n0 + c, sl.k0 + g * gs + ch * 32 + wi * 8 + i), got);
-            }
+        if (hip_layout) {
+            // the word of (super tile, group, tile, chunk, column, wi) holds inputs 8 wi .. 8 wi + 7 of the chunk,
+            // input i at nibble i, xor 8
+            const st = superTiles(sl.n);
+            for (0..sl.n) |col| for (0..sl.k) |kin| {
+                const t = col / 16;
+                const g = kin / gs;
+                const word = out[((((t / st * kg + g) * st + t % st) * (gs / 32) + kin % gs / 32) * 16 + col % 16) * 4 + kin % 32 / 8];
+                const got: u4 = @intCast(((word >> @intCast(4 * (kin % 8))) & 0xF) ^ 8);
+                try std.testing.expectEqual(code(src, sl.n0 + col, sl.k0 + kin), got);
+            };
         } else for (0..kg) |g| for (0..32) |lane| for (0..gs / 32) |b| {
             const word = out[(g * 32 + lane) * (gs / 32) + b];
             for (0..8) |j| {
@@ -423,8 +456,11 @@ test "packWords: a lane's word of a block holds its column's inputs 8 t .. 8 t +
         const scl = try gpa.alloc(u16, scalesOf(sl.n, sl.k, gs));
         defer gpa.free(scl);
         try packScales(src, sl, scl);
-        for (0..kg) |g| for (0..tile_n) |c| {
-            try std.testing.expectEqual(@as(u16, @intCast(((sl.k0 + g * gs) / 128) * n_full + sl.n0 + c)), scl[g * tile_n + c]);
+        const st = if (hip_layout) superTiles(sl.n) else 1;
+        for (0..sl.n) |col| for (0..kg) |g| {
+            const t = col / tile_n;
+            const at = ((t / st * kg + g) * st + t % st) * tile_n + col % tile_n;
+            try std.testing.expectEqual(@as(u16, @intCast(((sl.k0 + g * gs) / 128) * n_full + sl.n0 + col)), scl[at]);
         };
     }
 }

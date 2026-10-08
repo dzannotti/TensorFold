@@ -19,8 +19,8 @@ NTS = (1, 2, 4)
 MTS = (1, 4)
 
 
-def load(abl=0):
-    co = hiprun.build(f"{ROOT}/zig/kernels/hip/fn_int4.hip", hiprun.cache(f"fn_int4_{abl}.co"), [f"-DTF_INT4_ABL={abl}"])
+def load():
+    co = hiprun.build(f"{ROOT}/zig/kernels/hip/fn_int4.hip", hiprun.cache("fn_int4.co"))
     return hiprun.Module(co)
 
 
@@ -47,12 +47,19 @@ def codes(qw):
     return ((qw[:, None, :] >> sh) & 15).reshape(-1, qw.shape[1]).astype(np.int8)
 
 
+def super_tiles(n):
+    t = n // 16
+    return min(t & -t, 16)
+
+
 def pack(qw, sc, n0, n, k0, k, gs):
-    """Words [n/16][k/gs][gs/32][16][4] (GPTQ's word for 8 inputs, xor 0x88888888) and scales [n/16][k/gs][16]."""
-    w = qw[k0 // 8:(k0 + k) // 8, n0:n0 + n] ^ np.uint32(0x88888888)          # [k/8, n]
-    w = w.reshape(k // gs, gs // 32, 4, n // 16, 16).transpose(3, 0, 1, 4, 2)  # [t][g][ch][c][wi]
+    """Words [n/16/st][k/gs][st][gs/32][16][4] (GPTQ's word for 8 inputs, xor 0x88888888) and scales
+    [n/16/st][k/gs][st][16], st = super_tiles(n)."""
+    st = super_tiles(n)
+    w = qw[k0 // 8:(k0 + k) // 8, n0:n0 + n] ^ np.uint32(0x88888888)                     # [k/8, n]
+    w = w.reshape(k // gs, gs // 32, 4, n // 16 // st, st, 16).transpose(3, 0, 4, 1, 5, 2)  # [sp][g][t][ch][c][wi]
     rows = (k0 + gs * np.arange(k // gs)) // 128
-    s = sc[rows][:, n0:n0 + n].reshape(k // gs, n // 16, 16).transpose(1, 0, 2)
+    s = sc[rows][:, n0:n0 + n].reshape(k // gs, n // 16 // st, st, 16).transpose(1, 0, 2, 3)
     return np.ascontiguousarray(w).reshape(-1), np.ascontiguousarray(s).reshape(-1)
 
 
@@ -104,8 +111,9 @@ def blocks(name):
 
 def launch(gs, nt, mt, mats, epi, x, x_stride, slots, w, s, k, n, plan, rows, out, max_items, skip=-1):
     name = sym(gs, nt, mt, mats, epi)
-    units = max_items * (n // (16 * nt))
-    grid = min((units + WAVES - 1) // WAVES, blocks(name))
+    assert n % (16 * nt * WAVES // mats) == 0, (n, nt)
+    units = max_items * (n // (16 * nt * WAVES // mats))
+    grid = min(units, blocks(name))
     items, counts, members = plan if plan else (None, None, None)
     M.launch(name, grid, WAVES * 32, [x, ("i", x_stride), ("i", slots), w, s, ("i", k), ("i", n), items, counts,
                                       members, ("i", rows), out, ("i", n), ("f", 0.0), ("i", skip)])
@@ -163,7 +171,7 @@ def check_dense(rng, n, k_full, k0, k, gs, rows_list):
         perm = rng.permutation(most)[:rows]
         xs = xd[torch.from_numpy(perm).cuda()].contiguous()
         for nt in NTS:
-            if n % (16 * nt):
+            if n % (16 * nt * WAVES):
                 continue
             got = dense(xs, w, s, k, n, gs, rows, nt=nt).cpu().numpy()
             expect(np.array_equal(got.view(np.uint32), solo[perm].view(np.uint32)),
@@ -244,7 +252,7 @@ def check_experts(rng, E, ni, full_ni, lo, D, top, R):
         mi = max_items(pairs, E + 1, tile)
         for nt in NTS:
             act = torch.zeros(pairs, ni, dtype=torch.bfloat16, device="cuda")
-            if ni % (16 * nt) == 0:
+            if ni % (8 * nt * WAVES) == 0:
                 launch(128, nt, mt, 2, 2, x, D, slots, up, up_s, D, ni, plan, 0, act, mi, E)
             y = torch.full((pairs, D), float("nan"), device="cuda")
             y.view(torch.int32).fill_(0x5A5A5A5A)
@@ -252,7 +260,7 @@ def check_experts(rng, E, ni, full_ni, lo, D, top, R):
             a_in = res[(16, 1, 1)][0] if (16, 1, 1) in res else act
             launch(gs_down, nt, mt, 1, 0, a_in, ni, 0, dn, dn_s, ni, D, plan, 0, y, mi, E)
             launch(gs_down, nt, mt, 1, 3, a_in, ni, 0, dn, dn_s, ni, D, plan, 0, yb, mi, E)
-            res[(tile, mt, nt)] = (act, y, yb, ni % (16 * nt) == 0)
+            res[(tile, mt, nt)] = (act, y, yb, ni % (8 * nt * WAVES) == 0)
     ha, hy, hyb, _ = [t.cpu() if isinstance(t, torch.Tensor) else t for t in res[(16, 1, 1)]]
     ours = picks.reshape(-1) < E
     for key, (a, y, yb, did) in res.items():

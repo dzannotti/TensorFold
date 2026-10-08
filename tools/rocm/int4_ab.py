@@ -13,13 +13,13 @@ import int4_bench as b
 def cases(ex):
     """(name, bytes, fn(module)) at the decode shapes and the head."""
     out = []
-    V = 248320 // 4   # a quarter of the head (keeps memory small; still far past the caches)
+    V = 248320 // 5   # a fifth of the head (keeps memory small; still far past the caches; 32 | V / 16)
     hw = b.rand_words(V * b.D // 8)
     hs = torch.full((V * b.D // 128,), 0.01, dtype=torch.float16, device="cuda")
     hx = torch.randn(16, b.D, device="cuda").bfloat16()
     ho = torch.zeros(16, V, dtype=torch.bfloat16, device="cuda")
     for rows in (1, 16):
-        out.append((f"head/4 {rows} rows", V * b.D / 2, lambda rows=rows, nt=1: c.launch(128, nt, 1, 1, 3, hx, b.D, 0, hw, hs, b.D, V, None, rows, ho, (rows + 15) // 16)))
+        out.append((f"head/5 {rows} rows", V * b.D / 2, lambda rows=rows, nt=1: c.launch(128, nt, 1, 1, 3, hx, b.D, 0, hw, hs, b.D, V, None, rows, ho, (rows + 15) // 16)))
     for eu, m in ((5, 1), (40, 4), (40, 16), (75, 1)):
         # rotate through disjoint expert sets so the 32 MiB MALL never holds the next call's weights (a real layer)
         R = eu * m // b.TOP
@@ -44,6 +44,15 @@ def cases(ex):
         sink = torch.empty(40 * 64 * 256, dtype=torch.int32, device="cuda")
         for name, blocks in (("probe_stream", 1280), ("probe_stream4", 640), ("probe_stream8", 320)):
             out.append((f"{name} {mb} MiB", n * 16, lambda buf=buf, n=n, name=name, blocks=blocks: probe.launch(name, blocks, 256, [buf, ("q", n), sink])))
+    big = torch.empty(8 * 12 * 2**20 // 4, dtype=torch.int32, device="cuda")
+    n = 12 * 2**20 // 16
+    rot = iter(range(1 << 60))
+    for name, blocks in (("probe_stream", 1280), ("probe_stream4", 640)):
+        out.append((f"{name} 12 MiB of 96", n * 16, lambda name=name, blocks=blocks: probe.launch(name, blocks, 256, [big[(next(rot) % 8) * n * 4:], ("q", n), sink])))
+    total = 80 * 2**20
+    for steps in (2, 20, 160):
+        regions = total // (steps * 1024)
+        out.append((f"regions of {steps} KiB, 80 MiB", total, lambda steps=steps, regions=regions: probe.launch("probe_regions", 640, 128, [buf, ("i", regions), ("i", steps), sink])))
     return out
 
 
