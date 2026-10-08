@@ -5,6 +5,7 @@
 //! row's bits independent of every other row and of M. zig/kernels/cuda/fn_qmmf.cu is the device code copied by
 //! zig/tests/cuda/copies.py (SASS-equal to the Python extension tensorfold_nvfp4_v3); `matmul` is linear._matmul and
 //! qmmf_cuda's host logic. The host layout helpers make the loader's buffers byte for byte as from_checkpoint does.
+//! HIP (gfx1151): zig/kernels/hip/fn_qmmf{,_ld}.hip, the same layouts and arguments, slices added in the block.
 //!
 //! Python source (TensorFold, https://github.com/ashhart/TensorFold, cuda/nvfp4/linear.py and qmmf.cu, authored by
 //! Ash Hart (ashhart)).
@@ -29,6 +30,19 @@ pub fn splitK(n: usize, k: usize) usize {
     var sk: usize = 1;
     while (sk < 8 and tiles * sk < 192 and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
     return sk;
+}
+
+/// PLACEHOLDER(rocm): until the HIP build's device capability flag lands (cuda.has_clusters or the like), a HIP
+/// build is recognised by `cuda.is_hip`; replace both uses with that flag.
+const hip_build = @hasDecl(cuda, "is_hip") and cuda.is_hip;
+
+/// zig/kernels/hip/fn_qmmf.hip on gfx1151: no clusters; a block holds up to 4 K slices side by side (512 threads)
+/// and adds them in LDS in slice order (the cluster's sum without the cluster).
+pub const hip_slices: usize = 4;
+
+/// K slices on HIP: split_k capped at the slices a block holds; still a function of the shape alone.
+pub fn splitKHip(n: usize, k: usize) usize {
+    return @min(splitK(n, k), hip_slices);
 }
 
 /// qmm.bucket: the row tile.
@@ -90,22 +104,23 @@ pub const Kernels = struct {
         var k: Kernels = undefined;
         k.module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf);
         errdefer k.module.unload();
+        // HIP: no cluster instantiations (their slots repeat the one-slice kernels) and static LDS only
         for (0..2) |f| {
             for (0..2) |c| for (0..3) |b| {
-                k.tiled[f][c][b] = try k.module.function(sym.tiled[f][c][b]);
-                try k.tiled[f][c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
+                k.tiled[f][c][b] = try k.module.function(sym.tiled[f][if (hip_build) 0 else c][b]);
+                if (!hip_build) try k.tiled[f][c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
             };
             k.fused[f] = try k.module.function(sym.fused[f]);
-            try k.fused[f].allowDynamicShared(smem(64));
+            if (!hip_build) try k.fused[f].allowDynamicShared(smem(64));
         }
         k.ld_module = try cuda.Module.load(ctx.d, cuda.kernels.fn_qmmf_ld);
         errdefer k.ld_module.unload();
         for (0..2) |c| for (0..3) |b| {
-            k.ld_tiled[c][b] = try k.ld_module.function(sym.ld_tiled[c][b]);
-            try k.ld_tiled[c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
+            k.ld_tiled[c][b] = try k.ld_module.function(sym.ld_tiled[if (hip_build) 0 else c][b]);
+            if (!hip_build) try k.ld_tiled[c][b].allowDynamicShared(smem(@as(usize, 16) << @intCast(b)));
         };
         k.ld_fused = try k.ld_module.function(sym.ld_fused);
-        try k.ld_fused.allowDynamicShared(smem(64));
+        if (!hip_build) try k.ld_fused.allowDynamicShared(smem(64));
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
     }
@@ -143,12 +158,13 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     const n: usize = l.n;
     const kk: usize = l.k;
     if (kk % 64 != 0 or l.npad < n) return error.Invalid;
-    const sk = splitK(n, kk);
+    const sk = if (hip_build) splitKHip(n, kk) else splitK(n, kk);
     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
     const fused = bm == 0;
-    const cluster = !fused and sk > 1 and sk <= 8 and k.major >= 9;
-    // sm_89 and older would add slices in the reduce (part + reduce_kernel): never on GB10, not ported
-    if (!fused and sk > 1 and !cluster) return error.SplitWithoutCluster;
+    const cluster = !hip_build and !fused and sk > 1 and sk <= 8 and k.major >= 9;
+    // sm_89 and older would add slices in the reduce (part + reduce_kernel): never on GB10, not ported; HIP adds
+    // them in the block
+    if (!hip_build and !fused and sk > 1 and !cluster) return error.SplitWithoutCluster;
     const tile: usize = if (fused) 64 else bm;
     const rows_t = (m + tile - 1) / tile;
     const f = if (ldo != null) (if (fused) k.ld_fused else k.ld_tiled[@intFromBool(cluster)][bucketIndex(bm)]) else if (fused) k.fused[@intFromBool(f32_out)] else k.tiled[@intFromBool(f32_out)][@intFromBool(cluster)][bucketIndex(bm)];
@@ -161,11 +177,12 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     a.add(@as(u64, 0));
     for ([_]usize{ m, n, kk, sk, l.npad, if (m == 1) kk else x_stride, l2Group(rows_t, tile, kk) }) |v| a.add(@as(c_int, @intCast(v)));
     if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
-    const z: u32 = if (fused) 1 else @intCast(sk);
+    // HIP: one block a tile, its K slices side by side (128 threads each), static LDS
+    const z: u32 = if (fused or hip_build) 1 else @intCast(sk);
     try cuda.launch.launch(f, .{
         .grid = .{ .x = @intCast(rows_t * ((n + 63) / 64)), .y = 1, .z = z },
-        .block = .{ .x = 128 },
-        .shared = smem(tile),
+        .block = .{ .x = if (hip_build and !fused) @intCast(128 * sk) else 128 },
+        .shared = if (hip_build) 0 else smem(tile),
         .cluster = if (cluster) .{ .x = 1, .y = 1, .z = @intCast(sk) } else null,
     }, s, &a);
 }
@@ -219,6 +236,9 @@ test "split_k, buckets and shared memory follow qmm.py and qmmf.cu" {
     try std.testing.expectEqual(@as(usize, 4), splitK(2560, 3072));
     try std.testing.expectEqual(@as(usize, 1), splitK(2560, 640));
     try std.testing.expectEqual(@as(usize, 4), splitK(1280, 2560));
+    try std.testing.expectEqual(@as(usize, 4), splitKHip(2560, 6144));
+    try std.testing.expectEqual(@as(usize, 2), splitKHip(2560, 1280));
+    try std.testing.expectEqual(@as(usize, 1), splitKHip(16384, 2560));
     try std.testing.expectEqual(@as(usize, 25600), smem(16));
     try std.testing.expectEqual(@as(usize, 33792), smem(32));
     try std.testing.expectEqual(@as(usize, 50176), smem(64));
