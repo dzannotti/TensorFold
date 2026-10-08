@@ -30,7 +30,7 @@ ROWS = [1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 255, 2
 SHAPES = [  # (name, n, k): the INT4-AutoRound checkpoint's block-FP8 projections
     ("gdn_qkvz", 16384, 2560), ("attn_qkv", 13312, 2560), ("out_proj", 2560, 6144), ("shared_gu", 2560, 2560),
     ("shared_down", 2560, 1280), ("odd_n", 200, 384), ("odd_split", 200, 1536)]
-FUSED_ROWS, MAX_SLICES = 256, 4
+FUSED_ROWS, MAX_SLICES, WIDE_ROWS = 256, 4, 33
 
 
 # ---- cuda_fp8.zig's plan ---------------------------------------------------------------------------------------------
@@ -51,9 +51,14 @@ def l2_group(rows_t: int, bm: int, k: int) -> int:
     return max(1, min(rows_t, (12 << 20) // (bm * k * 2)))
 
 
-def plan(n: int, k: int, m: int, fused_rows: int = FUSED_ROWS):
-    """(bm, fused, sk, grid, block): matmulAt on gfx1151."""
+def plan(n: int, k: int, m: int, fused_rows: int = FUSED_ROWS, wide_rows: int = WIDE_ROWS):
+    """(bm, fused, sk, grid, block, group): matmulAt on gfx1151; from WIDE_ROWS the wide tile (bm 128 or -64 for 64,
+    `fused` its bn: 128, or 64 with K slices)."""
     sk = split_k(n, k)
+    if m >= wide_rows:                                     # cuda_fp8.zig wideTile; bm 64 passed as -64
+        bm, bn = 64 if m <= 64 else 128, 128 if sk == 1 else 64
+        rows_t = -(-m // bm)
+        return (bm if bm == 128 else -64), bn, sk, rows_t * -(-n // bn), 2 * bm, l2_group(rows_t, bm, k)
     fused = sk > 1 and m >= fused_rows
     bm = 64 if fused else bucket(m)
     rows_t = -(-m // bm)
@@ -73,15 +78,19 @@ class Hip:
             self._ok(self.h.hipModuleLoadData(ctypes.byref(mod), ctypes.c_char_p(data)), name)
             self.mods[name] = (mod, data)
         self.fns = {}
+        self.wide = b"qmmw_kernel" in self.mods["fn_qmmf"][1]  # an older build (A/B against it): no wide tile
 
     def _ok(self, r, what):
         if r != 0:
             raise RuntimeError(f"HIP error {r} ({what})")
 
-    def fn(self, ld: bool, bm: int, f32: bool, fused: bool):
+    def fn(self, ld: bool, bm: int, f32: bool, fused):
         ns, extra = ("13tf_fn_qmmf_ld", "i") if ld else ("10tf_fn_qmmf", "")
-        sym = (f"_ZN{ns}11qmmf_kernelILi3ELi{bm}ELi64ELi1ELi4ELi4ELb{int(f32)}ELb0ELb{int(fused)}EEEv"
-               f"PK14__hip_bfloat16PKhS5_fPvPfiiiiiii{extra}")
+        if bm in (-64, 128):                                   # the wide tile (bm 64 as -64): `fused` holds its bn
+            sym = f"_ZN{ns}11qmmw_kernelILi{abs(bm)}ELi{fused}ELb{int(f32)}EEEvPK14__hip_bfloat16PKhS5_fPvPfiiiiiii{extra}"
+        else:
+            sym = (f"_ZN{ns}11qmmf_kernelILi3ELi{bm}ELi64ELi1ELi4ELi4ELb{int(f32)}ELb0ELb{int(fused)}EEEv"
+                   f"PK14__hip_bfloat16PKhS5_fPvPfiiiiiii{extra}")
         if sym not in self.fns:
             f = ctypes.c_void_p()
             self._ok(self.h.hipModuleGetFunction(ctypes.byref(f), self.mods["fn_qmmf_ld" if ld else "fn_qmmf"][0],
@@ -89,10 +98,11 @@ class Hip:
             self.fns[sym] = f
         return self.fns[sym]
 
-    def matmul(self, lin, x, out, f32=False, ldo=None, ldx=None, fused_rows=FUSED_ROWS, force=None):
+    def matmul(self, lin, x, out, f32=False, ldo=None, ldx=None, fused_rows=FUSED_ROWS, wide_rows=WIDE_ROWS,
+               force=None):
         """cuda_fp8.zig matmulAt: x (m, K) bf16 rows ldx apart -> out (m, n) rows n (or ldo) apart."""
         m = x.shape[0]
-        bm, fused, sk, grid, block, group = force or plan(lin.n, lin.k, m, fused_rows)
+        bm, fused, sk, grid, block, group = force or plan(lin.n, lin.k, m, fused_rows, wide_rows if self.wide else 1 << 30)
         f = self.fn(ldo is not None, bm, f32, fused)
         ints = [m, lin.n, lin.k, sk, lin.npad, ldx or (lin.k if m == 1 else x.stride(0)), group]
         if ldo is not None:
@@ -152,14 +162,16 @@ def check_case(hip, name, lin, x, log, fp32=True):
     hip.matmul(lin, x, y)
     if not torch.equal(y, ybf):
         bad.append("rerun")
-    # forms: tiled one-block-slices vs fused (same bits by construction) at 256 rows
-    m = min(256, mm)
-    if sk > 1:
-        yt, yf = (torch.empty((m, n), dtype=torch.bfloat16, device="cuda") for _ in range(2))
-        hip.matmul(lin, x[:m], yt, fused_rows=1 << 30)
-        hip.matmul(lin, x[:m], yf, fused_rows=1)
-        if not torch.equal(yt, yf):
-            bad.append("tiled != fused")
+    # forms: tiled one-block-slices, fused and wide (same bits by construction), at 256 and at 17 rows
+    for m in sorted({min(256, mm), min(17, mm)}):
+        forms = {"tiled": dict(fused_rows=1 << 30, wide_rows=1 << 30), "wide": dict(wide_rows=1)}
+        if sk > 1:
+            forms["fused"] = dict(fused_rows=1, wide_rows=1 << 30)
+        ys = {}
+        for form, kw in forms.items():
+            ys[form] = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+            hip.matmul(lin, x[:m], ys[form], **kw)
+        bad += [f"{f} != tiled m {m}" for f in ys if not torch.equal(ys[f], ys["tiled"])]
     # matmulLd: rows ldo apart, gaps untouched
     ldo = n + 72
     for m in (1, 17, 100, mm):
@@ -250,8 +262,8 @@ def bench(hips, log, tries=15, only=None, rows=(1, 8, 16, 32, 64, 128, 512, 2048
         wbytes = lins[0].w8.numel() + lins[0].bs.numel()
         for _ in range(max(1, (96 << 20) // wbytes)):
             lins.append(Fp8BlockLinear(lins[0].w8.clone(), lins[0].bs.clone(), n, k, lins[0].npad))
-        x = torch.randn((2048, k), device="cuda").to(torch.bfloat16)
-        y = torch.empty((2048, n), dtype=torch.bfloat16, device="cuda")
+        x = torch.randn((max(rows), k), device="cuda").to(torch.bfloat16)
+        y = torch.empty((max(rows), n), dtype=torch.bfloat16, device="cuda")
         parts = []
         for m in rows:
             reps = len(lins) * (4 if m <= 128 else 1)
