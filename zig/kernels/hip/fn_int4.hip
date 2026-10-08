@@ -25,6 +25,9 @@ typedef uint32_t u4v __attribute__((ext_vector_type(4)));
 typedef uint32_t u8v __attribute__((ext_vector_type(8)));
 
 constexpr int WAVES = 4;
+#ifndef TF_INT4_ABL
+#define TF_INT4_ABL 0   // bench ablations: 1 no dequant, 2 no WMMA, 3 no activation loads
+#endif
 
 // Signed nibble j of w as fp32 (exact).
 __device__ __forceinline__ float nib(uint32_t w, int j) { return (float)((int)(w << (28 - 4 * j)) >> 28); }
@@ -63,15 +66,31 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
   return bf(gv / (1.f + expf(-gv))) * uv;
 }
 
-template <int GS, int NT, int MATS>
+// A group's operands in flight: every (matrix, n16 tile)'s words and scales, and with one row tile a pass (XS) the
+// tile's activations too (loaded with the weights, so waiting for this stage never waits for the next one's loads).
+template <int GS, int NT, int MATS, bool XS>
 struct Stage {
   u4v w[MATS][NT][GS / 32];
   float s[MATS][NT];
+  u4v x[XS ? GS / 8 : 1];
 };
 
-template <int GS, int NT, int MATS>
-__device__ __forceinline__ void load_stage(Stage<GS, NT, MATS>& st, const uint32_t* const (&w)[MATS][NT],
-                                           const _Float16* const (&s)[MATS][NT], int g) {
+__device__ __forceinline__ v16s xfrag(const uint16_t* p, bool v) {
+  u8v r = u8v{};
+  if (v && TF_INT4_ABL != 3) {
+    const u4v lo = reinterpret_cast<const u4v*>(p)[0], hi = reinterpret_cast<const u4v*>(p)[1];
+    r = u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+  }
+  return (v16s)r;
+}
+
+template <int GS, int NT, int MATS, bool XS>
+__device__ __forceinline__ void load_stage(Stage<GS, NT, MATS, XS>& st, const uint32_t* const (&w)[MATS][NT],
+                                           const _Float16* const (&s)[MATS][NT], const uint16_t* xr, bool xv, int g) {
+  if constexpr (XS)
+#pragma unroll
+    for (int q = 0; q < GS / 8; ++q)
+      st.x[q] = xv && TF_INT4_ABL != 3 ? reinterpret_cast<const u4v*>(xr + g * GS)[q] : u4v{};
 #pragma unroll
   for (int m = 0; m < MATS; ++m)
 #pragma unroll
@@ -84,8 +103,8 @@ __device__ __forceinline__ void load_stage(Stage<GS, NT, MATS>& st, const uint32
 }
 
 // One group: a fresh WMMA chain over its k16 steps for every (row tile, matrix, n16 tile), then the scale's fmaf.
-template <int GS, int NT, int MT, int MATS>
-__device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const Stage<GS, NT, MATS>& cur,
+template <int GS, int NT, int MT, int MATS, bool XS>
+__device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const Stage<GS, NT, MATS, XS>& cur,
                                               const uint16_t* const (&xr)[MT], const bool (&xv)[MT], int live, int g) {
   v8f d[MT][MATS][NT];
 #pragma unroll
@@ -99,23 +118,30 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
     v16s a[MT];
 #pragma unroll
     for (int r = 0; r < MT; ++r) {
-      u8v v = u8v{};
-      if (xv[r]) {
-        const u4v* p = reinterpret_cast<const u4v*>(xr[r] + g * GS + 16 * k);
-        const u4v lo = p[0], hi = p[1];
-        v = u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+      if constexpr (XS) {
+        const u4v lo = cur.x[2 * k], hi = cur.x[2 * k + 1];
+        a[r] = (v16s)u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+      } else {
+        a[r] = xfrag(xr[r] + g * GS + 16 * k, xv[r]);
       }
-      a[r] = (v16s)v;
     }
 #pragma unroll
     for (int m = 0; m < MATS; ++m)
 #pragma unroll
       for (int j = 0; j < NT; ++j) {
         const u4v q = cur.w[m][j][k / 2];
+#if TF_INT4_ABL == 1
+        const v16s b = (v16s)u8v{q[0], q[1], q[2], q[3], q[0], q[1], q[2], q[3]};
+#else
         const v16s b = dq(q[2 * (k & 1)], q[2 * (k & 1) + 1]);
+#endif
 #pragma unroll
         for (int r = 0; r < MT; ++r)
+#if TF_INT4_ABL == 2
+          if (r < live) d[r][m][j][0] += __builtin_bit_cast(float, ((u8v)b)[0] ^ ((u8v)a[r])[k & 7]);
+#else
           if (r < live) d[r][m][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[r], b, d[r][m][j]);
+#endif
       }
   }
 #pragma unroll
@@ -182,15 +208,16 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
         for (int m = 0; m < MATS; ++m)
 #pragma unroll
           for (int j = 0; j < NT; ++j) acc[r][m][j] = v8f{};
-      Stage<GS, NT, MATS> st[2];
-      load_stage<GS, NT, MATS>(st[0], w, s, 0);
+      constexpr bool XS = MT == 1;
+      Stage<GS, NT, MATS, XS> st[2];
+      load_stage<GS, NT, MATS, XS>(st[0], w, s, xr[0], xv[0], 0);
       for (int g0 = 0; g0 < KG; g0 += 2) {
 #pragma unroll
         for (int b = 0; b < 2; ++b) {   // stage b holds group g0 + b (indices known at compile time: no scratch)
           const int g = g0 + b;
           if (g >= KG) break;
-          if (g + 1 < KG) load_stage<GS, NT, MATS>(st[b ^ 1], w, s, g + 1);
-          compute_group<GS, NT, MT, MATS>(acc, st[b], xr, xv, live, g);
+          if (g + 1 < KG) load_stage<GS, NT, MATS, XS>(st[b ^ 1], w, s, xr[0], xv[0], g + 1);
+          compute_group<GS, NT, MT, MATS, XS>(acc, st[b], xr, xv, live, g);
         }
       }
 #pragma unroll

@@ -19,8 +19,8 @@ NTS = (1, 2, 4)
 MTS = (1, 4)
 
 
-def load():
-    co = hiprun.build(f"{ROOT}/zig/kernels/hip/fn_int4.hip", hiprun.cache("fn_int4.co"))
+def load(abl=0):
+    co = hiprun.build(f"{ROOT}/zig/kernels/hip/fn_int4.hip", hiprun.cache(f"fn_int4_{abl}.co"), [f"-DTF_INT4_ABL={abl}"])
     return hiprun.Module(co)
 
 

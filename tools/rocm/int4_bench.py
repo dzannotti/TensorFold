@@ -117,8 +117,9 @@ def main():
     ap.add_argument("--nt", default="1,2,4")
     ap.add_argument("--cases", default="stream,decode,head,prompt")
     ap.add_argument("--rounds", type=int, default=7)
+    ap.add_argument("--abl", type=int, default=0, help="fn_int4.hip TF_INT4_ABL (1 no dequant, 2 no WMMA, 3 no x loads)")
     a = ap.parse_args()
-    c.M = c.load()
+    c.M = c.load(a.abl)
     nts = [int(v) for v in a.nt.split(",")]
     cases = a.cases.split(",")
     if "stream" in cases:

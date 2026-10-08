@@ -64,16 +64,25 @@ class Module:
             "launch " + name)
 
 
-def best_us(f, reps=20, rounds=5):
-    """Best-of-`rounds` mean microseconds of `reps` calls (prod shares the GPU: the minimum is the signal)."""
+def best_us(f, reps=20, rounds=5, graph=True):
+    """Best-of-`rounds` mean microseconds of `reps` calls, replayed from one HIP graph (no host launch cost, as the
+    engine's graphs run them); prod shares the GPU, so the minimum is the signal."""
     f()
+    torch.cuda.synchronize()
+    g = None
+    if graph:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(reps):
+                f()
+    run = g.replay if g else (lambda: [f() for _ in range(reps)])
+    run()
     torch.cuda.synchronize()
     best = float("inf")
     for _ in range(rounds):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
-        for _ in range(reps):
-            f()
+        run()
         b.record()
         b.synchronize()
         best = min(best, a.elapsed_time(b) * 1000 / reps)

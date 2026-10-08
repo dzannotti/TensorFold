@@ -25,3 +25,20 @@ extern "C" __global__ void probe_stream(const u32x4* __restrict__ p, size_t n, u
   }
   out[blockIdx.x * blockDim.x + threadIdx.x] = s;
 }
+
+// probe_stream with U independent uint4 loads in flight a thread (memory-level parallelism).
+template <int U>
+__device__ void stream_u(const u32x4* __restrict__ p, size_t n, uint32_t* out) {
+  uint32_t s = 0;
+  const size_t T = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i + (U - 1) * T < n; i += U * T) {
+    u32x4 v[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) v[u] = __builtin_nontemporal_load(p + i + u * T);
+#pragma unroll
+    for (int u = 0; u < U; ++u) s ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
+  }
+  out[blockIdx.x * blockDim.x + threadIdx.x] = s;
+}
+extern "C" __global__ void probe_stream4(const u32x4* __restrict__ p, size_t n, uint32_t* out) { stream_u<4>(p, n, out); }
+extern "C" __global__ void probe_stream8(const u32x4* __restrict__ p, size_t n, uint32_t* out) { stream_u<8>(p, n, out); }
