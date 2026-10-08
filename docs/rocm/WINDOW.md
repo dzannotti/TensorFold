@@ -3,7 +3,7 @@
 Window opens 00:30 BST. Everything runs in `docker/rocm-dev/run.sh` containers (label `homelab.memwatch=stop`). Never
 touch production containers, /srv or /homelab; if prod is not down at 00:30, wait or stop: do not load next to it.
 Tree: branch `rocm` (this file's commit). Paths below: `R=/home/dzannotti/tf-rocm`,
-`M=/home/dzannotti/models/qwen38fn-int4-autoround`, `K=/home/dzannotti/tf-triton-scratch/aot-hip`,
+`M=/home/dzannotti/models/qwen38fn-int4-autoround`, `K=/home/dzannotti/tf-triton-scratch/aot-hip2` (the buffer-ops set),
 `O=/home/dzannotti/tf-window` (results; `mkdir -p $O`). Abort rule throughout: MemAvailable < 10 GiB -> stop our
 container (`docker stop tf-window`), note the step, and go no further.
 
@@ -21,7 +21,7 @@ engine keeps 12 GiB free and sizes sequence memory from min(MemAvailable, device
 ## 1. Build (before the window; only rebuild if the tree changed)
 
 ```bash
-cd $R && docker/rocm-dev/run.sh sh -c 'nice zig build -j12 -Dgpu=hip -Dhipcc=/opt/rocm/bin/hipcc -Dkernel-set=/home/dzannotti/tf-triton-scratch/aot-hip native install'
+cd $R && docker/rocm-dev/run.sh sh -c 'nice zig build -j12 -Dgpu=hip -Dhipcc=/opt/rocm/bin/hipcc -Dkernel-set=/home/dzannotti/tf-triton-scratch/aot-hip2 native install'
 ```
 
 Expected warnings: hipcc cannot build qmm_group, prefill_attention, qmm_prefill, experts_prefill, fn_qmm,
@@ -29,7 +29,7 @@ fn_qmm_prefill, fn_qmm_cluster, fn_roce (none on Flash Next's serving path; fn_i
 `zig-out/bin/{tensorfold,tf-cuda-test}`, `zig-out/native/bin/tensorfold-native`,
 `zig-out/native/share/tensorfold/cuda/gfx1151/` (the Triton set; TENSORFOLD_CUDA_KERNELS=$K is equivalent).
 To rebuild the set: `PYTHONPATH=src python -B tools/zig/flashnext_aot.py build --target hip --spec
-zig/tests/cuda/flashnext/kernels.json --spec zig/tests/cuda/flashnext/kernels_int4ar.json --out $K` (dev image).
+zig/tests/cuda/flashnext/kernels.json --spec zig/tests/cuda/flashnext/kernels_int4ar.json --out $K` (dev image; it must keep buffer ops, see notes/triton-aot.md).
 
 ## 2. Pre-flight (00:30, before any load; small GPU, ~10 min)
 
@@ -41,9 +41,10 @@ cd $R && docker/rocm-dev/run.sh sh -c "export TENSORFOLD_CUDA_KERNELS=$K
 docker/rocm-dev/run.sh sh -c "nice zig build test -Dgpu=hip -Daot-set=$K"   # dry: every fixture launch has a variant
 ```
 
-Expected: PASS everywhere except `glue-check` (FAIL from `_hc_up_mix`, which is off by default: see
-notes/integration.md; its `_hc_wb_norm` lines must all be EQUAL). If device free < ~85 GiB, prod still holds memory:
-stop here.
+Expected: PASS everywhere (also `glue-check`, and `mm-check $M` if run). If device free < ~85 GiB, prod still holds
+memory: stop here. The engine logs `largest Triton argument extent: ...` at load (the token embedding, 1.18 GiB);
+`error: TritonSpanPast2GiB` means a Triton argument would reach past buffer ops' 2 GiB (lower --context or
+TF_FLASHNEXT_PREFILL_ROWS).
 
 ## 3. Smallest first load: CLI, no MTP head (~61 GiB)
 
@@ -99,7 +100,7 @@ GB10 numbers are 64 tok/s prose / 57.5 code at 1 request, 201 aggregate at 8, pr
 ## 7. Triage toggles (same bits by design, so A/B one at a time)
 
 `TF_FLASHNEXT_PROMPT_MM=0`, `TF_FLASHNEXT_PROMPT_EXPERTS=0`, `TF_FLASHNEXT_FP4_SERIAL=0`, `TF_FLASHNEXT_WB_NORM=0`,
-`TF_FLASHNEXT_SHARED_SIDE=0`, `TF_FLASHNEXT_FP8_LD=0`, `TF_FLASHNEXT_EXPERT_SHAPE=0`, `--eager` (CLI, no graphs),
+`TF_FLASHNEXT_SHARED_SIDE=0`, `TF_FLASHNEXT_GLUE_FUSE=0`, `TF_FLASHNEXT_FP8_LD=0`, `TF_FLASHNEXT_EXPERT_SHAPE=0`, `--eager` (CLI, no graphs),
 `TF_FLASHNEXT_PREFILL_TAIL=0` (other chunking). For NaN or garbage: `TF_FLASHNEXT_DUMP_BINS=1 tensorfold prefill $M
 P.json NAME --dump DIR --no-drafts` writes each layer's tensors as .bin (first NaN = the culprit). Reproduce small
 on a 1-layer view: `python3 tools/rocm/layer_view.py $M OUT [--layer 3]`, then `run OUT ... --no-drafts`.

@@ -421,6 +421,7 @@ pub const Engine = struct {
         }
         e.pbuf = .{ .b = try state.Buffers.init(d, e.g, e.prefill_rows + e.prefill_tail, .{ .prefill = true, .capacity = e.max_len }), .y_f32 = false, .attn = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio) };
         errdefer e.pbuf.deinit();
+        try tritonSpans(e);
         try e.initWindows();
         const th = e.torch.on(e.stream);
         e.memo = .{ .gpa = gpa };
@@ -484,10 +485,7 @@ pub const Engine = struct {
         if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
         e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
         e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
-        // HIP: the AOT `_hc_up_mix` is wrong on a partial row tile (glue-check, rows 17 and 129) and 0.41x the
-        // unfused pair on gfx1151, so opt-in there (TF_FLASHNEXT_GLUE_FUSE=1)
-        const glue_fuse = if (envGet("TF_FLASHNEXT_GLUE_FUSE") != null) !envOff("TF_FLASHNEXT_GLUE_FUSE") else !cuda.hip;
-        e.f.up_mix = glue_fuse and prompt_mm.upMixAvailable(&e.set);
+        e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in
@@ -597,6 +595,32 @@ pub const Engine = struct {
         try e.stream.synchronize();
         e.load_seconds = seconds(io, t0);
         return e;
+    }
+
+    /// HIP: the Triton set uses buffer ops (as the ROCm JIT does for tensors under 2 GiB), which reach 2 GiB from each
+    /// pointer argument. The largest extents a launch reads from one pointer at this context and chunk size: refused
+    /// here, not wrong at run time.
+    fn tritonSpans(e: *const Engine) !void {
+        if (!cuda.hip) return;
+        const g = e.g;
+        const rows = @max(e.pbuf.b.rows, e.buf.b.rows);
+        const spans = [_]struct { what: []const u8, bytes: usize }{
+            .{ .what = "the token embedding (_embed)", .bytes = @as(usize, e.c.vocab) * g.hidden * 2 },
+            .{ .what = "a layer's key cache (_attn_prep, _chunks)", .bytes = e.max_len * g.kRow() },
+            .{ .what = "a layer's value cache (_attn_prep, _chunks)", .bytes = e.max_len * g.vRow() },
+            .{ .what = "a layer's indexer keys (_pool)", .bytes = e.max_len * g.index_dim * 2 },
+            .{ .what = "a chunk's indexer scores (_scores, _select)", .bytes = rows * e.pbuf.attn.nb * 4 },
+            .{ .what = "the decode projections of every DeltaNet layer (_shift_windows)", .bytes = g.linear_layers * e.buf.b.rows * g.gdnWidth() * 2 },
+        };
+        var top: usize = 0;
+        for (spans, 0..) |sp, i| {
+            if (sp.bytes > spans[top].bytes) top = i;
+            if (sp.bytes >= 1 << 31) {
+                std.log.err("{s}: {d:.2} GiB from one Triton argument, past buffer ops' 2 GiB (lower --context or TF_FLASHNEXT_PREFILL_ROWS)", .{ sp.what, @as(f64, @floatFromInt(sp.bytes)) / (1 << 30) });
+                return error.TritonSpanPast2GiB;
+            }
+        }
+        std.log.info("largest Triton argument extent: {s}, {d:.2} GiB (buffer ops reach 2 GiB)", .{ spans[top].what, @as(f64, @floatFromInt(spans[top].bytes)) / (1 << 30) });
     }
 
     /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3, stream 0 (Python
