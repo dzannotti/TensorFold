@@ -1,4 +1,4 @@
-//! A captured set of Triton cubins (aot.json + cubins/): each launch picks the variant Triton itself would have picked.
+//! A captured set of Triton binaries (aot.json + cubins/, or hsaco/ for AMD): each launch picks the variant Triton itself would have picked.
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -14,6 +14,7 @@ const KernelJson = struct {
     hash: []const u8,
     name: []const u8,
     num_warps: u32,
+    warp_size: u32 = 32,
     num_ctas: u32 = 1,
     shared: u32 = 0,
     global_scratch: u32 = 0,
@@ -23,7 +24,7 @@ const KernelJson = struct {
     params: []ParamJson,
     consts: std.json.ArrayHashMap(ConstJson),
 };
-const SetJson = struct { kernels: []KernelJson };
+const SetJson = struct { kernels: []KernelJson, bin_dir: []const u8 = "cubins", bin_ext: []const u8 = "cubin" };
 
 /// One argument of a launch, by the kernel's parameter name.
 pub const Arg = struct {
@@ -62,7 +63,7 @@ pub const Set = struct {
     variants: []Variant,
     gpa: std.mem.Allocator,
 
-    /// Loads every cubin listed in `dir`/aot.json into its own module.
+    /// Loads every binary listed in `dir`/aot.json (cubins, or AMD code objects) into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
         const path = try std.fs.path.join(gpa, &.{ dir, "aot.json" });
         defer gpa.free(path);
@@ -78,13 +79,13 @@ pub const Set = struct {
         }
         for (parsed.value.kernels) |k| {
             if (k.global_scratch != 0 or k.profile_scratch != 0) return error.ScratchUnsupported;
-            const file = try std.fmt.allocPrint(gpa, "{s}/cubins/{s}.cubin", .{ dir, k.hash });
+            const file = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}.{s}", .{ dir, parsed.value.bin_dir, k.hash, parsed.value.bin_ext });
             defer gpa.free(file);
             const cubin = try std.Io.Dir.cwd().readFileAllocOptions(io, file, gpa, .limited(1 << 26), .@"16", null);
             defer gpa.free(cubin);
             const name_z = try gpa.dupeSentinel(u8, k.name, 0);
             defer gpa.free(name_z);
-            const meta: triton.Meta = .{ .name = k.name, .num_warps = k.num_warps, .num_ctas = k.num_ctas, .shared = k.shared, .launch_pdl = k.pdl };
+            const meta: triton.Meta = .{ .name = k.name, .num_warps = k.num_warps, .warp_size = k.warp_size, .num_ctas = k.num_ctas, .shared = k.shared, .launch_pdl = k.pdl };
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
