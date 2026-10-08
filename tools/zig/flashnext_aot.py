@@ -516,6 +516,11 @@ def compile_one(k: dict, cache_dir: Path | None, target: tuple = TARGET):
         # Triton 3.6's JIT keys attributes by pointer and int parameters only (3.7, which captured the spec, keys all)
         attrs = {path_of(n, params): v for n, v in k["attrs"].items()
                  if k["signature"].get(n) != "constexpr" and not k["signature"].get(n, "").startswith("fp")}
+        # buffer ops, as the JIT specializes every tensor under 2 GiB: the plain global-load builds miscompile partial
+        # row tiles (_b16mm BM 128 at M 129: its last row wrong or NaN); the set needs each pointer's span < 2 GiB
+        for n, t in k["signature"].items():
+            if t.startswith("*"):
+                attrs[path_of(n, params)] = list(attrs.get(path_of(n, params), [])) + [["tt.pointer_range", 32]]
     else:
         options = {n: tuple(v) if isinstance(v, list) else v for n, v in k["options"].items()}
     src = ASTSource(fn, dict(k["signature"]), constexprs, attrs)

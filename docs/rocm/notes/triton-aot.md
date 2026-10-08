@@ -148,3 +148,15 @@ tensors (buffer ops, tt.pointer_range 32), both launched through the same ctypes
   _select          386ba33630 grid (3,)             NB=65536                     aot      8.1  jit      7.9  spills 0
   _scores          4dccf6de5e grid (3, 32)          NB=65536                     aot      7.5  jit      7.5  spills 0
 ```
+
+## Fix: buffer ops (tt.pointer_range 32) in every AOT build
+
+The first set left buffer ops out (plain global loads, what the JIT builds for tensors over 2 GiB). Those builds
+miscompile partial row tiles: `_b16mm` BM 128 with M not div16 (N 10240 K 320 / K 2560, N 8240) gets its last row
+wrong or NaN at M 129, 161, 2049, and `_hc_up_mix` likewise; the JIT itself, patched to skip buffer ops, gives the same
+wrong rows (a Triton 3.6 / LLVM AMDGPU bug in that path). The set now carries `tt.pointer_range 32` on every pointer
+as the JIT does for tensors under 2 GiB: 454/454 hashes still equal the JIT's, and `triton_parity.py run` at M 1, 3,
+16, 17, 129, 161, 2049 (model N tails such as 8240, 16480, 513) plus direct launches of prompt_mm's kernels and
+`_select_tiles` gives 748/748 bit-equal launches (17 without a variant: M 1 on BM-128-only kernels). The old set
+fails the same run (`_b16mm` 2/2, `_hc_up_mix` 10/12 differ). Requirement: no kernel argument may span 2 GiB or
+more from its pointer (offsets are 32-bit). `attn_multi`'s kernels (pointer tables) are still hash-checked only.
