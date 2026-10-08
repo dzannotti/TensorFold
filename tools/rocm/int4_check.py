@@ -310,6 +310,23 @@ def st_tensor(model, name):
     return np.fromfile(path, dtype=dt, count=(b - a) // np.dtype(dt).itemsize, offset=8 + hl + a).reshape(meta["shape"])
 
 
+def check_head(rng, model, cols):
+    """lm_head column slices [c0, c0 + n) against the host order (the whole tensor read on the host, a slice packed)."""
+    qw, sc, qz = (st_tensor(model, f"lm_head.{t}") for t in ("qweight", "scales", "qzeros"))
+    expect(bool((qz == 0x77777777).all()), "lm_head: zero points other than 8")
+    k = qw.shape[0] * 8
+    for c0, n in cols:
+        q = codes(qw[:, c0:c0 + n])
+        wp, sp = pack(qw, sc, c0, n, 0, k, 128)
+        x = bf16_rows(rng, 4, k)
+        got = dense(x.cuda(), dev(wp), dev(sp), k, n, 128, 4).cpu().numpy()
+        ref, exact, mag = emulate(q, sc[:, c0:c0 + n], 0, k, 128, x.double().numpy())
+        rel = np.abs(got - exact) / np.maximum(mag, 1e-30)
+        expect((rel <= 1e-4).all(), f"lm_head [{c0}, {c0 + n}): past 1e-4")
+        print(f"  lm_head columns [{c0}, {c0 + n}) k {k}: max {ulps(got, ref).max()} ulps vs host order, "
+              f"max |err|/sum|xw| {rel.max():.2e}, worst |err| {np.abs(got - exact).max():.3e} (|y| max {np.abs(exact).max():.3f})")
+
+
 def check_model(rng, model, layer, experts):
     for e in experts:
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -359,6 +376,8 @@ def main():
         check_experts(rng, 512, 640, 640, 0, 2560, 5, 300)
     if os.path.exists(f"{a.model}/model.safetensors.index.json"):
         check_model(rng, a.model, 0, (0, 511))
+        check_model(rng, a.model, 47, (137,))
+        check_head(rng, a.model, ((0, 4096), (248320 - 2048, 2048)))
     print("int4-check (HIP):", "FAILED " + "; ".join(FAIL) if FAIL else "ok")
     return 1 if FAIL else 0
 

@@ -167,6 +167,7 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
   static_assert(XN * WAVES * 32 == BR * CH, "whole chunks a thread");
   constexpr int WM = WAVES / MATS;                // waves a matrix: wave w takes matrix w % MATS
   __shared__ __attribute__((aligned(16))) uint16_t xs[2][BR * RS];
+  __shared__ int orow[BR];   // the pass's output rows (the epilogue reads them here, not from the plan again)
   float* ep = reinterpret_cast<float*>(&xs[0][0]);   // after the K loop: the up waves' sums for the SwiGLU epilogue
   static_assert(MATS == 1 || WM * MT * NT * 8 * 32 * 4 <= sizeof(xs), "the epilogue fits the row buffers");
   const int lane = threadIdx.x & 31, c = lane & 15, h = lane >> 4;
@@ -198,6 +199,8 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
     }
     for (int r0 = 0; r0 < cnt; r0 += BR) {
       const int live = min(MT, (cnt - r0 + 15) / 16);   // row tiles holding rows
+      const int ao = r0 + (int)threadIdx.x;   // loaded before the stage's loads: its wait never waits for them
+      const int po = threadIdx.x < BR && ao < cnt ? (items ? members[first + ao] : first + ao) : 0;
       const uint16_t* xp[XN];   // the thread's chunks of the pass's rows (row 0 of X past the item: loaded, zeroed)
       bool xv[XN];
 #pragma unroll
@@ -217,6 +220,7 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
       for (int b = 0; b < DS - 1; ++b)
         if (b < KG) load_stage<GS, NT, 1, XN>(st[b], w, s, xp, min(b, KG - 1), ST);
       lds_barrier();   // the previous pass no longer reads the buffers
+      if (threadIdx.x < BR) orow[threadIdx.x] = po;   // read after the group loop's barriers
       for (int g0 = 0; g0 < KG; g0 += DS) {
 #pragma unroll
         for (int b = 0; b < DS; ++b) {   // stage b, buffer b % 2 hold group g0 + b (known at compile time: no scratch)
@@ -252,7 +256,7 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
         for (int i = 0; i < 8; ++i) {
           const int a = r0 + 16 * r + 2 * i + h;
           if (a >= cnt) continue;
-          const size_t row = (size_t)(items ? members[first + a] : first + a) * out_stride;
+          const size_t row = (size_t)orow[16 * r + 2 * i + h] * out_stride;
 #pragma unroll
           for (int j = 0; j < NT; ++j) {
             const int col = ((cb * WM + tw) * NT + j) * 16 + c;
