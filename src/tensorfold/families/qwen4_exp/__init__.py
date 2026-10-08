@@ -163,7 +163,7 @@ def kernel_version(model: Any) -> str:
 # the CUDA engine reads MLX affine weights of this (bits, group size), or NVFP4 (ModelOpt) routed experts
 CUDA_QUANTIZATION = (4, 32)
 # the KV cache dtypes the CUDA engine can allocate (``--kv-dtype``)
-CUDA_KV_DTYPES = ("bf16", "int8", "int4")
+CUDA_KV_DTYPES = ("bf16", "int8", "int4", "fp8")
 CUDA_DECODE_SHARE = True           # --parallel rounds size their prompt pass by --decode-share (0: whole passes)
 CUDA_PREFILL_FP8 = True            # --prefill-fp8: an NVFP4 checkpoint's MXFP8 linears have an FP8 prompt kernel
 

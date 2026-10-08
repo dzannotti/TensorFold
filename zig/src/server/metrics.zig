@@ -6,6 +6,7 @@ const api = @import("engine_api");
 const prefix = "tensorfold:";
 /// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered.
 pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0 };
+pub const token_buckets = [_]f64{ 256, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144 };
 pub const tpot_buckets = [_]f64{ 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 };
 
 fn HistogramType(comptime edges: []const f64) type {
@@ -25,11 +26,24 @@ fn HistogramType(comptime edges: []const f64) type {
             };
             h.counts[edges.len] += 1;
         }
+
+        pub fn observeMany(h: *@This(), raw: f64, count: u64) void {
+            const value = @max(0, raw);
+            h.n += count;
+            h.total += value * @as(f64, @floatFromInt(count));
+            for (edges, 0..) |edge, i| if (value <= edge) {
+                h.counts[i] += count;
+                return;
+            };
+            h.counts[edges.len] += count;
+        }
     };
 }
 
 pub const Histogram = HistogramType(&buckets);
 pub const TpotHistogram = HistogramType(&tpot_buckets);
+pub const TokenHistogram = HistogramType(&token_buckets);
+const reasons = [_][]const u8{ "stop", "length", "abort", "error" };
 
 /// Counters of finished requests; gauges are read from the engine at scrape time.
 pub const Metrics = struct {
@@ -46,6 +60,11 @@ pub const Metrics = struct {
     decode: Histogram = .{},
     prefill: Histogram = .{},
     tpot: TpotHistogram = .{},
+    cached: u64 = 0,
+    queue: Histogram = .{},
+    prompts: TokenHistogram = .{},
+    between: TpotHistogram = .{},
+    finished: [reasons.len]u64 = @splat(0),
     requests: std.ArrayList(struct { key: []const u8, status: u16, count: u64 }) = .empty,
 
     pub fn note(m: *Metrics, io: std.Io, prompt: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
@@ -61,6 +80,17 @@ pub const Metrics = struct {
         if (decode) |d| m.decode.observe(d);
         if (prefill) |p| m.prefill.observe(p);
         if (tpot) |t| m.tpot.observe(t);
+    }
+
+    pub fn noteMore(m: *Metrics, io: std.Io, prompt: usize, cached: u64, queue: ?f64, decode: ?f64, generated: usize, reason: []const u8) void {
+        m.mutex.lockUncancelable(io);
+        defer m.mutex.unlock(io);
+        m.cached += cached;
+        m.prompts.observe(@floatFromInt(prompt));
+        if (queue) |q| m.queue.observe(q);
+        if (decode) |d| if (generated > 0) m.between.observeMany(d / @as(f64, @floatFromInt(generated)), generated);
+        const i: usize = if (std.mem.eql(u8, reason, "stop")) 0 else if (std.mem.eql(u8, reason, "length")) 1 else if (std.mem.eql(u8, reason, "cancelled")) 2 else 3;
+        m.finished[i] += 1;
     }
 
     pub fn tpotValue(_: *const Metrics, first: ?i96, last: ?i96, generated: usize) ?f64 {
@@ -137,6 +167,13 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        try gauge(w, "prefix_cache_queries_total", "counter", "Prompt tokens of finished requests, under vLLM's name.", snap.prompt);
+        try gauge(w, "prefix_cache_hits_total", "counter", "Prompt tokens found cached, in memory or on disk.", snap.cached);
+        try histogram(w, "request_queue_time_seconds", "Seconds from arrival to the first token, less the prompt pass.", snap.queue);
+        try histogram(w, "request_prompt_tokens", "Prompt tokens of a finished request.", snap.prompts);
+        try histogram(w, "inter_token_latency_seconds", "Decode seconds per generated token, counted once a token.", snap.between);
+        try family(w, "request_success_total", "counter", "Finished requests by finish reason.");
+        for (reasons, snap.finished) |r, n| try w.print("{s}request_success_total{{finished_reason=\"{s}\"}} {d}\n", .{ prefix, r, n });
     }
 };
 

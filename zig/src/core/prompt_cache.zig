@@ -26,6 +26,9 @@ pub const Snapshots = struct {
         trim: ?*const fn (ptr: *anyopaque, room: u64) void = null,
         /// Whether a save at `at` would take spare storage (no new storage).
         reuses: ?*const fn (ptr: *anyopaque, at: u32) bool = null,
+        spill: ?*const fn (ptr: *anyopaque, saved: Saved, tokens: []const u32) void = null,
+        recall_at: ?*const fn (ptr: *anyopaque, prompt: []const u32, longer_than: u32) u32 = null,
+        recall: ?*const fn (ptr: *anyopaque, prompt: []const u32, at: u32) anyerror!Saved = null,
     };
 };
 
@@ -141,7 +144,8 @@ pub const Store = struct {
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
-        const e = s.find(prompt, starts);
+        const found = s.find(prompt, starts);
+        const e = s.recalled(prompt, starts, found) orelse found;
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
@@ -158,9 +162,57 @@ pub const Store = struct {
         for (marks_) |at| need += s.family.vtable.bytes(s.family.ptr, at);
         while (s.held + need > s.budget) {
             const i = s.victimBut(from, prompt) orelse return;
-            s.remove(i);
-            s.counts.evicted += 1;
+            s.evict(i, prompt);
         }
+    }
+
+    fn evict(s: *Store, i: usize, prompt: []const u32) void {
+        const e = s.entries.items[i];
+        if (s.family.vtable.spill) |f| if (!s.extended(e, prompt)) f(s.family.ptr, e.saved, e.tokens);
+        s.remove(i);
+        s.counts.evicted += 1;
+    }
+
+    fn extended(s: *const Store, e: *const Entry, prompt: []const u32) bool {
+        if (prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) return true;
+        for (s.entries.items) |o| if (o != e and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
+        return false;
+    }
+
+    fn recalled(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
+        const peek = s.family.vtable.recall_at orelse return null;
+        const read = s.family.vtable.recall orelse return null;
+        const at = peek(s.family.ptr, prompt, if (have) |x| x.at else 0);
+        if (at == 0 or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) return null;
+        const bytes = s.family.vtable.bytes(s.family.ptr, at);
+        if (bytes > s.budget) return null;
+        while (s.held + s.spare() + bytes > s.budget) s.evict(s.victimBut(have, prompt) orelse return null, prompt);
+        const n = @as(usize, at) + s.rules.lookahead;
+        const e = s.gpa.create(Entry) catch return null;
+        const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
+            s.gpa.destroy(e);
+            return null;
+        };
+        const last = s.gpa.dupe(u32, prompt) catch {
+            s.gpa.free(tokens);
+            s.gpa.destroy(e);
+            return null;
+        };
+        const saved = read(s.family.ptr, prompt, at) catch |err| {
+            note("reading {d} tokens back from disk failed ({s}); prefilling them", .{ at, @errorName(err) });
+            s.gpa.free(last);
+            s.gpa.free(tokens);
+            s.gpa.destroy(e);
+            return null;
+        };
+        s.clock += 1;
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = bytes, .born = at, .used = s.clock, .last = last };
+        s.entries.append(s.gpa, e) catch {
+            s.free(e);
+            return null;
+        };
+        s.held += bytes;
+        return e;
     }
 
     /// A kept state a peer could not resume goes, so later prompts do not ask for it again.
@@ -264,8 +316,7 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.evict(s.victimBut(null, prompt).?, prompt); // its storage may come back spare and take this state
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
