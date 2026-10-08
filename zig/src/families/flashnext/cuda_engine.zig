@@ -397,7 +397,7 @@ pub const Engine = struct {
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
         // the draft vocabulary's 4-bit head needs fn_qmm*: a build without them drafts over the full head (same output)
         if (o.mtp and !e.k.q4) std.log.warn("no groups-of-32 4-bit kernels in this build: MTP drafts use the full head", .{});
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp and e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
         errdefer e.w.deinit();
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
@@ -537,7 +537,7 @@ pub const Engine = struct {
         };
         errdefer if (e.mtpq) |*t| t.deinit();
         // sampling scratch: the main head's rows and the draft head's one row
-        const draft_n: usize = if (e.w.draft_head) |q| q.n else e.g.head_n;
+        const draft_n: usize = if (e.w.draft_count != 0) e.w.draft_count else e.g.head_n;
         const main_sz = try sampleSizes(&e.torch.f, &.{ .{ state.max_rows, e.g.head_n, max_k }, .{ 1, e.g.head_n, max_k }, .{ rows, e.g.head_n, state.cand }, .{ 1, draft_n, state.cand }, .{ rows, draft_n, state.cand } });
         const draft_sz = try sampleSizes(&e.torch.f, &.{.{ 1, draft_n, draft_n }});
         const pack = state.max_rows * (2 * max_k + 1) * 4;
@@ -554,8 +554,8 @@ pub const Engine = struct {
         if (o.world > 1) e.tp = .{ .s = e.main_sample, .pack = e.extra.take(fixed[3]), .all = e.extra.take(fixed[4]), .max_rows = state.max_rows, .max_k = max_k };
         e.nsc = .{ .mass = e.extra.take(fixed[5]), .top = e.extra.take(fixed[6]), .sum = e.extra.take(fixed[7]) };
         if (e.w.mtp != null) {
-            if (e.w.draft_head != null) e.draft_host = try weights.draftIds(gpa, weights.draft_vocab, e.c.vocab, o.rank, o.world);
-            e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_head != null) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .tp = e.tp, .nsc = e.nsc };
+            if (e.w.draft_count != 0) e.draft_host = try weights.draftIds(gpa, weights.draft_vocab, e.c.vocab, o.rank, o.world);
+            e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_count != 0) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .tp = e.tp, .nsc = e.nsc };
         }
         errdefer gpa.free(e.draft_host);
         if (o.vmm) {
