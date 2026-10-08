@@ -32,35 +32,39 @@ def run_moe(ex, x, act, y, plan, mi, R, nt_up, nt_dn, mt, part):
         c.launch(128, nt_dn, mt, 1, 3, act, NI, 0, dn, dn_s, NI, D, plan, 0, y, mi, E)
 
 
+def decode_plans(eu, m, sets=8):
+    """Plans of `eu` experts x `m` pairs each (rows of 5 picks plus the skipped shared slot), rotated over `sets`
+    disjoint expert sets so the 32 MiB MALL never holds the next call's weights, as a real layer's."""
+    R = -(-eu * m // TOP)
+    plans = []
+    for v in range(sets):
+        picks = np.full(R * SLOTS, E, np.int32)
+        ids = [(i * (E // eu) + v) % E for i in range(eu) for _ in range(m)]
+        for p, e in enumerate(ids):
+            picks[(p // TOP) * SLOTS + p % TOP] = e
+        plans.append(c.make_plan(picks.reshape(R, SLOTS), E + 1, 16)[0])
+    return R, plans, c.max_items(R * SLOTS, E + 1, 16)
+
+
 def decode(ex, nts, rounds):
     print("decode experts (gate/up SwiGLU + down bf16), Eu experts x m pairs each, items of 16 (MT 1):")
     for eu in (5, 20, 40, 74):
         for m in (1, 4, 16):
-            R = eu * m // TOP if eu * m % TOP == 0 else None
-            if R is None:
-                continue
-            picks = np.full((R, SLOTS), E, np.int32)
-            for t in range(R):
-                for j in range(TOP):
-                    picks[t, j] = (TOP * t + j) % eu * (E // eu)
-            plan, n_items = c.make_plan(picks, E + 1, 16)
-            mi = c.max_items(R * SLOTS, E + 1, 16)
+            R, plans, mi = decode_plans(eu, m)
             x = torch.randn(R, D, device="cuda").bfloat16()
             act = torch.zeros(R * SLOTS, NI, dtype=torch.bfloat16, device="cuda")
             y = torch.zeros(R * SLOTS, D, dtype=torch.bfloat16, device="cuda")
             wb = eu * 3 * NI * D / 2 + eu * 3 * NI * D / 128 * 2
             res = []
-            for nu in nts:
-                for nd in nts:
-                    if NI % (8 * nu * c.waves(1)) or D % (16 * nd * c.waves(1)):
-                        continue
-                    tu = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 0), 20, rounds)
-                    td = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 1), 20, rounds)
-                    res.append((tu + td, nu, nd, tu, td))
+            for nt in nts:
+                it = iter(range(1 << 60))
+                tu = hiprun.best_us(lambda: run_moe(ex, x, act, y, plans[next(it) % len(plans)], mi, R, nt, nt, 1, 0), 16, rounds)
+                td = hiprun.best_us(lambda: run_moe(ex, x, act, y, plans[next(it) % len(plans)], mi, R, nt, nt, 1, 1), 16, rounds)
+                res.append((tu + td, nt, tu, td))
             best = min(res)
-            line = " ".join(f"[{nu},{nd}] {tu:.0f}+{td:.0f}" for _, nu, nd, tu, td in sorted(res, key=lambda r: (r[1], r[2])))
-            print(f"  Eu {eu:3d} m {m:2d} ({R * TOP} pairs): best NT up {best[1]} down {best[2]}: gate/up {best[3]:.1f} us "
-                  f"+ down {best[4]:.1f} us = {wb / best[0] / 1e3:.0f} GB/s   (NT [up,down] us: {line})")
+            line = " ".join(f"NT {nt}: {tu:.0f}+{td:.0f}" for _, nt, tu, td in res)
+            print(f"  Eu {eu:3d} m {m:2d} ({eu * m} pairs): NT {best[1]} gate/up {best[2]:.1f} us ({eu * 2 * NI * D / 2 / best[2] / 1e3:.0f} GB/s)"
+                  f" + down {best[3]:.1f} us ({eu * NI * D / 2 / best[3] / 1e3:.0f} GB/s) = {wb / best[0] / 1e3:.0f} GB/s  [{line}]")
 
 
 def head(nts, rounds):
@@ -91,7 +95,7 @@ def prompt(ex, nts, rounds):
         flops = 2 * R * TOP * 3 * NI * D
         eu = len(np.unique(picks[:, :TOP]))
         wb = eu * 3 * NI * D / 2
-        for tile, mt in ((16, 1), (64, 1), (64, 2)):
+        for tile, mt in ((16, 1), (64, 2)):
             plan, _ = c.make_plan(picks, E + 1, tile)
             mi = c.max_items(R * SLOTS, E + 1, tile)
             for nu, nd in ((nt, nt) for nt in nts):

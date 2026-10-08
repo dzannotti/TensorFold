@@ -285,6 +285,12 @@ fn unitCols(kind: usize, nt: usize) usize {
     return if (hip_layout) 16 * nt * (warps / kinds[kind].mats) else 8 * nt;
 }
 
+/// The n-tile counts a unit takes (checks force each) and whether `kind` over `n` outputs takes `nt` of them.
+pub const tile_counts = nts;
+pub fn fits(kind: usize, n: usize, nt: usize) bool {
+    return n % unitCols(kind, nt) == 0;
+}
+
 /// Units a block takes at once (CUDA: a warp each).
 const unit_blocks: usize = if (hip_layout) 1 else warps;
 
