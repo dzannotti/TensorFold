@@ -143,6 +143,30 @@ pub const Set = struct {
     }
 };
 
+/// A set's aot.json alone, no GPU: whether a launch would find a variant (dry coverage checks of a built set).
+pub const Specs = struct {
+    parsed: std.json.Parsed(SetJson),
+
+    pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Specs {
+        const path = try std.fs.path.join(gpa, &.{ dir, "aot.json" });
+        defer gpa.free(path);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+        defer gpa.free(text);
+        return .{ .parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) };
+    }
+
+    pub fn deinit(self: *Specs) void {
+        self.parsed.deinit();
+    }
+
+    pub fn has(self: *const Specs, function: []const u8, args: []const Arg, consts: []const Const) bool {
+        for (self.parsed.value.kernels) |k| {
+            if (std.mem.eql(u8, k.@"fn", function) and matches(k, args, consts)) return true;
+        }
+        return false;
+    }
+};
+
 fn lookup(args: []const Arg, name: []const u8) ?Arg {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
     return null;

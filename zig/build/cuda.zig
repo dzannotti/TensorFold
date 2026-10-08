@@ -152,7 +152,17 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("cuda", cuda);
     runner.addImport("flashnext", mods.flashnext);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer);
+    const native = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer);
+    // the Triton AOT set (tools/zig/flashnext_aot.py build) where tensorfold-native looks without TENSORFOLD_CUDA_KERNELS
+    if (b.option([]const u8, "kernel-set", "absolute directory of a Triton AOT set (aot.json + cubins/ or hsaco/) to install as native/share/tensorfold/cuda/<arch>")) |dir| {
+        const first = struct {
+            fn of(list: []const u8) []const u8 {
+                return std.mem.sliceTo(list, ',');
+            }
+        }.of;
+        const arch = if (gpu == .hip) first(arches) else b.fmt("sm{s}", .{first(sms)});
+        native.dependOn(&b.addInstallDirectory(.{ .source_dir = b.graph.cwdRelativePath(dir), .install_dir = .{ .custom = "native" }, .install_subdir = b.fmt("share/tensorfold/cuda/{s}", .{arch}) }).step);
+    }
     // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
     const comm_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
     b.step("flashnext-comm", "tf-flashnext-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-comm", .root_module = comm_test }), .{}).step);
@@ -175,7 +185,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module) void {
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module) *std.Build.Step {
     const m = engines(b, target, optimize, cuda, lanes, nemotron, flashnext);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
@@ -187,7 +197,9 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .imports = &.{ .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines } },
     }) });
     const install = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "native/bin" } } });
-    b.step("native", "tensorfold-native with the CUDA engines into zig-out/native/bin").dependOn(&install.step);
+    const step = b.step("native", "tensorfold-native with the CUDA engines into zig-out/native/bin (-Dkernel-set: its Triton set)");
+    step.dependOn(&install.step);
+    return step;
 }
 
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.

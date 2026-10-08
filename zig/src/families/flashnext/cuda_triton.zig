@@ -722,6 +722,17 @@ fn addr(i: u64) u64 {
     return 0x7f0000000000 + i * 0x100000;
 }
 
+/// TF_FLASHNEXT_AOT_SET=DIR: every fixture launch must also find a variant in DIR/aot.json (a built set, dry).
+var dry_set: ?aot.Specs = null;
+
+fn drySet() !?*const aot.Specs {
+    if (dry_set == null) {
+        const dir = std.c.getenv("TF_FLASHNEXT_AOT_SET") orelse return null;
+        dry_set = try aot.Specs.read(std.heap.page_allocator, testing.io, std.mem.span(dir));
+    }
+    return &dry_set.?;
+}
+
 fn check(f: *const Fixture, comptime fmt: []const u8, args: anytype, run: anytype) !void {
     var buf: [128]u8 = undefined;
     const id = try std.fmt.bufPrint(&buf, fmt, args);
@@ -729,6 +740,10 @@ fn check(f: *const Fixture, comptime fmt: []const u8, args: anytype, run: anytyp
     const t: Tri = .{ .set = null, .rec = &rec };
     try run.go(t);
     try expectLaunches(f, id, &rec);
+    if (try drySet()) |set| for (rec.launches[0..rec.n]) |l| if (!set.has(l.name, l.args[0..l.nargs], l.consts[0..l.nconsts])) {
+        std.debug.print("case {s}: no variant of {s} in TF_FLASHNEXT_AOT_SET\n", .{ id, l.name });
+        return error.MissingTritonVariant;
+    };
 }
 
 /// tools/zig/flashnext_triton_fixtures.py ROWS: decode windows, the capture's prompt pieces and full chunks
