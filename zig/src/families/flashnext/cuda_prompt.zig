@@ -477,10 +477,11 @@ pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast:
             try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[0], n, g, ends, dims);
             try qsaSelect(t, pos.ptr, scs[0], n, g, ends);
             for ([_]usize{ 8, 16, 0, 1, 2, 3 }) |rt| {
+                // a tile this device does not hold is skipped before its buffer is touched (the select reads it)
+                if (rt < 4) if (fast) |q| if (q.fs[rt] == null) continue;
                 try bufs[1][0].fill8(0xA7, t.s.handle);
                 if (rt < 4) {
                     const q = fast orelse continue;
-                    if (q.fs[rt] == null) continue;
                     var qq = q.*;
                     qq.pick = rt;
                     try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends);

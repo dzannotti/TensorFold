@@ -487,7 +487,9 @@ pub const Engine = struct {
         e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
-        if (!envOff("TF_FLASHNEXT_QSA_FAST")) {
+        // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in
+        const qsa_fast = if (envGet("TF_FLASHNEXT_QSA_FAST") != null) !envOff("TF_FLASHNEXT_QSA_FAST") else !cuda.hip;
+        if (qsa_fast) {
             e.qsa_fast = try prompt_mm.QsaScores.init(ctx);
             e.f.qsa_fast = &e.qsa_fast.?;
         }

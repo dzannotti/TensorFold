@@ -109,6 +109,10 @@ def triton_files(cache: Path, name: str, out: Path) -> dict:
     if len(metas) != 1:
         raise SystemExit(f"expected one compiled {name} in {cache}, found {metas}")
     base = Path(metas[0]).with_suffix("")
+    if torch.version.hip:  # ROCm: the code object goes where the Zig check reads the cubin; the metadata is the ABI
+        shutil.copy(f"{base}.hsaco", out / "kernel.cubin")
+        shutil.copy(f"{base}.json", out / "kernel.json")
+        return {"hsaco": True, "cache_dir": str(base.parent.name)}
     for ext in ("cubin", "json", "ptx"):
         shutil.copy(f"{base}.{ext}", out / f"kernel.{ext}")
     ptx = (out / "kernel.ptx").read_text()
@@ -161,13 +165,15 @@ def main() -> int:
     cache = Path(os.environ["TRITON_CACHE_DIR"])
     g = torch.Generator(device=DEV)
     g.manual_seed(20261003)
-    report = {"torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(),
+    report = {"torch": torch.__version__, "cuda": torch.version.cuda, "hip": torch.version.hip, "device": torch.cuda.get_device_name(),
               "capability": list(torch.cuda.get_device_capability())}
     import triton
     report["triton"] = triton.__version__
-    report["gdn_replay"] = gdn_replay(out / "fixtures/gdn_replay", g)
-    report["gdn_chain"] = gdn_window(out / "fixtures/gdn_chain", g, [-1] + list(range(15)))
-    report["gdn_tree"] = gdn_window(out / "fixtures/gdn_tree", g, [-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7])
+    # ROCm: the gdn extension builds with nvcc flags only; tools/rocm/check_gdn.py covers those kernels there
+    if not torch.version.hip:
+        report["gdn_replay"] = gdn_replay(out / "fixtures/gdn_replay", g)
+        report["gdn_chain"] = gdn_window(out / "fixtures/gdn_chain", g, [-1] + list(range(15)))
+        report["gdn_tree"] = gdn_window(out / "fixtures/gdn_tree", g, [-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7])
     report["triton_swiglu"] = triton_swiglu(out / "fixtures/triton_swiglu", g, cache)
     report["triton_add_rmsnorm"] = triton_add_rmsnorm(out / "fixtures/triton_add_rmsnorm", g, cache)
     ext = Path(os.environ["TORCH_EXTENSIONS_DIR"])
