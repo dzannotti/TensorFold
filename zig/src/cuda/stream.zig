@@ -15,6 +15,13 @@ pub const Stream = struct {
         return .{ .d = d, .handle = s };
     }
 
+    /// A non-blocking stream at `priority` (lower is higher; the driver clamps it to its range).
+    pub fn initPriority(d: *const Driver, priority: c_int) Error!Stream {
+        var s: abi.Stream = null;
+        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, priority), "cuStreamCreateWithPriority");
+        return .{ .d = d, .handle = s };
+    }
+
     pub fn deinit(self: *Stream) void {
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
         self.* = undefined;

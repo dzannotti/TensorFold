@@ -2,6 +2,11 @@
 
 pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
+/// True in -Dgpu=hip builds (AMD HIP runtime, AMDGPU code objects); `Context.features` names what the device can do.
+pub const hip = @import("driver.zig").hip;
+pub const mangle = @import("mangle.zig");
+/// Where a HIP build looks for libamdhip64.
+pub const hip_paths = @import("hip.zig").paths;
 pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
@@ -28,5 +33,7 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = mangle;
+    _ = @import("hip.zig");
     _ = roce;
 }

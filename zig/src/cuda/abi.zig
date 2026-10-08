@@ -1,4 +1,5 @@
-//! CUDA driver API types and entry points as NVIDIA documents them (CUDA 12.0+ ABI), declared by hand.
+//! CUDA driver API types and entry points as NVIDIA documents them (CUDA 12.0+ ABI), declared by hand; HIP builds
+//! bind the same table to libamdhip64 (hip.zig).
 
 pub const Result = c_int;
 pub const Device = c_int;
@@ -33,6 +34,7 @@ pub const DeviceAttribute = enum(c_int) {
     multiprocessor_count = 16,
     integrated = 18,
     l2_cache_size = 38,
+    max_threads_per_multiprocessor = 39,
     compute_capability_major = 75,
     compute_capability_minor = 76,
     max_shared_memory_per_multiprocessor = 81,
@@ -168,6 +170,7 @@ pub const Api = struct {
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
     cuMemsetD32Async: *const fn (DevicePtr, c_uint, usize, Stream) callconv(.c) R,
     cuStreamCreate: *const fn (*Stream, c_uint) callconv(.c) R,
+    cuStreamCreateWithPriority: *const fn (*Stream, c_uint, c_int) callconv(.c) R,
     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,

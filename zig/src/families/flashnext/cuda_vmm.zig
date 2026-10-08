@@ -3,7 +3,8 @@
 //! copy, no old-plus-new peak, pointers that captured graphs keep), and its indexer keys live in a ring: one
 //! physical chunk mapped again and again over the window's rows, since only the rows from the last incomplete
 //! block on are ever read (attention.py `_pool_block` reads rows [p0 - 3, p0 + R) of the keys attn_prep wrote).
-//! The driver's VMM entry points are looked up from libcuda here (the shared driver binding does not carry them).
+//! The driver's VMM entry points are looked up here (the shared driver binding does not carry them): libcuda's, or
+//! libamdhip64's hipMem* twins in -Dgpu=hip builds (same signatures; the prop structs and enums match cuda.h's).
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -42,13 +43,13 @@ pub const Vmm = struct {
 
     /// The VMM entry points of the driver that `ctx` runs on, and its allocation granularity (minimum).
     pub fn init(ctx: *const cuda.Context) !Vmm {
-        var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
-        errdefer lib.close();
         var v: Vmm = undefined;
-        v.lib = lib;
+        v.lib = try openDriver();
+        errdefer v.lib.close();
         v.device = @intCast(ctx.device);
-        inline for (.{ .{ "granularityFn", "cuMemGetAllocationGranularity" }, .{ "create", "cuMemCreate" }, .{ "release", "cuMemRelease" }, .{ "reserveFn", "cuMemAddressReserve" }, .{ "addressFree", "cuMemAddressFree" }, .{ "map", "cuMemMap" }, .{ "unmap", "cuMemUnmap" }, .{ "setAccess", "cuMemSetAccess" } }) |e| {
-            @field(v, e[0]) = v.lib.lookup(@TypeOf(@field(v, e[0])), e[1]) orelse return error.MissingSymbol;
+        const prefix = if (cuda.hip) "hip" else "cu";
+        inline for (.{ .{ "granularityFn", "MemGetAllocationGranularity" }, .{ "create", "MemCreate" }, .{ "release", "MemRelease" }, .{ "reserveFn", "MemAddressReserve" }, .{ "addressFree", "MemAddressFree" }, .{ "map", "MemMap" }, .{ "unmap", "MemUnmap" }, .{ "setAccess", "MemSetAccess" } }) |e| {
+            @field(v, e[0]) = v.lib.lookup(@TypeOf(@field(v, e[0])), prefix ++ e[1]) orelse return error.MissingSymbol;
         }
         const want: Prop = .{ .location = .{ .id = v.device } };
         try check(v.granularityFn(&v.granularity, &want, 0), "cuMemGetAllocationGranularity");
@@ -58,6 +59,12 @@ pub const Vmm = struct {
 
     pub fn deinit(v: *Vmm) void {
         v.lib.close();
+    }
+
+    fn openDriver() !std.DynLib {
+        if (!cuda.hip) return std.DynLib.open("libcuda.so.1") catch error.DriverUnavailable;
+        for (cuda.hip_paths) |path| return std.DynLib.open(path) catch continue;
+        return error.DriverUnavailable;
     }
 
     fn props(v: *const Vmm) Prop {
@@ -71,7 +78,7 @@ pub const Vmm = struct {
 
 fn check(rc: Result, what: []const u8) !void {
     if (rc != 0) {
-        std.log.err("{s}: CUDA error {d}", .{ what, rc });
+        std.log.err("{s}: driver error {d}", .{ what, rc });
         return error.CudaVmm;
     }
 }

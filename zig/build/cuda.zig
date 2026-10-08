@@ -1,14 +1,26 @@
 //! The CUDA half of the root build: kernel fatbins with each Python extension's nvcc flags, the runtime, Nemotron, the CLI.
 
 const std = @import("std");
+const hip_build = @import("hip.zig");
+
+/// The GPU runtime a Linux build targets: NVIDIA's driver, or AMD's HIP runtime (-Dgpu=hip).
+pub const Gpu = enum { cuda, hip };
+
+var gpu_option: ?Gpu = null;
+
+/// -Dgpu, declared once for the targets and the host tests.
+fn gpuOption(b: *std.Build) Gpu {
+    if (gpu_option == null) gpu_option = b.option(Gpu, "gpu", "GPU runtime: cuda (default) or hip") orelse .cuda;
+    return gpu_option.?;
+}
 
 /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
-const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
+pub const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
 
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
 
-const kernels = [_]Kernel{
+pub const kernels = [_]Kernel{
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
     .{ .name = "probe", .flags = &.{"-O3"} },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
@@ -63,8 +75,9 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 }
 
 /// The runtime module for `target`; `with_kernels` false builds it host-only (empty images).
-fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
+fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, gpu: Gpu, images: []const ?std.Build.LazyPath) *std.Build.Module {
     const options = b.addOptions();
+    options.addOption(Gpu, "gpu", gpu);
     var with = images.len > 0;
     for (images) |i| with = with and i != null;
     options.addOption(bool, "with_kernels", with);
@@ -97,28 +110,36 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer };
 }
 
-/// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
+/// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones; -Dgpu=hip -Dhipcc builds AMDGPU code
+/// objects instead), `tensorfold` and `tf-cuda-test`.
 pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module) void {
+    const gpu = gpuOption(b);
+    const hipcc = b.option([]const u8, "hipcc", "hipcc that builds the HIP kernel code objects (-Dgpu=hip)");
+    const arches = b.option([]const u8, "offload-arch", "AMDGPU targets, comma separated (default gfx1151)") orelse "gfx1151";
     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (121; later 120,89)") orelse "121";
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
-    const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
-        const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
+    const compiler: ?[]const u8 = if (gpu == .hip) hipcc else nvcc;
+    const version: ?std.Build.LazyPath = if (prebuilt == null and compiler != null) blk: {
+        const run = b.addSystemCommand(&.{ compiler.?, "--version" });
         run.has_side_effects = true;
         break :blk run.captureStdOut(.{});
     } else null;
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
     for (kernels, &images) |k, *image| {
-        if (prebuilt) |dir| {
+        if (gpu == .hip) {
+            if (hipcc) |tool| image.* = hip_build.codeObject(b, tool, version.?, k, arches);
+        } else if (prebuilt) |dir| {
             image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
         } else if (nvcc) |tool| {
             image.* = fatbin(b, tool, version.?, k, sms);
         }
-        if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
+        if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.{s}", .{ k.name, if (gpu == .hip) "hsaco" else "fatbin" })).step);
     }
-    const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
+    const built = if (gpu == .hip) hipcc != null else nvcc != null or prebuilt != null;
+    const cuda = runtime(b, target, optimize, gpu, if (built) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     cli.addImport("cuda", cuda);
@@ -129,6 +150,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
+    runner.addImport("flashnext", mods.flashnext);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer);
     // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
@@ -171,7 +193,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.
 pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.Step) void {
     const host = b.graph.host;
-    const cuda = runtime(b, host, .debug, &.{});
+    const cuda = runtime(b, host, .debug, gpuOption(b), &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext).engines;
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);

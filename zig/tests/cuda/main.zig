@@ -7,6 +7,7 @@ const runtime_tests = @import("runtime_tests.zig");
 const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
 const libs_tests = @import("libs_tests.zig");
+const device_tests = @import("device_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -18,6 +19,10 @@ const usage =
     \\  launch-ex                 cuLaunchKernelEx: clusters, cooperative grid, PDL on a stream and in a graph
     \\  ptx                       hand-written PTX through the driver JIT, and a refused broken image
     \\  symbols                   every gdn fatbin instantiation resolves by its listed symbol
+    \\  occupancy                 named features, occupancy, function attributes, dynamic shared limits
+    \\  vmm                       VMM: a region grown in place, one chunk mapped as a ring
+    \\  meminfo                   device free memory and MemAvailable around a 1 GiB allocation
+    \\  bandwidth [reps]          streaming reads of 1 GiB by launch shape, best of reps
     \\  cublaslt                  bf16 GEMM through cuBLASLt against an fp64 reference
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
@@ -55,7 +60,14 @@ fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
     return rest[i];
 }
 
+/// CUDA-only features: clusters and PDL, the PTX JIT, cuBLASLt and NCCL have no HIP counterpart here.
+const cuda_only = [_][]const u8{ "launch-ex", "overhead-pdl", "ptx", "cublaslt", "nccl" };
+
 fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+    if (cuda.hip) for (cuda_only) |c| if (std.mem.eql(u8, cmd, c)) {
+        std.debug.print("SKIP {s}: CUDA only\n", .{cmd});
+        return;
+    };
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
     if (std.mem.eql(u8, cmd, "graph")) return runtime_tests.graphs(gpu);
@@ -67,6 +79,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "launch-ex")) return runtime_tests.launchEx(gpu);
     if (std.mem.eql(u8, cmd, "ptx")) return runtime_tests.ptx(gpu);
     if (std.mem.eql(u8, cmd, "symbols")) return runtime_tests.symbols(gpu);
+    if (std.mem.eql(u8, cmd, "occupancy")) return device_tests.occupancy(gpu);
+    if (std.mem.eql(u8, cmd, "vmm")) return device_tests.vmmCheck(gpu);
+    if (std.mem.eql(u8, cmd, "meminfo")) return device_tests.meminfo(gpu);
+    if (std.mem.eql(u8, cmd, "bandwidth")) return device_tests.bandwidth(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 5);
     if (std.mem.eql(u8, cmd, "cublaslt")) return libs_tests.cublaslt(gpu);
     if (std.mem.eql(u8, cmd, "nccl")) return libs_tests.nccl(gpu);
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
@@ -80,9 +96,10 @@ fn info(gpu: check.Gpu) !void {
     var name_buf: [256]u8 = undefined;
     const name = try gpu.ctx.name(&name_buf);
     const mem = try gpu.ctx.memInfo();
-    std.debug.print("RESULT driver CUDA {d}, device {s}, sm_{d}, {d} SMs, {d} MiB total, {d} MiB free, kernels embedded {}\n", .{
-        try gpu.d.version(),                                 name,
-        try gpu.ctx.capability(),                            try gpu.ctx.attribute(.multiprocessor_count),
+    const f = try gpu.ctx.features();
+    std.debug.print("RESULT driver {s} {d}, device {s}, {s}, {d} SMs, {d} MiB total, {d} MiB free, kernels embedded {}\n", .{
+        if (cuda.hip) "HIP" else "CUDA", try gpu.d.version(), name,
+        f.arch(),                                            f.sms,
         mem.total >> 20,                                     mem.free >> 20,
         cuda.kernels.available,
     });
