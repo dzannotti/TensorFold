@@ -66,6 +66,14 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
   return bf(gv / (1.f + expf(-gv))) * uv;
 }
 
+// A barrier that orders shared memory only: __syncthreads' workgroup fence also waits for every global load in flight
+// (vmcnt(0) in WGP mode), which would drain the weights' prefetch at each group.
+__device__ __forceinline__ void lds_barrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 // n16 tiles a super tile of an [N, K] matrix: gcd(N / 16, 16) (cuda_int4.zig superTiles).
 __device__ __forceinline__ int super_tiles(int N) {
   const int t = N / 16;
@@ -77,7 +85,7 @@ __device__ __forceinline__ int super_tiles(int N) {
 template <int GS, int NT, int MATS, int XN>
 struct Stage {
   u4v w[MATS][NT][GS / 32];
-  float s[MATS][NT];
+  _Float16 s[MATS][NT];   // converted at use: a conversion here would wait for the load at once
   u4v x[XN];
 };
 
@@ -86,7 +94,7 @@ __device__ __forceinline__ void load_stage(Stage<GS, NT, MATS, XN>& st, const ui
                                            const _Float16* const (&s)[MATS][NT], const uint16_t* const (&xp)[XN],
                                            int g, int gw) {
 #pragma unroll
-  for (int i = 0; i < XN; ++i) st.x[i] = xp[i] ? reinterpret_cast<const u4v*>(xp[i] + g * GS)[0] : u4v{};
+  for (int i = 0; i < XN; ++i) st.x[i] = reinterpret_cast<const u4v*>(xp[i] + g * GS)[0];   // zeroed at use
 #pragma unroll
   for (int m = 0; m < MATS; ++m)
 #pragma unroll
@@ -94,15 +102,16 @@ __device__ __forceinline__ void load_stage(Stage<GS, NT, MATS, XN>& st, const ui
 #pragma unroll
       for (int q = 0; q < GS / 32; ++q)
         st.w[m][j][q] = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(w[m][j] + g * gw * 2 * GS + q * 64));
-      st.s[m][j] = (float)s[m][j][g * gw * 16];
+      st.s[m][j] = s[m][j][g * gw * 16];
     }
 }
 
 // One group: a fresh WMMA chain over its k16 steps for every (row tile, matrix, n16 tile), then the scale's fmaf.
-// `xs`: the group's rows in shared memory, RS bf16 apart.
+// `xs`: the group's rows in shared memory, RS bf16 apart (rows past the item are zero). Every row tile runs, live or
+// not: a run-time bound on the row-tile loops (or a branch to a one-tile copy) makes the compiler spill.
 template <int GS, int NT, int MT, int MATS, int XN, int RS>
 __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const Stage<GS, NT, MATS, XN>& cur,
-                                              const uint16_t* xs, int live, int c) {
+                                              const uint16_t* xs, int c) {
   v8f d[MT][MATS][NT];
 #pragma unroll
   for (int r = 0; r < MT; ++r)
@@ -114,8 +123,7 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
   for (int k = 0; k < GS / 16; ++k) {
     v16s a[MT];
 #pragma unroll
-    for (int r = 0; r < MT; ++r)
-      if (r < live) {
+    for (int r = 0; r < MT; ++r) {
         const u4v* p = reinterpret_cast<const u4v*>(xs + (16 * r + c) * RS + 16 * k);
         const u4v lo = p[0], hi = p[1];
         a[r] = (v16s)u8v{lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
@@ -127,8 +135,7 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
         const u4v q = cur.w[m][j][k / 2];
         const v16s b = dq(q[2 * (k & 1)], q[2 * (k & 1) + 1]);
 #pragma unroll
-        for (int r = 0; r < MT; ++r)
-          if (r < live) d[r][m][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[r], b, d[r][m][j]);
+        for (int r = 0; r < MT; ++r) d[r][m][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[r], b, d[r][m][j]);
       }
   }
 #pragma unroll
@@ -138,8 +145,9 @@ __device__ __forceinline__ void compute_group(v8f (&acc)[MT][MATS][NT], const St
 #pragma unroll
       for (int j = 0; j < NT; ++j)
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[r][m][j][i] = fmaf(d[r][m][j][i], cur.s[m][j], acc[r][m][j][i]);
+        for (int i = 0; i < 8; ++i) acc[r][m][j][i] = fmaf(d[r][m][j][i], (float)cur.s[m][j], acc[r][m][j][i]);
 }
+
 
 // A block a unit: (item, WAVES x NT n16 tiles of every matrix), a wave NT of them. Items (expert, first member, count)
 // from the experts plan, or, with `items` null, the dense rows [16 i, 16 i + 16) of `rows` (the head). `slots`: member
@@ -190,12 +198,14 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
     }
     for (int r0 = 0; r0 < cnt; r0 += BR) {
       const int live = min(MT, (cnt - r0 + 15) / 16);   // row tiles holding rows
-      const uint16_t* xp[XN];
+      const uint16_t* xp[XN];   // the thread's chunks of the pass's rows (row 0 of X past the item: loaded, zeroed)
+      bool xv[XN];
 #pragma unroll
       for (int i = 0; i < XN; ++i) {
         const int q = threadIdx.x + WAVES * 32 * i, a = r0 + q / CH;
-        const int p = a < cnt ? (items ? members[first + a] : first + a) : -1;
-        xp[i] = p < 0 ? nullptr : X + (size_t)(slots ? p / slots : p) * x_stride + (q % CH) * 8;
+        xv[i] = a < cnt;
+        const int p = xv[i] ? (items ? members[first + a] : first + a) : 0;
+        xp[i] = X + (size_t)(slots ? p / slots : p) * x_stride + (q % CH) * 8;
       }
       v8f acc[MT][1][NT];
 #pragma unroll
@@ -205,8 +215,8 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
       Stage<GS, NT, 1, XN> st[DS];
 #pragma unroll
       for (int b = 0; b < DS - 1; ++b)
-        if (b < KG) load_stage<GS, NT, 1, XN>(st[b], w, s, xp, b, ST);
-      __syncthreads();   // the previous pass no longer reads the buffers
+        if (b < KG) load_stage<GS, NT, 1, XN>(st[b], w, s, xp, min(b, KG - 1), ST);
+      lds_barrier();   // the previous pass no longer reads the buffers
       for (int g0 = 0; g0 < KG; g0 += DS) {
 #pragma unroll
         for (int b = 0; b < DS; ++b) {   // stage b, buffer b % 2 hold group g0 + b (known at compile time: no scratch)
@@ -215,15 +225,17 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
 #pragma unroll
           for (int i = 0; i < XN; ++i) {
             const int q = threadIdx.x + WAVES * 32 * i;
-            *reinterpret_cast<u4v*>(xs[b & 1] + (q / CH) * RS + (q % CH) * 8) = st[b].x[i];
+            *reinterpret_cast<u4v*>(xs[b & 1] + (q / CH) * RS + (q % CH) * 8) = xv[i] ? st[b].x[i] : u4v{};
           }
-          __syncthreads();   // buffer b % 2 written; the other (group g - 1) read by every wave
-          if (g + DS - 1 < KG) load_stage<GS, NT, 1, XN>(st[(b + DS - 1) % DS], w, s, xp, g + DS - 1, ST);
-          compute_group<GS, NT, MT, 1, XN, RS>(acc, st[b], xs[b & 1], live, c);
+          lds_barrier();   // buffer b % 2 written; the other (group g - 1) read by every wave
+          // unconditional (the last groups again past the end, from the cache): a load under a branch makes the
+          // waitcnt pass wait at the join as if no load were in flight
+          load_stage<GS, NT, 1, XN>(st[(b + DS - 1) % DS], w, s, xp, min(g + DS - 1, KG - 1), ST);
+          compute_group<GS, NT, MT, 1, XN, RS>(acc, st[b], xs[b & 1], c);
         }
       }
       if constexpr (MATS == 2) {   // the up waves hand their sums to the gate waves of the same tiles
-        __syncthreads();   // every wave is done with the row buffers
+        lds_barrier();   // every wave is done with the row buffers
         if (mw == 1)
 #pragma unroll
           for (int r = 0; r < MT; ++r)
@@ -231,7 +243,7 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
             for (int j = 0; j < NT; ++j)
 #pragma unroll
               for (int i = 0; i < 8; ++i) ep[(((tw * MT + r) * NT + j) * 8 + i) * 32 + lane] = acc[r][0][j][i];
-        __syncthreads();
+        lds_barrier();
       }
 #pragma unroll
       for (int r = 0; r < MT; ++r) {
@@ -262,9 +274,10 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
 
 }  // namespace tf_fn_int4
 
-// Entry points tf_int4_<gs>_<nt>_<mt>_<mats>_<epi> (cuda_int4.zig hipSymbol): gate/up SwiGLU (2 matrices, groups of
-// 128), down fp32 / bf16 (groups of 128, or 64 at a TP=2 rank), the head (bf16 / fp32); NT 1, 2, 4 n16 tiles a
-// wave; MT 1 row tile a pass (decode: items of 16 pairs) or 4 (prompt: items of 64). The same bits at every NT, MT.
+// Entry points tf_int4_<gs>_<nt>_<mt>_<mats>_<epi> (cuda_int4.zig symbol): gate/up SwiGLU (2 matrices, groups of
+// 128), down fp32 / bf16 (groups of 128, or 64 at a TP=2 rank), the head (bf16 / fp32); NT 1 or 2 n16 tiles a wave;
+// MT 1 row tile a pass (decode, items of 16 pairs: NT 1 measured best) or 2 (prompt, items of 64: NT 2). The same
+// bits at every NT, MT. NT 4 measured slower (registers) and is left out.
 #define TF_INT4(GS, NT, MT, MATS, EPI)                                                                              \
   extern "C" __global__ void __launch_bounds__(tf_fn_int4::WAVES * 32) tf_int4_##GS##_##NT##_##MT##_##MATS##_##EPI( \
       const uint16_t* X, int x_stride, int slots, const uint32_t* W, const _Float16* S, int K, int N,              \
@@ -273,9 +286,8 @@ __device__ __forceinline__ void int4_body(const uint16_t* __restrict__ X, int x_
     tf_fn_int4::int4_body<GS, NT, MT, MATS, EPI>(X, x_stride, slots, W, S, K, N, items, counts, members, rows, out,  \
                                                  out_stride, limit, skip);                                         \
   }
-#define TF_INT4_NT(GS, MATS, EPI)                                                                       \
-  TF_INT4(GS, 1, 1, MATS, EPI) TF_INT4(GS, 2, 1, MATS, EPI) TF_INT4(GS, 4, 1, MATS, EPI)                \
-  TF_INT4(GS, 1, 4, MATS, EPI) TF_INT4(GS, 2, 4, MATS, EPI) TF_INT4(GS, 4, 4, MATS, EPI)
+#define TF_INT4_NT(GS, MATS, EPI) \
+  TF_INT4(GS, 1, 1, MATS, EPI) TF_INT4(GS, 2, 1, MATS, EPI) TF_INT4(GS, 1, 2, MATS, EPI) TF_INT4(GS, 2, 2, MATS, EPI)
 TF_INT4_NT(128, 2, 2)
 TF_INT4_NT(128, 1, 0)
 TF_INT4_NT(128, 1, 3)

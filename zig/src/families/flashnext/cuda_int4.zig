@@ -167,10 +167,9 @@ pub fn weight(src: Source, n: usize, k: usize) f32 {
 const warps = 4;
 /// [kind: gate/up SwiGLU (gs 128), down fp32 gs 128, down bf16 gs 128, fp32 gs 64, bf16 gs 64][NT: 1, 2, 4]
 const n_kinds = 5;
-const nts = [_]usize{ 1, 2, 4 };
-/// row tiles of 16 a pass: 1 (decode), 2 (prompt items of up to 64 pairs: the weights read once for 32 rows; HIP: 4,
-/// all 64)
-const mts = [_]usize{ 1, if (hip_layout) 4 else 2 };
+const nts = if (hip_layout) [_]usize{ 1, 2 } else [_]usize{ 1, 2, 4 };
+/// row tiles of 16 a pass: 1 (decode), 2 (prompt items of up to 64 pairs: the weights read once for 32 rows)
+const mts = [_]usize{ 1, 2 };
 
 fn symbol(comptime gs: usize, comptime nt: usize, comptime mt: usize, comptime mats: usize, comptime epi: usize) [:0]const u8 {
     if (hip_layout) return std.fmt.comptimePrint("tf_int4_{d}_{d}_{d}_{d}_{d}", .{ gs, nt, mt, mats, epi });
@@ -185,8 +184,11 @@ pub const prompt_pairs: usize = 2048;
 /// Measured on GB10 (int4-check, 4096 rows, top 5 of 512): 64-pair items with two row tiles a pass are slower
 /// (gate/up 8.4 vs 6.0 ms, down 3.8 vs 3.2 ms: a third of the warps), so every call takes 16-pair items for now;
 /// TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile (the same bits either way, int4-check).
+/// HIP takes the prompt tile by default (gfx1151, 2048 rows top 5 of 512: gate/up 6.9 -> 4.1 ms, down 3.7 -> 2.3 ms;
+/// TF_FLASHNEXT_INT4_TILE=16 turns it off).
 pub fn tileFor(pairs: usize) usize {
-    const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch kern.plan_tile else kern.plan_tile;
+    const default: usize = if (hip_layout) prompt_tile else kern.plan_tile;
+    const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch default else default;
     return if (want == prompt_tile and pairs >= prompt_pairs) prompt_tile else kern.plan_tile;
 }
 
@@ -246,7 +248,7 @@ pub const Kernels = struct {
             k.fns[i][j][q] = try k.module.function(s);
             k.blocks[i][j][q] = @as(usize, @max(1, try k.fns[i][j][q].occupancy(warps * 32, 0))) * sms;
         };
-        if (hip_layout) return k; // prompt calls take int4_kernel's 4 row tiles (downPrompt)
+        if (hip_layout) return k; // prompt calls take int4_kernel's 2 row tiles (downPrompt)
         for (0..2) |g| for (0..2) |o| {
             const sm = promptSmem(if (g == 0) 128 else 64, prompt_stages[g]);
             k.pdown[g][o] = try k.module.function(prompt_symbols[g][o]);
@@ -267,6 +269,8 @@ fn int(x: usize) c_int {
 
 /// The widest n8-tile count whose units still fill the GPU twice over (the same bits at any NT).
 fn pickNt(k: *const Kernels, kind: usize, max_items: usize, n: usize, q: usize) usize {
+    // HIP (gfx1151, int4_bench.py): one n16 tile a wave at decode, two with two row tiles a pass
+    if (hip_layout) return if (q == 1 and n % unitCols(kind, 2) == 0) 1 else 0;
     var j: usize = nts.len;
     while (j > 1) {
         j -= 1;
@@ -349,7 +353,7 @@ pub fn downPrompt(k: *const Kernels, s: cuda.Stream, act: u64, act_stride: usize
     const kk: usize = ex.width;
     if (hip_layout) {
         const items = kern.maxItems(rows * plan_slots, plan_experts, prompt_down_tile);
-        return launch(k, s, @as(usize, if (g == 0) 1 else 3) + @intFromBool(!f32_out), items, act, act_stride, 0, ex.down, ex.down_s, kk, n, p, 0, out, n, skip, null, 4);
+        return launch(k, s, @as(usize, if (g == 0) 1 else 3) + @intFromBool(!f32_out), items, act, act_stride, 0, ex.down, ex.down_s, kk, n, p, 0, out, n, skip, null, mts[1]);
     }
     if (n % 128 != 0 or kk % gs != 0 or act_stride % 8 != 0 or act % 16 != 0 or ex.down % 16 != 0 or ex.down_s % 16 != 0 or out % 8 != 0) return error.Invalid;
     const items = kern.maxItems(rows * plan_slots, plan_experts, prompt_down_tile);
@@ -473,5 +477,5 @@ test "symmetric zero points and the kernel symbols" {
     z[19] = 0x77;
     z[3] = 0x78;
     try std.testing.expect(!zerosAreSymmetric(&z));
-    try std.testing.expectEqualStrings(if (hip_layout) "tf_int4_128_4_1_2_2" else "_ZN10tf_fn_int411int4_kernelILi128ELi4ELi1ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPKjPK6__halfiiPKiSA_SA_iPvifi", symbols[0][2][0]);
+    try std.testing.expectEqualStrings(if (hip_layout) "tf_int4_128_2_1_2_2" else "_ZN10tf_fn_int411int4_kernelILi128ELi2ELi1ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPKjPK6__halfiiPKiSA_SA_iPvifi", symbols[0][1][0]);
 }

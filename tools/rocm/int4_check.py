@@ -14,9 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hiprun
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WAVES = 4
-NTS = (1, 2, 4)
-MTS = (1, 4)
+NTS = (1, 2)
+MTS = (1, 2)
 
 
 def load():
@@ -103,19 +102,24 @@ def ulps(a, b):
 
 # ---- launches (cuda_int4.zig launch) ----------------------------------------------------------------------------
 
-def blocks(name):
+def waves(mt):
+    return 4
+
+
+def blocks(name, threads):
     if name not in OCC:
-        OCC[name] = max(1, M.occupancy(name, WAVES * 32)) * torch.cuda.get_device_properties(0).multi_processor_count
+        OCC[name] = max(1, M.occupancy(name, threads)) * torch.cuda.get_device_properties(0).multi_processor_count
     return OCC[name]
 
 
 def launch(gs, nt, mt, mats, epi, x, x_stride, slots, w, s, k, n, plan, rows, out, max_items, skip=-1):
     name = sym(gs, nt, mt, mats, epi)
-    assert n % (16 * nt * WAVES // mats) == 0, (n, nt)
-    units = max_items * (n // (16 * nt * WAVES // mats))
-    grid = min(units, blocks(name))
+    wv = waves(mt)
+    assert n % (16 * nt * wv // mats) == 0, (n, nt)
+    units = max_items * (n // (16 * nt * wv // mats))
+    grid = min(units, blocks(name, wv * 32))
     items, counts, members = plan if plan else (None, None, None)
-    M.launch(name, grid, WAVES * 32, [x, ("i", x_stride), ("i", slots), w, s, ("i", k), ("i", n), items, counts,
+    M.launch(name, grid, wv * 32, [x, ("i", x_stride), ("i", slots), w, s, ("i", k), ("i", n), items, counts,
                                       members, ("i", rows), out, ("i", n), ("f", 0.0), ("i", skip)])
 
 
@@ -171,7 +175,7 @@ def check_dense(rng, n, k_full, k0, k, gs, rows_list):
         perm = rng.permutation(most)[:rows]
         xs = xd[torch.from_numpy(perm).cuda()].contiguous()
         for nt in NTS:
-            if n % (16 * nt * WAVES):
+            if n % (16 * nt * waves(1)):
                 continue
             got = dense(xs, w, s, k, n, gs, rows, nt=nt).cpu().numpy()
             expect(np.array_equal(got.view(np.uint32), solo[perm].view(np.uint32)),
@@ -180,7 +184,7 @@ def check_dense(rng, n, k_full, k0, k, gs, rows_list):
     expect(np.array_equal(hb, f32_to_bf16_bits(solo[:17])), "dense bf16 out is not the fp32 out rounded")
     again = torch.cat([dense(xd[:most], w, s, k, n, gs, most) for _ in range(2)]).cpu().numpy().view(np.uint32)
     expect(np.array_equal(again[:most], again[most:]), "dense: two runs differ")
-    print(f"  dense n {n} k {k} (from {k0}) gs {gs}: rows {list(rows_list)} (permuted) NT 1/2/4 == 1-row calls, "
+    print(f"  dense n {n} k {k} (from {k0}) gs {gs}: rows {list(rows_list)} (permuted) NT 1/2 == 1-row calls, "
           f"deterministic; vs host order max {u.max()} ulps (median {np.median(u):.0f}); max |err|/sum|xw| "
           f"{rel.max():.2e} at row {worst[0]} col {worst[1]}, per-column worst median {np.median(col_worst):.2e}")
 
@@ -247,12 +251,12 @@ def check_experts(rng, E, ni, full_ni, lo, D, top, R):
     pairs = R * slots
     x = bf16_rows(rng, R, D).cuda()
     res = {}
-    for tile, mt in ((16, 1), (64, 4), (64, 1), (16, 4)):
+    for tile, mt in ((16, 1), (64, 2), (64, 1), (16, 2)):
         plan, _ = make_plan(picks, E + 1, tile)
         mi = max_items(pairs, E + 1, tile)
         for nt in NTS:
             act = torch.zeros(pairs, ni, dtype=torch.bfloat16, device="cuda")
-            if ni % (8 * nt * WAVES) == 0:
+            if ni % (16 * nt * waves(mt) // 2) == 0:
                 launch(128, nt, mt, 2, 2, x, D, slots, up, up_s, D, ni, plan, 0, act, mi, E)
             y = torch.full((pairs, D), float("nan"), device="cuda")
             y.view(torch.int32).fill_(0x5A5A5A5A)
@@ -260,7 +264,7 @@ def check_experts(rng, E, ni, full_ni, lo, D, top, R):
             a_in = res[(16, 1, 1)][0] if (16, 1, 1) in res else act
             launch(gs_down, nt, mt, 1, 0, a_in, ni, 0, dn, dn_s, ni, D, plan, 0, y, mi, E)
             launch(gs_down, nt, mt, 1, 3, a_in, ni, 0, dn, dn_s, ni, D, plan, 0, yb, mi, E)
-            res[(tile, mt, nt)] = (act, y, yb, ni % (8 * nt * WAVES) == 0)
+            res[(tile, mt, nt)] = (act, y, yb, ni % (16 * nt * waves(mt) // 2) == 0)
     ha, hy, hyb, _ = [t.cpu() if isinstance(t, torch.Tensor) else t for t in res[(16, 1, 1)]]
     ours = picks.reshape(-1) < E
     for key, (a, y, yb, did) in res.items():
@@ -289,7 +293,7 @@ def check_experts(rng, E, ni, full_ni, lo, D, top, R):
         yd = dense(res[(16, 1, 1)][0][p:p + 1], dn[e * dnw:], dn_s[e * dns:], ni, D, gs_down, 1).cpu()
         expect(torch.equal(yd[0].view(torch.int32), hy[p].view(torch.int32)), f"experts down pair {p} != dense")
     print(f"  experts E {E} width {ni} (of {full_ni}, from {lo}) D {D} top {top} rows {R}: plan == dense on {checked} "
-          f"pairs; tile 16/64, MT 1/4, NT 1/2/4 equal; skipped slot untouched; SwiGLU {swiglu_ulp} outputs 1 bf16 ulp "
+          f"pairs; tile 16/64, MT 1/2, NT 1/2 equal; skipped slot untouched; SwiGLU {swiglu_ulp} outputs 1 bf16 ulp "
           f"from host")
 
 

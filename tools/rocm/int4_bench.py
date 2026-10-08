@@ -52,7 +52,7 @@ def decode(ex, nts, rounds):
             res = []
             for nu in nts:
                 for nd in nts:
-                    if NI % (8 * nu * c.WAVES) or D % (16 * nd * c.WAVES):
+                    if NI % (8 * nu * c.waves(1)) or D % (16 * nd * c.waves(1)):
                         continue
                     tu = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 0), 20, rounds)
                     td = hiprun.best_us(lambda: run_moe(ex, x, act, y, plan, mi, R, nu, nd, 1, 1), 20, rounds)
@@ -91,7 +91,7 @@ def prompt(ex, nts, rounds):
         flops = 2 * R * TOP * 3 * NI * D
         eu = len(np.unique(picks[:, :TOP]))
         wb = eu * 3 * NI * D / 2
-        for tile, mt in ((16, 1), (64, 4)):
+        for tile, mt in ((16, 1), (64, 1), (64, 2)):
             plan, _ = c.make_plan(picks, E + 1, tile)
             mi = c.max_items(R * SLOTS, E + 1, tile)
             for nu, nd in ((nt, nt) for nt in nts):
@@ -114,7 +114,7 @@ def stream(rounds):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nt", default="1,2,4")
+    ap.add_argument("--nt", default="1,2")
     ap.add_argument("--cases", default="stream,decode,head,prompt")
     ap.add_argument("--rounds", type=int, default=7)
     a = ap.parse_args()
