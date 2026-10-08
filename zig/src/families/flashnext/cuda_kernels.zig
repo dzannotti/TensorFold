@@ -16,6 +16,9 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
+/// A HIP build (the runtime's `cuda.hip`; false when it does not say): no feature is read off a compute capability.
+const hip = @hasDecl(cuda, "hip") and cuda.hip;
+
 /// Mangled names of every entry point resolved here (cuobjdump -symbols of each fatbin).
 pub const sym = struct {
     pub const chain = [2][2][:0]const u8{
@@ -118,9 +121,14 @@ pub const tree_symbols = blk: {
     break :blk out;
 };
 
-/// dispatch_tree: the variant index for `slots` on this GPU ("wide": many-SM sm_120 with several streams).
-pub fn treeIndex(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_int) usize {
-    const wide = streams >= 2 and major == 12 and minor == 0 and sms >= 96;
+/// dispatch_tree's "wide" GPU: a many-SM sm_120 (never under HIP, whatever capability numbers it reports).
+pub fn wideGpu(is_hip: bool, major: c_int, minor: c_int, sms: c_int) bool {
+    return !is_hip and major == 12 and minor == 0 and sms >= 96;
+}
+
+/// dispatch_tree: the variant index for `slots` on this GPU (`wide_gpu`, wideGpu, with several streams).
+pub fn treeIndex(slots: u32, streams: u32, wide_gpu: bool) usize {
+    const wide = streams >= 2 and wide_gpu;
     if (slots == 0) return 0;
     if (wide and slots <= 1) return 1;
     if (wide and slots <= 2) return 2;
@@ -228,8 +236,7 @@ pub const Kernels = struct {
     plan_offsets: cuda.Function,
     plan_scatter: cuda.Function,
     sms: c_int,
-    major: c_int,
-    minor: c_int,
+    wide_gpu: bool, // wideGpu
 
     /// Loads every module and resolves every entry point; dynamic shared memory opted in as the wrappers do.
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -270,8 +277,7 @@ pub const Kernels = struct {
             try k.qmm_prefill[h].allowDynamicShared(qmm_prefill_smem);
         }
         k.sms = try ctx.attribute(.multiprocessor_count);
-        k.major = try ctx.attribute(.compute_capability_major);
-        k.minor = try ctx.attribute(.compute_capability_minor);
+        k.wide_gpu = wideGpu(hip, try ctx.attribute(.compute_capability_major), try ctx.attribute(.compute_capability_minor), k.sms);
         // nvfp4/experts.cu launch: cudaOccupancyMaxActiveBlocksPerMultiprocessor(128 threads, 0 bytes), at least 1
         for (k.nvfp4, &k.nvfp4_blocks) |f, *n| n.* = @as(usize, @max(1, try f.occupancy(128, 0))) * @as(usize, @intCast(k.sms));
         k.nvfp4_nt_blocks = @as(usize, @max(1, try k.nvfp4_nt.occupancy(32, 0))) * @as(usize, @intCast(k.sms));
@@ -379,7 +385,7 @@ pub const Ops = struct {
     /// one `state` (streams 1) or a `table` of every stream's states with `starts`; `tree_plan` (nodes, 3) int32.
     pub fn gdnTree(o: Ops, q: u64, k: u64, v: u64, g: u64, beta: u64, state: u64, table: u64, starts: u64, tree_plan: u64, nodes: usize, slots: u32, streams: usize, max_rows: usize, y: u64, hk: usize, hv: usize, dv: usize, pending: Pending, final_state: u64, final_table: u64) !void {
         if (slots > 32 or max_rows < 1 or (slots != 0 and max_rows > 1024)) return error.Invalid;
-        const i = treeIndex(slots, u(streams), o.k.major, o.k.minor, o.k.sms);
+        const i = treeIndex(slots, u(streams), o.k.wide_gpu);
         const t = tree_variants[i];
         const shared = treeShared(t, max_rows);
         if (shared > 48 * 1024) try o.k.tree[i].allowDynamicShared(u(shared));
@@ -559,10 +565,11 @@ test "shared memory, tiles and tree picks follow the C++ wrappers" {
     try std.testing.expectEqual(@as(usize, 1), splitK32(79591, 2560));
     try std.testing.expectEqual(@as(usize, 1), splitK32(39796, 2560));
     try std.testing.expectEqual(@as(usize, 1), l2Group(1, 16, 2560));
-    try std.testing.expectEqual(@as(usize, 0), treeIndex(0, 4, 12, 1, 48));
-    try std.testing.expectEqual(@as(usize, 3), treeIndex(1, 4, 12, 1, 48)); // GB10 is never "wide"
-    try std.testing.expectEqual(@as(usize, 1), treeIndex(1, 4, 12, 0, 188));
-    try std.testing.expectEqual(@as(usize, 7), treeIndex(17, 1, 12, 1, 48));
+    try std.testing.expectEqual(@as(usize, 0), treeIndex(0, 4, wideGpu(false, 12, 1, 48)));
+    try std.testing.expectEqual(@as(usize, 3), treeIndex(1, 4, wideGpu(false, 12, 1, 48))); // GB10 is never "wide"
+    try std.testing.expectEqual(@as(usize, 1), treeIndex(1, 4, wideGpu(false, 12, 0, 188)));
+    try std.testing.expectEqual(@as(usize, 7), treeIndex(17, 1, wideGpu(false, 12, 1, 48)));
+    try std.testing.expect(!wideGpu(true, 12, 0, 188)); // HIP: whatever its capability numbers say
     try std.testing.expectEqual(@as(usize, 32768 + 12 * 16), treeShared(tree_variants[5], 16));
     try std.testing.expect(treeShared(tree_variants[7], 1024) <= 48 * 1024); // no variant opts in past 48 KiB
     try std.testing.expectEqual(@as(usize, 0), treeShared(tree_variants[0], 4096));
