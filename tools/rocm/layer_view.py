@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A 1-layer view of the Flash Next checkpoint for engine tests that must stay small (~2.8 GiB of weights, no MTP):
+"""A 1-layer view of the Flash Next checkpoint for engine tests that must stay small (~2.8 GiB of weights; --mtp keeps the MTP layer):
 the embedding, head and glue tensors plus one decoder layer renamed to layer 0, in new safetensors (~3.7 GB on disk);
 everything else symlinked. Layer 0 is linear attention (DeltaNet); --layer 3 gives a full-attention one.
 
@@ -10,6 +10,7 @@ import argparse, json, os, re, struct
 
 ap = argparse.ArgumentParser()
 ap.add_argument("model"); ap.add_argument("out"); ap.add_argument("--layer", type=int, default=0)
+ap.add_argument("--mtp", action="store_true", help="keep the MTP layer (drafted runs)")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 for f in os.listdir(a.model):
@@ -24,7 +25,7 @@ P = "model.language_model.layers."
 
 def rename(k):
     if k.startswith("mtp"):
-        return None
+        return k if a.mtp else None
     m = re.match(r"model\.language_model\.layers\.(\d+)\.", k)
     return k if m is None else (P + "0." + k[m.end():] if int(m.group(1)) == a.layer else None)
 
