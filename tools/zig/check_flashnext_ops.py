@@ -17,7 +17,7 @@ import time
 
 import torch
 
-from ops_build import compile_operators, digest
+from ops_build import compile_operators, require_gpu, digest
 from ops_compare import RawCells
 from ops_ffi import P, U, bind, pointer
 
@@ -57,8 +57,7 @@ def main():
     lib, compiled = compile_operators(a.source, a.out, names)
     receipt.update(compiled)
     torch.cuda.set_device(0)
-    if torch.cuda.get_device_capability() != (12, 1):
-        raise RuntimeError("This packet is qualified for sm_121 only")
+    require_gpu()
     check = RawCells(a.out, receipt)
     handle = P(torch.cuda.current_stream().cuda_stream)
     swiglu = bind(lib, "tf_fn_shared_swiglu", [P, P, U, U, U, P])
@@ -114,6 +113,17 @@ def main():
             status = strided(pointer(src), pointer(dst), rows, 1, hidden * size, src.stride(0) * size,
                              hidden * size, dst.stride(0) * size, hidden * size, handle)
             check(f"slot-copy/{str(dtype)[6:]}/r{rows}", got, want, status)
+
+    # index_select(0, idx) of rows (b.pss / b.streams ends): cuda_torch_ops.gatherRows, a bad index flagged
+    gather = bind(lib, "tf_gather_rows", [P, P, P, U, U, U, P, P])
+    for rows, source_rows in ((1, 8), (5, 8), (16, 16)):
+        src = torch.randn((source_rows, hidden), device="cuda").to(torch.bfloat16)
+        idx = torch.randint(0, source_rows, (rows,), device="cuda", dtype=torch.int64)
+        got = torch.empty((rows, hidden), device="cuda", dtype=torch.bfloat16)
+        invalid = torch.zeros(1, device="cuda", dtype=torch.int32)
+        status = gather(pointer(src), pointer(got), pointer(idx), rows, source_rows, hidden * 2, pointer(invalid), handle)
+        check(f"gather-rows/r{rows}", got, src.index_select(0, idx), status)
+        check(f"gather-rows/r{rows}/valid", invalid, torch.zeros_like(invalid))
 
     # Tensor.fill_ of the conv-state pointer (int64)
     word = torch.zeros((1,), device="cuda", dtype=torch.int64)

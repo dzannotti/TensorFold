@@ -25,6 +25,11 @@
 // Launches: tf_fn_lse_max_kernel<<<R, 256>>>(x, maxes, R, N); tf_fn_lse_sum_kernel<<<(grid_x, ctas), (bw, bh)>>>(x,
 // maxes, partial, R, N, ctas, split); tf_fn_lse_finish_kernel<<<R, (bw, bh)>>>(partial, maxes, out, R, ctas).
 // Scratch: maxes R floats, partial R * ctas floats. No dynamic shared memory. Compile with --fmad=false --ftz=false.
+//
+// ROCm (ATen's USE_ROCM branches, torch 2.11+rocm7.13): the lane tree's shuffles run offsets 1, 2, 4, .. up, and the
+// CTA split takes ceil(v / 128) for ceil(v / 16) and, when it splits at all, at least 64 CTAs. The device's
+// multiProcessorCount (20 on gfx1151: WGPs) and maxThreadsPerMultiProcessor (2048) feed `target`. Compile with
+// -ffp-contract=off -fno-gpu-flush-denormals-to-zero.
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <math.h>
@@ -32,6 +37,13 @@
 namespace {
 
 constexpr int kMaxThreads = 512;
+#if defined(__HIP_PLATFORM_AMD__)
+constexpr bool kRocm = true;      // ATen-ROCm: 128 values a thread before splitting over CTAs, then at least 64 CTAs
+constexpr int kMinValues = 128;
+#else
+constexpr bool kRocm = false;
+constexpr int kMinValues = 16;
+#endif
 
 __device__ __forceinline__ float tf_lse_term(const float* row, int64_t at, float m) {
     return expf(__fsub_rn(row[at], m));
@@ -53,7 +65,11 @@ __device__ float tf_lse_lane_tree(float v, float* shared) {
         dim_x = 32;
     }
     __syncthreads();
+#if defined(__HIP_PLATFORM_AMD__)
+    for (int offset = 1; offset < dim_x; offset <<= 1)  // ATen-ROCm walks the shuffles up from 1
+#else
     for (int offset = dim_x >> 1; offset > 0; offset >>= 1)
+#endif
         v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, offset, 32));
     return v;
 }
@@ -190,9 +206,10 @@ extern "C" int tf_fn_logsumexp_config(uint64_t rows, uint64_t n, int num_mp, int
     int64_t ctas = 1;
     const int64_t v = tf_lse_div_up(int64_t(n), step);
     if (split && v >= 256 && grid_x <= target) {
-        const int64_t c1 = tf_lse_div_up(target, grid_x), c2 = tf_lse_div_up(v, 16), c3 = tf_lse_div_up(v, 256);
+        const int64_t c1 = tf_lse_div_up(target, grid_x), c2 = tf_lse_div_up(v, kMinValues), c3 = tf_lse_div_up(v, 256);
         ctas = (c1 < c2 ? c1 : c2);
         if (c3 > ctas) ctas = c3;
+        if (kRocm && ctas > 1 && ctas < 64) ctas = 64;
     }
     out[0] = uint32_t(bw);
     out[1] = uint32_t(bh);

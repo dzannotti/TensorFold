@@ -1,7 +1,7 @@
 """Compare framework-free CUDA C operators with the deployed Torch kernels by raw bytes."""
 
 import argparse
-from ops_build import compile_operators, digest
+from ops_build import compile_operators, require_gpu, digest
 from ops_compare import RawCells
 from ops_ffi import pointer, bind, P, U, I
 import json
@@ -42,8 +42,7 @@ def main():
     cast_down = bind(lib, 'tf_f32_to_bf16', [P, P, U, P])
     add = bind(lib, 'tf_tap_add', [P, P, P, U, P])
     torch.cuda.set_device(0)
-    if torch.cuda.get_device_capability() != (12, 1):
-        raise RuntimeError('This packet is qualified for sm_121 only')
+    require_gpu()
     checker = RawCells(args.out, receipt)
     check = checker
     torch.manual_seed(141)

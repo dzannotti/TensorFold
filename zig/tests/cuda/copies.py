@@ -162,10 +162,12 @@ COPIES = {
     "experts.cu": (
         "src/tensorfold/cuda/experts.cu", 1, 286, (3, 4, 7), (11, "tf_experts"),
         "// Decode form for groups of 64: up with relu^2 (epilogue 1), down to fp32 (epilogue 0).\n"
+        "#if !defined(__HIP_PLATFORM_AMD__)\n"
         "#define TF_EXPERT(EPI) template __global__ void tf_experts::expert_kernel<64, 1, EPI, 2, 4>(const __nv_bfloat16*, \\\n"
         "    int, int, const uint4*, int, int, const int*, const int*, const int*, void*, int, float);\n"
         "TF_EXPERT(1)\n"
-        "TF_EXPERT(0)\n",
+        "TF_EXPERT(0)\n"
+        "#endif\n",
     ),
     "experts_prefill.cu": (
         "src/tensorfold/cuda/experts_prefill.cu", 1, 153, (3, 4, 7), (11, "tf_experts_prefill"),
@@ -206,6 +208,9 @@ COPIES = {
 
 # name: {line: (source text, copy text)}: includes whose path differs from the copy's directory (same header bytes)
 EDITS = {
+    # HIP builds take the plan kernels only: expert_kernel is mma.sync (Nemotron's decode), not on Flash Next's path
+    "experts.cu": {9: ('#include "experts.cuh"\n', '#if !defined(__HIP_PLATFORM_AMD__)\n#include "experts.cuh"\n#endif\n'),
+                   12: ('\n', '\n#if !defined(__HIP_PLATFORM_AMD__)\n'), 156: ('\n', '#endif\n\n')},
     "fn_nvfp4_experts.cu": {11: ('#include "../experts.cuh"\n', '#include "experts.cuh"\n')},
     "fn_qmmf.cu": {12: ('#include "../kernels/qmm_frag.cuh"\n', '#include "qmm_frag.cuh"\n')},
 }
