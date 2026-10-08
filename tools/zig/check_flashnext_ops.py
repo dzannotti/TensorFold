@@ -17,7 +17,7 @@ import time
 
 import torch
 
-from ops_build import compile_operators, digest
+from ops_build import compile_operators, require_gpu, digest
 from ops_compare import RawCells
 from ops_ffi import P, U, bind, pointer
 
@@ -57,8 +57,7 @@ def main():
     lib, compiled = compile_operators(a.source, a.out, names)
     receipt.update(compiled)
     torch.cuda.set_device(0)
-    if torch.cuda.get_device_capability() != (12, 1):
-        raise RuntimeError("This packet is qualified for sm_121 only")
+    require_gpu()
     check = RawCells(a.out, receipt)
     handle = P(torch.cuda.current_stream().cuda_stream)
     swiglu = bind(lib, "tf_fn_shared_swiglu", [P, P, U, U, U, P])

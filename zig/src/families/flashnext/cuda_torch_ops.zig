@@ -20,12 +20,31 @@ const std = @import("std");
 const cuda = @import("cuda");
 const kk = cuda.kernels;
 
+/// A HIP build (the runtime's `cuda.hip`; false when it does not say): ATen-ROCm's orders where they differ.
+const hip = @hasDecl(cuda, "hip") and cuda.hip;
+
 /// topk.cu's column tile and threads; its workspace is four 8-bit digit passes, then ordered compaction.
 const topk_tile = 4096;
 const topk_threads = 256;
 
 fn tiles(columns: usize) usize {
     return (columns + topk_tile - 1) / topk_tile;
+}
+
+/// ATen-ROCm takes torch.topk of a single row of >= 10000 values through a descending stable sort.
+pub fn rocmSortsTopk(rows: usize, columns: usize) bool {
+    return rows == 1 and columns >= 10000;
+}
+
+/// The shapes whose ATen-ROCm order topk.cu reproduces (tf_topk_rocm_order): the sort, or ATen's multi-block gather
+/// (should_use_multiblock). Every Flash Next head width (>= 39795) at any row count is one.
+pub fn rocmTopkOrder(rows: usize, columns: usize) bool {
+    if (rocmSortsTopk(rows, columns)) return true;
+    const r = rows;
+    const c = columns;
+    return (r <= 20 and c >= 20000) or (r > 20 and r <= 40 and c >= 10000) or (r > 40 and r <= 80 and c >= 8000) or
+        (r > 80 and r < 200 and c >= 5000) or (r >= 200 and r < 800 and c >= 3000) or (r >= 800 and r <= 4000 and c >= 800) or
+        (r > 4000 and c >= 400);
 }
 
 /// Scratch bytes `topk` needs for `rows` rows of `columns` (tf_topk_f32_unsorted_scratch_bytes).
@@ -52,6 +71,7 @@ pub const Functions = struct {
     count: cuda.Function,
     prefix: cuda.Function,
     compact: cuda.Function,
+    sort: cuda.Function, // HIP: one row's picks in ATen-ROCm's sorted order (topk.cu tf_topk_f32_sort_kernel)
     to_f32: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -61,7 +81,8 @@ pub const Functions = struct {
     draft_pack: cuda.Function,
     candidates: cuda.Function,
     nucleus_mass: cuda.Function,
-    fp4_serial: cuda.Function,
+    /// null in a HIP build until fn_ops.cu's fp4_serial is ported (its #if block)
+    fp4_serial: ?cuda.Function,
     lse: Lse,
 
     pub fn resolve(m: []const cuda.Module) !Functions {
@@ -77,6 +98,7 @@ pub const Functions = struct {
             .count = try m[i(.topk)].function("tf_topk_f32_count_kernel"),
             .prefix = try m[i(.topk)].function("tf_topk_f32_prefix_kernel"),
             .compact = try m[i(.topk)].function("tf_topk_f32_compact_kernel"),
+            .sort = try m[i(.topk)].function("tf_topk_f32_sort_kernel"),
             .to_f32 = try m[i(.pointwise)].function("tf_bf16_to_f32_kernel"),
             .strided = try m[i(.movement)].function("tf_strided_copy_kernel"),
             .gather = try m[i(.movement)].function("tf_gather_rows_kernel"),
@@ -86,7 +108,7 @@ pub const Functions = struct {
             .draft_pack = try m[i(.ops)].function("tf_fn_draft_pack_kernel"),
             .candidates = try m[i(.ops)].function("tf_fn_candidates_kernel"),
             .nucleus_mass = try m[i(.ops)].function("tf_fn_nucleus_mass_kernel"),
-            .fp4_serial = try m[i(.ops)].function("tf_fn_fp4_serial_kernel"),
+            .fp4_serial = m[i(.ops)].function("tf_fn_fp4_serial_kernel") catch |e| if (hip) null else return e,
             .lse = try Lse.resolve(m[i(.lse)]),
         };
     }
@@ -94,7 +116,8 @@ pub const Functions = struct {
 
 /// fn_logsumexp.cu: torch.logsumexp(x, dim=-1, keepdim=True) on contiguous fp32 rows in ATen's reduction order:
 /// the row maxima (|max| == inf -> 0), the exp(x - max) sum by ATen's reduce config for (rows, n) on this device,
-/// its per-CTA partials folded, then log(sum) + max. The config needs n >= 128 and rows <= 65535.
+/// its per-CTA partials folded, then log(sum) + max. The config needs n >= 128 and rows <= 65535. ROCm's ATen
+/// differs in the CTA split (`rocm`) and the lane tree's shuffle order (fn_logsumexp.cu's HIP branch).
 pub const Lse = struct {
     max: cuda.Function,
     sum: cuda.Function,
@@ -102,6 +125,7 @@ pub const Lse = struct {
     /// the device's multiprocessors and threads a multiprocessor (ATen sizes its CTAs by them); Ops.load sets them
     mp: usize = 0,
     threads_mp: usize = 0,
+    rocm: bool = hip,
 
     fn resolve(m: cuda.Module) !Lse {
         return .{ .max = try m.function("tf_fn_lse_max_kernel"), .sum = try m.function("tf_fn_lse_sum_kernel"), .finish = try m.function("tf_fn_lse_finish_kernel") };
@@ -113,8 +137,9 @@ pub const Lse = struct {
         return if (v <= 1) 1 else std.math.floorPowerOfTwo(usize, v);
     }
 
-    /// tf_fn_logsumexp_config: ATen's block (bw, bh), rows a block, and CTAs a row for a last-dimension reduction.
-    pub fn config(rows: usize, n: usize, mp: usize, threads_mp: usize) !Config {
+    /// tf_fn_logsumexp_config: ATen's block (bw, bh), rows a block, and CTAs a row for a last-dimension reduction;
+    /// `rocm`: 128 values a thread (not 16) before a split over CTAs, and at least 64 CTAs once it splits.
+    pub fn config(rows: usize, n: usize, mp: usize, threads_mp: usize, rocm: bool) !Config {
         if (rows < 1 or n < 128 or rows > 65535 or n > (1 << 31)) return error.LseShape;
         const max_threads: usize = 512;
         const d0 = if (n / 4 < max_threads) lastPow2(n / 4) else max_threads;
@@ -131,18 +156,19 @@ pub const Lse = struct {
         const target = mp * (threads_mp / (bw * bh));
         var ctas: usize = 1;
         const v = cdiv(n, step);
-        if (split and v >= 256 and grid_x <= target) ctas = @max(@min(cdiv(target, grid_x), cdiv(v, 16)), cdiv(v, 256));
+        if (split and v >= 256 and grid_x <= target) ctas = @max(@min(cdiv(target, grid_x), cdiv(v, if (rocm) 128 else 16)), cdiv(v, 256));
+        if (rocm and ctas > 1) ctas = @max(ctas, 64);
         return .{ .bw = bw, .bh = bh, .grid_x = grid_x, .ctas = ctas, .split = split };
     }
 
     /// Scratch bytes: rows maxima, then rows * ctas partials.
     pub fn scratchBytes(l: Lse, rows: usize, n: usize) !usize {
-        const c = try config(rows, n, l.mp, l.threads_mp);
+        const c = try config(rows, n, l.mp, l.threads_mp, l.rocm);
         return rows * (1 + c.ctas) * 4;
     }
 
     fn run(l: Lse, t: Torch, in: u64, rows: usize, n: usize, out: u64, scratch: u64) !void {
-        const c = try config(rows, n, l.mp, l.threads_mp);
+        const c = try config(rows, n, l.mp, l.threads_mp, l.rocm);
         const maxes = scratch;
         const partial = scratch + rows * 4;
         var a: cuda.Args = .{};
@@ -164,8 +190,10 @@ pub const Lse = struct {
 };
 
 /// Threads a multiprocessor by compute capability (the driver attribute this runtime does not list): 1536 on
-/// sm_86/89 and sm_12x, 2048 on sm_80/90/100.
+/// sm_86/89 and sm_12x, 2048 on sm_80/90/100. HIP: 2048, what hipDeviceProp_t reports on gfx1151 (ATen's input),
+/// whatever capability numbers the device gives.
 pub fn threadsPerMultiprocessor(cc: u32) usize {
+    if (hip) return 2048;
     return switch (cc) {
         86, 87, 89, 120, 121 => 1536,
         else => 2048,
@@ -316,6 +344,7 @@ pub const Torch = struct {
     /// torch.topk(rows of fp32 `columns` wide, k, sorted=False): values [rows, k] fp32 and int64 columns, in
     /// torch's order; `scratch` is topkScratchBytes(rows, columns).
     pub fn topk(t: Torch, in: u64, columns: usize, rows: usize, k: usize, values: u64, indices: u64, scratch: u64) !void {
+        if (hip and (!rocmTopkOrder(rows, columns) or (rocmSortsTopk(rows, columns) and k > 1024))) return error.Unsupported;
         const n = tiles(columns);
         const row_bytes: u64 = columns * 4;
         const hist = scratch;
@@ -349,6 +378,13 @@ pub const Torch = struct {
         for ([_]u64{ in, values, indices, threshold, greater_prefix, equal_prefix, greater_total, columns, n, row_bytes, 4 }) |v| w.add(v);
         w.add(@as(u32, @intCast(k)));
         try t.go(t.f.compact, .{ n, rows }, topk_threads, &w);
+        if (hip and rocmSortsTopk(rows, columns)) {
+            var o: cuda.Args = .{};
+            o.add(values);
+            o.add(indices);
+            o.add(@as(u32, @intCast(k)));
+            try t.go(t.f.sort, .{ 1, 1 }, 1024, &o);
+        }
     }
 
     /// torch.logsumexp(rows of fp32, dim=-1, keepdim=True) -> out [rows] fp32; `scratch` is Lse.scratchBytes.
@@ -394,10 +430,11 @@ pub const Torch = struct {
     pub fn fp4Serial(t: Torch, x: u64, x_stride: usize, w: u64, scale: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
         if (m == 0) return;
         if (!fp4SerialFits(x_stride, n, k)) return error.Invalid;
+        const f = t.f.fp4_serial orelse return error.Unsupported;
         var a: cuda.Args = .{};
         for ([_]u64{ x, w, scale, out }) |v| a.add(v);
         for ([_]usize{ m, n, k, x_stride, @intFromBool(fp32) }) |v| a.add(@as(u32, @intCast(v)));
-        try t.go(t.f.fp4_serial, .{ (m + 15) / 16, n / 32 }, 128, &a);
+        try t.go(f, .{ (m + 15) / 16, n / 32 }, 128, &a);
     }
 
     pub fn candidates(t: Torch, vals: u64, idx: u64, id_map: ?u64, offset: i64, lse: u64, out: u64, rows: usize, cand: usize) !void {
@@ -479,17 +516,35 @@ test "launch blocks follow launch_shape.h" {
 
 test "logsumexp's reduce config follows ATen's for the sampler's rows (GB10: 48 multiprocessors, 1536 threads)" {
     // the draft head's row: one row split over CTAs; a rank's 16 candidate rows
-    const one = try Lse.config(1, 79591, 48, 1536);
+    const one = try Lse.config(1, 79591, 48, 1536, false);
     try std.testing.expectEqual(@as(usize, 512), one.bw * one.bh);
     try std.testing.expect(one.split);
-    const many = try Lse.config(16, 124160, 48, 1536);
+    const many = try Lse.config(16, 124160, 48, 1536, false);
     try std.testing.expectEqual(@as(usize, 16), many.grid_x);
     // the TP=1 head's width splits each row over CTAs (fn_logsumexp.cu's parity table on spark3)
     for ([_][2]usize{ .{ 1, 31 }, .{ 4, 31 }, .{ 5, 29 }, .{ 6, 24 }, .{ 7, 21 }, .{ 8, 18 }, .{ 12, 12 }, .{ 13, 12 }, .{ 16, 9 } }) |rc| {
-        try std.testing.expectEqual(rc[1], (try Lse.config(rc[0], 248320, 48, 1536)).ctas);
+        try std.testing.expectEqual(rc[1], (try Lse.config(rc[0], 248320, 48, 1536, false)).ctas);
     }
-    try std.testing.expectEqual(@as(usize, 1), (try Lse.config(16, 124160, 48, 1536)).ctas);
-    try std.testing.expect(!(try Lse.config(1, 4096, 48, 1536)).split);
-    try std.testing.expectError(error.LseShape, Lse.config(1, 64, 48, 1536));
-    try std.testing.expectEqual(@as(usize, 1536), threadsPerMultiprocessor(121));
+    try std.testing.expectEqual(@as(usize, 1), (try Lse.config(16, 124160, 48, 1536, false)).ctas);
+    try std.testing.expect(!(try Lse.config(1, 4096, 48, 1536, false)).split);
+    try std.testing.expectError(error.LseShape, Lse.config(1, 64, 48, 1536, false));
+    if (!hip) try std.testing.expectEqual(@as(usize, 1536), threadsPerMultiprocessor(121));
+}
+
+test "logsumexp's reduce config follows ATen-ROCm's (gfx1151: 20 multiprocessors, 2048 threads)" {
+    // tf_fn_logsumexp_config of the HIP build: the full head splits over 64 CTAs at any row count up to 16
+    for ([_]usize{ 1, 4, 8, 16 }) |r| try std.testing.expectEqual(@as(usize, 64), (try Lse.config(r, 248320, 20, 2048, true)).ctas);
+    const one = try Lse.config(1, 79591, 20, 2048, true);
+    try std.testing.expectEqual(@as(usize, 512), one.bw * one.bh);
+    try std.testing.expectEqual(@as(usize, 1), one.ctas);
+    const many = try Lse.config(16, 124160, 20, 2048, true);
+    try std.testing.expectEqual(@as(usize, 32), many.bw);
+    try std.testing.expectEqual(@as(usize, 1), many.ctas);
+    try std.testing.expect(!(try Lse.config(1, 4096, 20, 2048, true)).split);
+}
+
+test "topk shapes whose ATen-ROCm order topk.cu reproduces" {
+    try std.testing.expect(rocmTopkOrder(1, 248320) and rocmSortsTopk(1, 79591));
+    for ([_]usize{ 2, 7, 16, 20, 64, 512 }) |r| try std.testing.expect(rocmTopkOrder(r, 39795) and !rocmSortsTopk(r, 39795));
+    try std.testing.expect(!rocmTopkOrder(1, 4096) and !rocmTopkOrder(16, 10000) and rocmTopkOrder(21, 10000));
 }

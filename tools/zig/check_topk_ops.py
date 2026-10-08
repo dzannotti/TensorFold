@@ -24,8 +24,17 @@ def check_topk_ops(library, config, check):
     handle = pointer_type(stream.cuda_stream)
 
 
+    def rocm_order(rows, columns):  # topk.cu tf_topk_rocm_order: the shapes whose ATen-ROCm order it reproduces
+        return (rows == 1 and columns >= 10000) or (rows <= 20 and columns >= 20000) or \
+            (20 < rows <= 40 and columns >= 10000) or (40 < rows <= 80 and columns >= 8000) or \
+            (80 < rows < 200 and columns >= 5000) or (200 <= rows < 800 and columns >= 3000) or \
+            (800 <= rows <= 4000 and columns >= 800) or (rows > 4000 and columns >= 400)
+
     def run(name, input_tensor, k):
         rows, columns = input_tensor.shape
+        if torch.version.hip and not rocm_order(rows, columns):
+            check.receipt.setdefault('skipped_rocm_order', []).append(name)
+            return
         values = torch.empty((rows, k), device=input_tensor.device, dtype=torch.float32)
         indices = torch.empty((rows, k), device=input_tensor.device, dtype=torch.int64)
         scratch = torch.empty(size(rows, columns), device=input_tensor.device, dtype=torch.uint8)

@@ -209,6 +209,38 @@ extern "C" __global__ void tf_topk_f32_compact_kernel(
     }
 }
 
+// ATen-ROCm runs torch.topk of a single row of >= 10000 values as a descending sort (TensorTopK.cpp should_use_sort
+// under USE_ROCM), so its "unsorted" picks come out by key, ties by column (the radix sort is stable): this reorders
+// one row's k <= 1024 compacted picks that way. One block of 1024 threads.
+extern "C" __global__ void tf_topk_f32_sort_kernel(float* values, int64_t* indices, uint32_t k) {
+    __shared__ float value[1024];
+    __shared__ int64_t column[1024];
+    __shared__ uint32_t key[1024];
+    const uint32_t i = threadIdx.x;
+    if (i < k) {
+        value[i] = values[i];
+        column[i] = indices[i];
+        key[i] = selection_key(value[i]);
+    }
+    __syncthreads();
+    if (i >= k) return;
+    uint32_t rank = 0;
+    for (uint32_t j = 0; j < k; ++j) rank += key[j] > key[i] || (key[j] == key[i] && column[j] < column[i]);
+    values[rank] = value[i];
+    indices[rank] = column[i];
+}
+
+// The shapes whose ATen-ROCm order this reproduces: one row of >= 10000 (the sort above) or ATen's multi-block
+// gather (TensorTopK.cu should_use_multiblock: column order, ties after). Smaller slices take ATen's single-block
+// kernels, whose ROCm write order is not this one; every Flash Next head width (>= 39795) is covered.
+static bool tf_topk_rocm_order(uint64_t rows, uint64_t columns) {
+    if (rows == 1 && columns >= 10000) return true;
+    return (rows <= 20 && columns >= 20000) || (rows > 20 && rows <= 40 && columns >= 10000) ||
+           (rows > 40 && rows <= 80 && columns >= 8000) || (rows > 80 && rows < 200 && columns >= 5000) ||
+           (rows >= 200 && rows < 800 && columns >= 3000) || (rows >= 800 && rows <= 4000 && columns >= 800) ||
+           (rows > 4000 && columns >= 400);
+}
+
 extern "C" uint64_t tf_topk_f32_unsorted_scratch_bytes(uint64_t rows, uint64_t columns) {
     if (rows == 0 || columns == 0 || rows > 65535u || columns > UINT32_MAX) return 0;
     const uint64_t tiles = columns / topk_tile + (columns % topk_tile != 0);
@@ -229,6 +261,10 @@ extern "C" cudaError_t tf_topk_f32_unsorted(
         columns - 1 > (UINT64_MAX - sizeof(float)) / column_bytes ||
         (rows - 1 && row_bytes > (UINT64_MAX - sizeof(float) - (columns - 1) * column_bytes) / (rows - 1)))
         return cudaErrorInvalidValue;
+#if defined(__HIP_PLATFORM_AMD__)
+    if (!tf_topk_rocm_order(rows, columns)) return cudaErrorInvalidValue;
+    if (rows == 1 && columns >= 10000 && k > 1024) return cudaErrorInvalidValue;  // tf_topk_f32_sort_kernel's block
+#endif
     const uint64_t tiles = columns / topk_tile + (columns % topk_tile != 0);
     Workspace w = workspace(scratch, rows, tiles);
     const dim3 tile_grid{uint32_t(tiles), uint32_t(rows)};
@@ -250,5 +286,11 @@ extern "C" cudaError_t tf_topk_f32_unsorted(
     tf_topk_f32_compact_kernel<<<tile_grid, topk_threads, 0, stream>>>(
         input, values, indices, w.threshold, w.greater_prefix, w.equal_prefix, w.greater_total,
         columns, tiles, row_bytes, column_bytes, uint32_t(k));
+#if defined(__HIP_PLATFORM_AMD__)
+    if (rows == 1 && columns >= 10000) {
+        if ((status = cudaGetLastError()) != cudaSuccess) return status;
+        tf_topk_f32_sort_kernel<<<1, 1024, 0, stream>>>(values, indices, uint32_t(k));
+    }
+#endif
     return cudaGetLastError();
 }
