@@ -484,7 +484,10 @@ pub const Engine = struct {
         if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
         e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
         e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
-        e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
+        // HIP: the AOT `_hc_up_mix` is wrong on a partial row tile (glue-check, rows 17 and 129) and 0.41x the
+        // unfused pair on gfx1151, so opt-in there (TF_FLASHNEXT_GLUE_FUSE=1)
+        const glue_fuse = if (envGet("TF_FLASHNEXT_GLUE_FUSE") != null) !envOff("TF_FLASHNEXT_GLUE_FUSE") else !cuda.hip;
+        e.f.up_mix = glue_fuse and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in

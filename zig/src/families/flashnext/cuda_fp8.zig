@@ -422,7 +422,7 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: 
                     std.debug.print("  {s} {s} m {d}: DIFFER\n", .{ name, kind, m });
                 }
                 // row invariance: rows of this call against one-row calls
-                if (m == max_m or m == 300) for ([_]usize{ 0, 1, m / 2, m - 1 }) |r| {
+                for ([_]usize{ 0, 1, m / 2, m - 1 }) |r| if (r < m) {
                     try matmul(&k, stream, dx.ptr + r * kk * 2, kk, l, dy1.ptr, f32_out, 1);
                     try stream.synchronize();
                     try dy1.download(0, one[0 .. n * es]);

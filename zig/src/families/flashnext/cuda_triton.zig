@@ -569,6 +569,15 @@ pub const Tri = struct {
     pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
         if (k % 64 != 0) return error.KNotBlocked;
         const sk = b16SplitK(n, k);
+        // HIP: the gfx1151 set's BM 128 `_b16mm` built with M unspecialized (M % 16 != 0) is wrong against the ROCm JIT
+        // (tools/rocm notes); its M % 16 == 0 builds are right. The last M % 16 rows run on BM 16 instead: the same
+        // bits (a row's sums never depend on its tile). One K slice only (split K keeps its partials' row layout).
+        if (cuda.hip and m > 128 and m % 16 != 0 and sk == 1) {
+            const head = m - m % 16;
+            const es: usize = if (fp32) 4 else 2;
+            try t.b16mm(x, x_stride, w, out, fp32, part, head, n, k);
+            return t.b16mm(x + head * x_stride * 2, x_stride, w, out + head * n * es, fp32, part, m % 16, n, k);
+        }
         const bm: usize = if (m > 128) 128 else 16;
         const oty = if (fp32) f32p else bf16;
         const split = sk > 1;
@@ -898,6 +907,8 @@ test "bf16 matmul launches equal bf16.matmul's for every linear of the checkpoin
         for (rows_cases) |r| for (mats) |m| {
             if (world > 1 and m.replicated) continue;
             if (std.mem.eql(u8, m.name, "head") and r > 16) continue;
+            // HIP splits these into two launches on purpose (Tri.b16mm): Python's single launch is not the reference
+            if (cuda.hip and r > 128 and r % 16 != 0 and b16SplitK(m.n, m.k) == 1) continue;
             try check(&f, "b16/{s}/r{d}/tp{d}", .{ m.name, r, world }, struct {
                 r: usize,
                 m: Mat,
