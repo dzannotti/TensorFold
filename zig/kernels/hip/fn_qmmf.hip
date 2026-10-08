@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
 #endif
         ) {
     static_assert(MODE == 3 && BN == 64 && WN == 4 && !CLUSTER, "gfx1151: block FP8 on 64-column tiles, no clusters");
-    constexpr int MT = BM / 16;
+    constexpr int MT = BM / 16, PA = MT <= 2 ? MT : 0;   // row tiles; PA > 0: the next group's loads in flight
 #ifndef TF_QMMF_LD
     const int ldo = N;
 #endif
@@ -84,19 +84,36 @@ __global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
     for (int s = FUSE ? 0 : slice; s < (FUSE ? SK : slice + 1); ++s) {
 #pragma unroll
         for (int i = 0; i < MT; ++i) acc[i] = v8f{};
-        for (int g = s * per; g < (s + 1) * per; ++g) {
-            uint4 wb[4];
+        const int g1 = (s + 1) * per;
+        uint4 wn_[4], an[PA > 0 ? PA : 1][8];                          // the next group's words (and rows, PA tiles), in flight
+        float sn;
+        auto fetch = [&](int g) {
 #pragma unroll
-            for (int q = 0; q < 4; ++q) wb[q] = *reinterpret_cast<const uint4*>(wc + static_cast<size_t>(g) * 4096 + q * 16);
-            const float sg = sc[static_cast<size_t>(g) * 64];
+            for (int q = 0; q < 4; ++q) wn_[q] = *reinterpret_cast<const uint4*>(wc + static_cast<size_t>(g) * 4096 + q * 16);
+            sn = sc[static_cast<size_t>(g) * 64];
+#pragma unroll
+            for (int i = 0; i < PA; ++i)
+#pragma unroll
+                for (int u = 0; u < 8; ++u) an[i][u] = reinterpret_cast<const uint4*>(xr[i] + g * GS)[u];
+        };
+        if (PA > 0) fetch(s * per);
+        for (int g = s * per; g < g1; ++g) {
+            if (PA == 0) fetch(g);                        // 64-row tiles: no registers to spare
             v16s b[4];
 #pragma unroll
-            for (int q = 0; q < 4; ++q) b[q] = bfrag(wb[q]);
+            for (int q = 0; q < 4; ++q) b[q] = bfrag(wn_[q]);
+            const float sg = sn;
+            uint4 ac[PA > 0 ? PA : 1][8];
+#pragma unroll
+            for (int i = 0; i < PA; ++i)
+#pragma unroll
+                for (int u = 0; u < 8; ++u) ac[i][u] = an[i][u];
+            if (PA > 0 && g + 1 < g1) fetch(g + 1);
 #pragma unroll
             for (int i = 0; i < MT; ++i) {
                 uint4 a[8];
 #pragma unroll
-                for (int u = 0; u < 8; ++u) a[u] = reinterpret_cast<const uint4*>(xr[i] + g * GS)[u];
+                for (int u = 0; u < 8; ++u) a[u] = i < PA ? ac[i < PA ? i : 0][u] : reinterpret_cast<const uint4*>(xr[i] + g * GS)[u];
                 v8f d = v8f{};
 #pragma unroll
                 for (int q = 0; q < 4; ++q) d = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(afrag(a, q), b[q], d);

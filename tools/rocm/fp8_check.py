@@ -124,14 +124,15 @@ def check_case(hip, name, lin, x, log, fp32=True):
     err = (y32.double() - ref).abs()
     units = err / (mag * 2.0 ** -24).clamp_min(1e-300)
     sk = split_k(n, k)
-    bound = 5 * k / 64 + sk                                     # fp32 roundings in a row's chain (see report)
+    bound = 5 * k / 64 + sk                                     # fp32 roundings a row: 4 WMMA + 1 fma a group, 1 add a slice
     worst = int(units.argmax())
     r, c = divmod(worst, n)
     col_worst = units.max(0).values
     rne = torch.equal(ybf, y32.to(torch.bfloat16))
-    ulp = torch.ldexp(torch.ones_like(ref), torch.frexp(ref.abs().clamp_min(2.0 ** -126))[1] - 8)  # bf16 ulp
-    ulps = float(((ybf.double() - ref).abs() / ulp).max())
-    ok = rne and float(units.max()) <= bound
+    y64 = y32.double()                                         # bf16 error <= half its ulp + the fp32 error
+    half = torch.ldexp(torch.ones_like(ref), torch.frexp(y64.abs().clamp_min(2.0 ** -126))[1] - 9)
+    ulps = float(((ybf.double() - ref).abs() / (half + err)).max())
+    ok = rne and float(units.max()) <= bound and ulps <= 1.0
     bad = []
     # row invariance: every M's rows equal the largest call's; one-row calls equal their rows; determinism
     for m in ROWS:
@@ -177,7 +178,7 @@ def check_case(hip, name, lin, x, log, fp32=True):
     log(f"{'PASS' if ok else 'FAIL'} {name}: n {n} k {k} sk {sk} rows {mm}: fp32 worst {float(units.max()):.2f} "
         f"(bound {bound:.0f}) units of 2^-24 sum|xws| at ({r}, {c}) |err| {float(err.view(-1)[worst]):.3e} "
         f"ref {float(ref.view(-1)[worst]):.4e}; per-column worst median {float(col_worst.median()):.2f} max "
-        f"{float(col_worst.max()):.2f}; bf16 == RNE(fp32) {rne}, worst {ulps:.3f} bf16 ulp; invariance/determinism/ld/strided "
+        f"{float(col_worst.max()):.2f}; bf16 == RNE(fp32) {rne}, bf16 err / (half ulp + fp32 err) {ulps:.3f}; invariance/determinism/ld/strided "
         f"{'ok' if not bad else bad}")
     return ok
 
@@ -239,41 +240,52 @@ REAL = ["model.language_model.layers.0.linear_attn.in_proj_qkv", "model.language
         "model.language_model.layers.3.mlp.shared_expert.down_proj"]
 
 
-def bench(hip, log, reps=50, tries=5):
-    """Best-of-`tries` mean over `reps` launches: decode GB/s (weight bytes) and prefill TFLOP/s."""
+def bench(hips, log, tries=15, only=None, rows=(1, 8, 16, 32, 64, 128, 512, 2048)):
+    """Best-of-`tries` mean launch time, weights rotated over copies past the 32 MiB MALL: decode GB/s (weight bytes)
+    and prefill TFLOP/s. Production shares the GPU: compare runs A/B, not against peak."""
     for name, n, k in SHAPES[:5]:
-        lin = random_linear(n, k, 7)
-        wbytes = lin.w8.numel() + lin.bs.numel()
+        if only and name not in only:
+            continue
+        lins = [random_linear(n, k, 7)]
+        wbytes = lins[0].w8.numel() + lins[0].bs.numel()
+        for _ in range(max(1, (96 << 20) // wbytes)):
+            lins.append(Fp8BlockLinear(lins[0].w8.clone(), lins[0].bs.clone(), n, k, lins[0].npad))
         x = torch.randn((2048, k), device="cuda").to(torch.bfloat16)
         y = torch.empty((2048, n), dtype=torch.bfloat16, device="cuda")
         parts = []
-        for m in (1, 8, 16, 32, 64, 128, 512, 2048):
-            best = float("inf")
-            for _ in range(tries):
-                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                hip.matmul(lin, x[:m], y)
-                e0.record()
-                for _ in range(reps if m <= 128 else max(3, reps // 10)):
-                    hip.matmul(lin, x[:m], y)
-                e1.record()
-                e1.synchronize()
-                best = min(best, e0.elapsed_time(e1) * 1e3 / (reps if m <= 128 else max(3, reps // 10)))
-            parts.append(f"m{m} {best:.0f}us " + (f"{wbytes / best / 1e3:.0f}GB/s" if m <= 128 else
-                                                 f"{2 * m * n * k / best / 1e6:.1f}TF"))
+        for m in rows:
+            reps = len(lins) * (4 if m <= 128 else 1)
+            best = [float("inf")] * len(hips)
+            for _ in range(tries):                         # A/B alternated: production's load hits both alike
+                for h, hip in enumerate(hips):
+                    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    for i in range(reps):
+                        hip.matmul(lins[i % len(lins)], x[:m], y)
+                    e1.record()
+                    e1.synchronize()
+                    best[h] = min(best[h], e0.elapsed_time(e1) * 1e3 / reps)
+            parts.append(f"m{m} " + "/".join(f"{b:.0f}" for b in best) + "us " + "/".join(
+                f"{wbytes / b / 1e3:.0f}" if m <= 128 else f"{2 * m * n * k / b / 1e6:.1f}" for b in best)
+                + ("GB/s" if m <= 128 else "TF"))
         log(f"bench {name} n {n} k {k}: " + ", ".join(parts))
+        del lins
+        torch.cuda.empty_cache()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--co", default=str(Path(__file__).resolve().parents[2] / "build/rocm"))
     ap.add_argument("--real", help="model dir: check its block-FP8 tensors (a few layers)")
-    ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--bench", nargs="*", help="benchmark (optionally only these shape names)")
+    ap.add_argument("--co-b", help="second code-object dir: --bench times both, alternated (A/B)")
+    ap.add_argument("--rows", help="--bench row counts, comma separated")
     ap.add_argument("--quick", action="store_true", help="skip the random shapes")
     a = ap.parse_args()
     hip = Hip(Path(a.co))
     log = lambda s: print(s, flush=True)  # noqa: E731
     ok = exact_check(hip, log)
-    if not a.quick:
+    if not a.quick and a.bench is None:
         for i, (name, n, k) in enumerate(SHAPES):
             lin = random_linear(n, k, 1000 + i)
             x = torch.randn((2048, k), generator=torch.Generator().manual_seed(i), device="cpu").to(torch.bfloat16).cuda()
@@ -287,8 +299,9 @@ def main() -> int:
             ok = check_case(hip, p.split("layers.")[1], lin, x, log) and ok
             del lin, x
             torch.cuda.empty_cache()
-    if a.bench:
-        bench(hip, log)
+    if a.bench is not None:
+        hips = [hip] + ([Hip(Path(a.co_b))] if a.co_b else [])
+        bench(hips, log, only=a.bench, **({"rows": [int(r) for r in a.rows.split(",")]} if a.rows else {}))
     log("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
