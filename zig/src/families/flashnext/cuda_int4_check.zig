@@ -5,7 +5,7 @@
 //!    rounding is the only difference allowed (reported in fp32 ulps), and the error against the full fp64 dot
 //!    product relative to the sum of |products| is bounded;
 //!  - row invariance: each row of an m-row call is byte-equal to the 1-row call of that row, at every m;
-//!  - the n8 tiles a warp takes (1, 2, 4) never change a byte;
+//!  - the tiles a unit takes (n8 x 1, 2, 4 a warp; HIP: n16 x 1, 2 a wave) never change a byte;
 //!  - the routed experts on the plan (gate/up SwiGLU, down fp32 and bf16, groups of 128 and of 64) byte-equal to the
 //!    dense kernel on each pair's expert, the skipped (shared) slot untouched;
 //!  - timings: the head GEMV, decode experts, a prompt chunk's experts.
@@ -177,8 +177,8 @@ fn checkDense(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, 
         std.debug.print("  dense n {d} k {d} gs {d}: {d} outputs past 1e-4 of the fp64 sum\n", .{ n, kk, gs, bad });
         rep.ok = false;
     }
-    for (rows_list) |rows| for ([_]usize{ 1, 2, 4 }) |nt| {
-        if (n % (8 * nt) != 0) continue;
+    for (rows_list) |rows| for (int4.tile_counts) |nt| {
+        if (!int4.fits(1, n, nt)) continue;
         try int4.denseNt(k, s, xd, kk, m, out, true, rows, nt);
         try s.synchronize();
         try dv.get(out, std.mem.sliceAsBytes(host[0 .. rows * n]));
@@ -204,10 +204,11 @@ fn checkDense(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, 
     std.debug.print("  dense n {d} k {d} (from {d}) gs {d}: rows {any} NT 1/2/4 byte-equal to 1-row calls; vs host order max {d} ulps, max |err|/sum|x w| {e:.2}\n", .{ n, kk, k0, gs, rows_list, rep.max_ulps, rep.max_rel });
 }
 
-/// The group order, enforced: weights and inputs whose every group sum is exact in fp32 (one nonzero code a column
-/// and group, inputs that are small powers of two), so the MMA chain's own rounding cannot hide anything, and scales
-/// that make the groups cancel (2^25 s, -2^25 s, s, ...): the kernel must equal acc = fmaf(sum_g, scale_g, acc) in
-/// group order bit for bit (any other order or a sum of products first gives other bits).
+/// The group order, enforced: weights and inputs whose every group sum is exact in fp32 (one nonzero input a group,
+/// a small power of two, against one nonzero code a column: gfx11's WMMA sums other products inexactly even when
+/// they are zero), so the MMA chain's own rounding cannot hide anything, and scales that make the groups cancel
+/// (2^25 s, -2^25 s, s, ...): the kernel must equal acc = fmaf(sum_g, scale_g, acc) in group order bit for bit (any
+/// other order or a sum of products first gives other bits).
 fn checkOrder(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, r: std.Random, gs: usize, rep: *Report) !void {
     const n: usize = 64;
     const kk: usize = 1024;
@@ -216,18 +217,25 @@ fn checkOrder(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, 
     defer gpa.free(qw);
     const sc = try gpa.alloc(u8, kg * n * 2);
     defer gpa.free(sc);
-    // codes 8 (weight 0) everywhere, then one code a column and group of 128
+    // codes 8 (weight 0) and inputs 0 everywhere, then one input a group of 128 and its code in every column
     for (0..kk / 8 * n) |i| std.mem.writeInt(u32, qw[4 * i ..][0..4], 0x88888888, .little);
     const x = try gpa.alloc(u16, kk);
     defer gpa.free(x);
-    for (x, 0..) |*v, i| v.* = f32ToBf16(std.math.ldexp(@as(f32, if (i % 3 == 0) -1.0 else 1.0), @as(i32, @intCast(i % 7)) - 3));
+    @memset(x, 0);
+    var at: [kk / 128]usize = undefined;
+    for (0..kg) |g| {
+        at[g] = g * 128 + r.uintLessThan(usize, 128);
+        x[at[g]] = f32ToBf16(std.math.ldexp(@as(f32, if (g % 3 == 0) -1.0 else 1.0), @as(i32, @intCast(g % 7)) - 3));
+    }
+    // group 1 cancels group 0: the opposite input, the same codes and scales
+    x[at[1]] = f32ToBf16(-bf16ToF32(x[at[0]]));
     for (0..n) |col| {
+        const code0: u32 = if (r.boolean()) 15 else 1; // weights 7 or -7
         for (0..kg) |g| {
-            const kin = g * 128 + r.uintLessThan(usize, 128);
-            const code: u32 = if (r.boolean()) 15 else 1; // weights 7 or -7
-            const word_i = (kin / 8) * n + col;
+            const code: u32 = if (g <= 1) code0 else if (r.boolean()) 15 else 1;
+            const word_i = (at[g] / 8) * n + col;
             var w = std.mem.readInt(u32, qw[4 * word_i ..][0..4], .little);
-            const sh: u5 = @intCast(4 * (kin % 8));
+            const sh: u5 = @intCast(4 * (at[g] % 8));
             w = (w & ~(@as(u32, 0xF) << sh)) | (code << sh);
             std.mem.writeInt(u32, qw[4 * word_i ..][0..4], w, .little);
             // cancelling magnitudes: groups 0 and 1 huge and opposite, the rest small
@@ -238,23 +246,6 @@ fn checkOrder(gpa: Allocator, k: *const int4.Kernels, s: cuda.Stream, dv: *Dev, 
             const v: f16 = @floatCast(std.math.ldexp(@as(f32, 1.0) + @as(f32, @floatFromInt(col % 7)) / 8.0, e));
             std.mem.writeInt(u16, sc[2 * (g * n + col) ..][0..2], @bitCast(v), .little);
         }
-    }
-    // make group 1's term the negative of group 0's in every column (same |x q|, opposite sign)
-    for (0..n) |col| {
-        var k0: usize = 0;
-        var k1: usize = 0;
-        for (0..128) |j| {
-            if (int4.code(.{ .qweight = qw, .scales = sc, .n_full = n, .k_full = kk }, col, j) != 8) k0 = j;
-            if (int4.code(.{ .qweight = qw, .scales = sc, .n_full = n, .k_full = kk }, col, 128 + j) != 8) k1 = 128 + j;
-        }
-        x[k1] = f32ToBf16(-bf16ToF32(x[k0]));
-        const c0 = int4.code(.{ .qweight = qw, .scales = sc, .n_full = n, .k_full = kk }, col, k0);
-        const word_i = (k1 / 8) * n + col;
-        var w = std.mem.readInt(u32, qw[4 * word_i ..][0..4], .little);
-        const sh: u5 = @intCast(4 * (k1 % 8));
-        w = (w & ~(@as(u32, 0xF) << sh)) | (@as(u32, c0) << sh);
-        std.mem.writeInt(u32, qw[4 * word_i ..][0..4], w, .little);
-        std.mem.writeInt(u16, sc[2 * (128 / 128 * n + col) ..][0..2], std.mem.readInt(u16, sc[2 * col ..][0..2], .little), .little);
     }
     const src: int4.Source = .{ .qweight = qw, .scales = sc, .n_full = n, .k_full = kk };
     const g: Gen = .{ .qweight = qw, .scales = sc, .n = n, .k = kk };
@@ -409,8 +400,8 @@ fn checkExperts(gpa: Allocator, k: *const int4.Kernels, ops: kern.Ops, dv: *Dev,
             }
         }
     }
-    for ([_]usize{ 1, 2, 4 }) |nt| {
-        if (ni % (8 * nt) == 0) {
+    for (int4.tile_counts) |nt| {
+        if (int4.fits(0, ni, nt)) {
             try int4.expertsNt(k, s, 0, xd, D, slots, ex.up, ex.up_s, D, ni, pl, items, act2, @intCast(E), nt, 1);
             try s.synchronize();
             try dv.get(act2, std.mem.sliceAsBytes(ha2));
@@ -420,6 +411,7 @@ fn checkExperts(gpa: Allocator, k: *const int4.Kernels, ops: kern.Ops, dv: *Dev,
                 break;
             };
         }
+        if (!int4.fits(dk, D, nt)) continue;
         try int4.expertsNt(k, s, dk, act, ni, 0, ex.down, ex.down_s, ni, D, pl, items, y2, @intCast(E), nt, 1);
         try s.synchronize();
         try dv.get(y2, std.mem.sliceAsBytes(hy2));
