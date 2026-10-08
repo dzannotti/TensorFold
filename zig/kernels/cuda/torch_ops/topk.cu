@@ -230,6 +230,7 @@ extern "C" __global__ void tf_topk_f32_sort_kernel(float* values, int64_t* indic
     indices[rank] = column[i];
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
 // The shapes whose ATen-ROCm order this reproduces: one row of >= 10000 (the sort above) or ATen's multi-block
 // gather (TensorTopK.cu should_use_multiblock: column order, ties after). Smaller slices take ATen's single-block
 // kernels, whose ROCm write order is not this one; every Flash Next head width (>= 39795) is covered.
@@ -240,6 +241,7 @@ static bool tf_topk_rocm_order(uint64_t rows, uint64_t columns) {
            (rows >= 200 && rows < 800 && columns >= 3000) || (rows >= 800 && rows <= 4000 && columns >= 800) ||
            (rows > 4000 && columns >= 400);
 }
+#endif
 
 extern "C" uint64_t tf_topk_f32_unsorted_scratch_bytes(uint64_t rows, uint64_t columns) {
     if (rows == 0 || columns == 0 || rows > 65535u || columns > UINT32_MAX) return 0;

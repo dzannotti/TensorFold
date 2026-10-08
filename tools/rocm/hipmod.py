@@ -10,7 +10,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 KERNELS = ROOT / 'zig/kernels/cuda'
 FLAGS = ('-x', 'hip', '-O3', '-std=c++20', '-ffp-contract=off', '-fno-gpu-flush-denormals-to-zero',
-         '--offload-arch=gfx1151', '-include', 'hip_compat.cuh', '-I', str(KERNELS / 'hip'), '-I', str(KERNELS))
+         '--offload-arch=gfx1151', '-include' + str(KERNELS / 'hip_compat.cuh'), '-I', str(KERNELS / 'hip'),
+         '-I', str(KERNELS))
 
 
 def genco(source, out_dir):

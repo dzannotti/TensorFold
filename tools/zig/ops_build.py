@@ -18,7 +18,8 @@ def digest(path):
 # ROCm (gfx1151): the same arithmetic contract under hipcc, the CUDA headers mapped by zig/kernels/cuda/hip_compat.cuh
 HIP_ROOT = Path(__file__).resolve().parents[2] / 'zig/kernels/cuda'
 HIP_FLAGS = ('-x', 'hip', '-O3', '-std=c++20', '-ffp-contract=off', '-fno-gpu-flush-denormals-to-zero',
-             '--offload-arch=gfx1151', '-include', 'hip_compat.cuh', '-I', str(HIP_ROOT / 'hip'), '-I', str(HIP_ROOT),
+             '--offload-arch=gfx1151', '-include' + str(HIP_ROOT / 'hip_compat.cuh'), '-I', str(HIP_ROOT / 'hip'),
+             '-I', str(HIP_ROOT),
              '-shared', '-fPIC')
 
 

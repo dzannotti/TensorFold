@@ -8,7 +8,7 @@ out=$1; shift
 mkdir -p "$out"
 # CUDA's -O3 --fmad=false --ftz=false: no contraction, denormals kept; the CUDA headers map through hip/
 flags=(-x hip -O3 -std=c++20 -ffp-contract=off -fno-gpu-flush-denormals-to-zero --offload-arch=gfx1151
-       -include hip_compat.cuh -I "$root/zig/kernels/cuda/hip" -I "$root/zig/kernels/cuda" -I "$root/zig/kernels/cuda/torch_ops")
+       "-include$root/zig/kernels/cuda/hip_compat.cuh" -I "$root/zig/kernels/cuda/hip" -I "$root/zig/kernels/cuda" -I "$root/zig/kernels/cuda/torch_ops")
 if [ "${MODE:-genco}" = so ]; then
   nice hipcc "${flags[@]}" -shared -fPIC "$@" -o "$out/${NAME:-ops}.so"
 else
