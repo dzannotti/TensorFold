@@ -275,7 +275,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, cmd, "qsa-check")) return qsaCheck(gpa, init.io, &ctx, kernels);
     if (std.mem.eql(u8, cmd, "fp4-check")) return fp4Check(gpa, init.io, &ctx, kernels, o);
     if (std.mem.eql(u8, cmd, "glue-check")) return glueCheck(gpa, init.io, &ctx, kernels);
-    const mtp = !std.mem.eql(u8, cmd, "check-weights-nomtp");
+    // `run --no-drafts` never drafts: no MTP head (its memory too)
+    const mtp = !std.mem.eql(u8, cmd, "check-weights-nomtp") and !(std.mem.eql(u8, cmd, "run") and !o.drafts);
     // two ranks: both run the same command (every engine call in the same order), rank 0 listening on --master
     var server: ?flashnext.link.Server = null;
     defer if (server) |sv| sv.close();

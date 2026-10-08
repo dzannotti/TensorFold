@@ -627,6 +627,7 @@ pub const Tri = struct {
     /// forward.shift_windows: old [L, T, C] (in place, layers `old_l` elements apart) takes rows keep .. keep + T
     /// of [old; new rows], new rows `new_row` apart within a layer and `new_l` across layers (the first C columns).
     pub fn shiftWindows(t: Tri, old: u64, new: u64, keep: usize, old_l: usize, new_l: usize, new_row: usize, layers: usize, channels: usize, taps: usize) !void {
+        if (layers == 0) return; // no DeltaNet layers (an attention-only model): nothing to shift
         try t.run("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ p("OLD", bf16, old), p("NEW", bf16, new), int("keep", keep), int("OLD_L", old_l), int("NEW_L", new_l), int("NEW_ROW", new_row) }, &.{ ci("C", channels), ci("T", taps), ci("TP", pow2(taps)), ci("BLOCK", 256) });
     }
 };
