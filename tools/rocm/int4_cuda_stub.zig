@@ -1,5 +1,5 @@
-//! Type-only stand-in for the cuda module (int4 host code under is_hip): checks cuda_int4.zig's HIP paths compile.
-pub const is_hip = true;
+//! Type-only stand-in for the cuda module (int4 host code under cuda.hip): checks cuda_int4.zig's HIP paths compile.
+pub const hip = true;
 pub const Error = error{Cuda};
 pub const Stream = struct {
     pub fn synchronize(_: Stream) Error!void {}

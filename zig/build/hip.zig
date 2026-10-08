@@ -36,15 +36,9 @@ const script =
     \\fi
 ;
 
-fn exists(b: *std.Build, path: []const u8) bool {
-    b.root.access(b.graph.io, path, .{}) catch return false;
-    return true;
-}
-
 /// The source hipcc compiles: zig/kernels/hip/<name>.hip when a kernel has a HIP rewrite, else the shared .cu.
 fn source(b: *std.Build, k: Kernel) []const u8 {
-    const hip = b.fmt("zig/kernels/hip/{s}.hip", .{k.name});
-    if (exists(b, hip)) return hip;
+    if (k.hip) return b.fmt("zig/kernels/hip/{s}.hip", .{k.name});
     return b.fmt("zig/kernels/cuda/{s}.cu", .{k.src orelse k.name});
 }
 
@@ -61,9 +55,8 @@ pub fn codeObject(b: *std.Build, hipcc: []const u8, version: std.Build.LazyPath,
     for (k.flags) |f| run.addArg(clangFlag(f));
     var it = std.mem.tokenizeScalar(u8, arches, ',');
     while (it.next()) |arch| run.addArg(b.fmt("--offload-arch={s}", .{arch}));
-    // the CUDA-compat header the shared .cu sources build against, when the tree has it
-    const compat = "zig/kernels/cuda/hip_compat.cuh";
-    if (exists(b, compat)) run.addPrefixedFileArg("-include", b.path(compat));
+    // the CUDA-compat header the shared .cu sources build against
+    run.addPrefixedFileArg("-include", b.path("zig/kernels/cuda/hip_compat.cuh"));
     run.addPrefixedDirectoryArg("-I", b.path("zig/kernels/cuda/hip"));
     run.addPrefixedDirectoryArg("-I", b.path("zig/kernels/cuda"));
     return out;

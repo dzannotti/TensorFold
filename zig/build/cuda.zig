@@ -15,14 +15,16 @@ fn gpuOption(b: *std.Build) Gpu {
 }
 
 /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
-pub const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
+/// `hip`: a HIP rewrite at zig/kernels/hip/<name>.hip replaces the .cu under -Dgpu=hip (listed, not probed: the
+/// build's configuration is cached, so a probe would miss a rewrite added later).
+pub const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false, hip: bool = false };
 
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
 
 pub const kernels = [_]Kernel{
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
-    .{ .name = "probe", .flags = &.{"-O3"} },
+    .{ .name = "probe", .flags = &.{"-O3"}, .hip = true },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "qmm_prefill", .flags = &.{"-O3"} },
     .{ .name = "experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
@@ -42,21 +44,21 @@ pub const kernels = [_]Kernel{
     .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
     .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
-    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
+    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"}, .hip = true }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
     .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "fn_pack", .flags = &.{"-O3"} }, // ours: the n-gram table's GPU gather (flashnext/cuda_weights.zig)
     .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // ours: Flash Next torch ops (SwiGLU, sampler packing)
     .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ours: torch.logsumexp in ATen's order
-    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // ours: routed NVFP4 experts reading weights once a prompt call (fn_nvfp4_experts' bits)
+    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"}, .hip = true }, // ours: routed NVFP4 experts reading weights once a prompt call (fn_nvfp4_experts' bits)
     // INT4-AutoRound checkpoint (GPTQ int4 experts and head, 128x128-block FP8 dense linears)
-    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
-    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // ours: GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
-    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"} }, // fn_qmmf.cu with an output row stride (tools/zig/flashnext_qmmf_ld.py)
-    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // ours (decode D3): fn_nvfp4_experts' unit arithmetic in other launch shapes
+    .{ .name = "fn_qmmf", .flags = &.{"-O3"}, .hip = true }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
+    .{ .name = "fn_int4", .flags = &.{"-O3"}, .hip = true }, // ours: GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
+    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"}, .hip = true }, // fn_qmmf.cu with an output row stride (tools/zig/flashnext_qmmf_ld.py)
+    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"}, .hip = true }, // ours (decode D3): fn_nvfp4_experts' unit arithmetic in other launch shapes
     .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
     .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
-    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // ours: attention._scores' bits from row tiles (the prompt indexer)
+    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"}, .hip = true }, // ours: attention._scores' bits from row tiles (the prompt indexer)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

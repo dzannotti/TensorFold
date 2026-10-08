@@ -5,7 +5,7 @@
 //! counterpart): exact weights in bf16 MMAs, one fp32 MMA chain a group, groups added with fmaf in order, so a row's
 //! bits never depend on the other rows, the row count, the plan's items or the column tiles a warp takes.
 //!
-//! HIP builds (`cuda.is_hip`) run zig/kernels/hip/fn_int4.hip instead: the same arithmetic on wave32 WMMA over n16
+//! HIP builds (`cuda.hip`) run zig/kernels/hip/fn_int4.hip instead: the same arithmetic on wave32 WMMA over n16
 //! tiles, its own packed layout and entry points (`hip_layout`), one kernel for decode and prompt calls (4 row tiles a
 //! pass on 64-pair items in place of int4_prompt_kernel).
 //!
@@ -35,7 +35,7 @@ pub const Mat = struct { w: u64 = 0, s: u64 = 0, n: u32 = 0, k: u32 = 0, gs: u32
 pub const checkpoint_group = 128;
 
 /// fn_int4.hip's layout and entry points (HIP builds); the CUDA build keeps fn_int4.cu's.
-pub const hip_layout = @hasDecl(cuda, "is_hip") and cuda.is_hip;
+pub const hip_layout = cuda.hip;
 /// Output columns a packed tile holds: n8 (mma m16n8k16) or n16 (WMMA 16x16x16).
 pub const tile_n: usize = if (hip_layout) 16 else 8;
 
