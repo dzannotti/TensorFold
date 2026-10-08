@@ -2,7 +2,7 @@
 //! embeddings and the main model's final streams, normalized and projected (fc_e, fc_h per stream), added into the
 //! head's streams, its own attention layer over its own cache (State's last attention cache, `mtp_len` rows, the
 //! last `mtp_drafted` of them chained drafts), the mixer, and the draft head over the draft vocabulary (the lm_head's
-//! draft rows, 4-bit in groups of 32) on the last row. The draws (`sample_draft`, `sample_mapped`) read the head's
+//! draft rows, 4-bit in groups of 32; without fn_qmm the int4 lm_head's draft columns as they are) on the last row. The draws (`sample_draft`, `sample_mapped`) read the head's
 //! row on the GPU and draw on the host with the keyed rule (cuda_sampler.zig), so a draft equals Python's.
 //!
 //! Python source (TensorFold, https://github.com/ashhart/TensorFold, qwen4_exp/cuda/mtp.py and decode.py, authored
@@ -17,6 +17,7 @@ const state = @import("cuda_state.zig");
 const sampler = @import("cuda_sampler.zig");
 const fwd = @import("cuda_forward.zig");
 const nucleus = @import("cuda_nucleus.zig");
+const int4 = @import("cuda_int4.zig");
 
 const Allocator = std.mem.Allocator;
 const Forward = fwd.Forward;
@@ -176,13 +177,22 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
         const q4: kern.Q4 = .{ .w = q.weight, .s = q.scales, .b = q.biases, .n = q.n, .k = q.k, .npad = q.npad };
         if (b.prefill) try f.ops.qmmPrefill32(rows, D, q4, b.logits, 1, false) else try f.ops.qmm32(rows, D, xs, q4, b.logits, k, false);
         columns = q.n;
+    } else if (f.w.draft4) |h| {
+        // the int4 head's draft columns: rows h.n apart, packed to draft_count apart past the first
+        columns = f.w.draft_count;
+        const k4 = f.k4 orelse return error.NoInt4Kernels;
+        if (k == 1) try int4.dense(k4, f.s, rows, D, h, b.logits, false, 1) else {
+            const wide = b.logits + k * h.n * 2;
+            try int4.dense(k4, f.s, rows, D, h, wide, false, k);
+            try f.th.slotCopy(wide, h.n * 2, b.logits, columns * 2, columns * 2, k);
+        }
     } else {
         try f.headMm(rows, D, b.logits, k);
         columns = f.w.head.n;
     }
     try f.mark(.head);
     if (f.comm) |cm| {
-        try f.candidates(x, b.logits, k, columns, if (f.w.draft_head != null) f.w.draft_ids else null, f.vocab_offset, cm);
+        try f.candidates(x, b.logits, k, columns, if (f.w.draft_count != 0) f.w.draft_ids else null, f.vocab_offset, cm);
         try f.mark(.cands);
     }
     try f.put("head_logits", b.logits, k * columns * 2);
