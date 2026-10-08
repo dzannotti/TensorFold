@@ -732,7 +732,8 @@ fn addr(i: u64) u64 {
     return 0x7f0000000000 + i * 0x100000;
 }
 
-/// TF_FLASHNEXT_AOT_SET=DIR: every fixture launch must also find a variant in DIR/aot.json (a built set, dry).
+/// TF_FLASHNEXT_AOT_SET=DIR (zig build test -Daot-set=DIR): every fixture launch must also find a variant in
+/// DIR/aot.json (a built set, dry).
 var dry_set: ?aot.Specs = null;
 
 fn drySet() !?*const aot.Specs {

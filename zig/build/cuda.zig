@@ -210,7 +210,13 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const cuda = runtime(b, host, .debug, gpuOption(b), &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext).engines;
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // -Daot-set=DIR: Flash Next's fixture tests also require every launch to find a variant in DIR/aot.json
+    const aot_set = b.option([]const u8, "aot-set", "a built Triton set the Flash Next fixture tests must cover (dry, no GPU)");
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| {
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
+        if (aot_set) |dir| if (m == mods.flashnext) run.setEnvironmentVariable("TF_FLASHNEXT_AOT_SET", dir);
+        step.dependOn(&run.step);
+    }
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
