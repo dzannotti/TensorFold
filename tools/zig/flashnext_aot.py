@@ -505,6 +505,43 @@ def hip_options(k: dict) -> dict:
     return hip_tune.options(k["name"], _ints(k), o)
 
 
+def hip_entries(k: dict) -> list[dict]:
+    """A spec entry as the HIP set holds it: plus its gfx1151 tile (hip_tune.TILES) if the kernel has one, each in
+    both pointer forms."""
+
+    from tensorfold.cuda import hip_tune
+
+    t = hip_tune.tile(k["name"], _ints(k))
+    out = [k] + ([_derived(_with_consts(k, t), f"gfx1151 tile {t}")] if t and _ints(k) != {**_ints(k), **t} else [])
+    sm = hip_tune.slice_major(k["name"], _ints(k))
+    if sm:                                        # the same entries on the slice-major weight's kernel
+        for e in list(out):
+            e = _derived(e, f"slice-major weight ({sm})")
+            e["function"] = e["function"][: -len(k["name"])] + sm
+            e["name"] = sm
+            e["source"] = {"file": e["source"]["file"], "line": None}
+            out.append(e)
+    if k["name"] == "_hc_act":
+        out += _hc_act_sk(k)
+    return [x for e in out for x in (e, ranged(e))]
+
+
+def _hc_act_sk(k: dict) -> list[dict]:
+    """``glue._hc_act_sk`` from an ``_hc_act`` entry: the down projection's 32 K slices summed in it (HIP decode),
+    PART for DN, M a runtime int in each form it takes."""
+
+    e = _derived(k, "glue._hc_act_sk: _reduce fused (SK 32)")
+    e["function"] = k["function"][: -len("_hc_act")] + "_hc_act_sk"
+    e["name"] = "_hc_act_sk"
+    e["source"] = {"file": k["source"]["file"], "line": None}
+    e["params"] = ["PART", "ACT", "XS", "INJ", "M", "SK"] + [n for n in k["params"] if n not in ("DN", "ACT", "XS", "INJ")]
+    sig = {"PART": "*fp32", "M": "i32", "SK": "constexpr", **{n: t for n, t in k["signature"].items() if n != "DN"}}
+    att = {"PART": k["attrs"]["DN"], "M": [], "SK": [], **{n: a for n, a in k["attrs"].items() if n != "DN"}}
+    e["signature"], e["attrs"] = sig, att
+    e["constexprs"] = {"SK": {"int": 32}, **k["constexprs"]}
+    return [_int_form(_reorder(e), "M", form) for form in ("div16", "plain", "one")]
+
+
 def ranged(k: dict) -> dict:
     """The entry with every pointer built for AMD buffer ops (``tt.pointer_range`` 32: what the ROCm JIT specializes
     a tensor within 2 GiB to), marked ``range32``."""
@@ -605,7 +642,7 @@ def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: P
     same = 0
     todo = [k for k in kernels if tps & set(k.get("tp", [1])) and (not only or only in k["function"])]
     if hip:                                       # each specialization in both pointer forms (buffer ops, or not)
-        todo = [x for k in todo for x in (k, ranged(k))]
+        todo = [x for k in todo for x in hip_entries(k)]
     from concurrent.futures import ProcessPoolExecutor
 
     with ProcessPoolExecutor(max_workers=max(1, jobs)) as pool:

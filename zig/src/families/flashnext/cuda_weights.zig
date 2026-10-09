@@ -27,6 +27,7 @@ const ngram = @import("cuda_ngram.zig");
 const ropes = @import("cuda_rope.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
+const tri = @import("cuda_triton.zig");
 
 const Config = cfgs.Config;
 const st = core.safetensors;
@@ -61,7 +62,8 @@ pub const Options = struct {
 };
 
 /// A bf16 matrix [n, k] as stored (Python bf16._Routed, its B16 at `.b`: named "<path>.b.weight").
-pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
+/// `slices` > 0: stored slice-major, [slices, n, k / slices] (bf16.slice_major; HIP's hyper-connection down rows).
+pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0, slices: u32 = 0 };
 /// An FP4 table in the pattern form: bf16 bits [n/64][k/64][64][64], fp32 scales [k/16, n], fp32 scale2 [n].
 pub const Fp4 = struct { weight: u64 = 0, scale: u64 = 0, scale2: u64 = 0, n: u32 = 0, k: u32 = 0 };
 pub const Expert4 = struct { gu: Fp4 = .{}, down: Fp4 = .{} };
@@ -699,6 +701,26 @@ const Loader = struct {
         return .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k) };
     }
 
+    /// `face` of whole-row parts stored slice-major, [sk, n, k / sk] (Rows.slices; gfx1151 streams it faster).
+    fn sliceMajor(L: *Loader, path: []const u8, parts: []const Part, sk: usize) !Rows {
+        const k = parts[0].t.dim(1);
+        var n: usize = 0;
+        for (parts) |p| {
+            if (p.t.dtype != .bf16 or p.t.dim(1) != k or p.rows.len != 0 or p.cols != null) return error.UnexpectedTensor;
+            n += p.t.dim(0);
+        }
+        const ks = k / sk;
+        const host = try L.staging(n * k * 2);
+        var row: usize = 0;
+        for (parts) |p| for (0..p.t.dim(0)) |r| {
+            for (0..sk) |s| @memcpy(host[((s * n + row) * ks) * 2 ..][0 .. ks * 2], p.t.bytes[(r * k + s * ks) * 2 ..][0 .. ks * 2]);
+            row += 1;
+        };
+        const ptr = try L.out.whole(path, "bfloat16", &.{ sk, n, ks }, host);
+        L.out.ours();
+        return .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k), .slices = @intCast(sk) };
+    }
+
     fn b16(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !Rows {
         return L.face(path, &.{.{ .t = try L.linear(name, n, k) }});
     }
@@ -728,7 +750,11 @@ const Loader = struct {
         parts[0] = .{ .t = try L.linear(try L.nameOf("{s}.input_mix_weight_down", .{name}), c.low, sd) };
         if (inject) parts[1] = .{ .t = try L.linear(try L.nameOf("{s}.block_inject_weight", .{name}), c.streams, sd) };
         var pb: [192]u8 = undefined;
-        h.down = try L.face(try std.fmt.bufPrint(&pb, "{s}.down.b.weight", .{path}), parts[0 .. @as(usize, 1) + @intFromBool(inject)]);
+        const down = parts[0 .. @as(usize, 1) + @intFromBool(inject)];
+        h.down = if (cuda.hip and tri.b16SplitK(c.low + if (inject) c.streams else 0, sd) == 32)
+            try L.sliceMajor(try std.fmt.bufPrint(&pb, "{s}.down.sm.weight", .{path}), down, 32)
+        else
+            try L.face(try std.fmt.bufPrint(&pb, "{s}.down.b.weight", .{path}), down);
         h.up = try L.b16(try std.fmt.bufPrint(&pb, "{s}.up.b.weight", .{path}), try L.nameOf("{s}.input_mix_weight_up", .{name}), sd, c.low);
         h.scale = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.scale", .{path}), try L.nameOf("{s}.hc_norm.weight", .{name}), sd);
         return h;
