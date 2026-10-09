@@ -1,52 +1,46 @@
-# TensorFold (ROCm/HIP) serving Qwen3.8 Flash Next on mimiron, in ornith's place on 127.0.0.1:10001.
-# Build: docker compose -f docker/rocm-serve/compose.yaml build (from the repo; needs tf-rocm-dev:latest)
-# Cannot co-run with ornith or ComfyUI (~66 GiB weights + sequences): see docs/rocm/SERVE.md.
+# TensorFold (ROCm/HIP) serving Qwen3.8 Flash Next on a Strix Halo, on 127.0.0.1:8080.
+# start.sh checks the host, fills .env (MODEL_DIR, the host's video/render GIDs) and runs `docker compose up -d`.
+# By hand: copy env.example to .env, set it, then `docker compose -f docker/rocm-serve/compose.yaml up -d`.
+# Build (repo root, no GPU needed): docker build -t tensorfold-rocm:dev docker/rocm-dev
+#   && docker build -f docker/rocm-serve/Dockerfile -t tensorfold-rocm:serve .   (--build-arg PM4=0: stock runtime only)
 name: tensorfold
 
 services:
   tensorfold:
-    image: mimiron/tensorfold:rocm-0e40c85
-    build:
-      context: ../..
-      dockerfile: docker/rocm-serve/Dockerfile
-      args:
-        JOBS: "8"
+    image: tensorfold-rocm:serve
     container_name: tensorfold
     init: true
     network_mode: host
     ipc: host
     devices: [/dev/kfd, /dev/dri]
-    group_add: ["44", "991"]
+    # numeric host GIDs: /dev/kfd and /dev/dri/renderD* belong to the host's video/render groups, whose GIDs vary
+    group_add: ["${VIDEO_GID:?set VIDEO_GID in .env (getent group video)}", "${RENDER_GID:?set RENDER_GID in .env (getent group render)}"]
     restart: unless-stopped
     stop_grace_period: 60s
-    labels:
-      homelab.memwatch: stop
-      deunhealth.restart.on.unhealthy: "true"
     ulimits:
       memlock: -1
       stack: 67108864
-    # image defaults: TENSORFOLD_CUDA_KERNELS, TF_FLASHNEXT_DEPTH=15, PM4 LD_LIBRARY_PATH, DEBUG_HIP_GRAPH_PM4=1,
-    # GPU_MAX_HW_QUEUES=1, HF_HUB_OFFLINE=1. Stock ROCm 10.0 runtime instead: LD_LIBRARY_PATH: "" and DEBUG_HIP_GRAPH_PM4: ""
+    # image defaults: TENSORFOLD_CUDA_KERNELS (the baked set), TF_FLASHNEXT_DEPTH=15, HF_HUB_OFFLINE=1 and, PM4=1
+    # images, the PM4 libs first on LD_LIBRARY_PATH + DEBUG_HIP_GRAPH_PM4=1 + GPU_MAX_HW_QUEUES=1. Stock ROCm 10.0
+    # runtime from a PM4 image: LD_LIBRARY_PATH: "", DEBUG_HIP_GRAPH_PM4: "0", GPU_MAX_HW_QUEUES: "4"
     environment:
       TENSORFOLD_MEMORY_RESERVE_GIB: "12"
-    # read-only: the engine maps weights and the n-gram table, and writes nothing beside them
+    # read-only: serving maps the weights and the n-gram table and writes nothing (the prompt cache lives in memory)
     volumes:
-      - /home/dzannotti/models/qwen38fn-int4-autoround:/models/qwen38fn-int4-autoround:ro
+      - ${MODEL_DIR:?set MODEL_DIR in .env}:/models/qwen38fn-int4-autoround:ro
     command:
       - serve
       - /models/qwen38fn-int4-autoround
       - --name=qwen3.8-flash-next
-      - --alias=ornith-1.5-35b
       - --host=127.0.0.1
-      - --port=10001
+      - --port=8080
       - --context=262144
       - --parallel=8
       - --kv-dtype=fp8
       - --thinking
       - --backend=hip
-      - --no-update-check
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-m", "5", "http://127.0.0.1:10001/health"]
+      test: ["CMD", "curl", "-fsS", "-m", "5", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3

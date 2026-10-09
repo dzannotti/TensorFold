@@ -20,8 +20,44 @@ tools/rocm/e2e/bench.py; aggregate tok/s):
 
 Same harness against the same engine on a GB10 (thorim): prose 65.2, code 122.7, warm prefill 756 (8k) / 1,298 (32k).
 
-Build, serve and the checks to run after a change: [docs/rocm/SERVE.md](docs/rocm/SERVE.md). Port notes and every
-measurement: [docs/rocm/](docs/rocm/). Optional: pwilkin's retained-PM4 HIP runtime (+5-7% single-stream decode).
+## Quickstart (Strix Halo, Docker)
+
+Needs: a Ryzen AI MAX+ 395 with 128 GB, Linux 7.0+ with amdgpu (`/dev/kfd`, `/dev/dri`), Docker with compose, ~122 GB
+free on NVMe for the model and ~40 GB for the build. The GPU's memory is GTT (system RAM): raise its limit to >= 104
+GiB with `ttm.pages_limit=27262976 amd_iommu=off` on the kernel command line (reboot; leave the BIOS UMA/VRAM size at
+its minimum), and keep ~90 GiB of RAM free for the server. Everything below comes from public sources and needs no
+GPU until `start.sh`.
+
+```bash
+git clone -b rocm https://github.com/dzannotti/TensorFold.git && cd TensorFold
+docker/rocm-serve/fetch-model.sh ~/models/qwen38fn-int4-autoround      # ~122 GB (pip install huggingface_hub)
+docker build -t tensorfold-rocm:dev docker/rocm-dev                     # toolchain: ROCm 10.0, Zig, torch/Triton
+docker build -f docker/rocm-serve/Dockerfile -t tensorfold-rocm:serve .  # engine, kernels, PM4 runtime (~1 h CPU)
+docker/rocm-serve/start.sh ~/models/qwen38fn-int4-autoround             # checks the host, starts, waits for /health
+curl -s 127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-flash-next","messages":[{"role":"user","content":"Hello!"}],"max_tokens":200}'
+```
+
+It serves `qwen3.8-flash-next` on 127.0.0.1:8080 (OpenAI API) with `--context 262144 --parallel 8 --kv-dtype fp8
+--thinking`. Stop: `docker compose -f docker/rocm-serve/compose.yaml down`. `--build-arg PM4=0` leaves out pwilkin's
+retained-PM4 HIP runtime (+5-7% single-stream decode) for AMD's stock one. Details (PM4, tuning env, memory, the
+checks to run after a change): [docs/rocm/SERVE.md](docs/rocm/SERVE.md). Port notes and every measurement:
+[docs/rocm/](docs/rocm/).
+
+**Dev loop**: `docker/rocm-dev/run.sh` opens a shell in the toolchain image with GPU access, as your user, $HOME
+mounted read-write and the repo as working directory (models under `$HOME/models` or `TFDEV_MODELS`, read-only):
+
+```bash
+nice zig build -j12 -Dgpu=hip -Dhipcc=/opt/rocm/bin/hipcc native install           # engine + HIP code objects
+PYTHONPATH=src python -B tools/zig/flashnext_aot.py build --target hip --spec zig/tests/cuda/flashnext/kernels.json \
+  --spec zig/tests/cuda/flashnext/kernels_int4ar.json --out zig-out/native/share/tensorfold/cuda/gfx1151  # Triton set
+TF_FLASHNEXT_DEPTH=15 ./zig-out/native/bin/tensorfold-native serve ~/models/qwen38fn-int4-autoround --port 8088 \
+  --context 262144 --parallel 8 --kv-dtype fp8 --thinking --backend hip &
+python tools/rocm/e2e/contracts.py --url http://127.0.0.1:8088   # drafted == plain, concurrent == solo, resume, chunks
+python tools/rocm/e2e/agreement.py --url http://127.0.0.1:8088   # top-1 agreement vs the CUDA engine (ref/thorim.json)
+python tools/rocm/e2e/bench.py --url http://127.0.0.1:8088       # prefill/decode speed, MiaAI-Lab's method
+python tools/rocm/e2e/longctx.py --url http://127.0.0.1:8088     # decode speed against context
+```
 
 ---
 

@@ -2,3 +2,4 @@
 **/.zig-cache
 **/zig-out
 **/__pycache__
+docker/rocm-serve/.env
