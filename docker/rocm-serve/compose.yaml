@@ -1,0 +1,53 @@
+# TensorFold (ROCm/HIP) serving Qwen3.8 Flash Next on mimiron, in ornith's place on 127.0.0.1:10001.
+# Build: docker compose -f docker/rocm-serve/compose.yaml build (from the repo; needs tf-rocm-dev:latest)
+# Cannot co-run with ornith or ComfyUI (~66 GiB weights + sequences): see docs/rocm/SERVE.md.
+name: tensorfold
+
+services:
+  tensorfold:
+    image: mimiron/tensorfold:rocm-0e40c85
+    build:
+      context: ../..
+      dockerfile: docker/rocm-serve/Dockerfile
+      args:
+        JOBS: "8"
+    container_name: tensorfold
+    init: true
+    network_mode: host
+    ipc: host
+    devices: [/dev/kfd, /dev/dri]
+    group_add: ["44", "991"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    labels:
+      homelab.memwatch: stop
+      deunhealth.restart.on.unhealthy: "true"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    # image defaults: TENSORFOLD_CUDA_KERNELS, TF_FLASHNEXT_DEPTH=15, PM4 LD_LIBRARY_PATH, DEBUG_HIP_GRAPH_PM4=1,
+    # GPU_MAX_HW_QUEUES=1, HF_HUB_OFFLINE=1. Stock ROCm 10.0 runtime instead: LD_LIBRARY_PATH: "" and DEBUG_HIP_GRAPH_PM4: ""
+    environment:
+      TENSORFOLD_MEMORY_RESERVE_GIB: "12"
+    # read-only: the engine maps weights and the n-gram table, and writes nothing beside them
+    volumes:
+      - /home/dzannotti/models/qwen38fn-int4-autoround:/models/qwen38fn-int4-autoround:ro
+    command:
+      - serve
+      - /models/qwen38fn-int4-autoround
+      - --name=qwen3.8-flash-next
+      - --alias=ornith-1.5-35b
+      - --host=127.0.0.1
+      - --port=10001
+      - --context=262144
+      - --parallel=8
+      - --kv-dtype=fp8
+      - --thinking
+      - --backend=hip
+      - --no-update-check
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-m", "5", "http://127.0.0.1:10001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
