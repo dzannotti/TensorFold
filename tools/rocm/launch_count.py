@@ -13,7 +13,7 @@ import collections
 import csv
 import sys
 
-WB = ("_hc_writeback", "_hc_wbn", "_hc_wb_norm")
+WB = ("_hc_writeback", "_hc_wb_norm")
 
 
 def short(name: str) -> str:

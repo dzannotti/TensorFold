@@ -497,15 +497,13 @@ pub const Engine = struct {
         e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         e.f.act_sk = cuda.hip and !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.actSkAvailable(&e.set);
-        // HIP decode read-outs in 3 launches, not 6 (cuda_glue_dec.zig; TF_FLASHNEXT_DEC_FUSE=0 all off, each alone too)
+        // HIP decode glue in fewer launches (cuda_glue_dec.zig; TF_FLASHNEXT_DEC_FUSE=0 all off, each alone too)
         const dec = cuda.hip and !envOff("TF_FLASHNEXT_DEC_FUSE");
-        e.f.dec_wbn = dec and !envOff("TF_FLASHNEXT_DEC_WBN") and glue_dec.wbnAvailable(&e.set);
-        e.f.dec_act = dec and e.f.act_sk and !envOff("TF_FLASHNEXT_DEC_ACT") and glue_dec.actAvailable(&e.set);
         e.f.dec_upmix = dec and !envOff("TF_FLASHNEXT_DEC_UPMIX") and glue_dec.upMixAvailable(&e.set);
+        e.f.dec_finish = dec;
         e.f.reduce_ld = dec and !envOff("TF_FLASHNEXT_REDUCE_LD") and e.torch.f.reduce_ld != null;
         e.f.shared_ld = cuda.hip and !envOff("TF_FLASHNEXT_SHARED_LD");
         e.f.topk_plan = dec and !envOff("TF_FLASHNEXT_TOPK_PLAN") and e.torch.f.topk_plan != null;
-        if (dec and !envOff("TF_FLASHNEXT_DEC_TK") and glue_dec.tkAvailable(&e.set)) e.f.t.tick = e.f.sc.tick + glue_dec.tick_words * 4;
         if (envGet("TF_FLASHNEXT_DEC_BD")) |v| e.f.dec_bd = std.fmt.parseInt(usize, v, 10) catch glue_dec.bd_default;
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in

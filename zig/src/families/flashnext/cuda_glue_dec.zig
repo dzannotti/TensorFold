@@ -1,7 +1,7 @@
-//! HIP decode glue in fewer launches (src/tensorfold/families/qwen4_exp/cuda/glue_dec.py, docs/rocm/notes/fuse.md):
-//! a hyper-connection read-out takes 3 launches instead of 6 (`_hc_wbn`: write-back + norm; `_b16mm_sm_act`: the
-//! down projection with `_hc_act_sk` in its last program; `_hc_up_mix` at 16 rows: up + mix). Each gives the separate
-//! kernels' bytes; `check` (glue-check) compares them on random and edge inputs at decode rows and times both in graphs.
+//! HIP decode glue in fewer launches (docs/rocm/notes/fuse.md): `_hc_up_mix` at 16 rows (a read-out's up projection
+//! and mix), fn_ops' reduce_ld (`_reduce` + the strided copy) and topk_plan (`_topk_rows` + the one-block plan),
+//! fn_qmmf's SwiGLU epilogue (the shared expert's gate/up + SwiGLU). `check` (glue-check) compares each with the
+//! kernels it replaces, bytes, on random and edge inputs at decode rows, then times both in graphs.
 const std = @import("std");
 const cuda = @import("cuda");
 const aot = cuda.aot;
@@ -14,35 +14,11 @@ const fp8 = @import("cuda_fp8.zig");
 const bf16 = "*bf16";
 const f32p = "*fp32";
 
-/// The up + mix decode tile's columns a program (glue_dec: 16 or 32; TF_FLASHNEXT_DEC_BD).
+/// The up + mix decode tile's columns a program (16 or 32; TF_FLASHNEXT_DEC_BD).
 pub const bd_default: usize = 16;
-/// TICK words: (row tiles of 16) x (column tiles of 64); decode windows reach 128 rows, the down rows 324 columns.
-pub const tick_words: usize = 64;
-
-pub fn wbnAvailable(set: *const aot.Set) bool {
-    return set.smallestConst("_hc_wbn", "MODE", 0) != null;
-}
-
-pub fn actAvailable(set: *const aot.Set) bool {
-    return set.smallestConst("_b16mm_sm_act", "SK", 0) != null;
-}
-
-pub fn tkAvailable(set: *const aot.Set) bool {
-    return set.smallestConst("_b16mm_tk", "SK", 0) != null;
-}
 
 pub fn upMixAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_hc_up_mix", "BM", 16) == 16;
-}
-
-/// `_b16mm_sm_act`: the read-out's down projection (slice-major weight [SK, n, k / SK]) into its fp32 slices `part`,
-/// then `_hc_act_sk`'s act [m, low] and (n = low + streams) inject gates from them, a tile at a time; `tick`
-/// [tick_words] i32, zero (a ticket a (row, column) tile).
-pub fn downAct(t: tri.Tri, x: u64, x_stride: usize, w: u64, part: u64, act: u64, inject: ?u64, tick: u64, m: usize, n: usize, k: usize, streams: usize, low: usize) !void {
-    const sk = tri.b16SplitK(n, k);
-    const tl = tri.b16Tile(m, n, k);
-    if (tl.bm != 16 or sk < 2 or (m + 15) / 16 * ((n + tl.bn - 1) / tl.bn) > tick_words) return error.Invalid;
-    try t.run("_b16mm_sm_act", .{ (m + 15) / 16, (n + tl.bn - 1) / tl.bn, sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("PART", f32p, part), aot.ptr("ACT", bf16, act), aot.ptr("INJ", bf16, inject orelse act), aot.ptr("TICK", "*i32", tick), aot.int("M", @intCast(m)), aot.int("x_stride", @intCast(x_stride)) }, &.{ aot.ci("N", @intCast(n)), aot.ci("K", @intCast(k)), aot.ci("SK", @intCast(sk)), aot.ci("BM", 16), aot.ci("BLOCK_N", @intCast(tl.bn)), aot.ci("BK", @intCast(tl.bk)), aot.ci("S", @intCast(streams)), aot.ci("LOW", @intCast(low)), aot.ci("LOWP", @intCast(std.math.ceilPowerOfTwoAssert(usize, low))), aot.ci("HAS_INJ", @intFromBool(n == low + streams)) });
 }
 
 // -- glue-check: the fused kernels against the separate ones -------------------------------------------------------
@@ -85,9 +61,7 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
     defer bs.free();
     const h0 = try bs.get(d, max_m * S * D * 2);
     const ha = try bs.get(d, max_m * S * D * 2);
-    const hb = try bs.get(d, max_m * S * D * 2);
     const pa = try bs.get(d, max_m * NC * S * 4);
-    const pb = try bs.get(d, max_m * NC * S * 4);
     const na = try bs.get(d, max_m * S * D * 2);
     const nb = try bs.get(d, max_m * S * D * 2);
     const xs = try bs.get(d, max_m * S * D / 32 * 4);
@@ -100,17 +74,11 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
     const wdn = try bs.get(d, (LOW + S) * S * D * 2); // the down rows, slice-major [32, N, 320]
     const wup = try bs.get(d, S * D * LOW * 2);
     const parta = try bs.get(d, 32 * max_m * (LOW + S) * 4);
-    const partb = try bs.get(d, 32 * max_m * (LOW + S) * 4);
     const acta = try bs.get(d, max_m * LOW * 2);
-    const actb = try bs.get(d, max_m * LOW * 2);
     const ija = try bs.get(d, max_m * S * 2);
-    const ijb = try bs.get(d, max_m * S * 2);
     const up = try bs.get(d, max_m * S * D * 2);
-    const tick = try bs.get(d, tick_words * 4);
-    try tick.fill8(0, t.s.handle);
     var prng = std.Random.DefaultPrng.init(0x64_65_63);
     const r = prng.random();
-    const eps: f32 = 1e-6;
     var all = true;
     for ([_]prompt.Fill{ .normal, .wide, .edge, .special }) |fill| {
         const calm: prompt.Fill = if (fill == .special) .normal else fill;
@@ -131,119 +99,88 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
             .{ .name = "moe6 fp32", .br = .{ .moe = .{ .y = yf.ptr, .y_f32 = true, .wts = wts.ptr, .slots = 6 } } },
             .{ .name = "moe6 bf16", .br = .{ .moe = .{ .y = yb.ptr, .y_f32 = false, .wts = wts.ptr, .slots = 6 } } },
         };
-        for (rows_checked) |m| {
-            // write-back + norm: in place, and (a branch) into another buffer as finish does
-            for (kinds) |kd| for ([_]bool{ false, true }) |apart| {
-                if (apart and kd.br == .none) continue;
-                const inject: ?u64 = if (kd.br == .none) null else inj.ptr;
-                try ha.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
-                try hb.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
-                try pa.fill8(0xA5, t.s.handle);
-                try pb.fill8(0x5A, t.s.handle);
-                try na.fill8(0xA5, t.s.handle);
-                try nb.fill8(0x5A, t.s.handle);
-                try t.hcWriteback(ha.ptr, ha.ptr, pa.ptr, inject, kd.br, m, D, S);
-                try t.hcNormed(ha.ptr, pa.ptr, scale.ptr, na.ptr, xs.ptr, m, D, S, eps);
-                const out = if (apart) up.ptr else hb.ptr;
-                if (apart) try up.fill8(0x33, t.s.handle);
-                try t.hcWritebackNorm(hb.ptr, out, pb.ptr, inject, kd.br, m, D, S, .{ .scale = scale.ptr, .normed = nb.ptr, .eps = eps, .streams = true });
-                try t.s.synchronize();
-                var ok = try same(gpa, pa, pb, m * NC * S * 4) and try same(gpa, na, nb, m * S * D * 2);
-                ok = ok and try same(gpa, ha, if (apart) up else hb, m * S * D * 2);
-                if (apart) ok = ok and try same(gpa, h0, hb, m * S * D * 2); // the source rows untouched
-                if (!ok) all = false;
-                if (!ok or m == 1 or m == 128) std.debug.print("{s} _hc_wbn {s}{s} rows {d} {s}: streams, squared sums, normed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", kd.name, if (apart) " apart" else "", m, @tagName(fill) });
-            };
-            // down + act, with and without the inject gates; twice, so the second launch finds TICK at 0
-            for ([_]usize{ LOW + S, LOW }) |n| for (0..2) |rep| {
-                const inject: ?u64 = if (n == LOW + S) ija.ptr else null;
-                try acta.fill8(0xA5, t.s.handle);
-                try actb.fill8(0x5A, t.s.handle);
-                try ija.fill8(0xA5, t.s.handle);
-                try prompt.b16Slices("_b16mm_sm", t, h0.ptr, S * D, wdn.ptr, parta.ptr, true, m, n, S * D);
-                try t.hcActSk(parta.ptr, acta.ptr, xs.ptr, inject, m, n, S, LOW, 32);
-                const ia = try gpa.alloc(u8, m * S * 2);
-                defer gpa.free(ia);
-                try t.s.synchronize();
-                try ija.download(0, ia);
-                try ijb.fill8(0x5A, t.s.handle);
-                try downAct(t, h0.ptr, S * D, wdn.ptr, partb.ptr, actb.ptr, if (inject != null) ijb.ptr else null, tick.ptr, m, n, S * D, S, LOW);
-                try t.s.synchronize();
-                var ok = try same(gpa, parta, partb, 32 * m * n * 4) and try same(gpa, acta, actb, m * LOW * 2);
-                if (inject != null) {
-                    const ib = try gpa.alloc(u8, m * S * 2);
-                    defer gpa.free(ib);
-                    try ijb.download(0, ib);
-                    ok = ok and std.mem.eql(u8, ia, ib);
-                }
-                var tk: [tick_words]u32 = undefined;
-                try tick.download(0, std.mem.sliceAsBytes(&tk));
-                for (tk) |v| ok = ok and v == 0;
-                if (!ok) all = false;
-                if (!ok or (rep == 0 and (m == 1 or m == 128))) std.debug.print("{s} _b16mm_sm_act N {d} rows {d} {s}: slices, act, gates bytes, ticks back at 0\n", .{ if (ok) "EQUAL" else "DIFFER", n, m, @tagName(fill) });
-            };
-            // up + mix at 16 rows
-            for ([_]usize{ 16, 32 }) |bd| {
-                try na.fill8(0xA5, t.s.handle);
-                try nb.fill8(0x5A, t.s.handle);
-                try t.b16mm(acta.ptr, LOW, wup.ptr, up.ptr, false, 0, m, S * D, LOW);
-                try t.hcMix(up.ptr, h0.ptr, na.ptr, xs.ptr, m, D, S);
-                try prompt.upMixTile(t, acta.ptr, wup.ptr, h0.ptr, nb.ptr, m, D, S, LOW, 16, bd);
-                try t.s.synchronize();
-                const ok = try same(gpa, na, nb, m * D * 2);
-                if (!ok) all = false;
-                if (!ok or m == 1 or m == 128) std.debug.print("{s} _hc_up_mix BM 16 BD {d} rows {d} {s}: mixed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", bd, m, @tagName(fill) });
-            }
-        }
+        _ = kinds;
+        for (rows_checked) |m| for ([_]usize{ 16, 32 }) |bd| {
+            // up + mix at 16 rows against _b16mm + _hc_mix
+            try na.fill8(0xA5, t.s.handle);
+            try nb.fill8(0x5A, t.s.handle);
+            try t.b16mm(acta.ptr, LOW, wup.ptr, up.ptr, false, 0, m, S * D, LOW);
+            try t.hcMix(up.ptr, h0.ptr, na.ptr, xs.ptr, m, D, S);
+            try prompt.upMixTile(t, acta.ptr, wup.ptr, h0.ptr, nb.ptr, m, D, S, LOW, 16, bd);
+            try t.s.synchronize();
+            const ok = try same(gpa, na, nb, m * D * 2);
+            if (!ok) all = false;
+            if (!ok or m == 1 or m == 128) std.debug.print("{s} _hc_up_mix BM 16 BD {d} rows {d} {s}: mixed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", bd, m, @tagName(fill) });
+        };
+        try prompt.fillBuf(gpa, acta, max_m * LOW, r, calm);
     }
     if (!try reduceCheck(gpa, d, t, th)) all = false;
     if (!try topkCheck(gpa, d, t, th, ops)) all = false;
-    if (!try tkCheck(gpa, d, t)) all = false;
     if (!try swigluCheck(gpa, d, t, th, k8)) all = false;
-    for ([_]usize{ 1, 4, 16 }) |m| try bench(d, t, m, .{ .h = ha.ptr, .pss = pa.ptr, .inj = inj.ptr, .y = yb.ptr, .wts = wts.ptr, .scale = scale.ptr, .normed = na.ptr, .xs = xs.ptr, .wdn = wdn.ptr, .wup = wup.ptr, .part = parta.ptr, .act = acta.ptr, .ij = ija.ptr, .up = up.ptr, .mixed = nb.ptr, .tick = tick.ptr });
+    for ([_]usize{ 1, 4, 16 }) |m| try bench(d, t, m, .{ .h = ha.ptr, .pss = pa.ptr, .inj = inj.ptr, .y = yb.ptr, .wts = wts.ptr, .scale = scale.ptr, .normed = na.ptr, .xs = xs.ptr, .wdn = wdn.ptr, .wup = wup.ptr, .part = parta.ptr, .act = acta.ptr, .ij = ija.ptr, .up = up.ptr, .mixed = nb.ptr });
     return all;
 }
 
-const Ptrs = struct { h: u64, pss: u64, inj: u64, y: u64, wts: u64, scale: u64, normed: u64, xs: u64, wdn: u64, wup: u64, part: u64, act: u64, ij: u64, up: u64, mixed: u64, tick: u64 };
+const Ptrs = struct { h: u64, pss: u64, inj: u64, y: u64, wts: u64, scale: u64, normed: u64, xs: u64, wdn: u64, wup: u64, part: u64, act: u64, ij: u64, up: u64, mixed: u64 };
 
-/// One read-out (MoE branch, inject gates) the separate way (6 launches) or fused (3).
-fn readout(t: tri.Tri, m: usize, p: Ptrs, fused: bool) !void {
-    const br: tri.Branch = .{ .moe = .{ .y = p.y, .y_f32 = false, .wts = p.wts, .slots = 11 } };
-    if (fused) {
-        try t.hcWritebackNorm(p.h, p.h, p.pss, p.inj, br, m, D, S, .{ .scale = p.scale, .normed = p.normed, .eps = 1e-6, .streams = true });
-        try downAct(t, p.normed, S * D, p.wdn, p.part, p.act, p.ij, p.tick, m, LOW + S, S * D, S, LOW);
-        return prompt.upMixTile(t, p.act, p.wup, p.normed, p.mixed, m, D, S, LOW, 16, bd_default);
+/// One read-out (MoE branch, inject gates), the up projection and mix separate (6 launches) or in one (`bd` > 0: 5).
+const Readout = struct {
+    t: tri.Tri,
+    m: usize,
+    p: Ptrs,
+    bd: usize = 0,
+
+    fn run(r: Readout) !void {
+        const t = r.t;
+        const p = r.p;
+        const m = r.m;
+        const br: tri.Branch = .{ .moe = .{ .y = p.y, .y_f32 = false, .wts = p.wts, .slots = 11 } };
+        try t.hcWriteback(p.h, p.h, p.pss, p.inj, br, m, D, S);
+        try t.hcNormed(p.h, p.pss, p.scale, p.normed, p.xs, m, D, S, 1e-6);
+        try prompt.b16Slices("_b16mm_sm", t, p.normed, S * D, p.wdn, p.part, true, m, LOW + S, S * D);
+        try t.hcActSk(p.part, p.act, p.xs, p.ij, m, LOW + S, S, LOW, 32);
+        if (r.bd > 0) return prompt.upMixTile(t, p.act, p.wup, p.normed, p.mixed, m, D, S, LOW, 16, r.bd);
+        try t.b16mm(p.act, LOW, p.wup, p.up, false, 0, m, S * D, LOW);
+        try t.hcMix(p.up, p.normed, p.mixed, p.xs, m, D, S);
     }
-    try t.hcWriteback(p.h, p.h, p.pss, p.inj, br, m, D, S);
-    try t.hcNormed(p.h, p.pss, p.scale, p.normed, p.xs, m, D, S, 1e-6);
-    try prompt.b16Slices("_b16mm_sm", t, p.normed, S * D, p.wdn, p.part, true, m, LOW + S, S * D);
-    try t.hcActSk(p.part, p.act, p.xs, p.ij, m, LOW + S, S, LOW, 32);
-    try t.b16mm(p.act, LOW, p.wup, p.up, false, 0, m, S * D, LOW);
-    try t.hcMix(p.up, p.normed, p.mixed, p.xs, m, D, S);
+};
+
+/// `n` runs of `job` captured in one graph: the best ms a replay of 7 batches of 10.
+fn graphMs(d: *const cuda.Driver, s: cuda.Stream, job: anytype, n: usize) !f32 {
+    try cuda.graph.beginCapture(s, .thread_local);
+    for (0..n) |_| try job.run();
+    var g = try cuda.graph.endCapture(s);
+    defer g.deinit();
+    var x = try g.instantiate();
+    defer x.deinit();
+    var e0 = try cuda.Event.init(d, true);
+    defer e0.deinit();
+    var e1 = try cuda.Event.init(d, true);
+    defer e1.deinit();
+    try x.launchOn(s);
+    var best: f32 = std.math.inf(f32);
+    for (0..7) |_| { // the GPU may be shared: the best of 7 batches
+        try e0.record(s);
+        for (0..10) |_| try x.launchOn(s);
+        try e1.record(s);
+        try e1.synchronize();
+        best = @min(best, try cuda.Event.elapsedMs(e0, e1) / 10);
+    }
+    return best;
 }
 
-/// 96 read-outs (a decode round's) captured in a graph each way, replayed; ms a replay.
+/// 96 read-outs (a decode round's) each way in a graph.
 fn bench(d: *const cuda.Driver, t: tri.Tri, m: usize, p: Ptrs) !void {
-    var ms: [2]f32 = undefined;
-    for ([_]bool{ false, true }, 0..) |fused, i| {
-        try cuda.graph.beginCapture(t.s, .thread_local);
-        for (0..96) |_| try readout(t, m, p, fused);
-        var g = try cuda.graph.endCapture(t.s);
-        defer g.deinit();
-        var x = try g.instantiate();
-        defer x.deinit();
-        var e0 = try cuda.Event.init(d, true);
-        defer e0.deinit();
-        var e1 = try cuda.Event.init(d, true);
-        defer e1.deinit();
-        try x.launchOn(t.s);
-        try e0.record(t.s);
-        for (0..20) |_| try x.launchOn(t.s);
-        try e1.record(t.s);
-        try e1.synchronize();
-        ms[i] = try cuda.Event.elapsedMs(e0, e1) / 20;
-    }
-    std.debug.print("bench 96 read-outs in a graph, {d} rows: 6 launches each {d:.3} ms, fused 3 {d:.3} ms (saves {d:.3} ms)\n", .{ m, ms[0], ms[1], ms[0] - ms[1] });
+    var ms: [3]f32 = undefined;
+    for ([_]Readout{ .{ .t = t, .m = m, .p = p }, .{ .t = t, .m = m, .p = p, .bd = 16 }, .{ .t = t, .m = m, .p = p, .bd = 32 } }, &ms) |job, *v| v.* = try graphMs(d, t.s, job, 96);
+    std.debug.print("bench 96 read-outs in a graph, {d} rows, ms: separate {d:.3}, up + mix BD 16 {d:.3}, BD 32 {d:.3}\n", .{ m, ms[0], ms[1], ms[2] });
+}
+
+/// Two ways of one step, 96 of each in a graph: ms a replay each.
+fn benchPair(d: *const cuda.Driver, s: cuda.Stream, what: []const u8, m: usize, a: anytype, b: anytype) !void {
+    const x = try graphMs(d, s, a, 96);
+    const y = try graphMs(d, s, b, 96);
+    std.debug.print("bench 96 {s} in a graph, {d} rows: separate {d:.3} ms, fused {d:.3} ms\n", .{ what, m, x, y });
 }
 
 /// fn_ops reduce_ld against `_reduce` + the strided copy: a projection's split bf16 columns (DeltaNet b|a 96, the
@@ -279,6 +216,31 @@ fn reduceCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: to
             if (!ok or m == 1 or m == 128) std.debug.print("{s} reduce_ld N {d} SK {d} rows {d} {s}: rows bytes\n", .{ if (ok) "EQUAL" else "DIFFER", n, sk, m, @tagName(fill) });
         };
     }
+    const J = struct {
+        t: tri.Tri,
+        th: tops.Torch,
+        x: u64,
+        w: u64,
+        part: u64,
+        pb: u64,
+        out: u64,
+        m: usize,
+        fused: bool,
+        fn run(j: @This()) !void {
+            if (j.fused) {
+                try prompt.b16Slices("_b16mm", j.t, j.x, K, j.w, j.part, false, j.m, 96, K);
+                return j.th.reduceLd(j.part, j.out, j.m, 96, 8, ldo);
+            }
+            try j.t.b16mm(j.x, K, j.w, j.pb, false, j.part, j.m, 96, K);
+            try j.th.slotCopy(j.pb, 96 * 2, j.out, ldo * 2, 96 * 2, j.m);
+        }
+    };
+    for ([_]usize{ 1, 4, 16 }) |m| {
+        const j: J = .{ .t = t, .th = th, .x = x.ptr, .w = w.ptr, .part = part.ptr, .pb = pb.ptr, .out = oa.ptr, .m = m, .fused = false };
+        var j2 = j;
+        j2.fused = true;
+        try benchPair(d, t.s, "b|a projections (reduce_ld)", m, j, j2);
+    }
     return all;
 }
 
@@ -288,7 +250,7 @@ fn topkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
     var bs: Bufs = .{};
     defer bs.free();
     const E: usize = 512;
-    const rows_max: usize = 93;
+    const rows_max: usize = 128;
     const logits = try bs.get(d, rows_max * (E + 1) * 4);
     var out: [2][5]cuda.DeviceBuffer = undefined;
     const sizes = [5]usize{ 1024 * 4, 1024 * 4, 1024 * 4, (1024 + E + 1) * 3 * 4, 64 };
@@ -319,56 +281,25 @@ fn topkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
             if (!ok or m == 1 or m == 64) std.debug.print("{s} topk_plan top {d} rows {d} {s}: picks, weights, members, items, counts bytes\n", .{ if (ok) "EQUAL" else "DIFFER", top, m, kind });
         };
     }
-    return all;
-}
-
-/// `_b16mm_tk` against `_b16mm` + `_reduce` (+ the strided copy for rows ldo apart): the decode shapes with split K
-/// (DeltaNet b|a into its rows, the MTP head's fc_e / o_proj, fast-fp8's inject rows), bf16 and fp32 out, each twice
-/// (the second launch finds the tickets at 0).
-fn tkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
-    var bs: Bufs = .{};
-    defer bs.free();
-    const kmax: usize = 10240;
-    const x = try bs.get(d, max_m * kmax * 2);
-    const w = try bs.get(d, 2560 * 6144 * 2);
-    const part = try bs.get(d, 32 * max_m * 2560 * 4);
-    const ref = try bs.get(d, max_m * 2560 * 4);
-    const oa = try bs.get(d, max_m * 17000 * 4);
-    const ob = try bs.get(d, max_m * 17000 * 4);
-    const tick = try bs.get(d, tri.Tri.tk_words * 4);
-    try tick.fill8(0, t.s.handle);
-    var tt = t;
-    tt.tick = tick.ptr;
-    var prng = std.Random.DefaultPrng.init(0x74_6b_6b);
-    const r = prng.random();
-    const shapes = [_]struct { n: usize, k: usize, ldo: usize, fp32: bool }{
-        .{ .n = 96, .k = 2560, .ldo = 16480, .fp32 = false },
-        .{ .n = 640, .k = 2560, .ldo = 13952, .fp32 = false },
-        .{ .n = 2560, .k = 2560, .ldo = 2560, .fp32 = false },
-        .{ .n = 2560, .k = 6144, .ldo = 2560, .fp32 = false },
-        .{ .n = 4, .k = 10240, .ldo = 4, .fp32 = true },
-        .{ .n = 320, .k = 10240, .ldo = 320, .fp32 = true },
+    const J = struct {
+        t: tri.Tri,
+        th: tops.Torch,
+        ops: kern.Ops,
+        l: u64,
+        o: [5]u64,
+        m: usize,
+        fused: bool,
+        fn run(j: @This()) !void {
+            if (j.fused) return j.th.topkPlan(j.l, j.m, E, E + 1, 10, j.o[0], j.o[1], kern.plan_tile, j.o[2], j.o[3], j.o[4]);
+            try j.t.topkRows(j.l, j.o[0], j.o[1], j.m, E, 10);
+            try j.ops.plan(j.o[0], j.m * 11, E + 1, kern.plan_tile, .{ .members = j.o[2], .items = j.o[3], .counts = j.o[4], .rank = 0, .hist = 0 });
+        }
     };
-    var all = true;
-    for ([_]prompt.Fill{ .normal, .wide, .cancel, .edge, .special }) |fill| {
-        try prompt.fillBuf(gpa, x, max_m * kmax, r, fill);
-        try prompt.fillBuf(gpa, w, 2560 * 6144, r, if (fill == .special) .normal else fill);
-        for (shapes) |c| for (rows_checked) |m| {
-            if (!tt.tickFits("_b16mm", m, c.n, c.k)) continue;
-            const es: usize = if (c.fp32) 4 else 2;
-            try oa.fill8(0x11, t.s.handle);
-            try ob.fill8(0x11, t.s.handle);
-            try t.b16mm(x.ptr, c.k, w.ptr, ref.ptr, c.fp32, part.ptr, m, c.n, c.k);
-            for (0..m) |row| try oa.copyFrom(row * c.ldo * es, ref.ptr + row * c.n * es, c.n * es, t.s.handle);
-            for (0..2) |_| try tt.b16mmTk(x.ptr, c.k, w.ptr, ob.ptr, c.ldo, c.fp32, part.ptr, m, c.n, c.k);
-            try t.s.synchronize();
-            var ok = try same(gpa, oa, ob, m * c.ldo * es);
-            var tk: [tri.Tri.tk_words]u32 = undefined;
-            try tick.download(0, std.mem.sliceAsBytes(&tk));
-            for (tk) |v| ok = ok and v == 0;
-            if (!ok) all = false;
-            if (!ok or m == 1 or m == 128) std.debug.print("{s} _b16mm_tk N {d} K {d} ldo {d} {s} rows {d} {s}: rows bytes, ticks back at 0\n", .{ if (ok) "EQUAL" else "DIFFER", c.n, c.k, c.ldo, if (c.fp32) "fp32" else "bf16", m, @tagName(fill) });
-        };
+    for ([_]usize{ 1, 4, 16 }) |m| {
+        const j: J = .{ .t = t, .th = th, .ops = ops, .l = logits.ptr, .o = .{ out[0][0].ptr, out[0][1].ptr, out[0][2].ptr, out[0][3].ptr, out[0][4].ptr }, .m = m, .fused = false };
+        var j2 = j;
+        j2.fused = true;
+        try benchPair(d, t.s, "top-k + plans", m, j, j2);
     }
     return all;
 }
@@ -440,6 +371,29 @@ fn swigluCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: to
                 if (!ok or m == 1 or m == 32 or m == 128) std.debug.print("{s} shared SwiGLU n {d} rows {d} {s}: act bytes (interleaved + fn_ops{s})\n", .{ if (ok) "EQUAL" else "DIFFER", n, m, @tagName(fill), if (fused) ", matmulSwiglu" else "" });
             }
         }
+        const J = struct {
+            k8: *const fp8.Kernels,
+            th: tops.Torch,
+            s: cuda.Stream,
+            x: u64,
+            l: [2]fp8.Linear,
+            g: u64,
+            act: u64,
+            m: usize,
+            w: usize,
+            fused: bool,
+            fn run(j: @This()) !void {
+                if (j.fused) return fp8.matmulSwiglu(j.k8, j.s, j.x, K, j.l[1], j.act, j.m);
+                try fp8.matmul(j.k8, j.s, j.x, K, j.l[0], j.g, false, j.m);
+                try j.th.sharedSwiglu(j.g, j.act, j.m, j.w, j.w);
+            }
+        };
+        if (n == 2560) for ([_]usize{ 1, 4, 16 }) |m| {
+            const j: J = .{ .k8 = k8, .th = th, .s = t.s, .x = x.ptr, .l = lin, .g = g.ptr, .act = acts[0].ptr, .m = m, .w = w, .fused = false };
+            var j2 = j;
+            j2.fused = true;
+            try benchPair(d, t.s, "shared gate/up + SwiGLU", m, j, j2);
+        };
     }
     return all;
 }
