@@ -325,29 +325,38 @@ def run_check(aot: Path, cases: str, n_bench: int, specs: list[Path]) -> int:
 
 
 def kv8_cases(F, z) -> None:
-    """--kv-dtype fp8 (kv8.py): three rows written by _attn_prep8 into uint8 caches, then attended by _chunks8."""
+    """--kv-dtype fp8 (kv8.py): M rows (ROWS) written by _attn_prep8 into uint8 caches, then attended by _chunks8:
+    dense rows near the start, and at 262144 keys sparse rows (the indexer's selected blocks and tail) far in."""
 
     import torch
 
     from tensorfold.families.qwen4_exp.cuda import kv8
 
-    D, HD, NI, IHD, HALF, EPS, r = F.D, F.HD, F.NI, F.IHD, F.HALF, F.EPS, 3
+    D, HD, NI, IHD, HALF, EPS = F.D, F.HD, F.NI, F.IHD, F.HALF, F.EPS
     for world, rk in F.RANKS.items():
         heads, kv = rk["heads"], rk["kv"]
         pw = heads * 2 * HD + 2 * kv * HD + (NI + 1) * IHD
-        for capacity in (1024, 262144):
+        for capacity, p0 in ((1024, 5), (262144, 5), (262144, 200000)):
             kc = torch.zeros((capacity, kv, HD + kv8.PAD), dtype=torch.uint8, device="cuda")
             vc = torch.zeros((capacity, kv, HD), dtype=torch.uint8, device="cuda")
-            ikc, pos0 = z((capacity, IHD)), torch.full((1,), 5, dtype=torch.int32, device="cuda")
-            q, iq = z((r, heads, HD)), z((r, NI, IHD))
-            kv8.attn_prep(z((r, pw)), pos0, z((HD,), torch.float32), z((HD,), torch.float32), z((IHD,), torch.float32),
-                          z((HALF,), torch.float32), q, kc, vc, iq, ikc, EPS, q_heads=heads, kv_heads=kv, head_dim=HD,
-                          index_heads=NI, index_dim=IHD)
-            sc = F.attn_mod.AttnScratch(r, heads, HD, capacity, "cuda")
-            if sc.qsa:
-                F.attn_mod.qsa_select(iq, ikc, z((-(-capacity // 4), IHD)), pos0, z((IHD,), torch.float32),
-                                      z((HALF,), torch.float32), EPS, sc, r, context=8192)
-            kv8.attention(q, kc, vc, pos0, sc, r, HD ** -0.5, context=8192 if sc.qsa else None)
+            ikc, pos0 = z((capacity, IHD)), torch.full((1,), p0, dtype=torch.int32, device="cuda")
+            if p0 > 5:                      # the positions before p0: written once, untraced
+                kc[:p0], vc[:p0] = kv8.quantize(z((p0, kv, HD)), z((p0, kv, HD)))
+            for r in ROWS:
+                if p0 + r > capacity:
+                    continue
+                q, iq = z((r, heads, HD)), z((r, NI, IHD))
+                kv8.attn_prep(z((r, pw)), pos0, z((HD,), torch.float32), z((HD,), torch.float32),
+                              z((IHD,), torch.float32), z((HALF,), torch.float32), q, kc, vc, iq, ikc, EPS,
+                              q_heads=heads, kv_heads=kv, head_dim=HD, index_heads=NI, index_dim=IHD)
+                sc = F.attn_mod.AttnScratch(r, heads, HD, capacity, "cuda")
+                ctx = p0 + r
+                if sc.qsa:
+                    F.attn_mod.qsa_select(iq, ikc, z((-(-capacity // 4), IHD)), pos0, z((IHD,), torch.float32),
+                                          z((HALF,), torch.float32), EPS, sc, r, context=ctx)
+                kv8.attention(q, kc, vc, pos0, sc, r, HD ** -0.5, context=ctx)
+            del kc, vc, ikc
+            torch.cuda.empty_cache()
 
 
 ROWS = (1, 3, 16, 17, 129, 161, 2049)
