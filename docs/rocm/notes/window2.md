@@ -179,22 +179,32 @@ Server (tensorfold-native, Mia's flags, side off, product 0.1 everywhere, `~/tf-
 | stock, product 0.1, side off | 69.1 / 69.3 / 69.3 / 69.4 | 208.1 | 108.6 / 109.0 / 109.0 / 109.1 | 263.3 | 1,013 |
 | PM4, product 0.1, side off | 69.0 / 69.2 / 69.2 / 69.1 | 205.2 | 104.2 / 104.8 / 104.6 / 104.5 | 261.2 | 1,024 |
 
-  So in the server PM4 gains nothing (prose) or loses 4% (code), while the CLI gains 6%. Cause: a retained list is
-  prepared on a graph exec's first launch (encode ~44k dwords + executable allocation): 12.7 ms a preparation
-  (AMD_LOG_LEVEL=3 timestamps, logging included; a plain launch 4.5 us), and the server re-instantiates its graphs
-  for every request (TF_FLASHNEXT_GRAPH_LOG: ~25 captures a request, live graphs stay at 11-18 although the sequence
-  pool is on). ~25 x 12.7 ms = ~0.3 s a request, about the GPU time PM4 saves. GPU_MAX_HW_QUEUES (1 or 4) changes
-  nothing. Fix: keep a sequence's decode graphs across requests (why the pool recaptures is the open engine
-  question), or cache prepared lists by packet content in the runtime.
-- The draft policy alone (stock, product 0.1) is the server's real win: prose x1 57.1 -> 69.3 (+21%, above thorim's
-  65.2), prose x8 +6%, code x8 +4%, code x1 flat (CLI +5.6%; the server's per-request recaptures grow with the
-  number of distinct window sizes the deeper chains meet).
+  So in the server PM4 gained nothing (prose) or lost 4% (code), while the CLI gained 6%. Cause: a retained list
+  is prepared on a graph exec's first launch (encode ~44k dwords + executable allocation): 12.7 ms a preparation
+  (AMD_LOG_LEVEL=3 timestamps, logging included; a plain launch 4.5 us), and the server recaptured its decode graphs
+  for every request (TF_FLASHNEXT_GRAPH_LOG: ~25 captures a request over 20 requests). Root cause in the engine:
+  `newSeq` pooled a sequence only when prompt + max_tokens + window >= 8192 rows (`limit >= grow_step`), so
+  bench.py's 256-token requests never reused a pooled sequence or its graphs. GPU_MAX_HW_QUEUES (1 or 4) is irrelevant.
+
+**Fix: branch `w2-pool` b0c3cdc** (worktree `/home/dzannotti/tf-w2pool`, 3 lines in cuda_engine.zig `newSeq`): every
+request is poolable; a poolable sequence maps the whole first growth step (as a pooled one holds). Built with
+aot-final; `zig build test -Dgpu=hip -Daot-set=aot-final` 21/21. Server, product 0.1, side off:
+- contracts.py a-d: 54 pass / 0 fail / 6 unchecked with PM4 and with stock; decode shas unchanged
+  (prose 2880d0cb0fce, code 70ac5c54fa9a); captures stop after the first requests (50 in 12 requests).
+- x1, 6 reps, two alternated sessions each (steady reps): stock prose 70.8 / code 113.3 (was 69.3 / 109.0); PM4
+  prose **76.1** / code **120.4** (was 69.2 / 104.6). bench.py full (median of 3, incl. a warming rep): PM4 prose
+  75.3 / 209.3 (x8), code 114.5 / 266.9, 8k prefill 1,011, 32k 1,147; stock 70.8 / 207.6, 113.3 / 268.7, 1,060, 1,135.
+
+Server vs candidate defaults (cand-results.md 57.1 / 197.1 / 109.4 / 254.0): product 0.1 + pool fix + PM4 = prose x1
+76.1 (+33%, thorim 65.2), code x1 120.4 (+10%, thorim 122.7), prose x8 209 (+6%), code x8 267 (+5%). x8 in the
+server stays ~13% below the CLI's (240 / 301): not investigated.
 
 ## Recommendations
 1. HIP served defaults: running product 0.1 at every stream count (`TF_FLASHNEXT_CONFIDENCE=-0.1
    TF_FLASHNEXT_PRODUCT_STREAMS=8`, depth 15); in code a HIP branch of served_confidence / product_streams_default.
-2. Retained PM4 is usable with `TF_FLASHNEXT_SHARED_SIDE=0` (same bits, contracts pass). Ship it only after graphs
-   survive across requests (or a runtime prepared-list cache); until then it pays off in long single-stream decodes
-   only. Upstream report for pwilkin: PM4 batches in multi-segment (forked-stream) graphs hang on the first replay;
+2. Merge w2-pool b0c3cdc (short requests pooled). Then retained PM4 with `TF_FLASHNEXT_SHARED_SIDE=0` is a +7%
+   single-stream win in the server (same bits, contracts pass, flat at x8); it needs the out-of-tree runtime
+   (tf-rt-libs/pm4 + core-10.1 on LD_LIBRARY_PATH, DEBUG_HIP_GRAPH_PM4=1, GPU_MAX_HW_QUEUES=1). Each new graph still
+   costs a ~10 ms list preparation on first replay (first request after load, new context buckets). Upstream report for pwilkin: PM4 batches in multi-segment (forked-stream) graphs hang on the first replay;
    repro = any graph that forks a stream deeper than the collapse limit (max_level > 4).
 3. With the side stream off, rocprofv3 works in graph mode: use it for gap analysis (GPU idle ~10% a decode round).
