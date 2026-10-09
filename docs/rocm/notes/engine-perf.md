@@ -83,3 +83,21 @@ on the NVMe queue. Full model, table pages dropped first (POSIX_FADV_DONTNEED), 
 `/home/dzannotti/tf-engine-scratch/fullcheck.sh [123]` (memwatch, one process at a time, ~12 min):
 1 CLI sky drafted == plain; 2 cold-table first prefill, warm on vs off (drops only ple-table pages with
 POSIX_FADV_DONTNEED; reports load time and rep 0 / rep 1 prefill); 3 bench-many x1/x8 prose+code base vs new.
+
+## Sequence pool (branch perf-pool, b53eedf; full model 2026-10-09 ~05:00, server --parallel 8, fp8 KV, aot-hip3)
+Freed sequences (up to --parallel) wait in the engine with their graphs: caches trimmed to one growth step
+(Region.trimTo), graphs past the first context bucket dropped, zeroed and reset on reuse. TF_FLASHNEXT_SEQ_POOL=0 off.
+Same binary, pool off -> on, bench.py --prefill '' --clients 1,8 --reps 3 (medians, aggregate tok/s):
+
+| | pool off | pool on |
+|---|---:|---:|
+| prose x1 | 51.3 | 51.3 |
+| prose x8 | 157.3 | 157.5 |
+| code x1 | 92.8 | 94.3 |
+| code x8 | 186.1 | 203.0 |
+
+Time to first token also drops (prose x1 141 -> 110 ms, code x8 797 -> 734 ms). contracts.py --only a,b,c with the pool:
+50 pass, 0 fail, 6 unchecked (the same resume cases the window run leaves unchecked: the harness's fresh baseline was
+itself resumed); every resume/shared case's cached sha equals its fresh one. View: gate-many x8 --against-solo 24/24
+with and without the pool, every stream's sha/rounds/accepted equal to the base build. Not done: prewarming the
+pool's graphs at load (~48 captures a sequence; x1 gains little, the first requests pay as before).

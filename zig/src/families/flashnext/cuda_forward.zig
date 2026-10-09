@@ -101,6 +101,9 @@ pub const Seq = struct {
     held_par: u1 = 0,
     /// the prompt's images and video frames (null: text)
     media: ?SeqMedia = null,
+    /// its address space reserved for the engine's whole window: freed, it may wait in the engine's pool with its
+    /// captured graphs for the next request (Engine.freeSeq)
+    poolable: bool = false,
 
     /// The sequence's rotary table, when its prompt has images or video.
     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
