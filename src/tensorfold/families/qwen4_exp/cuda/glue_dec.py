@@ -64,13 +64,28 @@ try:
             tl.store(NORMED + r * (S * D) + s * D + d, (hv * rinv * w).to(tl.bfloat16))
 
     @triton.jit
+    def _slices(PART, at, mask, M, N: tl.constexpr, SK: tl.constexpr):
+        """``bf16._reduce``'s sum of a tile's SK fp32 slices (slice 0, then + slice s in order), the loads U at a time
+        in flight (read past the caches: other programs wrote them)."""
+
+        U: tl.constexpr = 8 if SK > 8 else SK
+        tot = tl.load(PART + at, mask=mask, other=0.0, cache_modifier=".cv")
+        for s0 in range(0, SK // U):
+            for u in tl.static_range(U):
+                s = s0 * U + u
+                v = tl.load(PART + s * (M * N) + at, mask=mask, other=0.0, cache_modifier=".cv")
+                tot = tl.where(s > 0, tot + v, tot)
+        return tot
+
+    @triton.jit
     def _b16mm_sm_act(X, W, PART, ACT, INJ, TICK, M, x_stride,
                       N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
                       BLOCK_N: tl.constexpr, BK: tl.constexpr, S: tl.constexpr, LOW: tl.constexpr,
                       LOWP: tl.constexpr, HAS_INJ: tl.constexpr):
-        """``bf16._b16mm_sm`` (SK > 1: its fp32 slices into PART [SK, M, N]), then the row tile's last program to
-        finish runs ``glue._hc_act_sk`` on the tile's rows (slices in slice order, act and the inject gates; no
-        32-group sums). TICK [row tiles] int32 counts finished programs and is left at 0 for the next launch."""
+        """``bf16._b16mm_sm`` (SK > 1: its fp32 slices into PART [SK, M, N]), then each (rows, columns) tile's last
+        program to finish runs ``glue._hc_act_sk`` on the tile (slices in slice order; act on columns < LOW, the
+        inject gates on LOW .. LOW + S; no 32-group sums: elementwise, so a tile at a time). TICK [row tiles, column
+        tiles] int32 counts finished programs and is left at 0 for the next launch."""
 
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -88,31 +103,20 @@ try:
             x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
             w = tl.load(W + pid_s * (N * KS) + rn[:, None] * KS + (i * BK + rk)[None, :], mask=n_ok[:, None], other=0.0)
             acc = tl.dot(x, tl.trans(w), acc)
-        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=m_ok[:, None] & n_ok[None, :])
+        mask = m_ok[:, None] & n_ok[None, :]
+        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=mask)
         # every wave's stores done before the ticket (the barrier's release), the last program reads past the caches
         tl.debug_barrier()
-        tiles = tl.num_programs(1) * tl.num_programs(2)
-        t = tl.atomic_add(TICK + pid_m, 1, sem="acq_rel", scope="gpu")
-        if t == tiles - 1:
-            tl.atomic_xchg(TICK + pid_m, 0, sem="relaxed", scope="gpu")
-            j = tl.arange(0, LOWP)
-            ok = j < LOW
-            r1 = tl.minimum(pid_m * BM + BM, M)
-            for r in range(pid_m * BM, r1):
-                v = tl.load(PART + r * N + j, mask=ok, other=0.0, cache_modifier=".cv")
-                for s_ in range(1, SK):
-                    v = v + tl.load(PART + (s_ * M + r) * N + j, mask=ok, other=0.0, cache_modifier=".cv")
-                v = (v / S).to(tl.bfloat16).to(tl.float32)
-                a = _bsilu(v)
-                a = tl.where(ok, a, 0.0)
-                tl.store(ACT + r * LOW + j, a.to(tl.bfloat16), mask=ok)
-                if HAS_INJ:
-                    sv = tl.arange(0, S)
-                    iv = tl.load(PART + r * N + LOW + sv, cache_modifier=".cv")
-                    for s_ in range(1, SK):
-                        iv = iv + tl.load(PART + (s_ * M + r) * N + LOW + sv, cache_modifier=".cv")
-                    iv = (iv / S).to(tl.bfloat16).to(tl.float32)
-                    tl.store(INJ + r * S + sv, (2.0 * _bsig(iv)).to(tl.bfloat16))
+        tick = TICK + pid_m * tl.num_programs(1) + pid_n
+        t = tl.atomic_add(tick, 1, sem="acq_rel", scope="gpu")
+        if t == SK - 1:
+            tl.atomic_xchg(tick, 0, sem="relaxed", scope="gpu")
+            v = _slices(PART, rm[:, None] * N + rn[None, :], mask, M, N, SK)
+            v = (v / S).to(tl.bfloat16).to(tl.float32)
+            tl.store(ACT + rm[:, None] * LOW + rn[None, :], _bsilu(v).to(tl.bfloat16), mask=mask & (rn < LOW)[None, :])
+            if HAS_INJ:
+                gate = (2.0 * _bsig(v)).to(tl.bfloat16)
+                tl.store(INJ + rm[:, None] * S + (rn - LOW)[None, :], gate, mask=mask & (rn >= LOW)[None, :])
 
     @triton.jit
     def _b16mm_tk(X, W, OUT, PART, TICK, M, x_stride, ldo,
@@ -145,10 +149,7 @@ try:
         t = tl.atomic_add(tick, 1, sem="acq_rel", scope="gpu")
         if t == SK - 1:
             tl.atomic_xchg(tick, 0, sem="relaxed", scope="gpu")
-            at = rm[:, None] * N + rn[None, :]
-            tot = tl.load(PART + at, mask=mask, other=0.0, cache_modifier=".cv")
-            for s in range(1, SK):
-                tot = tot + tl.load(PART + s * (M * N) + at, mask=mask, other=0.0, cache_modifier=".cv")
+            tot = _slices(PART, rm[:, None] * N + rn[None, :], mask, M, N, SK)
             tl.store(OUT + rm[:, None] * ldo + rn[None, :], tot if F32 else tot.to(tl.bfloat16), mask=mask)
 except ModuleNotFoundError:
     HAS_TRITON = False

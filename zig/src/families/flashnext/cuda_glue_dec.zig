@@ -15,7 +15,7 @@ const f32p = "*fp32";
 
 /// The up + mix decode tile's columns a program (glue_dec: 16 or 32; TF_FLASHNEXT_DEC_BD).
 pub const bd_default: usize = 16;
-/// TICK words (row tiles of 16): decode windows reach 128 rows.
+/// TICK words: (row tiles of 16) x (column tiles of 64); decode windows reach 128 rows, the down rows 324 columns.
 pub const tick_words: usize = 64;
 
 pub fn wbnAvailable(set: *const aot.Set) bool {
@@ -35,11 +35,12 @@ pub fn upMixAvailable(set: *const aot.Set) bool {
 }
 
 /// `_b16mm_sm_act`: the read-out's down projection (slice-major weight [SK, n, k / SK]) into its fp32 slices `part`,
-/// then `_hc_act_sk`'s act [m, low] and (n = low + streams) inject gates from them; `tick` [tick_words] i32, zero.
+/// then `_hc_act_sk`'s act [m, low] and (n = low + streams) inject gates from them, a tile at a time; `tick`
+/// [tick_words] i32, zero (a ticket a (row, column) tile).
 pub fn downAct(t: tri.Tri, x: u64, x_stride: usize, w: u64, part: u64, act: u64, inject: ?u64, tick: u64, m: usize, n: usize, k: usize, streams: usize, low: usize) !void {
     const sk = tri.b16SplitK(n, k);
     const tl = tri.b16Tile(m, n, k);
-    if (tl.bm != 16 or sk < 2 or (m + 15) / 16 > tick_words) return error.Invalid;
+    if (tl.bm != 16 or sk < 2 or (m + 15) / 16 * ((n + tl.bn - 1) / tl.bn) > tick_words) return error.Invalid;
     try t.run("_b16mm_sm_act", .{ (m + 15) / 16, (n + tl.bn - 1) / tl.bn, sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("PART", f32p, part), aot.ptr("ACT", bf16, act), aot.ptr("INJ", bf16, inject orelse act), aot.ptr("TICK", "*i32", tick), aot.int("M", @intCast(m)), aot.int("x_stride", @intCast(x_stride)) }, &.{ aot.ci("N", @intCast(n)), aot.ci("K", @intCast(k)), aot.ci("SK", @intCast(sk)), aot.ci("BM", 16), aot.ci("BLOCK_N", @intCast(tl.bn)), aot.ci("BK", @intCast(tl.bk)), aot.ci("S", @intCast(streams)), aot.ci("LOW", @intCast(low)), aot.ci("LOWP", @intCast(std.math.ceilPowerOfTwoAssert(usize, low))), aot.ci("HAS_INJ", @intFromBool(n == low + streams)) });
 }
 
