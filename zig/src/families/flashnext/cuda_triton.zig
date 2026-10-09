@@ -692,8 +692,10 @@ fn expectLaunches(f: *const Fixture, id: []const u8, rec: *const Recorder) !void
     for (want, rec.launches[0..rec.n]) |w, got| {
         const o = w.object;
         try testing.expectEqualStrings(o.get("fn").?.string, got.name);
+        // HIP launches bf16.matmul's gfx1151 tile (b16Tile; hip_tune.tile): its grid and tile constexprs differ
+        const tiled = cuda.hip and std.mem.eql(u8, got.name, "_b16mm");
         const grid = o.get("grid").?.array.items;
-        for (grid, got.grid) |g, x| try testing.expectEqual(jsonInt(g), @as(i64, x));
+        if (!tiled) for (grid, got.grid) |g, x| try testing.expectEqual(jsonInt(g), @as(i64, x));
         const args = o.get("args").?.array.items;
         try testing.expectEqual(args.len, got.nargs);
         for (args) |arg| {
@@ -734,6 +736,7 @@ fn expectLaunches(f: *const Fixture, id: []const u8, rec: *const Recorder) !void
             };
             errdefer std.debug.print("{s}: constexpr {s}\n", .{ got.name, name });
             const v = kv.value_ptr.object;
+            if (tiled and (std.mem.eql(u8, name, "BK") or std.mem.eql(u8, name, "BLOCK_N"))) continue;
             if (v.get("int")) |x| try testing.expectEqual(jsonInt(x), mine.int.?);
             if (v.get("f32")) |x| try testing.expectEqual(jsonInt(x), @as(i64, @as(u32, @bitCast(mine.f32.?))));
         }

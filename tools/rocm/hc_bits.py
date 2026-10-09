@@ -133,6 +133,8 @@ def main() -> int:
     w = rnd(S * D, K, scale=0.05)
     for m in ROWS:
         act, normed = rnd(m, K), rnd(m, S * D)
+        normed[:, ::3] = -0.0                                 # -0 products: the stream sum starts from +0
+        normed[:, 1::7] = 1e-38
         up = b16(act, w, S * D, K, 1, False)
         mixed = torch.empty(m, D, device="cuda", dtype=torch.bfloat16)
         glue.hc_mix(up, normed, mixed, torch.empty(m, D // 32, device="cuda"), S)

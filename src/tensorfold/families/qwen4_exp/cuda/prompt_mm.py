@@ -209,7 +209,7 @@ try:
         even, odd = tl.split(tl.permute(tl.reshape(p, (BM, 2, 2, BD)), (0, 3, 1, 2)))
         p0, p2 = tl.split(even)
         p1, p3 = tl.split(odd)
-        total = ((p0 + p1) + p2) + p3
+        total = (((p0 + 0.0) + p1) + p2) + p3                     # from +0, as the per-stream sum (-0 + 0 = +0)
         m = (total / S).to(tl.bfloat16)
         tl.store(MIXED + rm[:, None] * D + rd[None, :], m, mask=m_ok[:, None])
 
