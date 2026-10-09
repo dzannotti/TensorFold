@@ -56,7 +56,8 @@ Reading:
   (HIP: -0.1 and maxInt). The engine already picks the rule by live stream count (lanes.confidenceNow: product while
   live <= product_streams, else wide_confidence); depth is engine-wide (graph sizes), so a per-stream-count depth
   would be a cap on the chain length in confidenceNow's caller (draft_stops_most), not a depth change. Not needed
-  here: with product 0.1 depth 15 wins at x1 and x8. 2 and 4 streams were not measured (x1 and x8 both favour 0.1).
+  here: with product 0.1 depth 15 wins at x1 and x8. At 2 and 4 streams (bench-many --rows 2,4, rep 1) product 0.1 everywhere also wins: prose x2 87.1 -> 95.8, x4
+  151.6 -> 161.1; code x2 145.3 -> 160.7, x4 197.0 -> 216.5 (+6-11%).
 - The x8 samples are one run each; the d15/d8 repeats reproduced to 0.1%, so the steady CLI numbers are tight.
 
 ## 2. Re-profile (5074bde + aot-final; default draft rule, depth 15, fp8 KV)
