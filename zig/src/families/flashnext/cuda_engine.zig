@@ -395,10 +395,10 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        // the draft vocabulary's 4-bit head needs fn_qmm*: a build without them drafts over the full head (same output)
-        if (o.mtp and !e.k.q4) std.log.warn("no groups-of-32 4-bit kernels in this build: MTP drafts use the full head", .{});
         e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
         errdefer e.w.deinit();
+        // the draft vocabulary's head: fn_qmm's 4-bit rows, else the int4 lm_head's draft columns; neither, the full head
+        if (o.mtp and e.w.draft_head == null and e.w.draft_count == 0) std.log.warn("no draft-vocabulary head (no groups-of-32 4-bit kernels, no int4 lm_head): MTP drafts use the full head", .{});
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
         e.g.kv = o.kv;
