@@ -133,8 +133,30 @@ pub const NgramTable = struct {
     lut: [256]u16 = @splat(0),
     /// on the GPU: rows [base, base + count) as stored, the LUT ([256] bf16 bits), heads [head0, head0 + heads)
     gpu: ?struct { rows: u64, lut: u64, base: u64, count: u64, head0: u32, heads: u32 } = null,
+    /// warm's background read of the host map, and its stop flag (deinit)
+    warmer: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    /// The host-mapped shards read once in the background, so the first prompts' gathers hit the page cache: the
+    /// rows are hashed n-grams spread over the whole table, and a cold lookup faults in ~2 MiB of read-around (~1 ms;
+    /// a first 2048-row chunk paid ~16 s), where a sequential read takes the table in at disk speed. `t` must stay put.
+    pub fn warm(t: *NgramTable) void {
+        if (t.gpu != null or t.warmer != null) return;
+        t.warmer = std.Thread.spawn(.{}, touch, .{t}) catch null;
+    }
+
+    fn touch(t: *NgramTable) void {
+        var sum: u8 = 0;
+        for (t.shards.items) |s| {
+            var i: usize = 0;
+            while (i < s.len and !t.stop.load(.monotonic)) : (i += 4096) sum +%= @as(*const volatile u8, &s[i]).*;
+        }
+        std.mem.doNotOptimizeAway(sum);
+    }
 
     pub fn deinit(t: *NgramTable) void {
+        t.stop.store(true, .monotonic);
+        if (t.warmer) |th| th.join();
         for (t.files.items) |*f| f.close(t.io);
         t.files.deinit(t.gpa);
         t.shards.deinit(t.gpa);

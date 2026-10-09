@@ -593,6 +593,11 @@ pub const Engine = struct {
         e.own = try e.newSeq(e.max_len);
         e.bound = e.own;
         try e.stream.synchronize();
+        // the host-mapped n-gram table into the page cache behind the load (TF_FLASHNEXT_TABLE_WARM=0: on first use)
+        if (e.w.table) |*t| if (t.gpu == null and !envOff("TF_FLASHNEXT_TABLE_WARM")) {
+            t.warm();
+            std.log.info("n-gram table: reading its {d:.1} GiB into the page cache in the background", .{@as(f64, @floatFromInt(t.rows * t.width * @as(u64, if (t.fp8) 1 else 2))) / (1 << 30)});
+        };
         e.load_seconds = seconds(io, t0);
         return e;
     }
