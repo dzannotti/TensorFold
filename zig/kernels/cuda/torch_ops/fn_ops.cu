@@ -27,6 +27,41 @@ extern "C" __global__ void tf_fn_shared_swiglu_kernel(const __nv_bfloat16* g, __
     }
 }
 
+// bf16._reduce of a split matmul's K slices (part [sk, rows, n] fp32: slices added in order, one rounding to bf16 as
+// Triton rounds: nearest-even, NaN -> 0x7FFF), row r stored at out + r * ldo: `_reduce` and the strided copy after it
+// in one launch, the same bytes (a projection's bf16 columns into their place in the wider rows).
+extern "C" __global__ void tf_fn_reduce_ld_kernel(const float* part, uint16_t* out, uint64_t rows, uint64_t n,
+                                                  uint64_t sk, uint64_t ldo) {
+    const uint64_t count = rows * n;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        float acc = part[i];
+        for (uint64_t s = 1; s < sk; ++s) acc = __fadd_rn(acc, part[s * count + i]);
+        const uint32_t u = __float_as_uint(acc);
+        const uint64_t r = i / n;
+        out[r * ldo + (i - r * n)] = acc != acc ? 0x7FFF : uint16_t((u + ((u >> 16) & 1u) + 0x7FFFu) >> 16);
+    }
+}
+
+// tf_fn_shared_swiglu_kernel on gate|up rows interleaved in runs of `il` (32 gate columns, then the same 32 up
+// columns): the same operations on the same pairs (weights.interleave; the wide windows' path beside matmulSwiglu).
+extern "C" __global__ void tf_fn_shared_swiglu_il_kernel(const __nv_bfloat16* g, __nv_bfloat16* out, uint64_t rows,
+                                                         uint64_t ni, uint64_t out_stride, uint64_t il) {
+    const uint64_t count = rows * ni;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const uint64_t r = i / ni;
+        const uint64_t c = i - r * ni;
+        const uint64_t at = r * 2 * ni + (c / il) * 2 * il + c % il;
+        const float gate = __bfloat162float(g[at]);
+        const float up = __bfloat162float(g[at + il]);
+        const float e = expf(-gate);
+        const float act = __fdiv_rn(gate, __fadd_rn(e, 1.0f));
+        const float rounded = __bfloat162float(__float2bfloat16_rn(act));
+        out[r * out_stride + c] = __float2bfloat16_rn(__fmul_rn(rounded, up));
+    }
+}
+
 // Tensor.fill_ of `count` 64-bit words.
 extern "C" __global__ void tf_fn_fill_u64_kernel(uint64_t* out, uint64_t value, uint64_t count) {
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
@@ -244,3 +279,8 @@ extern "C" cudaError_t tf_fn_nucleus_mass(const void* logits, uint64_t ld, uint6
         static_cast<int64_t*>(mass), static_cast<unsigned long long*>(sums));
     return cudaGetLastError();
 }
+
+// ---- HIP decode: the router's top-k and the experts' one-block plan in one launch (gfx1151 only) ----
+#if defined(__HIP_PLATFORM_AMD__)
+#include "../../hip/topk_plan.hip"
+#endif

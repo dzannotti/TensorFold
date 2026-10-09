@@ -30,6 +30,7 @@ const vmm = @import("cuda_vmm.zig");
 const nucleus = @import("cuda_nucleus.zig");
 const profs = @import("cuda_prof.zig");
 const prompt_mm = @import("cuda_prompt.zig");
+const glue_dec = @import("cuda_glue_dec.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const spill = @import("spill.zig");
 
@@ -409,7 +410,7 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay, .shared_il = if (cuda.hip and !envOff("TF_FLASHNEXT_SHARED_SWIGLU")) 32 else 0 });
         errdefer e.w.deinit();
         // the draft vocabulary's head: fn_qmm's 4-bit rows, else the int4 lm_head's draft columns; neither, the full head
         if (o.mtp and e.w.draft_head == null and e.w.draft_count == 0) std.log.warn("no draft-vocabulary head (no groups-of-32 4-bit kernels, no int4 lm_head): MTP drafts use the full head", .{});
@@ -505,6 +506,14 @@ pub const Engine = struct {
         e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
         e.f.act_sk = cuda.hip and !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.actSkAvailable(&e.set);
+        // HIP decode glue in fewer launches (cuda_glue_dec.zig; TF_FLASHNEXT_DEC_FUSE=0 all off, each alone too)
+        const dec = cuda.hip and !envOff("TF_FLASHNEXT_DEC_FUSE");
+        e.f.dec_upmix = dec and !envOff("TF_FLASHNEXT_DEC_UPMIX") and glue_dec.upMixAvailable(&e.set);
+        e.f.dec_finish = dec;
+        e.f.reduce_ld = dec and !envOff("TF_FLASHNEXT_REDUCE_LD") and e.torch.f.reduce_ld != null;
+        e.f.shared_ld = cuda.hip and !envOff("TF_FLASHNEXT_SHARED_LD");
+        e.f.topk_plan = dec and !envOff("TF_FLASHNEXT_TOPK_PLAN") and e.torch.f.topk_plan != null;
+        if (envGet("TF_FLASHNEXT_DEC_BD")) |v| e.f.dec_bd = std.fmt.parseInt(usize, v, 10) catch glue_dec.bd_default;
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in
         const qsa_fast = if (envGet("TF_FLASHNEXT_QSA_FAST") != null) !envOff("TF_FLASHNEXT_QSA_FAST") else !cuda.hip;

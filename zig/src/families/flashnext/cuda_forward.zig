@@ -23,6 +23,7 @@ const comms = @import("cuda_comm.zig");
 const vmm = @import("cuda_vmm.zig");
 const profs = @import("cuda_prof.zig");
 const prompt = @import("cuda_prompt.zig");
+const glue_dec = @import("cuda_glue_dec.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
@@ -538,6 +539,21 @@ pub const Forward = struct {
     wb_norm: bool = false,
     /// HIP, on unless TF_FLASHNEXT_GLUE_FUSE=0: decode read-outs sum the down projection's K slices in `_hc_act_sk`
     act_sk: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_DEC_UPMIX=0: a read-out's up projection and mix in one launch (`_hc_up_mix`
+    /// at 16 rows, `dec_bd` columns a program: TF_FLASHNEXT_DEC_BD, 16 or 32)
+    dec_upmix: bool = false,
+    dec_bd: usize = glue_dec.bd_default,
+    /// HIP decode, on unless TF_FLASHNEXT_DEC_FUSE=0: the finish's write-back from h straight into the streams' copy
+    dec_finish: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_REDUCE_LD=0: a projection's split bf16 columns summed straight into their
+    /// place (fn_ops reduce_ld: `_reduce` + the strided copy in one launch)
+    reduce_ld: bool = false,
+    /// HIP, on unless TF_FLASHNEXT_SHARED_LD=0: the shared expert's down stored straight into its slot of the bf16
+    /// expert outputs (fn_qmmf_ld), not through a scratch and a copy
+    shared_ld: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_TOPK_PLAN=0: the router's top-k and the experts' plan in one launch
+    /// (fn_ops topk_plan, up to kern.plan_small pairs)
+    topk_plan: bool = false,
     /// two ranks, split prompt glue: the exchanges run on this stream beside the next rows' work (TF_FLASHNEXT_OVERLAP)
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
@@ -865,9 +881,15 @@ pub const Forward = struct {
             try fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, f.sc.p8, false, m);
             try f.th.slotCopy(f.sc.p8, l.n * 2, out, out_w * 2, l.n * 2, m);
         }
-        try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
-        try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
         if (l.n + rb.n != out_w) return error.ProjectionWidth;
+        const sk = tri.b16SplitK(rb.n, rb.k);
+        if (f.reduce_ld and sk > 1 and rb.slices == 0 and !prompt.b16Takes(f.prompt_mm, m, rb.n, rb.k)) {
+            try prompt.b16Slices("_b16mm", f.t, x, x_stride, rb.weight, f.sc.part, false, m, rb.n, rb.k);
+            try f.th.reduceLd(f.sc.part, out + l.n * 2, m, rb.n, sk, out_w);
+        } else {
+            try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
+            try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
+        }
         try f.mark(part);
     }
 
@@ -1366,12 +1388,8 @@ pub const Forward = struct {
         return true;
     }
 
-    /// _readout_b16: norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix.
-    fn readout(f: *Forward, hc: *const W.Hc, x: *const Bufs, h: u64, R: usize, inject: ?u64) !void {
-        try f.readoutAt(hc, x, h, x.b.pss, R, inject, x.b.mixed, x.b.xs_mixed, false);
-    }
-
-    /// `readout` of rows whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
+    /// _readout_b16 (norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix) of rows
+    /// whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
     fn readoutAt(f: *Forward, hc: *const W.Hc, x: *const Bufs, h: u64, pss: u64, R: usize, inject: ?u64, mixed: u64, xs: u64, normed_done: bool) !void {
         const b = &x.b;
         const g = f.g;
@@ -1405,6 +1423,12 @@ pub const Forward = struct {
         // 32-group sums of mixed, which only the 4-bit MTP draft matrices read)
         if (f.up_mix and b.prefill and R >= 16 and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
             try prompt.upMix(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 64);
+            try f.mark(.hc_mix);
+            return;
+        }
+        // HIP decode: the same on 16-row tiles (no 32-group sums of mixed: no 4-bit draft matrix or head reads them)
+        if (f.dec_upmix and !b.prefill and f.w.draft_head == null and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0 and g.hidden % f.dec_bd == 0) {
+            try prompt.upMixTile(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 16, f.dec_bd);
             try f.mark(.hc_mix);
             return;
         }
@@ -1732,23 +1756,27 @@ pub const Forward = struct {
         const es: usize = if (x.y_f32) 4 else 2;
         try f.t.router(b.mixed, D, m.router, b.moe_logits, R, D, E + 1);
         try f.mark(.router);
-        try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
+        // HIP decode: the top-k and the one-block plan (16-pair items: every decode path's tile) in one launch
+        const planned = f.topk_plan and !b.prefill and R * slots <= kern.plan_small and f.splitOf(x, R) == null and !(f.count_experts and f.prof != null);
+        if (planned) {
+            try f.th.topkPlan(b.moe_logits, R, E, E + 1, top, b.moe_pick, b.moe_wts, kern.plan_tile, b.plan_members, b.plan_items, b.plan_counts);
+        } else try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
         if (f.count_experts and f.prof != null and !b.prefill) try f.countExperts(b.moe_pick, R, slots, E);
         if (f.splitOf(x, R)) |q| if (f.cs != null and f.overlap & 2 != 0) {
             // the peer's rows first: their experts and partial, sent while this rank's own rows run
             const yrow = slots * D * es;
-            try f.moeRows(m, x, q.po, @min(q.rh, R - q.po), top);
+            try f.moeRows(m, x, q.po, @min(q.rh, R - q.po), top, false);
             try f.t.moePartial(b.moe_y + q.po * yrow, x.y_f32, b.moe_wts + q.po * slots * 4, b.part_moe, q.rh, D, slots);
             try f.mark(.moe_partial);
             try f.exchangeAsync(b.part_moe, b.g_moe + (1 - q.rank) * q.rh * D * 4, q.rh * D, .f32);
-            try f.moeRows(m, x, q.o, @min(q.rh, R - q.o), top);
+            try f.moeRows(m, x, q.o, @min(q.rh, R - q.o), top, false);
             try f.t.moePartial(b.moe_y + q.o * yrow, x.y_f32, b.moe_wts + q.o * slots * 4, b.g_moe + q.rank * q.rh * D * 4, q.rh, D, slots);
             try f.mark(.moe_partial);
             try f.exchangeWait();
             try f.mark(.moe_gather);
             return .{ .ranks = .{ .part = b.g_moe, .world = 2 } };
         };
-        try f.moeRows(m, x, 0, R, top);
+        try f.moeRows(m, x, 0, R, top, planned);
         if (f.splitOf(x, R)) |q| {
             // the peer's rows' partial first, sent while this rank's own rows' partial runs
             const yrow = slots * D * es;
@@ -1787,9 +1815,9 @@ pub const Forward = struct {
     }
 
     /// The experts, the shared expert and the slots of rows [a0, a0 + n) (the router's picks made for every row), `top`
-    /// routed experts a row.
-    fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
-        if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top);
+    /// routed experts a row; `planned`: the plan is made (topk_plan, 16-pair items).
+    fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize, planned: bool) !void {
+        if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top, planned);
         const b = &x.b;
         const g = f.g;
         const D = g.hidden;
@@ -1806,7 +1834,7 @@ pub const Forward = struct {
         // prompt chunks: gate/up and down on cuda_moe_prompt's items from their row counts (the same bits)
         const gu_px: ?*const moep.Prompt4 = if (f.px) |q| (if (R >= @max(moep.min_rows, q.gu_rows)) q else null) else null;
         const dn_px: ?*const moep.Prompt4 = if (f.px) |q| (if (R >= @max(moep.min_rows, q.down_rows)) q else null) else null;
-        if (gu_px) |q| try q.plan(f.ops, pick, R * slots, E + 1, plan) else try f.ops.plan(pick, R * slots, E + 1, kern.plan_tile, plan);
+        if (gu_px) |q| try q.plan(f.ops, pick, R * slots, E + 1, plan) else if (!planned) try f.ops.plan(pick, R * slots, E + 1, kern.plan_tile, plan);
         const ex: kern.Experts4 = .{ .up = m.routed.up, .down = m.routed.down, .up_scale = m.routed.up_scale, .down_scale = m.routed.down_scale, .width = m.routed.width, .dims = m.routed.dims };
         if (ex.width != ni or ex.dims != D) return error.ExpertShape;
         const skip: c_int = @intCast(E);
@@ -1853,7 +1881,7 @@ pub const Forward = struct {
     /// INT4-AutoRound's experts of rows [a0, a0 + n): the GPTQ int4 gate/up SwiGLU, the block-FP8 shared expert's
     /// gate|up and SwiGLU (its own scratch: the healed shared expert is wider than the routed ones), the int4 down,
     /// the shared down into its slot.
-    fn moeRowsInt4(f: *Forward, m: *const W.MoE, ex4: int4.Experts, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
+    fn moeRowsInt4(f: *Forward, m: *const W.MoE, ex4: int4.Experts, x: *const Bufs, a0: usize, n: usize, top: usize, planned: bool) !void {
         const b = &x.b;
         const g = f.g;
         const D = g.hidden;
@@ -1873,7 +1901,7 @@ pub const Forward = struct {
         const skip: c_int = @intCast(E);
         // items of 16 pairs (int4.tileFor; the prompt tile is opt-in, the same bits)
         const tile = int4.tileFor(R * slots);
-        try f.ops.plan(pick, R * slots, E + 1, tile, plan);
+        if (!planned or tile != kern.plan_tile) try f.ops.plan(pick, R * slots, E + 1, tile, plan);
         try f.mark(.topk_plan);
         const sh = m.shared8 orelse return error.NoSharedExpert;
         if (f.side) |sd| {
@@ -1883,10 +1911,11 @@ pub const Forward = struct {
             try sd.s.wait(sd.fork);
             var th2 = f.th;
             th2.s = sd.s;
-            try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.sh_g, false, R);
-            try th2.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
-            try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
-            try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+            try f.sharedGateUp(k8, sd.s, th2, sh, xin, R);
+            if (f.shared_ld and !x.y_f32) try fp8.matmulLd(k8, sd.s, f.sc.sh_a, sh.width, sh.down, y + top * D * es, slots * D, R) else {
+                try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
+                try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+            }
             try sd.join.record(sd.s);
             try int4.gateUp(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip, tile);
             try f.mark(.experts_gate_up);
@@ -1898,15 +1927,28 @@ pub const Forward = struct {
         }
         try int4.gateUp(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip, tile);
         try f.mark(.experts_gate_up);
-        try fp8.matmul(k8, f.s, xin, D, sh.gu, f.sc.sh_g, false, R);
-        try f.th.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
+        try f.sharedGateUp(k8, f.s, f.th, sh, xin, R);
         try f.mark(.shared_swiglu);
         try f.int4Down(k4, pick, act, ex4, plan, slots, E, y, x.y_f32, R, skip, tile);
         try f.mark(.experts_down);
+        if (f.shared_ld and !x.y_f32) {
+            try fp8.matmulLd(k8, f.s, f.sc.sh_a, sh.width, sh.down, y + top * D * es, slots * D, R);
+            try f.mark(.shared_down);
+            return;
+        }
         try fp8.matmul(k8, f.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
         try f.mark(.shared_down);
         try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
         try f.mark(.slot_copy);
+    }
+
+    /// The healed shared expert's gate|up and SwiGLU into f.sc.sh_a: one launch on interleaved rows (fp8.matmulSwiglu,
+    /// the 16/32-row tiles), else the matmul and fn_ops' SwiGLU (on the interleaved or plain rows).
+    fn sharedGateUp(f: *Forward, k8: *const fp8.Kernels, s: cuda.Stream, th: tops.Torch, sh: W.Shared8, xin: u64, R: usize) !void {
+        if (sh.il > 0 and fp8.swigluRows(k8, R)) return fp8.matmulSwiglu(k8, s, xin, f.g.hidden, sh.gu, f.sc.sh_a, R);
+        try fp8.matmul(k8, s, xin, f.g.hidden, sh.gu, f.sc.sh_g, false, R);
+        if (sh.il > 0) return th.sharedSwigluIl(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width, sh.il);
+        try th.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
     }
 
     /// The routed int4 down of rows' pairs: prompt calls on int4_prompt_kernel from a plan of 64-pair items (made
@@ -1938,6 +1980,9 @@ pub const Forward = struct {
             try f.writebackRows(b.streams, x, R, pending, q);
             try f.gatherRows(b.streams, q, Wd * 2, .bf16, 2);
             try f.gatherRows(b.pss, q, pssRow(g), .f32, 4);
+        } else if (f.dec_finish and !b.prefill and pending.branch != .none) {
+            // decode: the write-back from h straight into the streams' copy (every element written; h unchanged)
+            try f.t.hcWriteback(b.h, b.streams, b.pss, pending.inject, pending.branch, R, g.hidden, g.streams);
         } else {
             try f.th.copy(b.streams, b.h, R * Wd * 2);
             try f.writeback(b.streams, x, R, pending);
@@ -1963,7 +2008,7 @@ pub const Forward = struct {
                 n = 1;
             }
         }
-        try f.readout(mixer, x, rows, n, null);
+        try f.readoutAt(mixer, x, rows, x.b.pss, n, null, x.b.mixed, x.b.xs_mixed, false);
         try f.put("final_streams", b.streams, R * Wd * 2);
         try f.put("final_mixed", b.mixed, n * g.hidden * 2);
         if (!logits) return null;

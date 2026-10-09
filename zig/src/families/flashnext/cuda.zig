@@ -24,6 +24,7 @@ pub const mtp = @import("cuda_mtp.zig");
 pub const mtp_q4 = @import("cuda_mtp_q4.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const prompt = @import("cuda_prompt.zig");
+pub const glue_dec = @import("cuda_glue_dec.zig");
 pub const fp4_serial = @import("cuda_fp4_serial.zig");
 pub const prof = @import("cuda_prof.zig");
 pub const moe_prompt = @import("cuda_moe_prompt.zig");
@@ -54,6 +55,7 @@ test {
     _ = mtp;
     _ = engine;
     _ = prompt;
+    _ = glue_dec;
     _ = prof;
     _ = moe_prompt;
     _ = fp8;

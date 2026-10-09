@@ -117,7 +117,7 @@ def launch(gs, nt, mt, mats, epi, x, x_stride, slots, w, s, k, n, plan, rows, ou
     wv = waves(mt)
     assert n % (16 * nt * wv // mats) == 0, (n, nt)
     units = max_items * (n // (16 * nt * wv // mats))
-    grid = min(units, blocks(name, wv * 32))
+    grid = min(units, blocks(name, wv * 32) * (2 if mt == 2 else 1))  # cuda_int4.zig launch: prompt passes x2
     items, counts, members = plan if plan else (None, None, None)
     M.launch(name, grid, wv * 32, [x, ("i", x_stride), ("i", slots), w, s, ("i", k), ("i", n), items, counts,
                                       members, ("i", rows), out, ("i", n), ("f", 0.0), ("i", skip)])

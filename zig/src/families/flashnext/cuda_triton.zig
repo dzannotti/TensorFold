@@ -304,7 +304,7 @@ pub const Tri = struct {
     /// the variants already picked (null: `find` every launch)
     memo: ?*Memo = null,
 
-    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
+    pub fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
         const g: [3]u32 = .{ u(grid[0]), u(grid[1]), u(grid[2]) };
         if (t.rec) |r| return r.add(name, g, args, consts);
         const set = t.set.?;

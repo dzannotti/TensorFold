@@ -70,6 +70,12 @@ pub fn l2Group(rows_t: usize, bm: usize, k: usize) usize {
     return @max(1, @min(rows_t, (12 << 20) / (bm * k * 2)));
 }
 
+/// HIP's wide-tile band: 4 row tiles (measured 2-7% faster than l2Group's 12 MB band at 512-2048 rows, inputs and
+/// weights cold, notes/prefill.md); tile order only, no bits.
+pub fn wideGroup(rows_t: usize) usize {
+    return @min(rows_t, 4);
+}
+
 /// Mangled names of the FP8G instantiations (fn_qmmf.cu's footer): [F32][cluster][bm 16, 32, 64], and the fused [F32].
 pub const sym = struct {
     fn name(comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
@@ -106,6 +112,8 @@ pub const sym = struct {
         };
         break :blk out;
     };
+    /// fn_qmmf.hip's SwiGLU tiles (16, 32 rows; HIP builds only): the shared expert's interleaved gate|up into its act
+    pub const swiglu = [2][:0]const u8{ "_ZN10tf_fn_qmmf18qmmf_swiglu_kernelILi16EEEvPK13__nv_bfloat16PKhS5_fPviiiiii", "_ZN10tf_fn_qmmf18qmmf_swiglu_kernelILi32EEEvPK13__nv_bfloat16PKhS5_fPviiiiii" };
     pub const ld_wide = blk: {
         var out: [4][:0]const u8 = undefined;
         for (0..4) |i| out[i] = wideName("13tf_fn_qmmf_ld", 64 << (i / 2), 128 >> (i % 2), false, "i");
@@ -124,6 +132,8 @@ pub const Kernels = struct {
     /// HIP: the wide tile, [bf16, fp32][wideIndex] and its `ldo` form
     wide: [2][4]cuda.Function = undefined,
     ld_wide: [4]cuda.Function = undefined,
+    /// HIP: `matmulSwiglu`'s 16- and 32-row tiles (null: a build without them)
+    swiglu: [2]?cuda.Function = .{ null, null },
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -151,6 +161,10 @@ pub const Kernels = struct {
         if (hip_build) for (0..4) |i| {
             for (0..2) |f| k.wide[f][i] = try k.module.function(sym.wide[f][i]);
             k.ld_wide[i] = try k.ld_module.function(sym.ld_wide[i]);
+        };
+        k.swiglu = .{ null, null };
+        if (hip_build) for (0..2) |i| {
+            k.swiglu[i] = k.module.function(sym.swiglu[i]) catch null;
         };
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
@@ -219,6 +233,29 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
     }, s, &a);
 }
 
+/// The rows `matmulSwiglu` takes (its 16- and 32-row tiles; wider windows run `matmul` and fn_ops' interleaved SwiGLU).
+pub fn swigluRows(k: *const Kernels, m: usize) bool {
+    return hip_build and m >= 1 and m < wide_rows and k.swiglu[bucketIndex(bucket(m))] != null;
+}
+
+/// The shared expert's gate|up `l` (its rows interleaved: 32 gate rows, then the same 32 up rows, a 64-row tile;
+/// weights.interleave) with fn_ops' SwiGLU in the epilogue: act [m, n / 2] bf16 = the bytes `matmul` then
+/// tf_fn_shared_swiglu give on the plain rows. `swigluRows(m)` first.
+pub fn matmulSwiglu(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, act: u64, m: usize) !void {
+    if (!swigluRows(k, m) or l.n % 64 != 0 or l.k % 64 != 0) return error.Invalid;
+    const sk = splitKHip(l.n, l.k);
+    const bm = bucket(m);
+    const rows_t = (m + bm - 1) / bm;
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(l.w8);
+    a.add(l.bs);
+    a.add(@as(f32, 1.0));
+    a.add(act);
+    for ([_]usize{ m, l.n, l.k, sk, if (m == 1) l.k else x_stride, l2Group(rows_t, bm, l.k) }) |v| a.add(@as(c_int, @intCast(v)));
+    try cuda.launch.launch(k.swiglu[bucketIndex(bm)].?, .{ .grid = .{ .x = @intCast(rows_t * (l.n / 64)), .y = 1, .z = 1 }, .block = .{ .x = @intCast(128 * sk) } }, s, &a);
+}
+
 /// HIP's wide tile: a block of 2 * rows threads, static LDS, the L2 band over its row tiles.
 fn wide(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, out: u64, f32_out: bool, m: usize, ldo: ?usize, sk: usize) !void {
     const t = wideTile(m, sk);
@@ -231,7 +268,7 @@ fn wide(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, o
     a.add(@as(f32, 1.0));
     a.add(out);
     a.add(@as(u64, 0));
-    for ([_]usize{ m, l.n, l.k, sk, l.npad, x_stride, l2Group(rows_t, t[0], l.k) }) |v| a.add(@as(c_int, @intCast(v)));
+    for ([_]usize{ m, l.n, l.k, sk, l.npad, x_stride, wideGroup(rows_t) }) |v| a.add(@as(c_int, @intCast(v)));
     if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
     try cuda.launch.launch(if (ldo != null) k.ld_wide[i] else k.wide[@intFromBool(f32_out)][i], .{
         .grid = .{ .x = @intCast(rows_t * ((l.n + t[1] - 1) / t[1])), .y = 1, .z = 1 },
@@ -299,6 +336,8 @@ test "split_k, buckets and shared memory follow qmm.py and qmmf.cu" {
     try std.testing.expectEqual(@as(usize, 64), bucket(33));
     try std.testing.expectEqual(@as(usize, 1), l2Group(1, 16, 2560));
     try std.testing.expectEqual(@as(usize, 38), l2Group(64, 64, 2560));
+    try std.testing.expectEqual(@as(usize, 4), wideGroup(16));
+    try std.testing.expectEqual(@as(usize, 1), wideGroup(1));
     try std.testing.expectEqual([2]usize{ 64, 128 }, wideTile(33, 1));
     try std.testing.expectEqual([2]usize{ 128, 64 }, wideTile(65, 4));
     try std.testing.expectEqualStrings("_ZN10tf_fn_qmmf11qmmw_kernelILi128ELi64ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", sym.wide[1][3]);

@@ -261,3 +261,12 @@ thorim (117.2 vs 122.7; the steady-rep A/B in section 3 gave 120.4). PM4's gain 
 code); at 2-8 requests PM4 and stock are within noise. Server x2-x8 stays well below the CLI (bench-many prose x8
 240): the multi-request server path is the next thing to profile. Prefill is ~1.1-1.2k tok/s, 1.8x thorim, 0.45x Mia.
 How to serve: docs/rocm/SERVE.md.
+
+## 5. rocm-cand2 (rocm + perf-longctx + perf-prefill + perf-fuse), 2026-10-09 11:00 BST, PM4, set aot-fuse4
+
+- CLI sky: drafted == plain, sha b64935d893d5 (same as rocm); plain 33.8 ms/token (rocm 37.3), drafted 17.1 (18.2).
+- contracts.py --only a,b: 36 pass, 0 fail.
+- longctx.py (cached ~20k prefix, median of 3): sampled+thinking 56.5 tok/s (rocm ~47-50), greedy 85.4; 2k greedy 91.1.
+- bench.py quick: prefill 8k 1,234 / 32k 1,272 tok/s; prose 75.5 (x1) / 213.4 (x8 agg); code 117.9 / 271.4.
+- Not yet run on cand2: contracts c-d, agreement vs thorim.
+- thorim warm prefill with our harness (same day): 4k 838, 8k 756, 16k 1,088, 32k 1,298 tok/s.
