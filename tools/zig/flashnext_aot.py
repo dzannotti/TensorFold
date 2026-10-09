@@ -513,6 +513,14 @@ def hip_entries(k: dict) -> list[dict]:
 
     t = hip_tune.tile(k["name"], _ints(k))
     out = [k] + ([_derived(_with_consts(k, t), f"gfx1151 tile {t}")] if t and _ints(k) != {**_ints(k), **t} else [])
+    sm = hip_tune.slice_major(k["name"], _ints(k))
+    if sm:                                        # the same entries on the slice-major weight's kernel
+        for e in list(out):
+            e = _derived(e, f"slice-major weight ({sm})")
+            e["function"] = e["function"][: -len(k["name"])] + sm
+            e["name"] = sm
+            e["source"] = {"file": e["source"]["file"], "line": None}
+            out.append(e)
     return [x for e in out for x in (e, ranged(e))]
 
 

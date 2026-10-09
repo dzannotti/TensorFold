@@ -66,6 +66,44 @@ try:
         tl.store(OUT + rm[:, None] * N + rn[None, :], total if F32 else total.to(tl.bfloat16), mask=out_mask)
 
     @triton.jit
+    def _b16mm_ks_sm(X, W, OUT, M, x_stride,
+                     N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+                     BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, GROUP: tl.constexpr):
+        """``_b16mm_ks`` on the slice-major weight [SK, N, K / SK] (bf16.slice_major): the same bits."""
+
+        tiles_m = tl.cdiv(M, BM)
+        tiles_n: tl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
+        pid = tl.program_id(0)
+        band = pid // (GROUP * tiles_n)
+        first_m = band * GROUP
+        size_m = tl.minimum(tiles_m - first_m, GROUP)
+        pid_m = first_m + (pid % size_m)
+        pid_n = (pid % (GROUP * tiles_n)) // size_m
+        rm = pid_m * BM + tl.arange(0, BM)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BK)
+        m_ok = rm < M
+        n_ok = rn < N
+        KS: tl.constexpr = K // SK
+        NB: tl.constexpr = KS // BK
+        total = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for j in range(SK * NB):
+            k0 = j * BK
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + (j // NB) * (N * KS) + rn[:, None] * KS + ((j % NB) * BK + rk)[None, :],
+                        mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x, tl.trans(w), acc)
+            if (j + 1) % NB == 0:
+                if j < NB:
+                    total = acc
+                else:
+                    total = total + acc
+                acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        out_mask = m_ok[:, None] & n_ok[None, :]
+        tl.store(OUT + rm[:, None] * N + rn[None, :], total if F32 else total.to(tl.bfloat16), mask=out_mask)
+
+    @triton.jit
     def _fp4mm_ks(X, W, S, S2, OUT, M, x_stride,
                   N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
                   SBN: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr,

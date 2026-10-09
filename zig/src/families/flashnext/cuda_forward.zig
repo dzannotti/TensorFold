@@ -829,15 +829,16 @@ pub const Forward = struct {
 
     /// `mm`, its time marked as `part` when profiling (a split's `_reduce` apart, as `.reduce`).
     pub fn mmAt(f: *Forward, part: ?profs.Part, x: u64, x_stride: usize, r: W.Rows, out: u64, fp32: bool, m: usize) !void {
+        const sm = r.slices != 0; // stored slice-major: the _sm kernels (the same bits)
         if (prompt.b16Takes(f.prompt_mm, m, r.n, r.k)) {
-            try prompt.b16(f.t, x, x_stride, r.weight, out, fp32, m, r.n, r.k);
+            try prompt.b16Of(if (sm) "_b16mm_ks_sm" else "_b16mm_ks", f.t, x, x_stride, r.weight, out, fp32, m, r.n, r.k);
         } else if (f.prof != null and part != null and tri.b16SplitK(r.n, r.k) > 1 and f.t.rec == null) {
-            try prompt.b16Slices(f.t, x, x_stride, r.weight, f.sc.part, fp32, m, r.n, r.k);
+            try prompt.b16Slices(if (sm) "_b16mm_sm" else "_b16mm", f.t, x, x_stride, r.weight, f.sc.part, fp32, m, r.n, r.k);
             try f.mark(part.?);
             try prompt.reduce(f.t, f.sc.part, out, fp32, m * r.n, tri.b16SplitK(r.n, r.k));
             try f.mark(.reduce);
             return;
-        } else try f.t.b16mm(x, x_stride, r.weight, out, fp32, f.sc.part, m, r.n, r.k);
+        } else try f.t.b16mmOf(if (sm) "_b16mm_sm" else "_b16mm", x, x_stride, r.weight, out, fp32, f.sc.part, m, r.n, r.k);
         if (part) |pp| try f.mark(pp);
     }
 

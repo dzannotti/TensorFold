@@ -369,19 +369,19 @@ def direct_cases(z, specs: list[Path]) -> None:
     import torch
     import triton
 
-    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod, prompt_mm as pm
+    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod, bf16 as b16_mod, prompt_mm as pm
 
-    names = ("_b16mm_ks", "_fp4mm_ks", "_hc_up_mix", "_hc_wb_norm", "_scores_rows")
-    mods = {n: pm for n in names} | {"_select_tiles": attn_mod}
+    names = ("_b16mm_ks", "_b16mm_ks_sm", "_fp4mm_ks", "_hc_up_mix", "_hc_wb_norm", "_scores_rows")
+    mods = {n: pm for n in names} | {"_select_tiles": attn_mod, "_b16mm": b16_mod, "_b16mm_sm": b16_mod}
     wrapped = {n: getattr(m, n) if hasattr(getattr(m, n), "jit") else interceptor(HIP, getattr(m, n))
                for n, m in mods.items()}
     dt = {"*bf16": torch.bfloat16, "*fp32": torch.float32, "*u16": torch.uint16, "*u8": torch.uint8,
           "*i32": torch.int32, "*fp16": torch.float16}
     seen = set()
     for spec in specs:
-        for k in json.loads(spec.read_text())["kernels"]:
-            if k["name"] not in mods:
-                continue
+        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in A.hip_entries(e)):
+            if k["name"] not in mods or (k["name"] == "_b16mm" and "gfx1151 tile" not in k.get("rule", "")):
+                continue                              # _b16mm: the wrappers' launches cover the spec's own
             key = json.dumps([k["name"], k["constexprs"], k["signature"], k["attrs"], k["options"]["num_warps"]])
             if key in seen:
                 continue
@@ -395,7 +395,15 @@ def direct_cases(z, specs: list[Path]) -> None:
                 if k["name"] in ("_hc_wb_norm", "_select_tiles", "_scores_rows") and m > 161:
                     continue
                 kw = {}
-                if k["name"] == "_b16mm_ks":
+                if k["name"] in ("_b16mm", "_b16mm_sm"):
+                    n, kk, sk = c["N"], c["K"], c["SK"]
+                    if (m % 16 == 0) != div or n * kk > 1 << 26 or ("M" in c) != (m == 1) or (m > 128) != (c["BM"] == 128):
+                        continue
+                    out = t("OUT", (m, n))
+                    kw = dict(X=t("X", (m, kk)), W=t("W", (n, kk)), OUT=out, PART=z((sk, m, n), torch.float32) if sk > 1 else out,
+                              x_stride=kk, M=m)
+                    grid = (triton.cdiv(m, c["BM"]), triton.cdiv(n, c["BLOCK_N"]), sk)
+                elif k["name"] in ("_b16mm_ks", "_b16mm_ks_sm"):
                     if (m % 16 == 0) != div:
                         continue
                     n, kk = c["N"], c["K"]
@@ -456,14 +464,14 @@ def _tile_args(row: dict, m: int, base: dict | None = None):
     zero = lambda *s, dt=torch.float32: torch.zeros(s, device="cuda", dtype=dt)               # noqa: E731
     rows = lambda name, x: base[name][:m].contiguous() if base else x                         # noqa: E731
     fn = row["fn"]
-    if fn in ("_b16mm", "_b16mm_ks"):
+    if fn in ("_b16mm", "_b16mm_ks", "_b16mm_sm", "_b16mm_ks_sm"):
         n, k, sk = c["N"], c["K"], c["SK"]
         out = zero(m, n, dt=torch.float32 if c["F32"] else torch.bfloat16)
         t = {"X": rows("X", bf(m, k)), "W": base["W"] if base else bf(n, k), "OUT": out}
-        if fn == "_b16mm_ks":
-            return t, (-(-m // c["BM"]) * -(-n // 64), 1, 1), ("OUT", 0), {"x_stride": k}
+        if fn.startswith("_b16mm_ks"):
+            return t, (-(-m // c["BM"]) * -(-n // c["BLOCK_N"]), 1, 1), ("OUT", 0), {"x_stride": k}
         t["PART"] = zero(sk, m, n) if sk > 1 else out
-        return t, (-(-m // c["BM"]), -(-n // 64), sk), ("PART", 1) if sk > 1 else ("OUT", 0), {"x_stride": k}
+        return t, (-(-m // c["BM"]), -(-n // c["BLOCK_N"]), sk), ("PART", 1) if sk > 1 else ("OUT", 0), {"x_stride": k}
     if fn == "_router":
         d, ne = c["D"], c["NE"]
         t = {"X": rows("X", bf(m, d)), "W": base["W"] if base else bf(ne, d), "OUT": zero(m, ne)}
@@ -487,7 +495,7 @@ def tiles_check(aot: Path) -> int:
     forms: dict = {}
     u8 = lambda x: x.contiguous().view(torch.uint8)                     # noqa: E731
     for row in hip.rows:
-        if row["fn"] not in ("_b16mm", "_b16mm_ks", "_router", "_hc_up_mix"):
+        if row["fn"] not in ("_b16mm", "_b16mm_ks", "_b16mm_sm", "_b16mm_ks_sm", "_router", "_hc_up_mix"):
             continue
         c = {k: v.get("int") for k, v in row["consts"].items()}
         mp = next((p for p in row["params"] if p["name"] == "M"), None)

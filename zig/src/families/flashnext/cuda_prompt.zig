@@ -60,10 +60,15 @@ pub fn fp4Takes(on: bool, m: usize, n: usize, k: usize) bool {
 
 /// bf16.matmul's bits for m >= min_rows and split K: x [M, K] (rows `x_stride` apart) @ w [N, K].T -> out [M, N].
 pub fn b16(t: tri.Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
+    return b16Of("_b16mm_ks", t, x, x_stride, w, out, fp32, m, n, k);
+}
+
+/// `b16` of `kernel`: "_b16mm_ks", or "_b16mm_ks_sm" for a weight stored slice-major (W.Rows.slices).
+pub fn b16Of(kernel: []const u8, t: tri.Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
     const sk = tri.b16SplitK(n, k);
     if (m < min_rows or sk < 2 or k % 64 != 0) return error.NotAPromptSplit;
     const bm, const bn = ks_tile;
-    try run(t, "_b16mm_ks", .{ cdiv(m, bm) * cdiv(n, bn), 1, 1 }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", bn), ci("BK", 64), cb("F32", fp32), ci("GROUP", group) });
+    try run(t, kernel, .{ cdiv(m, bm) * cdiv(n, bn), 1, 1 }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", bn), ci("BK", 64), cb("F32", fp32), ci("GROUP", group) });
 }
 
 /// nvfp4.matmul's bits for m >= min_rows and split K (the shared expert's tables).
@@ -80,10 +85,10 @@ fn gpiFor(per: usize, want: usize) usize {
 }
 
 /// `_b16mm` alone into the partials (the profile's split of a matmul from its `_reduce`; Tri.b16mm's launch).
-pub fn b16Slices(t: tri.Tri, x: u64, x_stride: usize, w: u64, part: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
+pub fn b16Slices(kernel: []const u8, t: tri.Tri, x: u64, x_stride: usize, w: u64, part: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
     const sk = tri.b16SplitK(n, k);
     const tl = tri.b16Tile(m, n, k);
-    try run(t, "_b16mm", .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, part), aot.ptr("PART", f32p, part), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
+    try run(t, kernel, .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, part), aot.ptr("PART", f32p, part), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
 }
 
 /// `_reduce` of `sk` slices (Tri.reduce).

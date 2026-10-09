@@ -17,8 +17,11 @@ TABLE = (
     ("_b16mm", {"BM": 16}, {"num_warps": 2, "num_stages": 1}),
     ("_b16mm", {}, {"num_warps": 4, "num_stages": 1}),
     ("_b16mm_ks", {"BM": 64}, {"num_warps": 4, "num_stages": 1}),
+    ("_b16mm_ks_sm", {"BM": 64}, {"num_warps": 4, "num_stages": 1}),
+    ("_b16mm_ks_sm", {}, {"num_warps": 8, "num_stages": 1}),
+    ("_b16mm_sm", {"BM": 16}, {"num_warps": 2, "num_stages": 1}),
+    ("_b16mm_sm", {}, {"num_warps": 4, "num_stages": 1}),
     ("_b16mm_ks", {}, {"num_warps": 8, "num_stages": 1}),
-    ("_hc_up_mix", {"BM": 32}, {"num_warps": 4, "num_stages": 1}),
     ("_hc_up_mix", {}, {"num_warps": 8, "num_stages": 1}),
 )
 
@@ -54,3 +57,13 @@ def launch(name: str, consts: dict, **opts) -> dict:
     """A wrapper's launch options: the table's on ROCm, `opts` on CUDA."""
 
     return options(name, consts, opts) if hip() else opts
+
+
+SLICE_MAJOR = {"_b16mm": "_b16mm_sm", "_b16mm_ks": "_b16mm_ks_sm"}
+
+
+def slice_major(name: str, consts: dict) -> str | None:
+    """The kernel that reads a weight stored slice-major ([SK, N, K / SK], bf16.slice_major), for the matmuls whose
+    weight gfx1151 stores so: 32 K slices (the hyper-connections' down rows; cuda_weights.zig hc). Same bits."""
+
+    return SLICE_MAJOR.get(name) if consts.get("SK") == 32 else None

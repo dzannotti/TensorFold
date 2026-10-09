@@ -580,12 +580,17 @@ pub const Tri = struct {
     /// bf16.matmul: x [M, K] bf16 (rows `x_stride` apart) @ w [N, K].T -> out [M, N] (bf16, or fp32 sums with
     /// `f32`); K slices (b16SplitK) into `part` (b16PartBytes) are summed in slice order by `_reduce`.
     pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
+        return t.b16mmOf("_b16mm", x, x_stride, w, out, fp32, part, m, n, k);
+    }
+
+    /// `b16mm` of `kernel`: "_b16mm", or "_b16mm_sm" for a weight stored slice-major (W.Rows.slices).
+    pub fn b16mmOf(t: Tri, kernel: []const u8, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
         if (k % 64 != 0) return error.KNotBlocked;
         const sk = b16SplitK(n, k);
         const tl = b16Tile(m, n, k);
         const oty = if (fp32) f32p else bf16;
         const split = sk > 1;
-        try t.run("_b16mm", .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
+        try t.run(kernel, .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
         if (split) try t.reduce(part, out, fp32, m * n, sk);
     }
 
