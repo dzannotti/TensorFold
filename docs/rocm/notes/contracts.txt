@@ -1,0 +1,63 @@
+server http://127.0.0.1:8088, model qwen38fn-int4-autoround
+PASS      draft  prose-sky/greedy             sha 74ab0ed88811/74ab0ed88811 accepted 64 tokens 121
+PASS      draft  prose-sky/sampled            sha 3b7e8d9f711c/3b7e8d9f711c accepted 58 tokens 118
+PASS      draft  prose-hashmap/greedy         sha e081bdd89456/e081bdd89456 accepted 99 tokens 160
+PASS      draft  prose-hashmap/sampled        sha cca1f34c38ba/cca1f34c38ba accepted 98 tokens 160
+PASS      draft  code-fib/greedy              sha 924372193614/924372193614 accepted 121 tokens 160
+PASS      draft  code-fib/sampled             sha 0ced419a5cda/0ced419a5cda accepted 124 tokens 160
+PASS      draft  code-zig/greedy              sha 4f0dd25841ba/4f0dd25841ba accepted 113 tokens 160
+PASS      draft  code-zig/sampled             sha ed9270323a3e/ed9270323a3e accepted 115 tokens 160
+PASS      draft  math-primes/greedy           sha de8325173549/de8325173549 accepted 126 tokens 160
+PASS      draft  math-primes/sampled          sha 5a331d34393e/5a331d34393e accepted 124 tokens 160
+PASS      draft  json-book/greedy             sha cc707646c664/cc707646c664 accepted 56 tokens 69
+PASS      draft  json-book/sampled            sha 0115299b7a3b/0115299b7a3b accepted 47 tokens 59
+PASS      draft  tool-weather/greedy          sha 8c94de8fe0f4/8c94de8fe0f4 accepted 38 tokens 39
+PASS      draft  tool-weather/sampled         sha 8c94de8fe0f4/8c94de8fe0f4 accepted 38 tokens 39
+PASS      draft  tool-search/greedy           sha e0d2ee47b43b/e0d2ee47b43b accepted 47 tokens 55
+PASS      draft  tool-search/sampled          sha e0d2ee47b43b/e0d2ee47b43b accepted 47 tokens 55
+PASS      draft  long-6k/greedy               sha 69e487150571/69e487150571 accepted 83 tokens 134
+PASS      draft  long-6k/sampled              sha 9fd86f9001a8/9fd86f9001a8 accepted 57 tokens 85
+PASS      conc   prose-sky/greedy             sha 74ab0ed88811 solo 74ab0ed88811 (8 at once)
+PASS      conc   prose-sky/sampled            sha 3b7e8d9f711c solo 3b7e8d9f711c (8 at once)
+PASS      conc   prose-hashmap/greedy         sha e081bdd89456 solo e081bdd89456 (8 at once)
+PASS      conc   prose-hashmap/sampled        sha cca1f34c38ba solo cca1f34c38ba (8 at once)
+PASS      conc   code-fib/greedy              sha 924372193614 solo 924372193614 (8 at once)
+PASS      conc   code-fib/sampled             sha 0ced419a5cda solo 0ced419a5cda (8 at once)
+PASS      conc   code-zig/greedy              sha 4f0dd25841ba solo 4f0dd25841ba (8 at once)
+PASS      conc   code-zig/sampled             sha ed9270323a3e solo ed9270323a3e (8 at once)
+PASS      conc   math-primes/greedy           sha de8325173549 solo de8325173549 (8 at once)
+PASS      conc   math-primes/sampled          sha 5a331d34393e solo 5a331d34393e (8 at once)
+PASS      conc   json-book/greedy             sha cc707646c664 solo cc707646c664 (8 at once)
+PASS      conc   json-book/sampled            sha 0115299b7a3b solo 0115299b7a3b (8 at once)
+PASS      conc   tool-weather/greedy          sha 8c94de8fe0f4 solo 8c94de8fe0f4 (8 at once)
+PASS      conc   tool-weather/sampled         sha 8c94de8fe0f4 solo 8c94de8fe0f4 (8 at once)
+PASS      conc   tool-search/greedy           sha e0d2ee47b43b solo e0d2ee47b43b (8 at once)
+PASS      conc   tool-search/sampled          sha e0d2ee47b43b solo e0d2ee47b43b (8 at once)
+PASS      conc   long-6k/greedy               sha 69e487150571 solo 69e487150571 (2 at once)
+PASS      conc   long-6k/sampled              sha 9fd86f9001a8 solo 9fd86f9001a8 (2 at once)
+PASS      resume turn1/greedy                 cached 0 sha 27faa806c0e1 fresh 27faa806c0e1
+PASS      resume turn2/greedy                 cached 4770 sha 34d883f5470a fresh 34d883f5470a
+PASS      resume turn3/greedy                 cached 4806 sha d8edd685d31f fresh d8edd685d31f
+PASS      resume shared-q1/greedy             cached 4246 sha 6ba691bc7832 fresh 6ba691bc7832
+PASS      resume shared-q2/greedy             cached 4246 sha ce560fac7a0d fresh ce560fac7a0d
+PASS      resume shared-q3/greedy             cached 4246 sha 1959aac364d5 fresh 1959aac364d5
+PASS      resume shared-q1-again/greedy       cached 4768 sha 6ba691bc7832 fresh 6ba691bc7832
+UNCHECKED resume turn1/sampled                the fresh baseline resumed 4770 tokens
+UNCHECKED resume turn2/sampled                the fresh baseline resumed 4806 tokens
+UNCHECKED resume turn3/sampled                the fresh baseline resumed 4836 tokens
+UNCHECKED resume shared-q1/sampled            the fresh baseline resumed 4768 tokens
+UNCHECKED resume shared-q2/sampled            the fresh baseline resumed 4770 tokens
+UNCHECKED resume shared-q3/sampled            the fresh baseline resumed 4768 tokens
+PASS      resume turn1/sampled                cached 4770 sha 5f23ce19f53e fresh 5f23ce19f53e
+PASS      resume turn2/sampled                cached 4806 sha 34d883f5470a fresh 34d883f5470a
+PASS      resume turn3/sampled                cached 4836 sha 0ca230db51a5 fresh 0ca230db51a5
+PASS      resume shared-q1/sampled            cached 4768 sha 5d9fbbb5868e fresh 5d9fbbb5868e
+PASS      resume shared-q2/sampled            cached 4770 sha ce560fac7a0d fresh ce560fac7a0d
+PASS      resume shared-q3/sampled            cached 4768 sha 8979c9d40ec0 fresh 8979c9d40ec0
+PASS      resume shared-q1-again/sampled      cached 4768 sha 5d9fbbb5868e fresh 5d9fbbb5868e
+          chunks prompts: 18110 and 18144 tokens
+PASS      chunks beside-another               cached 0 sha 72fa50a30ddb fresh 72fa50a30ddb
+PASS      chunks beside-another-2             cached 0 sha ff2c6bfcf30b fresh ff2c6bfcf30b
+PASS      chunks chat-keeps                   cached 0 sha 72fa50a30ddb fresh 72fa50a30ddb
+PASS      chunks chat-resumed                 cached 18103 sha 72fa50a30ddb fresh 72fa50a30ddb
+contracts: UNCHECKED (54 pass, 0 fail, 6 unchecked)

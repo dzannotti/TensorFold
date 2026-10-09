@@ -1,0 +1,23 @@
+prompt            pos  agree  free-run  divergent positions
+prose-sky         102  97.1%         0  [0, 80, 87]
+prose-story       200  97.5%        29  [29, 92, 167, 194, 195]
+prose-hashmap     200 100.0%        22  []
+prose-email       145  99.3%        43  [69]
+code-fib          200 100.0%      same  []
+code-quicksort    200 100.0%      same  []
+code-zig          200  99.5%        55  [55]
+code-sql           85 100.0%      same  []
+code-bugfix       200  98.0%        63  [65, 112, 129, 132]
+code-cuda         200  99.5%        15  [30]
+math-primes       200  98.5%       108  [17, 108, 114]
+math-train        200  99.5%      same  [168]
+math-algebra      200  99.5%        27  [171]
+json-book          69  98.6%        47  [47]
+table-countries   133  99.2%         5  [5]
+count             200 100.0%      same  []
+fr-translate      200  98.5%        66  [55, 66, 158]
+zh-explain         73 100.0%        67  []
+tool-weather       39 100.0%      same  []
+tool-search        55 100.0%      same  []
+overall: 3076/3101 positions agree (99.19%); 7/20 free-run replies identical
+agreement: PASS (min 98%)
