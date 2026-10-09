@@ -25,7 +25,39 @@ off, glue fusions off), rocm-next binary + aot-hip3 vs this branch + aot-hc5, to
 
 ## Speed (microbenchmarks; see "Measurement")
 
-RESULT_SPEED
+Decode, us a launch, weights cold (rotated through 160 MB), M = rows of the window:
+
+| kernel / shape | M | rocm (CUDA cfg) | rocm-next | perf-hc |
+|---|---:|---:|---:|---:|
+| hc down `_b16mm` + `_reduce`, 324 x 10240 SK 32 | 1 | 48 | 43.8 | 35.5 (`_b16mm_sm`) |
+| | 4 | | 44.8 | 35.6 |
+| | 16 | 50 | 46.9 | 36.8 |
+| | 48 | | 74.7 | 42.9 |
+| `_reduce` launch removed (`_hc_act_sk`) | | | ~3 + gap | 0 |
+| hc up 10240 x 320 | 1-16 | 32-45 | 31-33 (~200 GB/s) | unchanged |
+| MTP bf16 13952 x 2560 | 1 / 8 | | 502 / 516 | 372 / 379 (BK 256) |
+| MTP bf16 16480 x 2560 | 1 / 8 | | 609 / 626 | 439 / 442 |
+| MTP bf16 10240 x 2560 | 1 / 8 | | 367 / 370 | 286 / 288 |
+| MTP bf16 2560 x 6144 SK 4 | 1 / 8 | | 307 / 310 | 304 / 318 (no gain) |
+| `_router` 513 x 2560 | 1 | 56 | 18.7 | unchanged |
+
+Per prose x1 round (96 hc read-outs): ~0.9 ms (down) + ~0.3 ms (one launch less) on the hyper-connections, plus the
+MTP layer's bf16 projections (~25% less where they run).
+
+Prefill, one 2048-row launch (hot weights; TFLOPS from shapes):
+
+| kernel | rocm-next | perf-hc |
+|---|---:|---:|
+| `_hc_up_mix` (D 2560, S 4, K 320) | 2138 us, 6.3 TF | 855 us, 15.7 TF (glue-check: 2.32x the unfused `_b16mm` + `_hc_mix`) |
+| `_b16mm_ks` hc down 324 x 10240 | 1318 us, 10.3 TF | 766 us, 17.7 TF |
+| `_b16mm_ks` 2560 x 2560 | 1066 us | 944 us |
+| `_b16mm_ks` 640 x 2560 | 285 us | 216 us |
+| `_b16mm_ks` 2560 x 6144 | 3105 us | 3088 us |
+| `_hc_wb_norm` (moe) | 1.68 ms | unchanged (memory-bound, ~230 GB/s) |
+
+A 2048-row chunk's hyper-connections (96 read-outs): ~(1.32 + 2.14) x 96 = 332 ms -> ~(0.77 + 0.86) x 96 = 156 ms
+(plus `_hc_wb_norm` ~100 ms, unchanged). The profile's 527 + 379 ms were the old (CUDA-config) set; rocm-next's
+retune already took most of the `_b16mm_ks` time.
 
 ## Measurement
 
