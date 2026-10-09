@@ -43,14 +43,15 @@ pub const default_confidence = 0.70;
 /// D4 after X1, research/X1-drafts.md 3.4: TP=2 code +13-19%, sampled hash map +7.5% over depth 6 / 0.70; a fixed 0.5
 /// at depth 15 cost hash-map prose 10% served), or TF_FLASHNEXT_CONFIDENCE (-1..1: c > 0 Python's per-draft rule, c < 0
 /// the running product at -c, 0 every draft). The oracle runs keep `default_confidence`. Drafts only: the kept tokens
-/// are the target's either way.
-pub const served_confidence = -0.4;
+/// are the target's either way. HIP: the product at 0.1 (gfx1151's verify rows are nearly free, so longer chains pay:
+/// prose x1 +21%, x8 +7%, docs/rocm/notes/window2.md).
+pub const served_confidence: f64 = if (cuda.hip) -0.1 else -0.4;
 
 /// The served hybrid: the running product (served_confidence) while at most this many streams are live, Python's
 /// per-draft rule at `wide_confidence` above that (TF_FLASHNEXT_PRODUCT_STREAMS; 2 by default). W6's served A/B: the
 /// product with the longest asks wins at one or two streams (code +10%) and loses prose at four and eight, where
-/// deeper chains cost rows (STATUS 2026-10-07).
-pub const product_streams_default = 2;
+/// deeper chains cost rows (STATUS 2026-10-07). HIP: the product at every stream count (window2.md: 2-8 streams +6-11%).
+pub const product_streams_default: usize = if (cuda.hip) std.math.maxInt(u32) else 2;
 pub const wide_confidence = 0.5;
 
 pub fn productStreams() usize {
@@ -252,6 +253,12 @@ fn envGet(name: [:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
+/// A HIP runtime lowering graphs to retained PM4 command lists (pwilkin's rocm-systems, DEBUG_HIP_GRAPH_PM4 set).
+fn retainedPm4() bool {
+    const v = envGet("DEBUG_HIP_GRAPH_PM4") orelse return false;
+    return cuda.hip and v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
 fn envOff(name: [:0]const u8) bool {
     const v = envGet(name) orelse return false;
     return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
@@ -450,8 +457,10 @@ pub const Engine = struct {
         e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
         e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
         e.pool_cap = if (envOff("TF_FLASHNEXT_SEQ_POOL")) 0 else @max(1, o.streams);
-        // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
-        if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
+        // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line); in line
+        // by default under a retained-PM4 HIP runtime, which hangs on a graph that forks a stream (window2.md 3)
+        const side = if (envGet("TF_FLASHNEXT_SHARED_SIDE") != null) !envOff("TF_FLASHNEXT_SHARED_SIDE") else !retainedPm4();
+        if (side) try e.f.initSide();
         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
         e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
         // the shared expert's single-slice gate/up on fn_ops' K-serial kernel where it is faster (the same bits,
