@@ -219,3 +219,81 @@ Decode reading:
   ~4x a 16-row matvec, no longer bandwidth-bound (no FP8 hardware: dequant + FMA bound). A WMMA bf16 path after
   dequant to LDS would help x8.
 - `tf_fn_gdn_tree` 1.3 ms (x1) -> 6.1-6.9 ms (x8).
+
+## 1d. Prefill, 8k tokens (CLI `bench`, no server, no prompt cache)
+
+Is server prefill inflated by non-compute work (kept prompt states, snapshots, spill, n-gram/PLE host work)? No:
+
+| run (8,212-token prompt, 4 chunks of 2048 + tail 20) | prefill s | tok/s |
+|---|---:|---:|
+| server bench.py (3 fresh prompts, prompt cache on) | 16.8 / 17.2 / 18.0 | 488 / 476 / 456 |
+| CLI `bench` graphed, rep 1 (no cache, no server) | 16.53 | 497 |
+| CLI `bench` 32k (32,776 tokens), rep 1 | 67.30 | 487 |
+| CLI `bench` TF_FLASHNEXT_PROFILE=1, rep 1 | 14.93 | 550 |
+| CLI `bench --eager` under rocprofv3, rep 1 | 19.36 | 424 |
+| **first prefill after load (any mode)** | 34.0-40.4 | 200-241 |
+
+- The server costs <= 4% over the bare engine; spill is not involved (TENSORFOLD_SPILL_DIR unset, nothing written).
+  So the cache/state saves do not explain Mia 2.6k vs thorim 635: that gap is outside this box (thorim's own
+  numbers are the right target; ours = 0.75-0.78x thorim).
+- **The first prefill after load is ~2x slower** (part profiler: `stage` = 16.2 s in chunk 0 and 2.4 s in chunk 1 of
+  the first prompt, 13 ms after). Rep 0 under rocprofv3 shows multi-second GPU-idle holes. This is one-time staging
+  (first touch of prompt buffers / lazily loaded code objects); bench.py's 4k row in window-results (276 tok/s) was
+  the first prompt and paid it. Warm the prompt path at load (one 2048-row dummy chunk) and the first user pays
+  nothing. Engine change, cheap.
+- Chunking is as expected: 2048 + 2048 + 2048 + 2068 rows (PREFILL_TAIL 512 absorbs the 20-row tail). Chunk time
+  grows with position (3.0 -> 3.9 -> 3.9 -> 4.1 s): attention.
+- GPU is ~100% busy during a warm prefill (union 99.7%): no host gaps. It is all kernel time.
+
+Parts (TF_FLASHNEXT_PROFILE, warm 8k, ms per 2048 rows; total 3,723 ms):
+attention 1,511 (40.6%) + mtp.attention 126 (3.4%); hc_down 482 (12.9%); hc_mix 329 (8.8%); gdn_proj 240 (6.5%);
+experts_gate_up 234 (6.3%); out_proj 140 (3.8%); hc_writeback 108 (2.9%); gdn_back 93; experts_down 89; gdn_chain 84;
+attn_proj 69; gdn_front 60; router 33; the rest < 100.
+
+Kernels (rocprofv3, eager, warm rep; this run was slower overall, 4.74 s a chunk, with attention at 2.6 s):
+
+### prefill8k: window 19.01s = 4 rounds at 4750.0 ms; GPU busy (union) 99.7% ; kernel-sum 103.4% ; dispatches/round 2065; busy/round 4737.39 ms; kernel-sum/round 4911.02 ms
+| kernel | ms per 2048-row chunk | % of kernel time | launches/round | us/launch |
+|---|---:|---:|---:|---:|
+| `_chunks8` | 2615.59 | 53.3 | 104.7 | 24984.6 |
+| `_b16mm_ks` | 526.86 | 10.7 | 148.2 | 3556.0 |
+| `_hc_up_mix` | 379.32 | 7.7 | 96.9 | 3912.9 |
+| `tf_fn_qmmf::qmmf_kernel<3, 64, 64, 1, 4, 4, false, false, ` | 291.27 | 5.9 | 143.2 | 2034.5 |
+| `tf_fn_qmmf_ld::qmmf_kernel<3, 64, 64, 1, 4, 4, false, fals` | 288.37 | 5.9 | 48.0 | 6011.2 |
+| `tf_int4_128_2_2_2_2` | 235.39 | 4.8 | 47.7 | 4932.6 |
+| `_hc_wb_norm` | 104.30 | 2.1 | 96.9 | 1075.9 |
+| `tf_fn_gdn_io::back_kernel<16, 48>` | 90.07 | 1.8 | 36.0 | 2503.5 |
+| `tf_int4_128_2_2_1_3` | 88.96 | 1.8 | 47.7 | 1864.2 |
+| `tf_fn_gdn_prefill::chain_kernel<float, 128, 32>` | 87.36 | 1.8 | 36.0 | 2428.0 |
+| `tf_fn_gdn_io::front_kernel<16, 48>` | 59.65 | 1.2 | 36.0 | 1658.0 |
+| `_router` | 31.67 | 0.6 | 48.5 | 653.4 |
+| `_merge` | 22.45 | 0.5 | 104.4 | 214.9 |
+| `_attn_gate` | 14.33 | 0.3 | 12.5 | 1147.3 |
+| `_b16mm` | 14.07 | 0.3 | 4.7 | 2964.4 |
+| `tf_strided_copy_kernel` | 12.32 | 0.3 | 96.4 | 127.8 |
+| `_scores` | 8.43 | 0.2 | 104.7 | 80.5 |
+| `_attn_prep8` | 6.12 | 0.1 | 12.7 | 480.4 |
+| `tf_fn_shared_swiglu_kernel` | 5.85 | 0.1 | 48.5 | 120.8 |
+| `_fp4mm` | 4.53 | 0.1 | 0.7 | 6049.8 |
+| `_select` | 4.26 | 0.1 | 104.7 | 40.7 |
+| `_hc_writeback` | 2.95 | 0.1 | 2.5 | 1179.2 |
+| `_ple_conv` | 2.70 | 0.1 | 1.0 | 2704.7 |
+| `fn_prompt4_gu_t2` | 2.65 | 0.1 | 0.7 | 3532.2 |
+| `fn_prompt4_b16_t4` | 2.58 | 0.1 | 0.7 | 3437.8 |
+
+
+Achieved rates (FLOPs from shapes; active ~4.7 B params => ~19 TFLOP of matmul a 2048-row chunk):
+
+| role | kernel(s) | ms / chunk | work / chunk | achieved | reasonable target | target ms |
+|---|---|---:|---|---:|---:|---:|
+| sparse attention (12 layers + MTP, indexer budget 2048 keys) | `_chunks8` (+`_merge`,`_scores`,`_select`) | 1,640-2,650 | ~1.3 TFLOP (2048 q x 24 h x <=2048 keys x 256 x 4 x 13) | **0.5-0.8 TF** | 10 TF (WMMA, Triton tl.dot) | ~150 |
+| hyper-connection mixes (bf16, K=10240/N=320 and back) | `_b16mm_ks`, `_hc_up_mix`, `_hc_wb_norm` | 810-1,010 | 2.6 TFLOP | **2.5-3.4 TF** | 20 TF | ~150 |
+| block-FP8 dense (GDN in_proj, out_proj, attn q/k/v/o, shared) | `tf_fn_qmmf(_ld)<3,64,...>` | 580 | ~10 TFLOP | ~17 TF | 25-30 TF (rocm-next FP8 LDS tile: 29-35) | ~360 |
+| int4 routed experts | `tf_int4_128_2_2_{2_2,1_3}` | 324 | 4.8 TFLOP | ~15 TF | 25 TF | ~200 |
+| GDN conv/gates/chain | `tf_fn_gdn_io::front/back`, `gdn_prefill::chain` | 237 | memory/latency | | | ~120 |
+| router + glue + rest | | ~100 | | | | ~80 |
+| **total** | | **3,720-4,740** | | **~490 tok/s** | | **~1,060 => ~1,900 tok/s** |
+
+So the 5.5x gap to Mia's 2.6k (and the ~1.3x gap to thorim's 635) is, in order: (1) `_chunks8` sparse attention at
+<1 TF = 40-55% of prefill; (2) the bf16 hyper-connection mixes at ~3 TF = 22-25%; (3) FP8/int4 matmuls at 15-17 TF
+= 23%. Fixing (1) and (2) alone takes a chunk from ~3.7 s to ~1.6 s (~1,280 tok/s); all of it to ~1.06 s (~1,900).
