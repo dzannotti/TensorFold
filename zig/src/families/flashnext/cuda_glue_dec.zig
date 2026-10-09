@@ -26,6 +26,10 @@ pub fn actAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_b16mm_sm_act", "SK", 0) != null;
 }
 
+pub fn tkAvailable(set: *const aot.Set) bool {
+    return set.smallestConst("_b16mm_tk", "SK", 0) != null;
+}
+
 pub fn upMixAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_hc_up_mix", "BM", 16) == 16;
 }
@@ -192,6 +196,7 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
     }
     if (!try reduceCheck(gpa, d, t, th)) all = false;
     if (!try topkCheck(gpa, d, t, th, ops)) all = false;
+    if (!try tkCheck(gpa, d, t)) all = false;
     for ([_]usize{ 1, 4, 16 }) |m| try bench(d, t, m, .{ .h = ha.ptr, .pss = pa.ptr, .inj = inj.ptr, .y = yb.ptr, .wts = wts.ptr, .scale = scale.ptr, .normed = na.ptr, .xs = xs.ptr, .wdn = wdn.ptr, .wup = wup.ptr, .part = parta.ptr, .act = acta.ptr, .ij = ija.ptr, .up = up.ptr, .mixed = nb.ptr, .tick = tick.ptr });
     return all;
 }
@@ -309,6 +314,57 @@ fn topkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
             for (out[0], out[1], used) |a, b, n| ok = ok and try same(gpa, a, b, n);
             if (!ok) all = false;
             if (!ok or m == 1 or m == 64) std.debug.print("{s} topk_plan top {d} rows {d} {s}: picks, weights, members, items, counts bytes\n", .{ if (ok) "EQUAL" else "DIFFER", top, m, kind });
+        };
+    }
+    return all;
+}
+
+/// `_b16mm_tk` against `_b16mm` + `_reduce` (+ the strided copy for rows ldo apart): the decode shapes with split K
+/// (DeltaNet b|a into its rows, the MTP head's fc_e / o_proj, fast-fp8's inject rows), bf16 and fp32 out, each twice
+/// (the second launch finds the tickets at 0).
+fn tkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
+    var bs: Bufs = .{};
+    defer bs.free();
+    const kmax: usize = 10240;
+    const x = try bs.get(d, max_m * kmax * 2);
+    const w = try bs.get(d, 2560 * 6144 * 2);
+    const part = try bs.get(d, 32 * max_m * 2560 * 4);
+    const ref = try bs.get(d, max_m * 2560 * 4);
+    const oa = try bs.get(d, max_m * 17000 * 4);
+    const ob = try bs.get(d, max_m * 17000 * 4);
+    const tick = try bs.get(d, tri.Tri.tk_words * 4);
+    try tick.fill8(0, t.s.handle);
+    var tt = t;
+    tt.tick = tick.ptr;
+    var prng = std.Random.DefaultPrng.init(0x74_6b_6b);
+    const r = prng.random();
+    const shapes = [_]struct { n: usize, k: usize, ldo: usize, fp32: bool }{
+        .{ .n = 96, .k = 2560, .ldo = 16480, .fp32 = false },
+        .{ .n = 640, .k = 2560, .ldo = 13952, .fp32 = false },
+        .{ .n = 2560, .k = 2560, .ldo = 2560, .fp32 = false },
+        .{ .n = 2560, .k = 6144, .ldo = 2560, .fp32 = false },
+        .{ .n = 4, .k = 10240, .ldo = 4, .fp32 = true },
+        .{ .n = 320, .k = 10240, .ldo = 320, .fp32 = true },
+    };
+    var all = true;
+    for ([_]prompt.Fill{ .normal, .wide, .cancel, .edge, .special }) |fill| {
+        try prompt.fillBuf(gpa, x, max_m * kmax, r, fill);
+        try prompt.fillBuf(gpa, w, 2560 * 6144, r, if (fill == .special) .normal else fill);
+        for (shapes) |c| for (rows_checked) |m| {
+            if (!tt.tickFits("_b16mm", m, c.n, c.k)) continue;
+            const es: usize = if (c.fp32) 4 else 2;
+            try oa.fill8(0x11, t.s.handle);
+            try ob.fill8(0x11, t.s.handle);
+            try t.b16mm(x.ptr, c.k, w.ptr, ref.ptr, c.fp32, part.ptr, m, c.n, c.k);
+            for (0..m) |row| try oa.copyFrom(row * c.ldo * es, ref.ptr + row * c.n * es, c.n * es, t.s.handle);
+            for (0..2) |_| try tt.b16mmTk(x.ptr, c.k, w.ptr, ob.ptr, c.ldo, c.fp32, part.ptr, m, c.n, c.k);
+            try t.s.synchronize();
+            var ok = try same(gpa, oa, ob, m * c.ldo * es);
+            var tk: [tri.Tri.tk_words]u32 = undefined;
+            try tick.download(0, std.mem.sliceAsBytes(&tk));
+            for (tk) |v| ok = ok and v == 0;
+            if (!ok) all = false;
+            if (!ok or m == 1 or m == 128) std.debug.print("{s} _b16mm_tk N {d} K {d} ldo {d} {s} rows {d} {s}: rows bytes, ticks back at 0\n", .{ if (ok) "EQUAL" else "DIFFER", c.n, c.k, c.ldo, if (c.fp32) "fp32" else "bf16", m, @tagName(fill) });
         };
     }
     return all;

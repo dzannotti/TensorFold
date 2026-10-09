@@ -209,7 +209,7 @@ pub const Scratch = struct {
     sh_a: u64, // [rows, shared width] bf16
 
     qsa_pos: u64, // [1] int32: a row-split indexer block's first own row position (cuda_prompt.zig)
-    tick: u64, // [glue_dec.tick_words] int32, zero between launches: `_b16mm_sm_act`'s finished programs
+    tick: u64, // int32 tickets, zero between launches: `_b16mm_sm_act`'s [glue_dec.tick_words], then `_b16mm_tk`'s
 
     fn sizes(g: state.Geometry, rows: usize, part: usize) [25]usize {
         const ni = g.moe_width;
@@ -220,7 +220,7 @@ pub const Scratch = struct {
         const face8 = @max(g.gdnConv() + g.nv * state.gdn_dv, g.heads * 2 * g.head_dim + 2 * g.kv_heads * g.head_dim);
         const faceb = @max(2 * g.nv, (g.index_heads + 1) * g.index_dim);
         const sw = g.sharedWidth();
-        return .{ part, rows * (g.low + g.streams) * 4, rows * 2 * ni * 2, rows * g.hidden * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nv * state.gdn_dv * 2, rows * g.nv * 4, rows * g.nv * 4, rows * g.nv * state.gdn_dv * 2, 256, 256, 256, g.nv * state.gdn_dv * state.gdn_dk * 4, if (two) rows * g.pleHeads() * 8 else 0, emb, xs, emb, xs, 256, if (on4) rows * face8 * 2 else 0, if (on4) rows * faceb * 2 else 0, if (on4) rows * 2 * sw * 2 else 0, if (on4) rows * sw * 2 else 0, glue_dec.tick_words * 4 };
+        return .{ part, rows * (g.low + g.streams) * 4, rows * 2 * ni * 2, rows * g.hidden * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nv * state.gdn_dv * 2, rows * g.nv * 4, rows * g.nv * 4, rows * g.nv * state.gdn_dv * 2, 256, 256, 256, g.nv * state.gdn_dv * state.gdn_dk * 4, if (two) rows * g.pleHeads() * 8 else 0, emb, xs, emb, xs, 256, if (on4) rows * face8 * 2 else 0, if (on4) rows * faceb * 2 else 0, if (on4) rows * 2 * sw * 2 else 0, if (on4) rows * sw * 2 else 0, (glue_dec.tick_words + tri.Tri.tk_words) * 4 };
     }
 
     pub fn init(d: *const cuda.Driver, g: state.Geometry, rows: usize, part: usize) !Scratch {
@@ -886,7 +886,10 @@ pub const Forward = struct {
         }
         if (l.n + rb.n != out_w) return error.ProjectionWidth;
         const sk = tri.b16SplitK(rb.n, rb.k);
-        if (f.reduce_ld and sk > 1 and rb.slices == 0 and !prompt.b16Takes(f.prompt_mm, m, rb.n, rb.k)) {
+        if (sk > 1 and rb.slices == 0 and f.t.tickFits("_b16mm", m, rb.n, rb.k)) {
+            // HIP decode: each tile's last program sums the slices straight into out's columns
+            try f.t.b16mmTk(x, x_stride, rb.weight, out + l.n * 2, out_w, false, f.sc.part, m, rb.n, rb.k);
+        } else if (f.reduce_ld and sk > 1 and rb.slices == 0 and !prompt.b16Takes(f.prompt_mm, m, rb.n, rb.k)) {
             try prompt.b16Slices("_b16mm", f.t, x, x_stride, rb.weight, f.sc.part, false, m, rb.n, rb.k);
             try f.th.reduceLd(f.sc.part, out + l.n * 2, m, rb.n, sk, out_w);
         } else {
@@ -1867,6 +1870,7 @@ pub const Forward = struct {
             try sd.s.wait(sd.fork);
             var t2 = f.t;
             t2.s = sd.s;
+            t2.tick = 0; // the tickets serve the main stream's launches, one at a time
             var th2 = f.th;
             th2.s = sd.s;
             try f.fp4On(t2, th2, xin, D, .{ .weight = gu.weight, .scale = gu.scale, .scale2 = gu.scale2 }, f.sc.shared_g, false, R, gu.n, gu.k);

@@ -113,5 +113,42 @@ try:
                         iv = iv + tl.load(PART + (s_ * M + r) * N + LOW + sv, cache_modifier=".cv")
                     iv = (iv / S).to(tl.bfloat16).to(tl.float32)
                     tl.store(INJ + r * S + sv, (2.0 * _bsig(iv)).to(tl.bfloat16))
+
+    @triton.jit
+    def _b16mm_tk(X, W, OUT, PART, TICK, M, x_stride, ldo,
+                  N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+                  BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
+        """``bf16._b16mm`` with SK > 1 (its fp32 slices into PART [SK, M, N]), then the (rows, columns) tile's last
+        program to finish runs ``bf16._reduce`` on the tile (slices added in slice order, one rounding for bf16 out),
+        rows ``ldo`` elements apart. TICK [row tiles, column tiles] int32, left at 0 for the next launch."""
+
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        pid_s = tl.program_id(2)
+        rm = pid_m * BM + tl.arange(0, BM)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BK)
+        m_ok = rm < M
+        n_ok = rn < N
+        KS: tl.constexpr = K // SK
+        NB: tl.constexpr = KS // BK
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for i in range(NB):
+            k0 = (pid_s * NB + i) * BK
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x, tl.trans(w), acc)
+        mask = m_ok[:, None] & n_ok[None, :]
+        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=mask)
+        tl.debug_barrier()
+        tick = TICK + pid_m * tl.num_programs(1) + pid_n
+        t = tl.atomic_add(tick, 1, sem="acq_rel", scope="gpu")
+        if t == SK - 1:
+            tl.atomic_xchg(tick, 0, sem="relaxed", scope="gpu")
+            at = rm[:, None] * N + rn[None, :]
+            tot = tl.load(PART + at, mask=mask, other=0.0, cache_modifier=".cv")
+            for s in range(1, SK):
+                tot = tot + tl.load(PART + s * (M * N) + at, mask=mask, other=0.0, cache_modifier=".cv")
+            tl.store(OUT + rm[:, None] * ldo + rn[None, :], tot if F32 else tot.to(tl.bfloat16), mask=mask)
 except ModuleNotFoundError:
     HAS_TRITON = False

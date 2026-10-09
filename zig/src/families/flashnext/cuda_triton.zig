@@ -303,6 +303,9 @@ pub const Tri = struct {
     rec: ?*Recorder = null,
     /// the variants already picked (null: `find` every launch)
     memo: ?*Memo = null,
+    /// HIP decode (TF_FLASHNEXT_DEC_TK): `tk_words` zeroed int32 tickets; nonzero, a split bf16 matmul of <= 128 rows
+    /// sums its slices in each tile's last program (`_b16mm_tk`, `_reduce`'s bits) instead of launching `_reduce`
+    tick: u64 = 0,
 
     pub fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
         const g: [3]u32 = .{ u(grid[0]), u(grid[1]), u(grid[2]) };
@@ -597,8 +600,24 @@ pub const Tri = struct {
         const tl = b16Tile(m, n, k);
         const oty = if (fp32) f32p else bf16;
         const split = sk > 1;
+        if (split and t.tickFits(kernel, m, n, k)) return t.b16mmTk(x, x_stride, w, out, n, fp32, part, m, n, k);
         try t.run(kernel, .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
         if (split) try t.reduce(part, out, fp32, m * n, sk);
+    }
+
+    pub const tk_words: usize = 2048;
+
+    /// Whether `_b16mm_tk` takes this split matmul (row-major weight, 16-row tiles, the tiles' tickets in TICK).
+    pub fn tickFits(t: Tri, kernel: []const u8, m: usize, n: usize, k: usize) bool {
+        return t.tick != 0 and std.mem.eql(u8, kernel, "_b16mm") and b16Tile(m, n, k).bm == 16 and b16SplitK(n, k) > 1 and cdiv(m, 16) * cdiv(n, 64) <= tk_words;
+    }
+
+    /// `_b16mm_tk`: x [M, K] @ w.T in `b16SplitK` slices (fp32 into `part`), each tile's last program adding them as
+    /// `_reduce` does into out, rows `ldo` elements apart (`tickFits` first).
+    pub fn b16mmTk(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, ldo: usize, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
+        const sk = b16SplitK(n, k);
+        const tl = b16Tile(m, n, k);
+        try t.run("_b16mm_tk", .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", if (fp32) f32p else bf16, out), p("PART", f32p, part), p("TICK", "*i32", t.tick), int("M", m), int("x_stride", x_stride), int("ldo", ldo) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
     }
 
     /// bf16._reduce and nvfp4._reduce: `total` fp32 sums of `sk` slices in order, one rounding for bf16 out.

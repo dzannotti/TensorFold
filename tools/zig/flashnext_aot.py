@@ -554,6 +554,15 @@ def _dec_entries(k: dict, made: list[dict]) -> list[dict]:
                 out.append(_int_form(e, "M", form))
     for s in made:
         c = _ints(s)
+        if s["name"] == "_b16mm" and c.get("BM") == 16 and c.get("SK", 1) > 1:
+            for form in ("div16", "plain"):
+                e = _derived(s, "glue_dec._b16mm_tk: _reduce in the tile's last program, rows ldo apart")
+                e["function"], e["name"], e["source"] = f"{DEC}._b16mm_tk", "_b16mm_tk", {"file": s["source"]["file"], "line": None}
+                p = s["params"]
+                e["params"] = p[:p.index("PART") + 1] + ["TICK"] + p[p.index("PART") + 1:p.index("x_stride") + 1] + ["ldo"] + p[p.index("x_stride") + 1:]
+                e["signature"].update({"TICK": "*i32", "ldo": "i32"})
+                e["attrs"].update({"TICK": [["tt.divisibility", 16]], "ldo": [["tt.divisibility", 16]] if form == "div16" else []})
+                out.append(_reorder(e))
         if s["name"] != "_b16mm_sm" or c.get("BM") != 16 or c.get("N") not in (320, 324) or c.get("SK", 1) <= 1:
             continue
         e = _derived(s, "glue_dec._b16mm_sm_act: _hc_act_sk in the last program")
