@@ -17,7 +17,7 @@ A/B alternated; 02:37 BST, perf lead's model between runs, GB/s of weight + scal
 | shared down 2560 x 1280 (sk 2) | 191 -> 207 | 191 -> 207 | 191 -> 207 | 190 -> 205 | 180 -> 194 | 180 -> 193 |
 
 A later run (03:29, noisier) gives the new tiles attn 211-229, out 217-228, shared gu 207-225, shared down 193-208,
-base 5-10% below; its gdn row (194-208 for both) was hit by the co-tenant.
+base 5-10% below; its gdn rows (new 181-208, base 152-164) were hit by the co-tenant.
 Ceilings measured with `build/s`-style probes (pure loads of this layout, no math): 227-232 GB/s gdn, ~218 out,
 211-213 shared down; a plain contiguous read of 3.3 MB tops at ~205-213 (launch + ramp ~3 us), so shared down
 cannot reach 220 as its own launch.
