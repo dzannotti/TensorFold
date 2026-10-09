@@ -701,7 +701,8 @@ pub const Engine = struct {
     pub fn newSeq(e: *Engine, limit_rows: usize) !*Seq {
         const limit = @min(limit_rows, e.max_len);
         // a pooled sequence is as a new one: zeroed caches at one growth step, reset state, its graphs kept
-        const poolable = e.vm != null and e.pool_cap > 0 and limit >= state.grow_step;
+        // a short request is poolable too: it maps the whole first growth step, as a pooled sequence holds
+        const poolable = e.vm != null and e.pool_cap > 0;
         if (poolable) if (e.pool.pop()) |s| {
             errdefer e.destroySeq(s);
             s.st.limit = limit;
@@ -715,7 +716,7 @@ pub const Engine = struct {
         const s = try e.gpa.create(Seq);
         errdefer e.gpa.destroy(s);
         // caches start at one growth step and grow with the stream (State.ensure), up to `limit`
-        const first = @min(limit, state.grow_step);
+        const first = if (poolable) state.grow_step else @min(limit, state.grow_step);
         if (!e.fits(first)) return error.NoRoom;
         // a poolable one reserves the whole window's address space, so it serves any later request
         s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, if (poolable) e.max_len else limit), .poolable = poolable };
