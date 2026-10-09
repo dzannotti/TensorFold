@@ -340,3 +340,36 @@ agent: KV/indexer caches sit in reserved address space at 4 KiB granularity (`ca
 granularity)`), so the sparse key gather is TLB-bound and depends on where the slot's pages landed; check with 2 MiB
 mappings or a contiguous slot. Also check whether rocm-next's hip_tune changed `_chunks8`'s warps/stages (next is
 slower on rep 1 too). The repeated-prompt prefill slowdown (rep 1 fast, reps 2-3 slower, both trees) points the same way.
+
+## 3b. Runtime A/B/C on rocm-next (same binary, tf-next zig-out, set aot-hip3)
+
+Loaded libraries checked from the server's /proc/PID/maps:
+A `/opt/rocm/core-10.0/lib/libamdhip64.so.7.15.26333`; B `tf-rt-libs/core-10.1/libamdhip64.so.7.16.26385` +
+`core-10.1/libhsa-runtime64.so.1.21.0`; C `tf-rt-libs/pm4/libamdhip64.so.7.16.26366-7dda3ac6cf` + `pm4/libhsa-runtime64`.
+
+| runtime | quick contracts (a,b; 2 cases) | 8k prefill s (first, then 3 warm) | prose x1 tok/s | code x1 tok/s | accepted |
+|---|---|---|---:|---:|---|
+| A stock ROCm 10.0 | PASS 8/0 | 25.7, 14.8 / 14.9 / 14.9 | 51.1 | 93.2 | 155/192, 217/251 |
+| B stock ROCm 10.1 | PASS 8/0 | 24.5, 14.9 / 14.4 / 14.4 | 51.2 | 93.0 | 155/192, 217/251 |
+| C 10.1 + retained PM4 (DEBUG_HIP_GRAPH_PM4=1, GPU_MAX_HW_QUEUES=1) | - | **hangs** | - | - | - |
+
+(server bench.py, 1 request, median of 3, no other GPU user; the warm 8k prefill = 550 tok/s.)
+
+C: the engine hangs on its first graph replay (server: after `sequence memory`, before `serving`; CLI `run`: right
+after load), GPU at 100%, killed after 290-400 s. Variants (CLI sky, 102 tokens):
+
+| variant | result |
+|---|---|
+| B (10.1 libs) control | OK, drafted == plain, 46.1 ms/token |
+| pm4 libs, no DEBUG_HIP_GRAPH_PM4 | OK, same tokens, 53.6 ms/token (single run) |
+| pm4 + DEBUG_HIP_GRAPH_PM4=1 + GPU_MAX_HW_QUEUES=1 | hang |
+| same with default GPU_MAX_HW_QUEUES | hang |
+| same + HSA_OVERRIDE_GFX_VERSION=11.5.1 | hang |
+| pm4 + flag + 1 queue, `--eager` (no graphs) | OK, same tokens, but 97.1 ms/token |
+
+So retained PM4 breaks in graph replay, the same place rocprofv3's kernel trace hangs. The llama.cpp recipe needed
+VMM off with PM4; the engine has `Options.vmm` (cuda_engine.zig: caches in reserved address space) but no runtime
+switch, so VMM-off could not be tried without an engine change. Ask: the engine agent adds `TF_FLASHNEXT_VMM=0`
+(caches grow by copying, the existing fallback when VMM init fails), then rerun C. The prize: the engine agent
+measured the decode round's ~9% idle as ~3 us between every pair of graph kernels (~1,700-3,000 launches a round =
+~5 ms of a 52 ms prose round), which is what PM4 retention removes.
