@@ -209,3 +209,55 @@ server stays ~13% below the CLI's (240 / 301): not investigated.
    costs a ~10 ms list preparation on first replay (first request after load, new context buckets). Upstream report for pwilkin: PM4 batches in multi-segment (forked-stream) graphs hang on the first replay;
    repro = any graph that forks a stream deeper than the collapse limit (max_level > 4).
 3. With the side stream off, rocprofv3 works in graph mode: use it for gap analysis (GPU idle ~10% a decode round).
+
+## 4. Final full-model run: rocm a2f8e7e (HIP defaults in code, pool fix), aot-final
+
+Defaults now in code (a2f8e7e): HIP served rule = running product 0.1 at every stream count; shared-expert side
+stream off when DEBUG_HIP_GRAPH_PM4 is set (env overrides kept). Served with Mia's flags, TF_FLASHNEXT_DEPTH=15, no
+other TF_ env. Script `~/tf-window/w2/final.sh`, logs `~/tf-window/w2/final/`. Each server session: an 8k warm-up first.
+
+| check | PM4 runtime (side off by default) | stock runtime (side on) |
+|---|---|---|
+| CLI sky depth 15: drafted == plain | True, de8d7a445fe7 both, 57/77 accepted | True, de8d7a445fe7 both, 57/77 |
+| contracts.py a-d | 54 pass, 0 fail, 6 unchecked | 54 pass, 0 fail, 6 unchecked |
+| agreement.py vs thorim, --max-positions 40 | 790/799 (98.87%), 8/20 free-run identical | 790/799 (98.87%), 8/20 |
+
+**Prefill** (bench.py, one request; tok/s)
+
+| Prompt | Tokens | PM4 | TTFT | stock | TTFT | candidate 5074bde | Mia GB10 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4k | 4,094 | 1,042 | 3.93 s | 1,200 | 3.41 s | 1,077 | 2,526 |
+| 8k | 8,202 | 1,094 | 7.49 s | 1,196 | 6.86 s | 1,079 | 2,606 |
+| 16k | 16,403 | 1,165 | 14.08 s | 1,185 | 13.84 s | 1,096 | 2,643 |
+| 32k | 32,772 | 1,217 | 26.94 s | 1,163 | 28.17 s | 1,187 | 2,630 |
+| 64k | 65,549 | 1,217 | 53.88 s | 1,167 | 56.16 s | 1,124 | 2,564 |
+| 128k | 131,081 | 1,148 | 114.19 s | 1,125 | 116.49 s | 1,115 | 2,415 |
+
+(thorim, our harness: 8k 635 tok/s. Prefill is eager, so PM4 does not touch it; the differences are run-to-run.
+Stock quick session: 8k 1,180.)
+
+**Decode, prose** (greedy, thinking off, 256 tokens, EOS ignored, median of 3; aggregate tok/s, per request in brackets)
+
+| Requests | PM4 | stock | candidate 5074bde | Mia GB10 | thorim |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | **75.2** (91 ms TTFT) | 71.4 | 57.1 | 64.4 | 65.2 |
+| 2 | 90.4 (45.9) | 94.9 (47.6) | 85.6 | 89.0 | |
+| 4 | 150.0 (38.3) | 146.8 (38.6) | 146.6 | 140.7 | |
+| 8 | 201.8 (27.0) | 203.7 (27.7) | 197.1 | 200.9 | |
+
+**Decode, code**
+
+| Requests | PM4 | stock | candidate 5074bde | Mia GB10 | thorim |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | **117.2** (123 ms TTFT) | 113.2 | 109.4 | 57.5 | 122.7 |
+| 2 | 135.7 (69.1) | 139.8 (72.4) | 130.3 | 92.7 | |
+| 4 | 176.2 (46.9) | 171.6 (46.2) | 175.4 | 130.8 | |
+| 8 | 270.7 (37.6) | 271.4 (37.4) | 254.0 | 189.3 | |
+
+(stock quick session: prose 71.5 / 203.5, code 113.1 / 268.6 at 1 / 8.)
+
+Reading: at one request we now beat Mia's GB10 prose (75.2 vs 64.4) and thorim's prose (65.2); code x1 is at 96% of
+thorim (117.2 vs 122.7; the steady-rep A/B in section 3 gave 120.4). PM4's gain is single-stream only (+5% prose, +4%
+code); at 2-8 requests PM4 and stock are within noise. Server x2-x8 stays well below the CLI (bench-many prose x8
+240): the multi-request server path is the next thing to profile. Prefill is ~1.1-1.2k tok/s, 1.8x thorim, 0.45x Mia.
+How to serve: docs/rocm/SERVE.md.
