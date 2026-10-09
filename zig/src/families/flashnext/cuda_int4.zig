@@ -324,7 +324,10 @@ fn launch(k: *const Kernels, s: cuda.Stream, kind: usize, max_items: usize, x: u
     const j = if (force_nt) |f| (std.mem.indexOfScalar(usize, &nts, f) orelse return error.Invalid) else pickNt(k, kind, max_items, n, q);
     if (n % unitCols(kind, nts[j]) != 0) return error.Invalid;
     const units = max_items * (n / unitCols(kind, nts[j]));
-    const grid = @min((units + unit_blocks - 1) / unit_blocks, k.blocks[kind][j][q]);
+    // HIP prompt passes (MT 2): twice the resident blocks (occupancy x 20 WGPs = 1.5 blocks a CU; 3 a CU is 8-12%
+    // faster at 512-2048 rows, notes/prefill.md); units stride the grid, so no bits change
+    const cap = k.blocks[kind][j][q] * @as(usize, if (hip_layout and mts[q] == 2) 2 else 1);
+    const grid = @min((units + unit_blocks - 1) / unit_blocks, cap);
     if (grid < 1) return;
     var a: cuda.Args = .{};
     a.add(x);
