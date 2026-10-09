@@ -70,6 +70,12 @@ pub fn l2Group(rows_t: usize, bm: usize, k: usize) usize {
     return @max(1, @min(rows_t, (12 << 20) / (bm * k * 2)));
 }
 
+/// HIP's wide-tile band: 4 row tiles (measured 2-7% faster than l2Group's 12 MB band at 512-2048 rows, inputs and
+/// weights cold, notes/prefill.md); tile order only, no bits.
+pub fn wideGroup(rows_t: usize) usize {
+    return @min(rows_t, 4);
+}
+
 /// Mangled names of the FP8G instantiations (fn_qmmf.cu's footer): [F32][cluster][bm 16, 32, 64], and the fused [F32].
 pub const sym = struct {
     fn name(comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
@@ -231,7 +237,7 @@ fn wide(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, o
     a.add(@as(f32, 1.0));
     a.add(out);
     a.add(@as(u64, 0));
-    for ([_]usize{ m, l.n, l.k, sk, l.npad, x_stride, l2Group(rows_t, t[0], l.k) }) |v| a.add(@as(c_int, @intCast(v)));
+    for ([_]usize{ m, l.n, l.k, sk, l.npad, x_stride, wideGroup(rows_t) }) |v| a.add(@as(c_int, @intCast(v)));
     if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
     try cuda.launch.launch(if (ldo != null) k.ld_wide[i] else k.wide[@intFromBool(f32_out)][i], .{
         .grid = .{ .x = @intCast(rows_t * ((l.n + t[1] - 1) / t[1])), .y = 1, .z = 1 },
@@ -299,6 +305,8 @@ test "split_k, buckets and shared memory follow qmm.py and qmmf.cu" {
     try std.testing.expectEqual(@as(usize, 64), bucket(33));
     try std.testing.expectEqual(@as(usize, 1), l2Group(1, 16, 2560));
     try std.testing.expectEqual(@as(usize, 38), l2Group(64, 64, 2560));
+    try std.testing.expectEqual(@as(usize, 4), wideGroup(16));
+    try std.testing.expectEqual(@as(usize, 1), wideGroup(1));
     try std.testing.expectEqual([2]usize{ 64, 128 }, wideTile(33, 1));
     try std.testing.expectEqual([2]usize{ 128, 64 }, wideTile(65, 4));
     try std.testing.expectEqualStrings("_ZN10tf_fn_qmmf11qmmw_kernelILi128ELi64ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", sym.wide[1][3]);

@@ -51,6 +51,11 @@ def l2_group(rows_t: int, bm: int, k: int) -> int:
     return max(1, min(rows_t, (12 << 20) // (bm * k * 2)))
 
 
+def wide_group(rows_t: int) -> int:
+    """cuda_fp8.zig wideGroup: the wide tile's band (tile order only)."""
+    return min(rows_t, 4)
+
+
 def plan(n: int, k: int, m: int, fused_rows: int = FUSED_ROWS, wide_rows: int = WIDE_ROWS):
     """(bm, fused, sk, grid, block, group): matmulAt on gfx1151; from WIDE_ROWS the wide tile (bm 128 or -64 for 64,
     `fused` its bn: 128, or 64 with K slices)."""
@@ -58,7 +63,7 @@ def plan(n: int, k: int, m: int, fused_rows: int = FUSED_ROWS, wide_rows: int = 
     if m >= wide_rows:                                     # cuda_fp8.zig wideTile; bm 64 passed as -64
         bm, bn = 64 if m <= 64 else 128, 128 if sk == 1 else 64
         rows_t = -(-m // bm)
-        return (bm if bm == 128 else -64), bn, sk, rows_t * -(-n // bn), 2 * bm, l2_group(rows_t, bm, k)
+        return (bm if bm == 128 else -64), bn, sk, rows_t * -(-n // bn), 2 * bm, wide_group(rows_t)
     fused = sk > 1 and m >= fused_rows
     bm = 64 if fused else bucket(m)
     rows_t = -(-m // bm)
