@@ -338,7 +338,9 @@ pub const Torch = struct {
         a.add(out);
         for ([_]usize{ rows, vocab, ld }) |v| a.add(@as(i64, @intCast(v)));
         a.add(@as(i32, 0)); // dtype 0: bf16
-        try t.go(t.f.argmax, .{ rows, 1 }, 256, &a);
+        // 1024 threads a row (any whole warps; the pick is a total order, so the same column): a 248k row in one
+        // block was ~72 us at 256 on gfx1151
+        try t.go(t.f.argmax, .{ rows, 1 }, 1024, &a);
     }
 
     /// torch.topk(rows of fp32 `columns` wide, k, sorted=False): values [rows, k] fp32 and int64 columns, in

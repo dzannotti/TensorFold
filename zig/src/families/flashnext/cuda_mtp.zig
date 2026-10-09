@@ -235,25 +235,45 @@ pub const Draws = struct {
     /// sampleDraft on row `row` of the head's `rows` rows (a shared step's streams, one row each).
     pub fn sampleDraftRow(d: *const Draws, f: *Forward, x: *const Bufs, logits_base: u64, row: usize, rows: usize, position: u64, s: ?lanes.Sampling) !sampler.Draw {
         if (d.world > 1) return d.gathered(f, x, row, rows, position, s);
+        const got = try d.gpa.alloc(f32, try d.slotFloats(s));
+        defer d.gpa.free(got);
+        try d.queueRow(f, logits_base, row, s, d.out);
+        try d.read(f, d.out, std.mem.sliceAsBytes(got));
+        return d.takeRow(got, position, s);
+    }
+
+    /// The floats a row's draw reads back (one rank): [max, lse, column] greedy, else [k values | lse | k columns].
+    pub fn slotFloats(d: *const Draws, s: ?lanes.Sampling) !usize {
+        if (s == null or s.?.temperature <= 0) return 3;
+        const k = topK(d.columns, s.?);
+        if (k > d.max_k) return error.TopKPastScratch;
+        return 2 * k + 1;
+    }
+
+    /// The device half of row `row`'s draw (one rank) into `slot` (slotFloats floats); the scratch is reused, so
+    /// rows queue one after another on the stream and are read back together.
+    pub fn queueRow(d: *const Draws, f: *Forward, logits_base: u64, row: usize, s: ?lanes.Sampling, slot: u64) !void {
         const logits = logits_base + row * d.columns * 2;
-        const greedy = s == null or s.?.temperature <= 0;
-        if (greedy) {
-            try f.th.draftGreedy(logits, d.columns, d.s, d.out);
-            var got: [3]f32 = undefined;
-            try d.read(f, d.out, std.mem.asBytes(&got));
+        if (s == null or s.?.temperature <= 0) return f.th.draftGreedy(logits, d.columns, d.s, slot);
+        try f.th.draftTopk(logits, d.columns, topK(d.columns, s.?), d.s, slot);
+    }
+
+    /// The host half: the keyed draft at `position` and its probability from the row's read-back `got`.
+    pub fn takeRow(d: *const Draws, got: []const f32, position: u64, s: ?lanes.Sampling) !sampler.Draw {
+        if (s == null or s.?.temperature <= 0) {
             const c: usize = @intFromFloat(got[2]);
             return .{ .token = d.id(c), .prob = exp(@as(f64, got[0]) - @as(f64, got[1])) };
         }
-        const k = topK(d.columns, s.?);
-        if (k > d.max_k) return error.TopKPastScratch;
-        try f.th.draftTopk(logits, d.columns, k, d.s, d.out);
-        const got = try d.gpa.alloc(f32, 2 * k + 1);
-        defer d.gpa.free(got);
-        try d.read(f, d.out, std.mem.sliceAsBytes(got));
+        const k = (got.len - 1) / 2;
         const ids = try d.gpa.alloc(u64, k);
         defer d.gpa.free(ids);
         for (ids, got[k + 1 ..]) |*t, c| t.* = d.id(@intFromFloat(c));
         return sampler.drawRow(d.gpa, got[0..k], ids, position, s, got[k]);
+    }
+
+    /// The out buffer's floats: several rows' slots fit when their sum stays under it.
+    pub fn outFloats(d: *const Draws) usize {
+        return 2 * d.max_k + 1;
     }
 
     /// decode.sample_mapped (a chain without the confidence rule): the keyed draw over the head's row.
