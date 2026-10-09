@@ -58,3 +58,63 @@ Reading:
   would be a cap on the chain length in confidenceNow's caller (draft_stops_most), not a depth change. Not needed
   here: with product 0.1 depth 15 wins at x1 and x8. 2 and 4 streams were not measured (x1 and x8 both favour 0.1).
 - The x8 samples are one run each; the d15/d8 repeats reproduced to 0.1%, so the steady CLI numbers are tight.
+
+## 2. Re-profile (5074bde + aot-final; default draft rule, depth 15, fp8 KV)
+
+`p2.sh`: TF_FLASHNEXT_PROFILE=1 bench-many prose x1 and CLI `bench` on the 8k prompt (perf/p8k.ids, 8,212 tokens), then
+the same under `rocprofv3 --kernel-trace` with `--eager`. Eager under rocprofv3: prose x1 57.7 tok/s (graphed 59.0);
+8k prefill 1,377 tok/s (CLI, no server; the server measures ~1,080 on the same build: its bench sends fresh
+prompts through the prompt-cache/state path, see cand-results.md).
+
+**Decode, prose x1** (part profiler: 46.3 ms a round eager = main 40.8 + MTP 5.6; rocprofv3 window: 44.2 ms a round,
+GPU busy 40.2 ms = 91%, 1,629 dispatches a round). Parts (ms a round): gdn_proj 8.53, experts_gate_up 5.87, out_proj
+4.07, hc_up 3.61, hc_down 3.60, experts_down 3.17, attn_proj 2.47, gdn_chain 1.52, head 1.40, router 1.03 (was 2.37),
+attention 0.66 (was 3.00), MTP head 5.56 (absorb 2.16, levels 1.72/0.87/0.46/...).
+
+| kernel | ms/round | % of kernel time | launches/round | us/launch |
+|---|---:|---:|---:|---:|
+| `void tf_fn_qmmf::qmmf_kernel<3, 16, 64, 1, 4, 4, false, fals` | 11.45 | 23.6 | 144.0 | 79.5 |
+| `void tf_fn_qmmf_ld::qmmf_kernel<3, 16, 64, 1, 4, 4, false, f` | 9.94 | 20.5 | 48.0 | 207.1 |
+| `_b16mm` | 6.50 | 13.4 | 166.2 | 39.1 |
+| `tf_int4_128_1_1_1_3` | 5.55 | 11.4 | 51.7 | 107.2 |
+| `tf_int4_128_1_1_2_2` | 5.39 | 11.1 | 48.0 | 112.3 |
+| `_b16mm_sm` | 3.48 | 7.2 | 105.2 | 33.1 |
+| `void tf_fn_gdn_tree::tree_kernel<float, 0, 8, 4, true>` | 1.33 | 2.7 | 36.0 | 37.0 |
+| `_router` | 0.88 | 1.8 | 50.7 | 17.3 |
+| `_chunks8` | 0.55 | 1.1 | 14.7 | 37.6 |
+| `_fp4mm` | 0.41 | 0.8 | 5.5 | 75.0 |
+
+- Dense block-FP8 (`qmmf` + `qmmf_ld`) 21.4 ms + bf16 (`_b16mm`/`_b16mm_sm`: hc mixes + MTP projections) 10.0 ms =
+  31.4 ms for ~4.6 GiB of dense weights a round: ~157 GB/s average vs the 242 GB/s streaming floor (20.5 ms). This
+  is still the biggest lever at x1: ~11 ms a round (25%) if all dense reads ran at the floor. Per kernel: qmmf_ld
+  (fused GDN in_proj, ~40 MB) 207 us = ~195 GB/s; qmmf 80 us per launch (small out/attn matrices: launch/tail bound);
+  `_b16mm` 39 us for a 6.5 MB hc mix = ~165 GB/s.
+- int4 experts 10.9 ms (2.55 rows a round x 8 experts x 48 layers; weight-bound per distinct expert).
+- Router (0.88 ms, was 2.29) and attention (`_chunks8` 0.55 ms, was 3.20) are fixed. Glue (`_hc_*`, strided copies,
+  `_reduce`): ~1.5 ms; gaps (9% idle) ~4 ms: ~3 us between dependent kernels (engine-perf.md) = launch count.
+
+**Prefill 8k** (part profiler warm rep: 1,477 ms a 2048-row chunk = 1,387 rows/s; rocprofv3 window 1,484 ms a
+chunk, busy 99.2%, 2,101 dispatches a chunk). Parts (ms a chunk): experts_gate_up 179, attention 174 (was 1,511-2,940),
+gdn_proj 169, experts_down 146, hc_down 112, hc_writeback 106, out_proj 106, gdn_back 97, gdn_chain 84, hc_mix 80,
+gdn_front 68, attn_proj 48.
+
+| kernel | ms/chunk | % of kernel time | launches/chunk | us/launch |
+|---|---:|---:|---:|---:|
+| `void tf_fn_qmmf::qmmw_kernel<128, 64, false>` | 396.60 | 22.2 | 143.6 | 2761.1 |
+| `void tf_fn_qmmf_ld::qmmw_kernel<128, 128, false>` | 213.12 | 11.9 | 47.9 | 4451.0 |
+| `tf_int4_128_2_2_2_2` | 178.94 | 10.0 | 47.9 | 3737.2 |
+| `_chunks8` | 177.97 | 10.0 | 107.2 | 1659.7 |
+| `tf_int4_128_2_2_1_3` | 146.30 | 8.2 | 47.9 | 3055.6 |
+| `_b16mm_ks_sm` | 113.74 | 6.4 | 97.5 | 1166.5 |
+| `_hc_wb_norm` | 103.98 | 5.8 | 97.5 | 1066.4 |
+| `void tf_fn_gdn_io::back_kernel<16, 48>` | 95.55 | 5.4 | 35.9 | 2660.7 |
+| `void tf_fn_gdn_prefill::chain_kernel<float, 128, 32>` | 84.18 | 4.7 | 35.9 | 2344.2 |
+| `_hc_up_mix` | 80.30 | 4.5 | 97.5 | 823.5 |
+
+- Block-FP8 matmuls (`qmmw` WMMA tiles) 610 ms for ~10 TFLOP a chunk = ~16 TF; int4 experts 325 ms for 4.8 TFLOP =
+  ~15 TF; the bf16 hc mixes (`_b16mm_ks_sm` + `_hc_wb_norm` + `_hc_up_mix`) 298 ms for 2.6 TFLOP = ~9 TF; attention
+  (`_chunks8` + `_merge`) 190 ms (~7 TF); GDN conv/gates/chain 248 ms (memory/latency bound). gfx1151's dense bf16
+  WMMA peak is ~59 TF (40 CUs x 512 flop/clk x 2.9 GHz); a realistic 30 TF on every matmul would take a chunk from
+  1.48 s to ~0.9 s (~2,300 tok/s): FP8 dequant in the WMMA tiles (no FP8 hardware) and the GDN kernels are what
+  is left. Mia's 2.6k is a GB10 FP8-hardware number.
+- Only `_chunks8` uses scratch now (116 bytes a lane; was 2,420 with `_router` and `_hc_up_mix` also spilling).
