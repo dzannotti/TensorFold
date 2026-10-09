@@ -146,7 +146,7 @@ def check(args) -> int:
                 bad += not ok
                 print(f"{'ok  ' if ok else 'FAIL'} cap {capacity:6d} p0 {p0:6d} M {rows:4d}: det {det} inv {inv} "
                       f"max|err| {err.amax().item():.3e} (rel {rel.item():.2e}) per-head worst "
-                      f"{per_head.max().item():.3e} best {per_head.min().item():.3e}", flush=True)
+                      f"{per_head.max().item():.3e} best {per_head.min().item():.3e} mean|err| {err.mean().item():.4e}", flush=True)
                 del sub
         del kc, vc
         torch.cuda.empty_cache()
