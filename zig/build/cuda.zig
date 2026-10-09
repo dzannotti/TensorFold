@@ -171,6 +171,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // Flash Next's weights against the oracle's digests (zig/tests/cuda/flashnext/weights_check.zig): its own step
     const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
     b.step("flashnext-weights", "tf-flashnext-weights SNAPSHOT [WEIGHTS.json]: the loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-weights", .root_module = weights_check }), .{}).step);
+    // the host n-gram gather's stall a decode window, cold and warm row cache (no GPU): its own step
+    const ngram_bench = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/ngram_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "flashnext", .module = mods.flashnext } } });
+    b.step("flashnext-ngram-bench", "tf-flashnext-ngram-bench MODEL TOKENS: the n-gram gather's stall a window, direct vs row cache (host only)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-ngram-bench", .root_module = ngram_bench }), .{}).step);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.

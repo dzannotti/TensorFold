@@ -33,12 +33,16 @@ const prompt_mm = @import("cuda_prompt.zig");
 const glue_dec = @import("cuda_glue_dec.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const spill = @import("spill.zig");
+const ngc = @import("cuda_ngram_cache.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// MTP drafts a round by default (Python DEPTH) and their chain's confidence (CONFIDENCE).
 pub const default_depth = 6;
 pub const default_confidence = 0.70;
+/// HIP: the n-gram table's hot rows held in engine memory (GiB, ~6.5M rows a GiB); the 49 GiB table mostly misses the
+/// page cache beside the weights in GTT. TF_FLASHNEXT_NGRAM_CACHE_GIB overrides, 0 off (GB10's page cache holds it).
+const ngram_cache_gib = 1.0;
 
 /// The chains' stop rule as served (cuda_decode.Stop): the running product p1 * ... * pj >= 0.4 (encoded -0.4; decode
 /// D4 after X1, research/X1-drafts.md 3.4: TP=2 code +13-19%, sampled hash map +7.5% over depth 6 / 0.70; a fixed 0.5
@@ -342,6 +346,9 @@ pub const Engine = struct {
     absorbing: bool = true,
     own: *Seq = undefined,
     bound: *Seq = undefined,
+    /// the bound stream's next window as drafted so far (its n-gram rows read ahead: warmDraft)
+    ahead: [16]u32 = undefined,
+    ahead_n: usize = 0,
     rows: usize = 0,
     load_seconds: f64 = 0,
     graphs_on: bool = true,
@@ -410,7 +417,7 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay, .shared_il = if (cuda.hip and !envOff("TF_FLASHNEXT_SHARED_SWIGLU")) 32 else 0 });
+        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay, .shared_il = if (cuda.hip and !envOff("TF_FLASHNEXT_SHARED_SWIGLU")) 32 else 0, .ngram_cache = ngc.cacheBytes(if (cuda.hip) ngram_cache_gib else 0) });
         errdefer e.w.deinit();
         // the draft vocabulary's head: fn_qmm's 4-bit rows, else the int4 lm_head's draft columns; neither, the full head
         if (o.mtp and e.w.draft_head == null and e.w.draft_count == 0) std.log.warn("no draft-vocabulary head (no groups-of-32 4-bit kernels, no int4 lm_head): MTP drafts use the full head", .{});
@@ -1638,6 +1645,8 @@ pub const Engine = struct {
         }
         _ = try mtp.stageMany(&e.f, inputs[0..reqs.len], mb, &segs);
         try e.runMulti(true, segs[0..reqs.len], mb);
+        // each stream's next window starts with its last kept token: its n-gram rows read while the head drafts
+        for (reqs) |r| if (r.next.len > 0) e.f.warmWindow(r.seq, r.next[r.next.len - 1 ..], 0);
         const logits = mb.b.logits;
         var n_active: usize = 0;
         for (reqs, 0..) |*r, i| {
@@ -1693,6 +1702,12 @@ pub const Engine = struct {
                 if (!t.propose) continue;
                 r.out[r.drafted] = @intCast(got.token);
                 r.drafted += 1;
+                if (r.next.len > 0 and r.drafted < 16) {
+                    var win: [16]u32 = undefined;
+                    win[0] = r.next[r.next.len - 1];
+                    @memcpy(win[1 .. 1 + r.drafted], r.out[0..r.drafted]);
+                    e.f.warmWindow(r.seq, win[0 .. 1 + r.drafted], r.drafted);
+                }
                 if (t.more and j + 1 < @min(r.count, r.out.len)) {
                     next[n_next] = .{ .req = a.req, .row = a.row, .tok = @intCast(got.token) };
                     n_next += 1;
@@ -2250,6 +2265,20 @@ pub const Engine = struct {
         };
         try e.mtpForward(mb, next_tokens, streams);
         try e.f.setMtpLen(st, st.mtp_len + next_tokens.len);
+        // the next window starts with the last kept token: its n-gram rows read while the head drafts
+        if (next_tokens.len > 0) {
+            e.ahead[0] = next_tokens[next_tokens.len - 1];
+            e.ahead_n = 1;
+            e.f.warmWindow(e.bound, e.ahead[0..1], 0);
+        }
+    }
+
+    /// A draft of the bound stream's next window: its n-gram rows read ahead (draftMany's for one stream).
+    fn warmDraft(e: *Engine, token: u32) void {
+        if (e.ahead_n == 0 or e.ahead_n >= e.ahead.len) return;
+        e.ahead[e.ahead_n] = token;
+        e.ahead_n += 1;
+        e.f.warmWindow(e.bound, e.ahead[0..e.ahead_n], e.ahead_n - 1);
     }
 
     /// One more MTP step on draft `token`, from the head's output row `from_row` (decode.draft's chain).
@@ -2265,12 +2294,15 @@ pub const Engine = struct {
     pub fn sampleDraft(e: *Engine, position: u64) !decode.Draw {
         const d = &(e.draws orelse return error.NoMtpHead);
         const got = try d.sampleDraft(&e.f, &e.mbuf.?, e.mbuf.?.b.logits, position, e.sampling);
+        e.warmDraft(@intCast(got.token));
         return .{ .token = @intCast(got.token), .prob = got.prob };
     }
 
     pub fn drawDraft(e: *Engine, position: u64) !u32 {
         const d = &(e.draws orelse return error.NoMtpHead);
-        return @intCast(try d.drawDraft(&e.f, &e.mbuf.?, e.mbuf.?.b.logits, position, e.sampling));
+        const tok: u32 = @intCast(try d.drawDraft(&e.f, &e.mbuf.?, e.mbuf.?.b.logits, position, e.sampling));
+        e.warmDraft(tok);
+        return tok;
     }
 
     pub fn isEos(e: *Engine, token: u32) bool {
