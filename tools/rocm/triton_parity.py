@@ -73,7 +73,7 @@ def hash_check(aot: Path, specs: list[Path]) -> int:
     bad = 0
     n = 0
     for spec in specs:
-        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in (e, A.ranged(e))):
+        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in A.hip_entries(e)):
             fn = A.resolve(k["function"])
             opts = A.hip_options(k)
             ck = fn.warmup(grid=(1,), **jit_kwargs(k), **opts)

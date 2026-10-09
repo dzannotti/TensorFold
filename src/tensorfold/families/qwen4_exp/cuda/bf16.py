@@ -108,6 +108,9 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
                          f"dtype matching f32={f32}")
     part = torch.empty((sk, m, b.n), dtype=torch.float32, device=x.device) if sk > 1 else out
     bm = 128 if m > 128 else 16
+    t = hip_tune.tile("_b16mm", {"BM": bm, "K": k, "SK": sk}) if hip_tune.hip() else None
+    if t:
+        block_n, bk = t["BLOCK_N"], t["BK"]
     grid = (triton.cdiv(m, bm), -(-b.n // block_n), sk)
     _b16mm[grid](x, b.weight, out, part, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm,
                  BLOCK_N=block_n, BK=bk, F32=f32,

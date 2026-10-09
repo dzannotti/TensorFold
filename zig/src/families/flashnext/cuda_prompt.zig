@@ -19,6 +19,8 @@ const f32p = "*fp32";
 pub const min_rows = 129;
 /// `_b16mm_ks`'s row tiles a band (tools/zig/flashnext_prompt_spec.py GROUP).
 const group = 8;
+/// `_b16mm_ks`'s (rows, columns) tile: gfx1151 takes 64 x 128 (src/tensorfold/cuda/hip_tune.py TILES; no bits change).
+const ks_tile: [2]usize = if (cuda.hip) .{ 64, 128 } else .{ 128, 64 };
 
 fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
@@ -60,7 +62,8 @@ pub fn fp4Takes(on: bool, m: usize, n: usize, k: usize) bool {
 pub fn b16(t: tri.Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
     const sk = tri.b16SplitK(n, k);
     if (m < min_rows or sk < 2 or k % 64 != 0) return error.NotAPromptSplit;
-    try run(t, "_b16mm_ks", .{ cdiv(m, 128) * cdiv(n, 64), 1, 1 }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", 128), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32), ci("GROUP", group) });
+    const bm, const bn = ks_tile;
+    try run(t, "_b16mm_ks", .{ cdiv(m, bm) * cdiv(n, bn), 1, 1 }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", bn), ci("BK", 64), cb("F32", fp32), ci("GROUP", group) });
 }
 
 /// nvfp4.matmul's bits for m >= min_rows and split K (the shared expert's tables).
@@ -79,8 +82,8 @@ fn gpiFor(per: usize, want: usize) usize {
 /// `_b16mm` alone into the partials (the profile's split of a matmul from its `_reduce`; Tri.b16mm's launch).
 pub fn b16Slices(t: tri.Tri, x: u64, x_stride: usize, w: u64, part: u64, fp32: bool, m: usize, n: usize, k: usize) !void {
     const sk = tri.b16SplitK(n, k);
-    const bm: usize = if (m > 128) 128 else 16;
-    try run(t, "_b16mm", .{ cdiv(m, bm), cdiv(n, 64), sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, part), aot.ptr("PART", f32p, part), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32) });
+    const tl = tri.b16Tile(m, n, k);
+    try run(t, "_b16mm", .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ aot.ptr("X", bf16, x), aot.ptr("W", bf16, w), aot.ptr("OUT", if (fp32) f32p else bf16, part), aot.ptr("PART", f32p, part), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
 }
 
 /// `_reduce` of `sk` slices (Tri.reduce).

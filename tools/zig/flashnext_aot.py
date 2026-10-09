@@ -505,6 +505,17 @@ def hip_options(k: dict) -> dict:
     return hip_tune.options(k["name"], _ints(k), o)
 
 
+def hip_entries(k: dict) -> list[dict]:
+    """A spec entry as the HIP set holds it: plus its gfx1151 tile (hip_tune.TILES) if the kernel has one, each in
+    both pointer forms."""
+
+    from tensorfold.cuda import hip_tune
+
+    t = hip_tune.tile(k["name"], _ints(k))
+    out = [k] + ([_derived(_with_consts(k, t), f"gfx1151 tile {t}")] if t and _ints(k) != {**_ints(k), **t} else [])
+    return [x for e in out for x in (e, ranged(e))]
+
+
 def ranged(k: dict) -> dict:
     """The entry with every pointer built for AMD buffer ops (``tt.pointer_range`` 32: what the ROCm JIT specializes
     a tensor within 2 GiB to), marked ``range32``."""
@@ -605,7 +616,7 @@ def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: P
     same = 0
     todo = [k for k in kernels if tps & set(k.get("tp", [1])) and (not only or only in k["function"])]
     if hip:                                       # each specialization in both pointer forms (buffer ops, or not)
-        todo = [x for k in todo for x in (k, ranged(k))]
+        todo = [x for k in todo for x in hip_entries(k)]
     from concurrent.futures import ProcessPoolExecutor
 
     with ProcessPoolExecutor(max_workers=max(1, jobs)) as pool:
