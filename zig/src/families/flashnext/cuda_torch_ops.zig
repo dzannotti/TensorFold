@@ -76,6 +76,12 @@ pub const Functions = struct {
     strided: cuda.Function,
     gather: cuda.Function,
     swiglu: cuda.Function,
+    /// interleaved gate|up (weights.interleave); null in a build without it
+    swiglu_il: ?cuda.Function,
+    /// null in a build whose fn_ops predates it (the forward then keeps `_reduce` and the strided copy)
+    reduce_ld: ?cuda.Function,
+    /// HIP: `_topk_rows` + the one-block plan in one launch (topk_plan.hip); null elsewhere
+    topk_plan: ?cuda.Function,
     fill64: cuda.Function,
     draft_pick: cuda.Function,
     draft_pack: cuda.Function,
@@ -103,6 +109,9 @@ pub const Functions = struct {
             .strided = try m[i(.movement)].function("tf_strided_copy_kernel"),
             .gather = try m[i(.movement)].function("tf_gather_rows_kernel"),
             .swiglu = try m[i(.ops)].function("tf_fn_shared_swiglu_kernel"),
+            .swiglu_il = m[i(.ops)].function("tf_fn_shared_swiglu_il_kernel") catch null,
+            .reduce_ld = m[i(.ops)].function("tf_fn_reduce_ld_kernel") catch null,
+            .topk_plan = m[i(.ops)].function("tf_fn_topk_plan_kernel") catch null,
             .fill64 = try m[i(.ops)].function("tf_fn_fill_u64_kernel"),
             .draft_pick = try m[i(.ops)].function("tf_fn_draft_pick_kernel"),
             .draft_pack = try m[i(.ops)].function("tf_fn_draft_pack_kernel"),
@@ -308,6 +317,41 @@ pub const Torch = struct {
 
     /// MoE4.shared_act into its slot: g [rows, 2 ni] bf16 (gate | up) -> out rows `out_stride` elements apart
     /// (buf.act[:, top_k]: (top_k + 1) * ni).
+    /// bf16 `_reduce` of `sk` fp32 slices part [sk, rows, n] into rows `ldo` elements apart (fn_ops.cu, the same bytes as
+    /// `_reduce` + slotCopy).
+    pub fn reduceLd(t: Torch, part: u64, out: u64, rows: usize, n: usize, sk: usize, ldo: usize) !void {
+        if (rows * n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(part);
+        a.add(out);
+        for ([_]u64{ rows, n, sk, ldo }) |v| a.add(v);
+        try t.go(t.f.reduce_ld orelse return error.NoReduceLd, .{ blocks(rows * n, 256), 1 }, 256, &a);
+    }
+
+    /// moe.select_rows + the one-block plan (pairs <= 1024): logits [rows, nl] (ne routed, the shared gate) -> picks
+    /// and weights [rows, top + 1], members, items of `tile` pairs and counts (topk_plan.hip, the same bytes).
+    pub fn topkPlan(t: Torch, logits: u64, rows: usize, ne: usize, nl: usize, top: usize, pick: u64, wts: u64, tile: usize, members: u64, items: u64, counts: u64) !void {
+        if (rows * (top + 1) > 1024 or ne > 512 or top >= 32) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        for ([_]usize{ rows, ne, nl, top }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(pick);
+        a.add(wts);
+        a.add(@as(c_int, @intCast(tile)));
+        for ([_]u64{ members, items, counts }) |v| a.add(v);
+        try t.go(t.f.topk_plan orelse return error.NoTopkPlan, .{ 1, 1 }, 1024, &a);
+    }
+
+    /// `sharedSwiglu` of gate|up rows interleaved in runs of `il` (fn_ops.cu, the same bytes on the same pairs).
+    pub fn sharedSwigluIl(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize, il: usize) !void {
+        if (rows * ni == 0) return;
+        var a: cuda.Args = .{};
+        a.add(g);
+        a.add(out);
+        for ([_]u64{ rows, ni, out_stride, il }) |v| a.add(v);
+        try t.go(t.f.swiglu_il orelse return error.NoSwigluIl, .{ blocks(rows * ni, 256), 1 }, 256, &a);
+    }
+
     pub fn sharedSwiglu(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize) !void {
         if (rows * ni == 0) return;
         var a: cuda.Args = .{};

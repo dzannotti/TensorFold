@@ -1629,7 +1629,7 @@ fn benchMany(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
     return 0;
 }
 
-/// `glue-check`: no checkpoint; the fused hyper-connection up projection + mix against _b16mm + _hc_mix, and the fused write-back + norm against _hc_writeback + _hc_normed.
+/// `glue-check`: no checkpoint; the fused hyper-connection up projection + mix against _b16mm + _hc_mix, the fused write-back + norm against _hc_writeback + _hc_normed, and (HIP) the decode fusions (cuda_glue_dec.zig).
 fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8) !u8 {
     var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
     defer set.deinit();
@@ -1637,7 +1637,15 @@ fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []co
     defer stream.deinit();
     const t: flashnext.triton.Tri = .{ .set = &set, .s = stream };
     const up = try flashnext.prompt.glueCheck(gpa, ctx.d, t);
-    const ok = (try flashnext.prompt.wbNormCheck(gpa, ctx.d, t)) and up;
+    const wb = try flashnext.prompt.wbNormCheck(gpa, ctx.d, t);
+    var ops = try flashnext.torch_ops.Ops.load(ctx);
+    defer ops.deinit();
+    var k = try flashnext.kernels.Kernels.load(ctx);
+    defer k.deinit();
+    var k8 = try flashnext.fp8.Kernels.load(ctx);
+    defer k8.deinit();
+    const dec = !cuda.hip or try flashnext.glue_dec.check(gpa, ctx.d, t, ops.on(stream), .{ .k = &k, .s = stream }, &k8);
+    const ok = wb and up and dec;
     std.debug.print("{s} glue-check\n", .{if (ok) "PASS" else "FAIL"});
     return if (ok) 0 else 1;
 }

@@ -523,7 +523,24 @@ def hip_entries(k: dict) -> list[dict]:
             out.append(e)
     if k["name"] == "_hc_act":
         out += _hc_act_sk(k)
+    out += _dec_entries(k)
     return [x for e in out for x in (e, ranged(e))]
+
+
+UP_MIX_DEC = (16, 32)      # _hc_up_mix decode tiles: BM 16, BD 16 or 32
+
+
+def _dec_entries(k: dict) -> list[dict]:
+    """HIP decode: ``_hc_up_mix`` at 16 rows (BD 16 / 32) from its 64-row entries, in every M form."""
+
+    out = []
+    if k["name"] == "_hc_up_mix" and _ints(k)["BM"] == 64 and _ints(k)["BD"] == 64:
+        forms = ("div16",) if k["attrs"].get("M") else ("plain", "one")
+        for bd in UP_MIX_DEC:
+            for form in forms:
+                e = _derived(_with_consts(k, {"BM": 16, "BD": bd}), f"decode up + mix, BM 16 BD {bd}")
+                out.append(_int_form(e, "M", form))
+    return out
 
 
 def _hc_act_sk(k: dict) -> list[dict]:
