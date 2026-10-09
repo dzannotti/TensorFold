@@ -21,15 +21,20 @@ noisy (A/B alternated) unless noted. Scripts: `/home/dzannotti/tf-engine-scratch
     rows-split inside layerForward/attnBlock (attention is being rewritten elsewhere).
 
 ## 2. First prefill after load
-Not GPU staging: the `stage` interval is host time before the chunk's first kernel, spent in the n-gram gather on the
-48 GiB host-mapped FP8 table (ple-table/, NVMe). Rows are hashed n-grams spread over the table; with
-read_ahead_kb 4096 a cold touch faults in ~2.3 MiB (measured: 300 random touches 1.1 ms each, +686 MiB page cache;
-with MADV_RANDOM 0.12 ms each, +1 MiB). Chunk 0 paid ~15k cold faults (16 s), chunk 1 2.4 s, then warm (13 ms). A
-dummy chunk at load would only warm what its own n-grams touch; reading the table sequentially takes it all in
-(~3.5 GB/s measured by page-touch on a partly cached shard, ~15 s for 48 GiB). bf50f56: `NgramTable.warm` reads one
-byte a page of every shard on a background thread started at the end of Engine.init (load time unchanged; joined by
-deinit; `TF_FLASHNEXT_TABLE_WARM=0` off). Page cache only (reclaimable, counted in MemAvailable). NOT yet measured
-on the full model (see "pending").
+Instrumented on the full model (host ms inside stageMany, cold table): chunk 0's n-gram gather took 20.9 s (then
+3.0, 1.0, 0.5 s; 13 ms warm). It is the 48 GiB host-mapped FP8 table (ple-table/, NVMe): rows are hashed n-grams
+spread over the table, and a cold lookup faulted in ~2.3 MiB of read-around (read_ahead_kb 4096; 1.1 ms a touch,
+0.12 ms with MADV_RANDOM), one lookup at a time. (The later chunks' 2.4-3.5 s "ids" time is the staged-event wait
+on the previous chunk's GPU work: overlapped, harmless.) A background read of the table after load (bf50f56) did not
+help (37.3 vs 39.0 s: the load evicts the table and the read competed with the gather) and was reverted (b43781b).
+b40f6bd: the shards are MADV_RANDOM and a chunk's lookups run on the loader's threads (256 a job), so faults overlap
+on the NVMe queue. Full model, table pages dropped first (POSIX_FADV_DONTNEED), 8,212-token prompt:
+
+| | rep 0 (first after load) | rep 1 | sha |
+|---|---:|---:|---|
+| before (no warm) | 38.96 s | 14.33 s | a11a30d2c83f |
+| background warm (reverted) | 37.28 s | 18.84 s | a11a30d2c83f |
+| b40f6bd | **16.04 s** | 14.24 s | a11a30d2c83f |
 
 ## 3. GPU idle in the round loop
 - profile.md's 9% idle (4.5 ms a prose round) was measured eager. Graph-mode rocprofv3 on the 1-layer MTP view
@@ -52,7 +57,29 @@ on the full model (see "pending").
   sha, rounds and accepted identical between base and new (served rule and confidence 0).
 - `zig build test -Dgpu=hip -Daot-set=aot-hip3`: 21/21 steps.
 
-## Pending (full model; ask the coordinator first)
+## Full-model results (prod down, GPU exclusive per step, fp8 KV, aot-hip3)
+- CLI sky drafted == `--no-drafts`: sha de8d7a445fe7 both (accepted 50 of 69 drafts).
+- bench-many --served, steady reps (rep 0 pays the per-request captures), base 7ec5235 -> new (2cbb025 + ac1a5d9):
+  prose x1 51.3 -> 51.6 tok/s; code x1 93.4 -> 94.2; prose x8 157.4 -> 157-163; code x8 199.7 -> 206.3 (draws+commits
+  1.1 -> 0.4 ms a round, drafting 38.1 -> 35.2). Rounds and tokens a stream-round identical (100/2.55, 38/6.71,
+  109/2.65, 62/5.37).
+- TF_FLASHNEXT_VMM=0 (eda4701; view: same sha, gate-many 24/24): stock runtime prose x1 ~47-48, code x1 ~82 tok/s
+  (VMM costs nothing; copy-grown caches do).
+- Retained PM4 (tf-rt-libs/pm4, DEBUG_HIP_GRAPH_PM4=1, GPU_MAX_HW_QUEUES=1): full model hangs after load at the
+  first replay with VMM on AND off (CLI run, plain and drafted; also with ROC_AQL_QUEUE_SIZE=65536). On the 1-layer
+  view it runs, VMM on and off (same sha as stock). So not VMM; something with the full graph's size/content.
+- rocprofv3 --kernel-trace graph hang: unchanged with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 and with ROC_AQL_QUEUE_SIZE=65536
+  ("Async signal handler still waiting on signal" right after load); view works. Same size-dependent pattern as PM4.
+- Code x1 host enqueue (34 of 55 ms a verify): graphs are keyed by sequence (they bake its buffers) and every
+  request gets a new sequence (lanes.preparePrefill / generateMany newSeq; freeSeq drops its graphs; warmGraphs only
+  warms the engine's own). A request recaptures each window size x DeltaNet parity it meets (TF_FLASHNEXT_GRAPH_LOG:
+  ~100 captures over 6 requests); code meets most of the 16 sizes x 2 parities in its 38 rounds, prose few. A
+  capture is an eager run, a wait, the capture and an instantiate: host-bound, hence the CPU-load sensitivity. The
+  server pays the same per request. Tried: capturing without the wait (overlapping the eager run): slower (prose
+  47-49, code 31-83 tok/s), dropped. Fix to do: keep sequences (and their graphs) across requests: a pool of freed
+  VMM sequences reserved at max_len, physical pages unmapped back to the first step when pooled.
+
+## Scripts
 `/home/dzannotti/tf-engine-scratch/fullcheck.sh [123]` (memwatch, one process at a time, ~12 min):
 1 CLI sky drafted == plain; 2 cold-table first prefill, warm on vs off (drops only ple-table pages with
 POSIX_FADV_DONTNEED; reports load time and rep 0 / rep 1 prefill); 3 bench-many x1/x8 prose+code base vs new.
