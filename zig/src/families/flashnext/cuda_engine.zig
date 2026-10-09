@@ -303,7 +303,11 @@ pub const Engine = struct {
     cand_host: std.ArrayList(f32) = .empty,
     cand_round: u64 = 0,
     cand_have: u64 = std.math.maxInt(u64),
-    /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
+    /// one rank, greedy windows: the round's argmax over every row, read once (sampleWindow)
+    ids_host: std.ArrayList(i32) = .empty,
+    ids_have: u64 = std.math.maxInt(u64),
+    /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again, and one rank's draws
+    /// wait a window or a draft at a time (the old way)
     draw_once: bool = true,
     /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
     /// are live, `wide_confidence` above (maxInt: the request's rule always)
@@ -661,6 +665,7 @@ pub const Engine = struct {
         e.extra.buf.free();
         if (e.prof) |p| p.deinit(e.gpa);
         e.cand_host.deinit(e.gpa);
+        e.ids_host.deinit(e.gpa);
         e.memo.deinit();
         if (e.px) |*q| q.deinit();
         if (e.k8) |*q| q.deinit();
@@ -1481,6 +1486,17 @@ pub const Engine = struct {
             }
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
+        if (e.world == 1 and e.draw_once and smp == null) {
+            // greedy: one argmax over the round's rows and one wait for every window (a row's argmax is its own)
+            if (e.ids_have != e.cand_round) {
+                try e.ids_host.resize(e.gpa, total);
+                try e.f.th.argmax(e.buf.b.logits, e.g.head_n, e.g.head_n, e.main_sample.col, total);
+                try e.read(e.main_sample.col, std.mem.sliceAsBytes(e.ids_host.items));
+                e.ids_have = e.cand_round;
+            }
+            for (out[0 .. sg.a1 - sg.a0], e.ids_host.items[sg.a0..sg.a1]) |*o, x| o.* = @intCast(x);
+            return;
+        }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
     }
 
@@ -1578,10 +1594,25 @@ pub const Engine = struct {
                 cands = c;
                 try e.read(mb.b.cand_all, std.mem.sliceAsBytes(c));
             }
+            // one rank: every row's draw queued, then one wait for all of them (each row's own kernels and slot)
+            var queued: ?[]f32 = null;
+            defer if (queued) |q| e.gpa.free(q);
+            var stride: usize = 0;
+            if (e.world == 1 and e.draw_once and n_active > 1) {
+                for (active[0..n_active]) |a| stride = @max(stride, try d.slotFloats(smpOf(reqs[a.req].sampling)));
+                if (n_active * stride <= d.outFloats()) {
+                    for (active[0..n_active], 0..) |a, k| try d.queueRow(&e.f, lg, row_of[k], smpOf(reqs[a.req].sampling), d.out + k * stride * 4);
+                    const q = try e.gpa.alloc(f32, n_active * stride);
+                    queued = q;
+                    try e.read(d.out, std.mem.sliceAsBytes(q));
+                }
+            }
             for (active[0..n_active], 0..) |a, k| {
                 const r = &reqs[a.req];
-                const smp: ?lanes.Sampling = if (r.sampling) |x| (if (x.temperature > 0) x else null) else null;
-                const got = if (cands != null and sampler.gatheredFits(smp))
+                const smp = smpOf(r.sampling);
+                const got = if (queued) |q|
+                    try d.takeRow(q[k * stride ..][0..try d.slotFloats(smp)], r.seq.st.pos + 1 + j, smp)
+                else if (cands != null and sampler.gatheredFits(smp))
                     try d.gatheredFrom(cands.?, row_of[k], rows, r.seq.st.pos + 1 + j, smp)
                 else
                     try d.sampleDraftRow(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp);
@@ -1615,6 +1646,11 @@ pub const Engine = struct {
             }
             n_active = n_next;
         }
+    }
+
+    /// A stream's sampling as its draws take it: temperature 0 is greedy (null).
+    fn smpOf(s: ?lanes.Sampling) ?lanes.Sampling {
+        return if (s) |x| (if (x.temperature > 0) x else null) else null;
     }
 
     /// One request of a reference multi-stream run (generateMany): its prompt, reply cap, rule and drafting, and
