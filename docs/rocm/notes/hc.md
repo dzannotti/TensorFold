@@ -16,12 +16,14 @@ fp64 comparison was needed: today's error is unchanged.
 
 ## Bits
 
-`tools/rocm/hc_bits.py` (ROCm JIT): RESULT_BITS
+`tools/rocm/hc_bits.py` (ROCm JIT, rows 1/3/16/17/129/161/2049, random plus -0 and subnormal inputs): 111 cases, 0 differ.
 
-`triton_parity.py` on the new set (aot-hc5): RESULT_PARITY
+`triton_parity.py` on the rebased set (aot-hc7): hash 1100/1100 equal; tiles 508 partial-tile launches, 0 differ; run 1522
+launches, 1454 equal, 0 differ, 68 no variant (the prompt-only `_ks` / `_hc_up_mix` entries at M 1..128, which the engine
+never launches; `_fp4mm_ks` has the same). glue-check PASS (edge/wide fills), mm-check PASS, `zig build test -Dgpu=hip` PASS.
 
 1-layer views (`fn1` linear, `fn1a` attention; prompts 17 / 129 / 2300 rows, 24 decoded tokens; default, prompt mm
-off, glue fusions off), rocm-next binary + aot-hip3 vs this branch + aot-hc5, tokens and prefill digests: RESULT_E2E
+off, glue fusions off), rocm-next binary + aot-hip3 vs this branch + aot-hc5 (18/18 identical) and, rebased on rocm-cand, + aot-hc7 (12/12 identical).
 
 ## Speed (microbenchmarks; see "Measurement")
 
