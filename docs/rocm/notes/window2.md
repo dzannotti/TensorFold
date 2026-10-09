@@ -118,3 +118,83 @@ gdn_front 68, attn_proj 48.
   1.48 s to ~0.9 s (~2,300 tok/s): FP8 dequant in the WMMA tiles (no FP8 hardware) and the GDN kernels are what
   is left. Mia's 2.6k is a GB10 FP8-hardware number.
 - Only `_chunks8` uses scratch now (116 bytes a lane; was 2,420 with `_router` and `_hc_up_mix` also spilling).
+
+## 3. Retained-PM4 hang: root cause and workaround
+
+Runtime: `LD_LIBRARY_PATH=tf-rt-libs/pm4:tf-rt-libs/core-10.1 DEBUG_HIP_GRAPH_PM4=1 GPU_MAX_HW_QUEUES=1` (pwilkin
+rocm-systems `ilintar-experiments`, commits 58580be2b3 "hip: add retained PM4 graph command lists" + a7694b306d; its
+design doc is `projects/rocr-runtime/runtime/docs/contribution/retained-pm4-command-lists.rst`). Knobs in the libs:
+DEBUG_HIP_GRAPH_PM4, DEBUG_HIP_GRAPH_PM4_UNQUALIFIED (gfx1151 is already qualified), HSA_GRAPH_COMMAND_LIST_DIAGNOSTICS=1
+(prints encoder rejections), plus the stock DEBUG_HIP_GRAPH_BATCH_SIZE / _MERGE_COLLAPSED / _SEGMENT_SCHEDULING. HIP
+lowers a graph segment's packet batch to one PM4 IB only when every packet is a kernel dispatch without completion
+signal; scratch kernels are bound to the queue's main scratch (falls back to AQL if it does not fit). Script:
+`~/tf-window/w2/p3.sh LABEL MODEL [VAR=VAL...]` (CLI sky, 32 tokens, plain, AMD_LOG_LEVEL=3 to count `[PM4] retained`).
+
+Bisect (views built by `~/tf-window/w2/tools/nview.py --layers N --mtp`: the first N layers, PLE kept):
+
+| model | result | HIP graph log |
+|---|---|---|
+| fn1 (1 DeltaNet layer) | OK, PM4 lists of 2-24 dispatches | `collapse-eligible (max_level=2)` |
+| fn1a (1 full-attention layer: `_chunks8` uses 116 B scratch) | OK, a 28-dispatch list with private 116 B | collapse-eligible |
+| v4, v12 (4 / 12 layers) | **hang** after the first replay's lists (4 dispatches each) | `deep graph (max_level=8>4), skip collapse -> round-robin (13 segs)`, `Creating 1 parallel streams`, `Resolved queue collision` |
+| v4 / v24 + `TF_FLASHNEXT_SHARED_SIDE=0` | OK, one segment, lists of 136 / 736 dispatches, same sha as stock | `collapse-eligible (max_level=0) -> 1 segs` |
+
+Root cause: the engine forks the shared expert onto a second stream inside the captured graph (event record/wait
+per layer, cuda_forward.zig `f.side`). From 2 layers on the graph is deep enough that HIP keeps it multi-segment
+(two streams, cross-segment sync barriers and completion signals); the retained-PM4 path in that runtime does not
+handle a segment's PM4 batch feeding a cross-stream dependency (its own design doc lists "dependency shapes" as
+fallback-only, but this shape is not detected), so the first replay waits forever. 1-layer views are shallow enough
+to collapse to one stream, which is why they worked. Not size, scratch, LDS, kernargs or VMM (all present in the
+working 1-layer and side-off runs). The stock-runtime rocprofv3 graph-mode hang is the same shape: `rocprofv3 --kernel-trace` on graphed bench-many runs
+fine with `TF_FLASHNEXT_SHARED_SIDE=0` (prose x1 56.2 tok/s under the tracer; graph-mode trace: 44.7 ms a round, GPU
+busy 89.8%, 1,604 dispatches a round; `qmmf` is 42.7 us a launch graphed vs 79.5 eager, so eager traces inflate the
+small dense kernels).
+
+Workaround: `TF_FLASHNEXT_SHARED_SIDE=0` (shared expert in line; same bits by design, verified below). Full model:
+
+- CLI sky depth 15, PM4 + side off: `--no-drafts` sha de8d7a445fe7, drafted de8d7a445fe7 (51/69): drafted == plain and
+  equal to stock.
+- bench-many (served rule, steady reps), same session:
+
+| | stock, side on (default) | stock, side off | PM4, side off |
+|---|---:|---:|---:|
+| prose x1, default rule | 58.9 | 58.2 | **62.8** (verify 35.3 ms vs 37.8) |
+| code x1, default rule | 113.3 | 113.2 | **120.7** |
+| prose x1, product 0.1 (PS=8) | 71.5 | 70.9 | **75.3** |
+| code x1, product 0.1 | 119.4 | 119.4 | **122.5** |
+| prose x8, product 0.1 | 242.3 | 240.3 | 240.1 |
+| code x8, product 0.1 | 303.8 | 302.4 | 301.0 |
+
+PM4 gains 5-7% at one stream (the ~3 us gap between dependent dispatches) and nothing at 8 streams (longer kernels,
+fewer gaps per byte). The side stream itself is worth ~1% (58.9 vs 58.2).
+
+Server (tensorfold-native, Mia's flags, side off, product 0.1 everywhere, `~/tf-window/w2/p3f.sh pm4|stock`):
+- contracts.py a-d: PM4 54 pass / 0 fail / 6 unchecked; stock 54 / 0 / 6 (as the candidate). Decode token shas at
+  x1 equal the candidate's default-rule run (prose 2880d0cb0fce, code 70ac5c54fa9a): the policy and PM4 change speed only.
+- bench.py (1 and 8 requests, median of 3; then a 4-session alternated x1 A/B):
+
+| server | prose x1 | prose x8 | code x1 | code x8 | 8k prefill |
+|---|---:|---:|---:|---:|---:|
+| candidate, default rule, side on (cand-results.md) | 57.1 | 197.1 | 109.4 | 254.0 | 1,079 |
+| stock, product 0.1, side off | 69.1 / 69.3 / 69.3 / 69.4 | 208.1 | 108.6 / 109.0 / 109.0 / 109.1 | 263.3 | 1,013 |
+| PM4, product 0.1, side off | 69.0 / 69.2 / 69.2 / 69.1 | 205.2 | 104.2 / 104.8 / 104.6 / 104.5 | 261.2 | 1,024 |
+
+  So in the server PM4 gains nothing (prose) or loses 4% (code), while the CLI gains 6%. Cause: a retained list is
+  prepared on a graph exec's first launch (encode ~44k dwords + executable allocation): 12.7 ms a preparation
+  (AMD_LOG_LEVEL=3 timestamps, logging included; a plain launch 4.5 us), and the server re-instantiates its graphs
+  for every request (TF_FLASHNEXT_GRAPH_LOG: ~25 captures a request, live graphs stay at 11-18 although the sequence
+  pool is on). ~25 x 12.7 ms = ~0.3 s a request, about the GPU time PM4 saves. GPU_MAX_HW_QUEUES (1 or 4) changes
+  nothing. Fix: keep a sequence's decode graphs across requests (why the pool recaptures is the open engine
+  question), or cache prepared lists by packet content in the runtime.
+- The draft policy alone (stock, product 0.1) is the server's real win: prose x1 57.1 -> 69.3 (+21%, above thorim's
+  65.2), prose x8 +6%, code x8 +4%, code x1 flat (CLI +5.6%; the server's per-request recaptures grow with the
+  number of distinct window sizes the deeper chains meet).
+
+## Recommendations
+1. HIP served defaults: running product 0.1 at every stream count (`TF_FLASHNEXT_CONFIDENCE=-0.1
+   TF_FLASHNEXT_PRODUCT_STREAMS=8`, depth 15); in code a HIP branch of served_confidence / product_streams_default.
+2. Retained PM4 is usable with `TF_FLASHNEXT_SHARED_SIDE=0` (same bits, contracts pass). Ship it only after graphs
+   survive across requests (or a runtime prepared-list cache); until then it pays off in long single-stream decodes
+   only. Upstream report for pwilkin: PM4 batches in multi-segment (forked-stream) graphs hang on the first replay;
+   repro = any graph that forks a stream deeper than the collapse limit (max_level > 4).
+3. With the side stream off, rocprofv3 works in graph mode: use it for gap analysis (GPU idle ~10% a decode round).
