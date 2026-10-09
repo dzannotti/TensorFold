@@ -7,7 +7,9 @@ const Stream = @import("stream.zig").Stream;
 const launch = @import("launch.zig");
 const triton = @import("triton.zig");
 
-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+/// `range32`: a pointer built with AMD's `tt.pointer_range = 32` (buffer loads and stores, 32-bit offsets), which a
+/// launch takes only when its tensor lies within 2 GiB of the pointer (Triton's JIT: storage <= 2^31 - 1 bytes).
+const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool, range32: bool = false };
 const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
 const KernelJson = struct {
     @"fn": []const u8,
@@ -58,10 +60,33 @@ pub fn cf(name: []const u8, v: f32) Const {
 
 const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
 
+/// Bytes a buffer-op pointer may address (Triton's `is_within_2gb`).
+pub const max_range: u64 = (1 << 31) - 1;
+
+/// The driver's allocation lookups `Set.small` uses (cuMemGetAddressRange / hipMemGetAddressRange and the VMM handle
+/// retain that tells a mapped chunk from a whole allocation).
+const Ranges = struct {
+    range: *const fn (*u64, *usize, u64) callconv(.c) c_int,
+    retain: *const fn (*u64, u64) callconv(.c) c_int,
+    release: *const fn (u64) callconv(.c) c_int,
+
+    fn init(d: *const Driver) ?Ranges {
+        var lib = d.lib;
+        const hip = @import("driver.zig").hip;
+        return .{
+            .range = lib.lookup(*const fn (*u64, *usize, u64) callconv(.c) c_int, if (hip) "hipMemGetAddressRange" else "cuMemGetAddressRange_v2") orelse return null,
+            .retain = lib.lookup(*const fn (*u64, u64) callconv(.c) c_int, if (hip) "hipMemRetainAllocationHandle" else "cuMemRetainAllocationHandle") orelse return null,
+            .release = lib.lookup(*const fn (u64) callconv(.c) c_int, if (hip) "hipMemRelease" else "cuMemRelease") orelse return null,
+        };
+    }
+};
+
 pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
     gpa: std.mem.Allocator,
+    /// the set holds `range32` variants and the driver can size allocations (else no pointer is ever `small`)
+    ranges: ?Ranges = null,
 
     /// Loads every binary listed in `dir`/aot.json (cubins, or AMD code objects) into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -73,6 +98,7 @@ pub const Set = struct {
         errdefer parsed.deinit();
         const variants = try gpa.alloc(Variant, parsed.value.kernels.len);
         var n: usize = 0;
+        var ranged = false;
         errdefer {
             for (variants[0..n]) |*v| v.kernel.unload();
             gpa.free(variants);
@@ -88,8 +114,9 @@ pub const Set = struct {
             const meta: triton.Meta = .{ .name = k.name, .num_warps = k.num_warps, .warp_size = k.warp_size, .num_ctas = k.num_ctas, .shared = k.shared, .launch_pdl = k.pdl };
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
+            for (k.params) |p| ranged = ranged or p.range32;
         }
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .ranges = if (ranged) Ranges.init(d) else null };
     }
 
     pub fn deinit(self: *Set) void {
@@ -99,11 +126,28 @@ pub const Set = struct {
         self.* = undefined;
     }
 
+    /// Whether a buffer-op variant may take the pointer: its allocation ends within `max_range` bytes of it. A VMM
+    /// mapping answers for one physical chunk, not its reservation, so VMM memory (the KV caches) never counts.
+    /// ponytail: two driver lookups a pointer a launch (~140 ns on gfx1151); graphs replay without them.
+    pub fn small(self: *const Set, addr: u64) bool {
+        const r = self.ranges orelse return false;
+        var base: u64 = 0;
+        var size: usize = 0;
+        if (r.range(&base, &size, addr) != 0 or addr < base or base + size - addr > max_range) return false;
+        var h: u64 = 0;
+        if (r.retain(&h, addr) == 0) {
+            _ = r.release(h);
+            return false;
+        }
+        return true;
+    }
+
     /// The variant of `function` compiled for these constexprs and these arguments' specialization.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
+        const all_small = allSmall(self, args);
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+            if (matches(v.spec, args, consts, all_small)) return v;
         }
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
@@ -161,18 +205,30 @@ pub const Specs = struct {
 
     pub fn has(self: *const Specs, function: []const u8, args: []const Arg, consts: []const Const) bool {
         for (self.parsed.value.kernels) |k| {
-            if (std.mem.eql(u8, k.@"fn", function) and matches(k, args, consts)) return true;
+            if (std.mem.eql(u8, k.@"fn", function) and matches(k, args, consts, null)) return true;
         }
         return false;
     }
 };
+
+/// Every pointer argument of a launch `small` (the form a variant's pointers are built in).
+pub fn allSmall(set: *const Set, args: []const Arg) bool {
+    if (set.ranges == null) return false;
+    for (args) |a| switch (a.value) {
+        .ptr => |x| if (!set.small(x.addr)) return false,
+        else => {},
+    };
+    return true;
+}
 
 fn lookup(args: []const Arg, name: []const u8) ?Arg {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+/// `small` null (a dry check): either pointer form matches; else a `range32` param exactly when every pointer of the
+/// launch is `small` (allSmall: a variant is built with all its pointers in one form).
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const, small: ?bool) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
@@ -199,6 +255,7 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
             .ptr => |x| {
                 const p = param orelse return false;
                 if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
+                if (small) |all| if (p.range32 != all) return false;
             },
             .f32 => {
                 const p = param orelse return false;

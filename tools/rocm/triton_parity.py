@@ -3,6 +3,8 @@
 
   hash: every spec entry is warmed up through the JIT (MockTensor pointers: nothing allocated, nothing launched); its
         kernel hash must be in aot.json and its hsaco byte-equal to the AOT one.
+  tiles: every row-tiled matmul variant (_b16mm, _b16mm_ks, _router, _hc_up_mix; both pointer forms) on a partial
+        last row tile against whole tiles: each row's bits must not depend on M.
   run:  the Python wrappers (tools/zig/flashnext_triton_fixtures.py's calls, small rows) on random GPU tensors; each
         Triton launch runs through the JIT, then again from aot.json's hsaco with the Zig launcher's ABI (variant by
         aot.zig's matching rules, runtime args + two null scratch pointers, 32 * num_warps threads, metadata shared
@@ -30,16 +32,17 @@ import flashnext_aot as A  # noqa: E402
 # ------------------------------------------------------------------------------------------------------------- hash
 
 class Ptr:
-    """A MockTensor whose address is 16-aligned or not, as the spec's divisibility says."""
+    """A MockTensor whose address is 16-aligned or not, as the spec's divisibility says, within 2 GiB (Triton's
+    ``is_within_2gb``: the JIT then specializes it to buffer ops) or not."""
 
-    def __init__(self, dtype, aligned: bool) -> None:
-        self.dtype, self.addr = dtype, 0 if aligned else 8
+    def __init__(self, dtype, aligned: bool, small: bool = False) -> None:
+        self.dtype, self.addr, self.small = dtype, 0 if aligned else 8, small
 
     def data_ptr(self):
         return self.addr
 
-    def ptr_range(self):          # under 2 GiB: the JIT adds tt.pointer_range 32 (buffer ops)
-        return 1 << 20
+    def ptr_range(self):
+        return 1024 if self.small else 1 << 40
 
 
 def jit_kwargs(k: dict):
@@ -49,13 +52,13 @@ def jit_kwargs(k: dict):
     kw = {}
     for p in k["params"]:
         t = k["signature"][p]
-        div = bool(k["attrs"].get(p))
+        div = ["tt.divisibility", 16] in k["attrs"].get(p, [])
         if t == "constexpr":
             kw[p] = A.value(k["constexprs"][p], tl, reg)
         elif t.startswith("*"):
             short = t[1:]
             name = {"i": "int", "u": "uint"}.get(short[0], "") + short[1:] if short[0] in "iu" else short
-            kw[p] = Ptr(tl.dtype(name), div)
+            kw[p] = Ptr(tl.dtype(name), div, bool(k.get("range32")))
         elif t in ("i32", "i64", "u32", "u64"):
             kw[p] = 32 if div else 7
         elif t == "fp32":
@@ -70,7 +73,7 @@ def hash_check(aot: Path, specs: list[Path]) -> int:
     bad = 0
     n = 0
     for spec in specs:
-        for k in json.loads(spec.read_text())["kernels"]:
+        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in A.hip_entries(e)):
             fn = A.resolve(k["function"])
             opts = A.hip_options(k)
             ck = fn.warmup(grid=(1,), **jit_kwargs(k), **opts)
@@ -87,8 +90,9 @@ def hash_check(aot: Path, specs: list[Path]) -> int:
 
 # -------------------------------------------------------------------------------------------------------------- run
 
-def zig_match(row: dict, args: list[tuple], consts: dict) -> bool:
-    """aot.zig's ``matches``: args are (name, kind, value, type) with kind ptr / i32 / f32."""
+def zig_match(row: dict, args: list[tuple], consts: dict, small: bool) -> bool:
+    """aot.zig's ``matches``: args are (name, kind, value, type) with kind ptr / i32 / f32; ``small``: every pointer's
+    storage within 2 GiB (aot.zig's allSmall, as the JIT decides it)."""
 
     for n, c in consts.items():
         got = row["consts"].get(n)
@@ -108,7 +112,7 @@ def zig_match(row: dict, args: list[tuple], consts: dict) -> bool:
             if p["div16"] != (not p["nospec"] and v % 16 == 0):
                 return False
         elif kind == "ptr":
-            if p is None or p["type"] != ty or p["div16"] != (v % 16 == 0):
+            if p is None or p["type"] != ty or p["div16"] != (v % 16 == 0) or p.get("range32", False) != small:
                 return False
         elif p is None or p["type"] != "fp32":
             return False
@@ -217,7 +221,8 @@ def interceptor(hip: Hip, jit):
                 after = [t.clone() for t in tensors]
                 fn = jit.fn.__name__
                 STATS["launches"] += 1
-                rows = [r for r in hip.rows if r["fn"] == fn and zig_match(r, args, zc)]
+                small = all(t.untyped_storage().size() <= A.MAX_RANGE for t in tensors)
+                rows = [r for r in hip.rows if r["fn"] == fn and zig_match(r, args, zc, small)]
                 st = STATS["fns"].setdefault(fn, [0, 0, 0])
                 if not rows:
                     STATS["novariant"] += 1
@@ -320,29 +325,38 @@ def run_check(aot: Path, cases: str, n_bench: int, specs: list[Path]) -> int:
 
 
 def kv8_cases(F, z) -> None:
-    """--kv-dtype fp8 (kv8.py): three rows written by _attn_prep8 into uint8 caches, then attended by _chunks8."""
+    """--kv-dtype fp8 (kv8.py): M rows (ROWS) written by _attn_prep8 into uint8 caches, then attended by _chunks8:
+    dense rows near the start, and at 262144 keys sparse rows (the indexer's selected blocks and tail) far in."""
 
     import torch
 
     from tensorfold.families.qwen4_exp.cuda import kv8
 
-    D, HD, NI, IHD, HALF, EPS, r = F.D, F.HD, F.NI, F.IHD, F.HALF, F.EPS, 3
+    D, HD, NI, IHD, HALF, EPS = F.D, F.HD, F.NI, F.IHD, F.HALF, F.EPS
     for world, rk in F.RANKS.items():
         heads, kv = rk["heads"], rk["kv"]
         pw = heads * 2 * HD + 2 * kv * HD + (NI + 1) * IHD
-        for capacity in (1024, 262144):
+        for capacity, p0 in ((1024, 5), (262144, 5), (262144, 200000)):
             kc = torch.zeros((capacity, kv, HD + kv8.PAD), dtype=torch.uint8, device="cuda")
             vc = torch.zeros((capacity, kv, HD), dtype=torch.uint8, device="cuda")
-            ikc, pos0 = z((capacity, IHD)), torch.full((1,), 5, dtype=torch.int32, device="cuda")
-            q, iq = z((r, heads, HD)), z((r, NI, IHD))
-            kv8.attn_prep(z((r, pw)), pos0, z((HD,), torch.float32), z((HD,), torch.float32), z((IHD,), torch.float32),
-                          z((HALF,), torch.float32), q, kc, vc, iq, ikc, EPS, q_heads=heads, kv_heads=kv, head_dim=HD,
-                          index_heads=NI, index_dim=IHD)
-            sc = F.attn_mod.AttnScratch(r, heads, HD, capacity, "cuda")
-            if sc.qsa:
-                F.attn_mod.qsa_select(iq, ikc, z((-(-capacity // 4), IHD)), pos0, z((IHD,), torch.float32),
-                                      z((HALF,), torch.float32), EPS, sc, r, context=8192)
-            kv8.attention(q, kc, vc, pos0, sc, r, HD ** -0.5, context=8192 if sc.qsa else None)
+            ikc, pos0 = z((capacity, IHD)), torch.full((1,), p0, dtype=torch.int32, device="cuda")
+            if p0 > 5:                      # the positions before p0: written once, untraced
+                kc[:p0], vc[:p0] = kv8.quantize(z((p0, kv, HD)), z((p0, kv, HD)))
+            for r in ROWS:
+                if p0 + r > capacity:
+                    continue
+                q, iq = z((r, heads, HD)), z((r, NI, IHD))
+                kv8.attn_prep(z((r, pw)), pos0, z((HD,), torch.float32), z((HD,), torch.float32),
+                              z((IHD,), torch.float32), z((HALF,), torch.float32), q, kc, vc, iq, ikc, EPS,
+                              q_heads=heads, kv_heads=kv, head_dim=HD, index_heads=NI, index_dim=IHD)
+                sc = F.attn_mod.AttnScratch(r, heads, HD, capacity, "cuda")
+                ctx = p0 + r
+                if sc.qsa:
+                    F.attn_mod.qsa_select(iq, ikc, z((-(-capacity // 4), IHD)), pos0, z((IHD,), torch.float32),
+                                          z((HALF,), torch.float32), EPS, sc, r, context=ctx)
+                kv8.attention(q, kc, vc, pos0, sc, r, HD ** -0.5, context=ctx)
+            del kc, vc, ikc
+            torch.cuda.empty_cache()
 
 
 ROWS = (1, 3, 16, 17, 129, 161, 2049)
@@ -355,19 +369,19 @@ def direct_cases(z, specs: list[Path]) -> None:
     import torch
     import triton
 
-    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod, prompt_mm as pm
+    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod, bf16 as b16_mod, prompt_mm as pm
 
-    names = ("_b16mm_ks", "_fp4mm_ks", "_hc_up_mix", "_hc_wb_norm", "_scores_rows")
-    mods = {n: pm for n in names} | {"_select_tiles": attn_mod}
+    names = ("_b16mm_ks", "_b16mm_ks_sm", "_fp4mm_ks", "_hc_up_mix", "_hc_wb_norm", "_scores_rows")
+    mods = {n: pm for n in names} | {"_select_tiles": attn_mod, "_b16mm": b16_mod, "_b16mm_sm": b16_mod}
     wrapped = {n: getattr(m, n) if hasattr(getattr(m, n), "jit") else interceptor(HIP, getattr(m, n))
                for n, m in mods.items()}
     dt = {"*bf16": torch.bfloat16, "*fp32": torch.float32, "*u16": torch.uint16, "*u8": torch.uint8,
           "*i32": torch.int32, "*fp16": torch.float16}
     seen = set()
     for spec in specs:
-        for k in json.loads(spec.read_text())["kernels"]:
-            if k["name"] not in mods:
-                continue
+        for k in (x for e in json.loads(spec.read_text())["kernels"] for x in A.hip_entries(e)):
+            if k["name"] not in mods or (k["name"] == "_b16mm" and "gfx1151 tile" not in k.get("rule", "")):
+                continue                              # _b16mm: the wrappers' launches cover the spec's own
             key = json.dumps([k["name"], k["constexprs"], k["signature"], k["attrs"], k["options"]["num_warps"]])
             if key in seen:
                 continue
@@ -381,7 +395,15 @@ def direct_cases(z, specs: list[Path]) -> None:
                 if k["name"] in ("_hc_wb_norm", "_select_tiles", "_scores_rows") and m > 161:
                     continue
                 kw = {}
-                if k["name"] == "_b16mm_ks":
+                if k["name"] in ("_b16mm", "_b16mm_sm"):
+                    n, kk, sk = c["N"], c["K"], c["SK"]
+                    if (m % 16 == 0) != div or n * kk > 1 << 26 or ("M" in c) != (m == 1) or (m > 128) != (c["BM"] == 128):
+                        continue
+                    out = t("OUT", (m, n))
+                    kw = dict(X=t("X", (m, kk)), W=t("W", (n, kk)), OUT=out, PART=z((sk, m, n), torch.float32) if sk > 1 else out,
+                              x_stride=kk, M=m)
+                    grid = (triton.cdiv(m, c["BM"]), triton.cdiv(n, c["BLOCK_N"]), sk)
+                elif k["name"] in ("_b16mm_ks", "_b16mm_ks_sm"):
                     if (m % 16 == 0) != div:
                         continue
                     n, kk = c["N"], c["K"]
@@ -428,6 +450,83 @@ def direct_cases(z, specs: list[Path]) -> None:
                           for n, v in k["constexprs"].items() if n not in kw}
                 wrapped[k["name"]][grid](**kw, **consts, **A.hip_options(k))
 
+# ------------------------------------------------------------------------------------------------------------ tiles
+
+def _tile_args(row: dict, m: int, base: dict | None = None):
+    """Inputs for a row-tiled matmul at ``m`` rows (random, or the first ``m`` rows of ``base``'s), zeroed outputs:
+    tensors by name, grid, the compared output (its rows axis) and the strides."""
+
+    import torch
+
+    c = {n: v.get("int") for n, v in row["consts"].items()}
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    bf = lambda *s: (torch.randn(s, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)   # noqa: E731
+    zero = lambda *s, dt=torch.float32: torch.zeros(s, device="cuda", dtype=dt)               # noqa: E731
+    rows = lambda name, x: base[name][:m].contiguous() if base else x                         # noqa: E731
+    fn = row["fn"]
+    if fn in ("_b16mm", "_b16mm_ks", "_b16mm_sm", "_b16mm_ks_sm"):
+        n, k, sk = c["N"], c["K"], c["SK"]
+        out = zero(m, n, dt=torch.float32 if c["F32"] else torch.bfloat16)
+        t = {"X": rows("X", bf(m, k)), "W": base["W"] if base else bf(n, k), "OUT": out}
+        if fn.startswith("_b16mm_ks"):
+            return t, (-(-m // c["BM"]) * -(-n // c["BLOCK_N"]), 1, 1), ("OUT", 0), {"x_stride": k}
+        t["PART"] = zero(sk, m, n) if sk > 1 else out
+        return t, (-(-m // c["BM"]), -(-n // c["BLOCK_N"]), sk), ("PART", 1) if sk > 1 else ("OUT", 0), {"x_stride": k}
+    if fn == "_router":
+        d, ne = c["D"], c["NE"]
+        t = {"X": rows("X", bf(m, d)), "W": base["W"] if base else bf(ne, d), "OUT": zero(m, ne)}
+        return t, (-(-m // c["BM"]), -(-ne // c["BLOCK_E"]), 1), ("OUT", 0), {"x_stride": d}
+    d, s_, k = c["D"], c["S"], c["K"]                                   # _hc_up_mix
+    t = {"ACT": rows("ACT", bf(m, k)), "W": base["W"] if base else bf(s_ * d, k),
+         "NORMED": rows("NORMED", bf(m, s_ * d)), "MIXED": zero(m, d, dt=torch.bfloat16)}
+    return t, (-(-m // c["BM"]), d // c["BD"], 1), ("MIXED", 0), {}
+
+
+def tiles_check(aot: Path) -> int:
+    """Every row-tiled matmul variant with M a runtime int (both pointer forms): a launch whose last row tile is
+    partial gives each row the bits a launch of whole tiles gives it (the gfx1151 miscompile of heavily spilled
+    masked loads broke exactly this), and the two pointer forms of one specialization give the same bits."""
+
+    import torch
+
+    hip = Hip(aot)
+    stream = torch.cuda.current_stream().cuda_stream
+    bad = n = 0
+    forms: dict = {}
+    u8 = lambda x: x.contiguous().view(torch.uint8)                     # noqa: E731
+    for row in hip.rows:
+        if row["fn"] not in ("_b16mm", "_b16mm_ks", "_b16mm_sm", "_b16mm_ks_sm", "_router", "_hc_up_mix"):
+            continue
+        c = {k: v.get("int") for k, v in row["consts"].items()}
+        mp = next((p for p in row["params"] if p["name"] == "M"), None)
+        if mp is None or c.get("N", 0) * c.get("K", 0) > 1 << 26:      # one row only, or a head-sized weight
+            continue
+        bm = c["BM"]
+        full = 2 * bm if bm >= 64 else 64
+        ms = [x for x in ((bm + 16, full - 16) if mp["div16"] else (bm + 1, full - 3)) if x % bm]
+        pr = any(p.get("range32") for p in row["params"])
+
+        def launch(t, grid, ints, m):
+            args = [(p["name"], "ptr", t[p["name"]].data_ptr(), p["type"]) if p["type"].startswith("*") else
+                    (p["name"], "i32", m if p["name"] == "M" else ints[p["name"]], "i32") for p in row["params"]]
+            hip.launch(row, grid, args, stream)
+            torch.cuda.synchronize()
+
+        whole, grid, (o, ax), ints = _tile_args(row, full)
+        launch(whole, grid, ints, full)
+        for m in ms:
+            t, grid, _, _ = _tile_args(row, m, whole)
+            launch(t, grid, ints, m)
+            n += 1
+            want = whole[o][:m] if ax == 0 else whole[o][:, :m]
+            key = (row["fn"], json.dumps(row["consts"], sort_keys=True), mp["div16"], m)
+            prev = forms.setdefault(key, t[o])
+            if not torch.equal(u8(want), u8(t[o])) or not torch.equal(u8(prev), u8(t[o])):
+                bad += 1
+                print(f"DIFFER {row['fn']} {row['hash'][:10]} {c} range32 {pr} M {m}")
+    print(f"{n} partial-tile launches against whole tiles and the other pointer form, {bad} differ")
+    return 1 if bad else 0
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -444,7 +543,11 @@ def main() -> int:
                    "fp4/,b16/,attention/tp1/c1024/r3/p100,attention/tp1/c262144/r3/p3000/x8192,"
                    "attention/tp2/c262144/r16/p3000/x16384,attention_prefill/tp1/c1024/s0/n30,"
                    "attention_prefill/tp1/c262144/s4096/n19,attention_prefill/tp1/c262144/s2048/n974,shift/,kv8,direct")
+    t = sub.add_parser("tiles")
+    t.add_argument("--aot", required=True)
     a = ap.parse_args()
+    if a.cmd == "tiles":
+        return tiles_check(Path(a.aot))
     if a.cmd == "hash":
         return hash_check(Path(a.aot), [Path(s) for s in a.spec])
     return run_check(Path(a.aot), a.cases, a.bench, [Path(x) for x in a.spec])

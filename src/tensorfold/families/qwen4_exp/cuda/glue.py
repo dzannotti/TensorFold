@@ -172,6 +172,34 @@ def _hc_act(DN, ACT, XS, INJ, S: tl.constexpr, LOW: tl.constexpr, LOWP: tl.const
 
 
 @triton.jit
+def _hc_act_sk(PART, ACT, XS, INJ, M, SK: tl.constexpr, S: tl.constexpr, LOW: tl.constexpr, LOWP: tl.constexpr,
+               HAS_INJ: tl.constexpr, NDN: tl.constexpr):
+    """``bf16._reduce`` (fp32 out: the slices of PART [SK, M, NDN] added in slice order) fused with ``_hc_act``: the
+    same bits, one launch less (HIP decode rows)."""
+
+    r = tl.program_id(0)
+    i = tl.arange(0, LOWP)
+    ok = i < LOW
+    v = tl.load(PART + r * NDN + i, mask=ok, other=0.0)
+    for s_ in tl.static_range(1, SK):
+        v = v + tl.load(PART + (s_ * M + r) * NDN + i, mask=ok, other=0.0)
+    v = (v / S).to(tl.bfloat16).to(tl.float32)
+    a = _bsilu(v)
+    a = tl.where(ok, a, 0.0)
+    tl.store(ACT + r * LOW + i, a.to(tl.bfloat16), mask=ok)
+    sums = tl.sum(tl.reshape(a, (LOWP // 32, 32)), axis=1)
+    g = tl.arange(0, LOWP // 32)
+    tl.store(XS + r * (LOW // 32) + g, sums, mask=g < LOW // 32)
+    if HAS_INJ:
+        s = tl.arange(0, S)
+        iv = tl.load(PART + r * NDN + LOW + s)
+        for s_ in tl.static_range(1, SK):
+            iv = iv + tl.load(PART + (s_ * M + r) * NDN + LOW + s)
+        iv = (iv / S).to(tl.bfloat16).to(tl.float32)
+        tl.store(INJ + r * S + s, (2.0 * _bsig(iv)).to(tl.bfloat16))
+
+
+@triton.jit
 def _hc_reduce_act(PART, ACT, XS, INJ, SK: tl.constexpr, M, S: tl.constexpr, LOW: tl.constexpr,
                    LOWP: tl.constexpr, HAS_INJ: tl.constexpr, NDN: tl.constexpr):
     """``qmm``'s split-K sum (slices in order, one bf16 rounding) fused with ``hc_act``: the same bits."""

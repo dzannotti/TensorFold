@@ -27,6 +27,7 @@ const ngram = @import("cuda_ngram.zig");
 const ropes = @import("cuda_rope.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
+const tri = @import("cuda_triton.zig");
 
 const Config = cfgs.Config;
 const st = core.safetensors;
@@ -61,7 +62,8 @@ pub const Options = struct {
 };
 
 /// A bf16 matrix [n, k] as stored (Python bf16._Routed, its B16 at `.b`: named "<path>.b.weight").
-pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0 };
+/// `slices` > 0: stored slice-major, [slices, n, k / slices] (bf16.slice_major; HIP's hyper-connection down rows).
+pub const Rows = struct { weight: u64 = 0, n: u32 = 0, k: u32 = 0, slices: u32 = 0 };
 /// An FP4 table in the pattern form: bf16 bits [n/64][k/64][64][64], fp32 scales [k/16, n], fp32 scale2 [n].
 pub const Fp4 = struct { weight: u64 = 0, scale: u64 = 0, scale2: u64 = 0, n: u32 = 0, k: u32 = 0 };
 pub const Expert4 = struct { gu: Fp4 = .{}, down: Fp4 = .{} };
@@ -133,6 +135,8 @@ pub const NgramTable = struct {
     lut: [256]u16 = @splat(0),
     /// on the GPU: rows [base, base + count) as stored, the LUT ([256] bf16 bits), heads [head0, head0 + heads)
     gpu: ?struct { rows: u64, lut: u64, base: u64, count: u64, head0: u32, heads: u32 } = null,
+    /// host threads a prompt chunk's gather runs on (Options.threads)
+    threads: u32 = 1,
 
     pub fn deinit(t: *NgramTable) void {
         for (t.files.items) |*f| f.close(t.io);
@@ -152,8 +156,29 @@ pub const NgramTable = struct {
     }
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
+    /// A prompt chunk's lookups run on `threads` threads: on a cold page cache each is a disk read (the rows are
+    /// hashed n-grams spread over the whole table), and parallel faults keep the disk's queue full.
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
+        const per = 256;
+        if (t.threads <= 1 or ids.len < 4 * per) return t.gatherSome(ids, out);
+        const Ctx = struct {
+            t: *const NgramTable,
+            ids: []const i64,
+            out: []u16,
+            failed: *std.atomic.Value(bool),
+            fn run(c: @This(), i: usize) void {
+                const a = i * per;
+                const b = @min(a + per, c.ids.len);
+                c.t.gatherSome(c.ids[a..b], c.out[a * c.t.width .. b * c.t.width]) catch c.failed.store(true, .monotonic);
+            }
+        };
+        var failed = std.atomic.Value(bool).init(false);
+        parallel(t.threads, (ids.len + per - 1) / per, Ctx{ .t = t, .ids = ids, .out = out, .failed = &failed }, Ctx.run);
+        if (failed.load(.monotonic)) return error.NgramIdOutOfRange;
+    }
+
+    fn gatherSome(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
@@ -676,6 +701,26 @@ const Loader = struct {
         return .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k) };
     }
 
+    /// `face` of whole-row parts stored slice-major, [sk, n, k / sk] (Rows.slices; gfx1151 streams it faster).
+    fn sliceMajor(L: *Loader, path: []const u8, parts: []const Part, sk: usize) !Rows {
+        const k = parts[0].t.dim(1);
+        var n: usize = 0;
+        for (parts) |p| {
+            if (p.t.dtype != .bf16 or p.t.dim(1) != k or p.rows.len != 0 or p.cols != null) return error.UnexpectedTensor;
+            n += p.t.dim(0);
+        }
+        const ks = k / sk;
+        const host = try L.staging(n * k * 2);
+        var row: usize = 0;
+        for (parts) |p| for (0..p.t.dim(0)) |r| {
+            for (0..sk) |s| @memcpy(host[((s * n + row) * ks) * 2 ..][0 .. ks * 2], p.t.bytes[(r * k + s * ks) * 2 ..][0 .. ks * 2]);
+            row += 1;
+        };
+        const ptr = try L.out.whole(path, "bfloat16", &.{ sk, n, ks }, host);
+        L.out.ours();
+        return .{ .weight = ptr, .n = @intCast(n), .k = @intCast(k), .slices = @intCast(sk) };
+    }
+
     fn b16(L: *Loader, path: []const u8, name: []const u8, n: usize, k: usize) !Rows {
         return L.face(path, &.{.{ .t = try L.linear(name, n, k) }});
     }
@@ -705,7 +750,11 @@ const Loader = struct {
         parts[0] = .{ .t = try L.linear(try L.nameOf("{s}.input_mix_weight_down", .{name}), c.low, sd) };
         if (inject) parts[1] = .{ .t = try L.linear(try L.nameOf("{s}.block_inject_weight", .{name}), c.streams, sd) };
         var pb: [192]u8 = undefined;
-        h.down = try L.face(try std.fmt.bufPrint(&pb, "{s}.down.b.weight", .{path}), parts[0 .. @as(usize, 1) + @intFromBool(inject)]);
+        const down = parts[0 .. @as(usize, 1) + @intFromBool(inject)];
+        h.down = if (cuda.hip and tri.b16SplitK(c.low + if (inject) c.streams else 0, sd) == 32)
+            try L.sliceMajor(try std.fmt.bufPrint(&pb, "{s}.down.sm.weight", .{path}), down, 32)
+        else
+            try L.face(try std.fmt.bufPrint(&pb, "{s}.down.b.weight", .{path}), down);
         h.up = try L.b16(try std.fmt.bufPrint(&pb, "{s}.up.b.weight", .{path}), try L.nameOf("{s}.input_mix_weight_up", .{name}), sd, c.low);
         h.scale = try L.cscale(try std.fmt.bufPrint(&pb, "{s}.scale", .{path}), try L.nameOf("{s}.hc_norm.weight", .{name}), sd);
         return h;
@@ -1328,9 +1377,15 @@ const Loader = struct {
             if (t.width == 0) t.width = @intCast(tensor.dim(1));
             if (tensor.dim(1) != t.width) return error.NgramShardsDiffer;
             try t.shards.append(L.gpa, tensor.bytes);
+            // lookups are random: fault in the page, not the 2-4 MiB read-around (~1.1 ms a cold lookup, ~0.12 random)
+            const lo = std.mem.alignBackward(usize, @intFromPtr(tensor.bytes.ptr), std.heap.pageSize());
+            const hi = std.mem.alignForward(usize, @intFromPtr(tensor.bytes.ptr) + tensor.bytes.len, std.heap.pageSize());
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
+            std.posix.madvise(p, hi - lo, std.posix.MADV.RANDOM) catch {};
             try t.starts.append(L.gpa, t.starts.items[t.starts.items.len - 1] + tensor.dim(0));
         }
         t.rows = t.starts.items[t.starts.items.len - 1];
+        t.threads = L.o.threads;
         t.fp8 = kind.? == .f8_e4m3;
         var b: [256]u8 = undefined;
         const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale", .{base});

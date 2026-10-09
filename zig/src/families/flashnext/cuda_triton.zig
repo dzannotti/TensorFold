@@ -203,6 +203,17 @@ pub fn b16SplitK(n: usize, k: usize) usize {
     return sk;
 }
 
+/// `_b16mm`'s tile: bf16.matmul's (BM 16 or 128, 64 columns, K blocks of 64), and on HIP the decode rows' gfx1151 tile
+/// for long K slices (src/tensorfold/cuda/hip_tune.py tile(); no bits change: each output's MMA chain is the same).
+pub const B16Tile = struct { bm: usize, bn: usize, bk: usize };
+
+pub fn b16Tile(m: usize, n: usize, k: usize) B16Tile {
+    const bm: usize = if (m > 128) 128 else 16;
+    const ks = k / b16SplitK(n, k);
+    if (cuda.hip and bm == 16 and ks >= 1024 and ks % 256 == 0) return .{ .bm = bm, .bn = 64, .bk = 256 };
+    return .{ .bm = bm, .bn = 64, .bk = 64 };
+}
+
 /// The fp32 scratch bf16.matmul's split K needs for `m` rows (0 without a split).
 pub fn b16PartBytes(m: usize, n: usize, k: usize) usize {
     const sk = b16SplitK(n, k);
@@ -256,9 +267,11 @@ pub const Memo = struct {
         m.map.deinit(m.gpa);
     }
 
-    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const) u64 {
+    /// `small`: aot.allSmall (the buffer-op pointer form `find` picks by).
+    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const, small: bool) u64 {
         var h = std.hash.Wyhash.init(0x7472693a);
         h.update(name);
+        h.update(&.{@intFromBool(small)});
         for (consts) |c| {
             h.update(&.{0xc0});
             h.update(c.name);
@@ -296,7 +309,7 @@ pub const Tri = struct {
         if (t.rec) |r| return r.add(name, g, args, consts);
         const set = t.set.?;
         const m = t.memo orelse return set.run(t.s, name, g, args, consts);
-        const k = Memo.key(name, args, consts);
+        const k = Memo.key(name, args, consts, aot.allSmall(set, args));
         const at = m.map.get(k) orelse blk: {
             const v = try set.find(name, args, consts);
             const i = (@intFromPtr(v) - @intFromPtr(set.variants.ptr)) / @sizeOf(@TypeOf(set.variants[0]));
@@ -391,6 +404,11 @@ pub const Tri = struct {
     /// with `inject` (ndn = low + S) the inject gates [R, S].
     pub fn hcAct(t: Tri, dn: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize) !void {
         try t.run("_hc_act", .{ rows, 1, 1 }, &.{ p("DN", f32p, dn), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act) }, &.{ ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
+    }
+
+    /// glue.hc_act_sk: hcAct of the down projection's `sk` fp32 K slices part [sk, R, ndn], summed in slice order.
+    pub fn hcActSk(t: Tri, part: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize, sk: usize) !void {
+        try t.run("_hc_act_sk", .{ rows, 1, 1 }, &.{ p("PART", f32p, part), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act), int("M", rows) }, &.{ ci("SK", sk), ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
     }
 
     /// glue.hc_mix: mixed [R, D] = bf16(sum_s bf16(sigmoid(up_s) * normed_s) / S) and its group sums.
@@ -567,12 +585,17 @@ pub const Tri = struct {
     /// bf16.matmul: x [M, K] bf16 (rows `x_stride` apart) @ w [N, K].T -> out [M, N] (bf16, or fp32 sums with
     /// `f32`); K slices (b16SplitK) into `part` (b16PartBytes) are summed in slice order by `_reduce`.
     pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
+        return t.b16mmOf("_b16mm", x, x_stride, w, out, fp32, part, m, n, k);
+    }
+
+    /// `b16mm` of `kernel`: "_b16mm", or "_b16mm_sm" for a weight stored slice-major (W.Rows.slices).
+    pub fn b16mmOf(t: Tri, kernel: []const u8, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
         if (k % 64 != 0) return error.KNotBlocked;
         const sk = b16SplitK(n, k);
-        const bm: usize = if (m > 128) 128 else 16;
+        const tl = b16Tile(m, n, k);
         const oty = if (fp32) f32p else bf16;
         const split = sk > 1;
-        try t.run("_b16mm", .{ cdiv(m, bm), cdiv(n, 64), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32) });
+        try t.run(kernel, .{ cdiv(m, tl.bm), cdiv(n, tl.bn), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", tl.bm), ci("BLOCK_N", tl.bn), ci("BK", tl.bk), cb("F32", fp32) });
         if (split) try t.reduce(part, out, fp32, m * n, sk);
     }
 
@@ -669,8 +692,10 @@ fn expectLaunches(f: *const Fixture, id: []const u8, rec: *const Recorder) !void
     for (want, rec.launches[0..rec.n]) |w, got| {
         const o = w.object;
         try testing.expectEqualStrings(o.get("fn").?.string, got.name);
+        // HIP launches bf16.matmul's gfx1151 tile (b16Tile; hip_tune.tile): its grid and tile constexprs differ
+        const tiled = cuda.hip and std.mem.eql(u8, got.name, "_b16mm");
         const grid = o.get("grid").?.array.items;
-        for (grid, got.grid) |g, x| try testing.expectEqual(jsonInt(g), @as(i64, x));
+        if (!tiled) for (grid, got.grid) |g, x| try testing.expectEqual(jsonInt(g), @as(i64, x));
         const args = o.get("args").?.array.items;
         try testing.expectEqual(args.len, got.nargs);
         for (args) |arg| {
@@ -711,6 +736,7 @@ fn expectLaunches(f: *const Fixture, id: []const u8, rec: *const Recorder) !void
             };
             errdefer std.debug.print("{s}: constexpr {s}\n", .{ got.name, name });
             const v = kv.value_ptr.object;
+            if (tiled and (std.mem.eql(u8, name, "BK") or std.mem.eql(u8, name, "BLOCK_N"))) continue;
             if (v.get("int")) |x| try testing.expectEqual(jsonInt(x), mine.int.?);
             if (v.get("f32")) |x| try testing.expectEqual(jsonInt(x), @as(i64, @as(u32, @bitCast(mine.f32.?))));
         }

@@ -76,6 +76,12 @@ pub const Table = struct {
         defer gpa.free(rows);
         const src: cuda.DeviceBuffer = .{ .d = d, .ptr = r.weight, .len = n * k * 2 };
         try src.download(0, std.mem.sliceAsBytes(rows));
+        if (r.slices != 0) { // stored slice-major [slices, n, k / slices]: back to rows
+            const sm = try gpa.dupe(u16, rows);
+            defer gpa.free(sm);
+            const ks = k / r.slices;
+            for (0..r.slices) |s| for (0..n) |i| @memcpy(rows[i * k + s * ks ..][0..ks], sm[(s * n + i) * ks ..][0..ks]);
+        }
         const kg = k / 32;
         const words = try gpa.alloc(u32, n * k / 8);
         defer gpa.free(words);

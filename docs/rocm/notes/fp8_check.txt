@@ -1,4 +1,4 @@
-# tools/rocm/fp8_check.py --real <ckpt>; then --bench (best of 15, weights rotated past MALL). 2026-10-08, gfx1151 shared with production at ~100% GPU use: timings are noisy, compare A/B only.
+# tools/rocm/fp8_check.py --real <ckpt> (2026-10-09, wide tile from 33 rows; same worst-case numbers as before: same bits)
 PASS exact: all 254 e4m3 codes (subnormals, zeros, signs) one-hot through the kernel
 PASS gdn_qkvz: n 16384 k 2560 sk 1 rows 2048: fp32 worst 3.37 (bound 201) units of 2^-24 sum|xws| at (1976, 9450) |err| 7.579e-05 ref 1.6938e+02; per-column worst median 1.37 max 3.37; bf16 == RNE(fp32) True, bf16 err / (half ulp + fp32 err) 1.000; invariance/determinism/ld/strided ok
 PASS attn_qkv: n 13312 k 2560 sk 1 rows 2048: fp32 worst 6.05 (bound 201) units of 2^-24 sum|xws| at (660, 63) |err| 6.294e-05 ref 7.3118e+01; per-column worst median 1.39 max 6.05; bf16 == RNE(fp32) True, bf16 err / (half ulp + fp32 err) 1.000; invariance/determinism/ld/strided ok
@@ -16,10 +16,15 @@ PASS 3.self_attn.o_proj: n 2560 k 6144 sk 4 rows 512: fp32 worst 0.32 (bound 484
 PASS 3.mlp.shared_expert.gate_proj: n 1280 k 2560 sk 4 rows 512: fp32 worst 0.33 (bound 204) units of 2^-24 sum|xws| at (352, 77) |err| 1.882e-07 ref 8.5594e-01; per-column worst median 0.17 max 0.33; bf16 == RNE(fp32) True, bf16 err / (half ulp + fp32 err) 1.000; invariance/determinism/ld/strided ok
 PASS 3.mlp.shared_expert.down_proj: n 2560 k 1280 sk 2 rows 512: fp32 worst 0.73 (bound 102) units of 2^-24 sum|xws| at (314, 546) |err| 1.196e-07 ref -5.4200e-01; per-column worst median 0.34 max 0.73; bf16 == RNE(fp32) True, bf16 err / (half ulp + fp32 err) 1.000; invariance/determinism/ld/strided ok
 PASS
-PASS exact: all 254 e4m3 codes (subnormals, zeros, signs) one-hot through the kernel
-bench gdn_qkvz n 16384 k 2560: m1 235us 190GB/s, m8 236us 189GB/s, m16 460us 97GB/s, m32 229us 195GB/s, m64 284us 157GB/s, m128 448us 99GB/s, m512 1573us 27.3TF, m2048 6898us 24.9TF
-bench attn_qkv n 13312 k 2560: m1 180us 201GB/s, m8 201us 180GB/s, m16 386us 94GB/s, m32 649us 56GB/s, m64 299us 121GB/s, m128 608us 60GB/s, m512 1845us 18.9TF, m2048 7013us 19.9TF
-bench out_proj n 2560 k 6144: m1 81us 206GB/s, m8 83us 202GB/s, m16 85us 195GB/s, m32 85us 196GB/s, m64 106us 157GB/s, m128 158us 106GB/s, m512 607us 26.5TF, m2048 2896us 22.2TF
-bench shared_gu n 2560 k 2560: m1 34us 204GB/s, m8 35us 201GB/s, m16 35us 199GB/s, m32 36us 194GB/s, m64 45us 153GB/s, m128 72us 97GB/s, m512 252us 26.7TF, m2048 1087us 24.7TF
-bench shared_down n 2560 k 1280: m1 21us 167GB/s, m8 21us 166GB/s, m16 21us 166GB/s, m32 21us 163GB/s, m64 29us 122GB/s, m128 36us 98GB/s, m512 130us 25.7TF, m2048 523us 25.7TF
-PASS
+
+# --bench --co build/base --co-b build/rocm: A = before (16/32/64-row tiles, fused), B = this commit; best of 15, weights rotated past MALL; prod down, another tenant at ~98% GPU busy: m8192 attn_qkv and m1 out_proj samples are noise
+bench gdn_qkvz n 16384 k 2560: m1 225/225us 198/198GB/s, m8 222/222us 201/201GB/s, m16 223/233us 200/191GB/s, m32 232/231us 192/193GB/s, m48 284/254us 157/175GB/s, m64 290/257us 154/173GB/s, m96 430/359us 104/124GB/s, m128 456/372us 98/120GB/s, m256 850/740us 25.3/29.0TF, m512 1599/1498us 26.9/28.7TF, m2048 6816/5288us 25.2/32.5TF, m4096 13669/10876us 25.1/31.6TF, m8192 28491/20890us 24.1/32.9TF
+bench attn_qkv n 13312 k 2560: m1 184/183us 197/198GB/s, m8 183/183us 197/198GB/s, m16 183/182us 198/199GB/s, m32 176/176us 206/206GB/s, m48 257/184us 141/196GB/s, m64 263/186us 137/194GB/s, m96 340/281us 106/129GB/s, m128 357/284us 102/128GB/s, m256 678/569us 25.7/30.7TF, m512 1289/1076us 27.1/32.4TF, m2048 5522/4174us 25.3/33.4TF, m4096 11007/8022us 25.4/34.8TF, m8192 28292/30958us 19.7/18.0TF
+bench out_proj n 2560 k 6144: m1 419/430us 40/39GB/s, m8 83/82us 202/203GB/s, m16 85/85us 197/196GB/s, m32 89/87us 188/191GB/s, m48 106/94us 157/178GB/s, m64 107/95us 156/175GB/s, m96 158/130us 106/129GB/s, m128 174/131us 96/128GB/s, m256 314/270us 25.7/29.9TF, m512 617/510us 26.1/31.6TF, m2048 2895/2255us 22.3/28.6TF, m4096 6037/4569us 21.3/28.2TF, m8192 12913/9009us 20.0/28.6TF
+bench shared_gu n 2560 k 2560: m1 34/34us 203/203GB/s, m8 35/35us 200/200GB/s, m16 35/35us 197/197GB/s, m32 36/36us 193/192GB/s, m48 45/38us 154/184GB/s, m64 46/38us 153/183GB/s, m96 72/53us 97/130GB/s, m128 73/55us 95/127GB/s, m256 131/111us 25.7/30.2TF, m512 253/220us 26.5/30.5TF, m2048 1060/843us 25.3/31.8TF, m4096 2227/1712us 24.1/31.4TF, m8192 4563/3653us 23.5/29.4TF
+bench shared_down n 2560 k 1280: m1 19/21us 179/164GB/s, m8 22/22us 162/161GB/s, m16 22/22us 161/162GB/s, m32 22/22us 158/158GB/s, m48 28/22us 123/158GB/s, m64 29/23us 121/151GB/s, m96 35/28us 99/123GB/s, m128 40/42us 88/83GB/s, m256 64/56us 26.1/30.2TF, m512 126/112us 26.7/30.0TF, m2048 506/453us 26.5/29.6TF, m4096 1089/958us 24.6/28.0TF, m8192 2226/1972us 24.1/27.2TF
+
+# decode "16 rows = 2x 8 rows" (previous log): not reproducible. Same bm=16 kernel, same code for 8 and 16 rows; A/B alternated, 4 runs under prod load and 1 clean: m16 = m8 within 3% (gdn_qkvz 218-243 vs 222-240 us, attn_qkv 180-211 vs 180-200 us). The earlier 460/386/649 us were co-tenant bursts.
+# wide tile limits (gfx1151): compute core alone (no global loads or staging) ~39 TF; one LDS barrier a group costs ~15% (a microbench with a barrier every 2 groups is free, but 2 groups of a 128x128 tile need 128 KiB of LDS); WGP -> CU mode +10-30%.
+# tensorfold fp8-check (HIP build, cuda_fp8.zig dispatch): PASS all 10 cases, rows 1..4096 equal one-row calls, matmulLd byte-equal at 17 row counts.
+# perf-fp8dec (nontemporal weight loads in the 16/32-row tiles): rerun fp8_check.py on random shapes PASS, worst-case numbers identical to the above (same bits); decode GB/s in notes/fp8dec.md

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ....cuda import hip_tune
+
 HAS_TRITON = True
 try:
     import triton
@@ -75,6 +77,34 @@ if HAS_TRITON:
             tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
 
     @triton.jit
+    def _b16mm_sm(X, W, OUT, PART, M, x_stride,
+                  N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+                  BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
+        """``_b16mm`` on the weight stored slice-major, [SK, N, K / SK] (``slice_major``): a slice's rows contiguous,
+        the same loads, dots and bits (gfx1151 streams the hyper-connection's down rows faster so)."""
+
+        pid_n = tl.program_id(1)
+        pid_s = tl.program_id(2)
+        rm = tl.program_id(0) * BM + tl.arange(0, BM)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BK)
+        m_ok = rm < M
+        n_ok = rn < N
+        KS: tl.constexpr = K // SK
+        NB: tl.constexpr = KS // BK
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for i in range(NB):
+            k0 = (pid_s * NB + i) * BK
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + pid_s * (N * KS) + rn[:, None] * KS + (i * BK + rk)[None, :], mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x, tl.trans(w), acc)
+        out_mask = m_ok[:, None] & n_ok[None, :]
+        if SK == 1:
+            tl.store(OUT + rm[:, None] * N + rn[None, :], acc if F32 else acc.to(tl.bfloat16), mask=out_mask)
+        else:
+            tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
+
+    @triton.jit
     def _reduce(PART, OUT, total, SK: tl.constexpr, BLOCK: tl.constexpr, F32: tl.constexpr):
         """The K slices summed in slice order, one fp32 add a slice, in one launch for either output face."""
 
@@ -106,13 +136,24 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
                          f"dtype matching f32={f32}")
     part = torch.empty((sk, m, b.n), dtype=torch.float32, device=x.device) if sk > 1 else out
     bm = 128 if m > 128 else 16
+    t = hip_tune.tile("_b16mm", {"BM": bm, "K": k, "SK": sk}) if hip_tune.hip() else None
+    if t:
+        block_n, bk = t.get("BLOCK_N", block_n), t.get("BK", bk)
     grid = (triton.cdiv(m, bm), -(-b.n // block_n), sk)
     _b16mm[grid](x, b.weight, out, part, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm,
-                 BLOCK_N=block_n, BK=bk, F32=f32, num_warps=num_warps, num_stages=num_stages)
+                 BLOCK_N=block_n, BK=bk, F32=f32,
+                 **hip_tune.launch("_b16mm", {"BM": bm}, num_warps=num_warps, num_stages=num_stages))
     if sk > 1:
         total = m * b.n
         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
     return out
+
+
+def slice_major(w: torch.Tensor, sk: int) -> torch.Tensor:
+    """[N, K] -> the [SK, N, K / SK] layout ``_b16mm_sm`` reads."""
+
+    n, k = w.shape
+    return w.reshape(n, sk, k // sk).transpose(0, 1).contiguous()
 
 
 def quantize4(w: torch.Tensor, chunk: int = 8192, out: str = "q4"):

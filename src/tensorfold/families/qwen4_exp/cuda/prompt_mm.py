@@ -66,6 +66,44 @@ try:
         tl.store(OUT + rm[:, None] * N + rn[None, :], total if F32 else total.to(tl.bfloat16), mask=out_mask)
 
     @triton.jit
+    def _b16mm_ks_sm(X, W, OUT, M, x_stride,
+                     N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+                     BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, GROUP: tl.constexpr):
+        """``_b16mm_ks`` on the slice-major weight [SK, N, K / SK] (bf16.slice_major): the same bits."""
+
+        tiles_m = tl.cdiv(M, BM)
+        tiles_n: tl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
+        pid = tl.program_id(0)
+        band = pid // (GROUP * tiles_n)
+        first_m = band * GROUP
+        size_m = tl.minimum(tiles_m - first_m, GROUP)
+        pid_m = first_m + (pid % size_m)
+        pid_n = (pid % (GROUP * tiles_n)) // size_m
+        rm = pid_m * BM + tl.arange(0, BM)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BK)
+        m_ok = rm < M
+        n_ok = rn < N
+        KS: tl.constexpr = K // SK
+        NB: tl.constexpr = KS // BK
+        total = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        for j in range(SK * NB):
+            k0 = j * BK
+            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + (j // NB) * (N * KS) + rn[:, None] * KS + ((j % NB) * BK + rk)[None, :],
+                        mask=n_ok[:, None], other=0.0)
+            acc = tl.dot(x, tl.trans(w), acc)
+            if (j + 1) % NB == 0:
+                if j < NB:
+                    total = acc
+                else:
+                    total = total + acc
+                acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+        out_mask = m_ok[:, None] & n_ok[None, :]
+        tl.store(OUT + rm[:, None] * N + rn[None, :], total if F32 else total.to(tl.bfloat16), mask=out_mask)
+
+    @triton.jit
     def _fp4mm_ks(X, W, S, S2, OUT, M, x_stride,
                   N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
                   SBN: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr,
@@ -149,22 +187,29 @@ try:
         """The hyper-connection read-out's up projection and mix in one pass (the up rows never stored): each
         stream's up = bf16(act @ W[s D + d].T) as ``bf16._b16mm`` computes it (one K slice: BK steps in order from
         a zero accumulator, one bf16 rounding), then ``glue._hc_mix``'s expression in stream order:
-        mixed = bf16((sum_s bf16(bsig(up_s) * normed_s)) / S). The 32-group sums are not made (no reader then)."""
+        mixed = bf16((sum_s bf16(bsig(up_s) * normed_s)) / S). The 32-group sums are not made (no reader then).
+        The S streams' BD rows are one [S BD, BK] weight tile a step (one dot: each output's MMA chain is the
+        per-stream dot's), then split back per stream and added in stream order. S must be 4."""
 
         rm = tl.program_id(0) * BM + tl.arange(0, BM)
         rd = tl.program_id(1) * BD + tl.arange(0, BD)
         rk = tl.arange(0, BK)
         m_ok = rm < M
-        total = tl.zeros((BM, BD), dtype=tl.float32)
-        for s in tl.static_range(S):
-            acc = tl.zeros((BM, BD), dtype=tl.float32)
-            for i in range(K // BK):
-                x = tl.load(ACT + rm[:, None] * K + (i * BK + rk)[None, :], mask=m_ok[:, None], other=0.0)
-                w = tl.load(W + (s * D + rd)[:, None] * K + (i * BK + rk)[None, :])
-                acc = tl.dot(x, tl.trans(w), acc)
-            u = acc.to(tl.bfloat16).to(tl.float32)
-            n = tl.load(NORMED + rm[:, None] * (S * D) + s * D + rd[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
-            total += (_bsig(u) * n).to(tl.bfloat16).to(tl.float32)
+        rs = tl.arange(0, S * BD)
+        col = (rs // BD) * D + tl.program_id(1) * BD + rs % BD          # stream s's dim d at column s BD + d
+        acc = tl.zeros((BM, S * BD), dtype=tl.float32)
+        for i in range(K // BK):
+            x = tl.load(ACT + rm[:, None] * K + (i * BK + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            w = tl.load(W + col[:, None] * K + (i * BK + rk)[None, :])
+            acc = tl.dot(x, tl.trans(w), acc)
+        u = acc.to(tl.bfloat16).to(tl.float32)
+        n = tl.load(NORMED + rm[:, None] * (S * D) + col[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+        p = (_bsig(u) * n).to(tl.bfloat16).to(tl.float32)
+        # [BM, (s_hi, s_lo, d)] -> [BM, d, s_hi, s_lo]: split s_lo, then s_hi (stream 2 s_hi + s_lo)
+        even, odd = tl.split(tl.permute(tl.reshape(p, (BM, 2, 2, BD)), (0, 3, 1, 2)))
+        p0, p2 = tl.split(even)
+        p1, p3 = tl.split(odd)
+        total = (((p0 + 0.0) + p1) + p2) + p3                     # from +0, as the per-stream sum (-0 + 0 = +0)
         m = (total / S).to(tl.bfloat16)
         tl.store(MIXED + rm[:, None] * D + rd[None, :], m, mask=m_ok[:, None])
 

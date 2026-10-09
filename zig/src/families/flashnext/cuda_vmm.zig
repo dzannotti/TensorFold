@@ -145,6 +145,25 @@ pub const Region = struct {
         return size;
     }
 
+    /// Physical memory past the first `bytes` (rounded up) given back, whole mappings from the end; what it freed.
+    /// The address space stays reserved (graphs that bake it stay valid once it is mapped again).
+    pub fn trimTo(r: *Region, bytes: usize) usize {
+        std.debug.assert(!r.ring);
+        const want = r.v.up(bytes);
+        var freed: usize = 0;
+        while (r.maps.items.len > 0) {
+            const m = r.maps.items[r.maps.items.len - 1];
+            if (m[0] < want) break;
+            _ = r.v.unmap(r.base + m[0], m[1]);
+            _ = r.v.release(r.handles.items[r.handles.items.len - 1]);
+            r.maps.items.len -= 1;
+            r.handles.items.len -= 1;
+            r.mapped = m[0];
+            freed += m[1];
+        }
+        return freed;
+    }
+
     pub fn deinit(r: *Region, gpa: Allocator) void {
         for (r.maps.items) |m| _ = r.v.unmap(r.base + m[0], m[1]);
         for (r.handles.items) |h| _ = r.v.release(h);

@@ -303,7 +303,14 @@ pub const Engine = struct {
     cand_host: std.ArrayList(f32) = .empty,
     cand_round: u64 = 0,
     cand_have: u64 = std.math.maxInt(u64),
-    /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
+    /// one rank, greedy windows: the round's argmax over every row, read once (sampleWindow)
+    ids_host: std.ArrayList(i32) = .empty,
+    /// freed sequences kept with their captured graphs for the next requests (TF_FLASHNEXT_SEQ_POOL=0: none)
+    pool: std.ArrayList(*Seq) = .empty,
+    pool_cap: usize = 0,
+    ids_have: u64 = std.math.maxInt(u64),
+    /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again, and one rank's draws
+    /// wait a window or a draft at a time (the old way)
     draw_once: bool = true,
     /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
     /// are live, `wide_confidence` above (maxInt: the request's rule always)
@@ -395,10 +402,10 @@ pub const Engine = struct {
         // and MTP experts; lossy against the bf16 ones, opt-in)
         var overlay_buf: [1024]u8 = undefined;
         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
-        // the draft vocabulary's 4-bit head needs fn_qmm*: a build without them drafts over the full head (same output)
-        if (o.mtp and !e.k.q4) std.log.warn("no groups-of-32 4-bit kernels in this build: MTP drafts use the full head", .{});
         e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .draft_q4 = e.k.q4, .mode = .device, .driver = d, .overlay = overlay });
         errdefer e.w.deinit();
+        // the draft vocabulary's head: fn_qmm's 4-bit rows, else the int4 lm_head's draft columns; neither, the full head
+        if (o.mtp and e.w.draft_head == null and e.w.draft_count == 0) std.log.warn("no draft-vocabulary head (no groups-of-32 4-bit kernels, no int4 lm_head): MTP drafts use the full head", .{});
         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
         e.g.kv = o.kv;
@@ -442,6 +449,7 @@ pub const Engine = struct {
         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
         e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
         e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
+        e.pool_cap = if (envOff("TF_FLASHNEXT_SEQ_POOL")) 0 else @max(1, o.streams);
         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
         if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
@@ -487,6 +495,7 @@ pub const Engine = struct {
         e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
         e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
         e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
+        e.f.act_sk = cuda.hip and !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.actSkAvailable(&e.set);
         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
         // HIP: fn_qsa_scores.hip trails `_scores` below ~1M keys on gfx1151 (qsa-check's bench; the same bits), so opt-in
         const qsa_fast = if (envGet("TF_FLASHNEXT_QSA_FAST") != null) !envOff("TF_FLASHNEXT_QSA_FAST") else !cuda.hip;
@@ -556,7 +565,8 @@ pub const Engine = struct {
             e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_count != 0) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .tp = e.tp, .nsc = e.nsc };
         }
         errdefer gpa.free(e.draft_host);
-        if (o.vmm) {
+        // TF_FLASHNEXT_VMM=0: caches grow by copying (the same bits; HIP's retained-PM4 graphs need it)
+        if (o.vmm and !envOff("TF_FLASHNEXT_VMM")) {
             e.vm = vmm.Vmm.init(ctx) catch |err| blk: {
                 std.log.warn("CUDA VMM unavailable ({s}): caches grow by copying", .{@errorName(err)});
                 break :blk null;
@@ -650,12 +660,16 @@ pub const Engine = struct {
         e.multi = .empty;
         e.seen.deinit(e.gpa);
         e.seen = .empty;
+        e.pool_cap = 0;
         e.freeSeq(e.own);
+        for (e.pool.items) |s| e.destroySeq(s);
+        e.pool.deinit(e.gpa);
         e.gpa.free(e.draft_host);
         e.gpa.free(e.round_segs);
         e.extra.buf.free();
         if (e.prof) |p| p.deinit(e.gpa);
         e.cand_host.deinit(e.gpa);
+        e.ids_host.deinit(e.gpa);
         e.memo.deinit();
         if (e.px) |*q| q.deinit();
         if (e.k8) |*q| q.deinit();
@@ -686,17 +700,31 @@ pub const Engine = struct {
     /// A new empty sequence whose caches grow up to `limit_rows` (at most the engine's max_len).
     pub fn newSeq(e: *Engine, limit_rows: usize) !*Seq {
         const limit = @min(limit_rows, e.max_len);
+        // a pooled sequence is as a new one: zeroed caches at one growth step, reset state, its graphs kept
+        const poolable = e.vm != null and e.pool_cap > 0 and limit >= state.grow_step;
+        if (poolable) if (e.pool.pop()) |s| {
+            errdefer e.destroySeq(s);
+            s.st.limit = limit;
+            try s.st.fixed.buf.fill8(0, null);
+            for (s.regions.items) |*r| try e.f.th.zero(r.base, if (r.ring) e.ringBytes(r.v) else r.mapped);
+            s.window.clearRetainingCapacity();
+            try e.f.register(s);
+            try e.f.reset(s);
+            return s;
+        };
         const s = try e.gpa.create(Seq);
         errdefer e.gpa.destroy(s);
         // caches start at one growth step and grow with the stream (State.ensure), up to `limit`
         const first = @min(limit, state.grow_step);
         if (!e.fits(first)) return error.NoRoom;
-        s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, limit) };
+        // a poolable one reserves the whole window's address space, so it serves any later request
+        s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, if (poolable) e.max_len else limit), .poolable = poolable };
         errdefer s.deinit(e.gpa);
         s.charged = s.st.fixed.buf.len + (if (s.st.ctx) |c| c.buf.len else 0) + e.g.wide() * 2;
         e.budget.used += s.charged;
         errdefer e.budget.used -|= s.charged;
         if (e.vm) |*v| try e.mapSeq(s, v, first);
+        s.st.limit = limit;
         try e.f.register(s);
         errdefer e.f.unregister(s);
         s.last_streams = try cuda.DeviceBuffer.alloc(e.ctx.d, e.g.wide() * 2);
@@ -743,6 +771,42 @@ pub const Engine = struct {
 
     pub fn freeSeq(e: *Engine, s: *Seq) void {
         if (e.bound == s and s != e.own) e.bound = e.own;
+        if (e.toPool(s)) return;
+        e.destroySeq(s);
+    }
+
+    /// Into the pool when it has room: the caches trimmed back to one growth step (their memory given back), the
+    /// graphs at the first context bucket kept (the ones a new request replays), the others dropped.
+    fn toPool(e: *Engine, s: *Seq) bool {
+        if (!s.poolable or s == e.own or s.media != null or e.pool.items.len >= e.pool_cap) return false;
+        e.pool.ensureUnusedCapacity(e.gpa, 1) catch return false;
+        // launches in flight may still read the caches being unmapped
+        e.stream.synchronize() catch return false;
+        const g = e.g;
+        const step = state.grow_step;
+        var freed: usize = 0;
+        const layers = s.regions.items.len / 4;
+        for (0..layers) |i| {
+            const r = s.regions.items[4 * i ..][0..4];
+            for ([_]usize{ 0, 1, 3 }, [_]usize{ step * g.kRow(), step * g.vRow(), g.blocks(step) * g.index_dim * 2 }) |j, bytes| freed += r[j].trimTo(bytes);
+        }
+        s.st.capacity = step;
+        e.budget.used -|= freed;
+        s.charged -|= freed;
+        e.f.unregister(s);
+        while (true) {
+            var it = e.graphs.iterator();
+            const found = while (it.next()) |kv| {
+                if (kv.key_ptr.seq == @intFromPtr(s) and kv.key_ptr.ctx > step) break kv.key_ptr.*;
+            } else null;
+            var gr = e.graphs.fetchRemove(found orelse break).?.value;
+            gr.deinit();
+        }
+        e.pool.appendAssumeCapacity(s);
+        return true;
+    }
+
+    fn destroySeq(e: *Engine, s: *Seq) void {
         e.budget.used -|= s.charged;
         e.f.unregister(s);
         e.dropGraphs(@intFromPtr(s), null);
@@ -1476,6 +1540,17 @@ pub const Engine = struct {
             }
             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
         }
+        if (e.world == 1 and e.draw_once and smp == null) {
+            // greedy: one argmax over the round's rows and one wait for every window (a row's argmax is its own)
+            if (e.ids_have != e.cand_round) {
+                try e.ids_host.resize(e.gpa, total);
+                try e.f.th.argmax(e.buf.b.logits, e.g.head_n, e.g.head_n, e.main_sample.col, total);
+                try e.read(e.main_sample.col, std.mem.sliceAsBytes(e.ids_host.items));
+                e.ids_have = e.cand_round;
+            }
+            for (out[0 .. sg.a1 - sg.a0], e.ids_host.items[sg.a0..sg.a1]) |*o, x| o.* = @intCast(x);
+            return;
+        }
         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
     }
 
@@ -1573,10 +1648,25 @@ pub const Engine = struct {
                 cands = c;
                 try e.read(mb.b.cand_all, std.mem.sliceAsBytes(c));
             }
+            // one rank: every row's draw queued, then one wait for all of them (each row's own kernels and slot)
+            var queued: ?[]f32 = null;
+            defer if (queued) |q| e.gpa.free(q);
+            var stride: usize = 0;
+            if (e.world == 1 and e.draw_once and n_active > 1) {
+                for (active[0..n_active]) |a| stride = @max(stride, try d.slotFloats(smpOf(reqs[a.req].sampling)));
+                if (n_active * stride <= d.outFloats()) {
+                    for (active[0..n_active], 0..) |a, k| try d.queueRow(&e.f, lg, row_of[k], smpOf(reqs[a.req].sampling), d.out + k * stride * 4);
+                    const q = try e.gpa.alloc(f32, n_active * stride);
+                    queued = q;
+                    try e.read(d.out, std.mem.sliceAsBytes(q));
+                }
+            }
             for (active[0..n_active], 0..) |a, k| {
                 const r = &reqs[a.req];
-                const smp: ?lanes.Sampling = if (r.sampling) |x| (if (x.temperature > 0) x else null) else null;
-                const got = if (cands != null and sampler.gatheredFits(smp))
+                const smp = smpOf(r.sampling);
+                const got = if (queued) |q|
+                    try d.takeRow(q[k * stride ..][0..try d.slotFloats(smp)], r.seq.st.pos + 1 + j, smp)
+                else if (cands != null and sampler.gatheredFits(smp))
                     try d.gatheredFrom(cands.?, row_of[k], rows, r.seq.st.pos + 1 + j, smp)
                 else
                     try d.sampleDraftRow(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp);
@@ -1610,6 +1700,11 @@ pub const Engine = struct {
             }
             n_active = n_next;
         }
+    }
+
+    /// A stream's sampling as its draws take it: temperature 0 is greedy (null).
+    fn smpOf(s: ?lanes.Sampling) ?lanes.Sampling {
+        return if (s) |x| (if (x.temperature > 0) x else null) else null;
     }
 
     /// One request of a reference multi-stream run (generateMany): its prompt, reply cap, rule and drafting, and

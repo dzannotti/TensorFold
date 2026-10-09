@@ -169,20 +169,29 @@ def prep_row8(P, pos, r, head, QW, KW, IW, INV, Q, KC, VC, KS, IQ, IKC, eps, PW:
 
 
 @triton.jit
-def _tile8(q, k, v, sk, sv, m, l, o, valid, scale: tl.constexpr):
-    """attention._tile on FP8 rows: k, v the codes as bf16, each key's s_k on its dots and s_v on its probabilities
-    (powers of two: the products are the dequantized rows' exactly)."""
-    scores = tl.dot(q, tl.trans(k)).to(tl.float32) * sk[None, :]
-    scores = scores * scale
-    scores = tl.where(valid[None, :], scores, float("-inf"))
-    tile_m = tl.max(scores, 1)
-    active = tile_m != float("-inf")
-    next_m = tl.where(active, tl.maximum(m, tile_m), m)
-    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
-    p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
-    o = o * alpha[:, None] + tl.dot((p * sv[None, :]).to(tl.bfloat16), v)
-    l = l * alpha + tl.sum(p, 1)
-    return next_m, l, o
+def _half(w):
+    """The low two e4m3 codes of words w as an fp16 pair (each code's magnitude bits in an fp16's: its value / 2^8)."""
+    return ((w & 0x7F) << 7) | ((w & 0x80) << 8) | ((w & 0x7F00) << 15) | ((w & 0x8000) << 16)
+
+
+@triton.jit
+def _cut(h):
+    """An fp16 (low 16 bits of h) widened to fp32 in hardware, cut to its bf16 (exact here) as uint16."""
+    f = (h & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    return (f.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16)
+
+
+@triton.jit
+def bf16_words(w):
+    """uint32 words [N, W] of 4 e4m3 codes -> bf16 [N, 4W] (element 4i + j from byte j of word i): each code's value
+    / 256, exact. A code's magnitude bits placed as an fp16's are its value / 2^8 (its subnormals fp16's), widened to
+    fp32 in hardware and cut to bf16 (exact, so no rounding): ~3 ops a code where Triton's own e4m3 -> bf16 (gfx1151
+    has no FP8 unit) takes ~30. The 2^-8 keeps every code a bf16 normal (the WMMA flushes bf16 subnormals). Done a
+    word at a time before any layout change, so the codes never go through LDS byte by byte."""
+    lo = _half(w)
+    hi = _half(w >> 16)
+    x = tl.interleave(tl.interleave(_cut(lo), _cut(hi)), tl.interleave(_cut(lo >> 16), _cut(hi >> 16)))
+    return x.to(tl.bfloat16, bitcast=True)
 
 
 @triton.jit
@@ -201,36 +210,97 @@ def _chunks8(Q, KC, VC, KS, POS0, PO, PM, PL, IDS, NKR, SPR,
 
 
 @triton.jit
+def _qk(Q, KC, qrow, row, here, j: tl.constexpr, D: tl.constexpr, DC: tl.constexpr):
+    """q's and the keys' D slice j as bf16 tiles (the keys / 256, ``bf16_words``). ``here`` (always true) ties q's
+    load to the tile, so the compiler does not hoist all of q into registers for the whole loop."""
+    d = j * DC + tl.arange(0, DC)
+    q = tl.load(Q + qrow[:, None] * D + d[None, :], mask=here, other=0.0)
+    w = j * (DC // 4) + tl.arange(0, DC // 4)
+    k = bf16_words(tl.load(KC.to(tl.pointer_type(tl.uint32)) + row[:, None] * ((D + 16) // 4) + w[None, :]))
+    return q, k
+
+
+@triton.jit
+def _pv(VC, row, pb, o, alpha, j: tl.constexpr, D: tl.constexpr, DC: tl.constexpr):
+    """o's D slice j: o * alpha + p . v (the values / 256)."""
+    w = j * (DC // 4) + tl.arange(0, DC // 4)
+    v = bf16_words(tl.load(VC.to(tl.pointer_type(tl.uint32)) + row[:, None] * (D // 4) + w[None, :]))
+    return o * alpha[:, None] + tl.dot(pb, v)
+
+
+@triton.jit
+def _store(PO, base, o, j: tl.constexpr, D: tl.constexpr, DC: tl.constexpr, live):
+    """o's D slice j, times 256 (the values' / 256 undone), into the chunk's partial."""
+    d = j * DC + tl.arange(0, DC)
+    tl.store(PO + base[:, None] * D + d[None, :], o * 256.0, mask=live[:, None])
+
+
+@triton.jit
 def chunk8(Q, KC, VC, KS, n, sparse, r, hk, c, PO, PM, PL, IDS,
            H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr,
            NCH: tl.constexpr, SCALE: tl.constexpr, IDW: tl.constexpr, QSA: tl.constexpr):
-    """attention._chunk on FP8 rows: row r's keys in chunk c of its ``n`` (a sparse row's through IDS)."""
+    """attention._chunk on FP8 rows: row r's keys in chunk c of its ``n`` (a sparse row's through IDS), 64 keys a
+    tile, as s^T = k . q^T (the 64 keys over the warps; q's 16 head slots are one WMMA tile) and o = p . v.
 
+    The codes become bf16 / 256 (exact), each key's s_k * 256 goes on its dots and s_v on its probabilities, and the
+    partial o comes out times 256: powers of two, so the products are the dequantized rows' exactly. q . k and p . v
+    run in four D slices (q . k's K steps in D order; o's columns apart), which keeps the tiles and o in registers
+    on gfx1151. A tile's keys past n read a written row (row n - 1, or a sparse row's key 0) instead of masking every
+    load: their scores are -inf and their probabilities 0. The padded head slots read head 0's q and are not stored."""
+
+    tl.static_assert(D % 64 == 0)
+    DC: tl.constexpr = D // 4
     start = c * CH
     if start < n:                       # chunks past a row's keys write nothing: the merge never reads them
         gg = tl.arange(0, 16)
-        d = tl.arange(0, D)
-        q = tl.load(Q + (r * H + hk * G + gg[:, None]) * D + d[None, :], mask=gg[:, None] < G, other=0.0)
+        live = gg < G
+        qrow = r * H + hk * G + tl.where(live, gg, 0)
         m = tl.full((16,), float("-inf"), tl.float32)
         l = tl.zeros((16,), tl.float32)
-        o = tl.zeros((16, D), tl.float32)
-        tiles = tl.minimum(n - start, CH)
-        for t in range(0, tl.cdiv(tiles, 64)):
+        o0 = tl.zeros((16, DC), tl.float32)
+        o1 = tl.zeros((16, DC), tl.float32)
+        o2 = tl.zeros((16, DC), tl.float32)
+        o3 = tl.zeros((16, DC), tl.float32)
+        tiles = tl.cdiv(tl.minimum(n - start, CH), 64)
+        for t in range(0, tiles):
             ki = start + t * 64 + tl.arange(0, 64)
             valid = ki < n
+            ki = tl.minimum(ki, n - 1)
             if QSA:
                 if sparse:
-                    ki = tl.load(IDS + r * IDW + ki, mask=valid, other=0)
+                    ki = tl.load(IDS + r * IDW + ki)
             row = ki.to(tl.int64) * HK + hk
-            kk = tl.load(KC + row[:, None] * (D + 16) + d[None, :], mask=valid[:, None], other=0.0).to(tl.bfloat16)
-            vv = tl.load(VC + row[:, None] * D + d[None, :], mask=valid[:, None], other=0.0).to(tl.bfloat16)
-            sk = tl.load(KS + row * ((D + 16) // 4) + D // 4, mask=valid, other=1.0)
-            sv = tl.load(KS + row * ((D + 16) // 4) + D // 4 + 1, mask=valid, other=1.0)
-            m, l, o = _tile8(q, kk, vv, sk, sv, m, l, o, valid, SCALE)
+            here = start + t * 64 < n
+            q, k = _qk(Q, KC, qrow, row, here, 0, D, DC)
+            acc = tl.dot(k, tl.trans(q))
+            q, k = _qk(Q, KC, qrow, row, here, 1, D, DC)
+            acc = tl.dot(k, tl.trans(q), acc)
+            q, k = _qk(Q, KC, qrow, row, here, 2, D, DC)
+            acc = tl.dot(k, tl.trans(q), acc)
+            q, k = _qk(Q, KC, qrow, row, here, 3, D, DC)
+            acc = tl.dot(k, tl.trans(q), acc)
+            sk = tl.load(KS + row * ((D + 16) // 4) + D // 4) * 256.0
+            sv = tl.load(KS + row * ((D + 16) // 4) + D // 4 + 1)
+            scores = tl.where(valid[:, None], acc * sk[:, None] * SCALE, float("-inf"))
+            tile_m = tl.max(scores, 0)
+            active = tile_m != float("-inf")
+            next_m = tl.where(active, tl.maximum(m, tile_m), m)
+            alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+            p = tl.where(valid[:, None] & active[None, :], tl.exp(scores - next_m[None, :]), 0.0)
+            pb = tl.trans((p * sv[:, None]).to(tl.bfloat16))
+            o0 = _pv(VC, row, pb, o0, alpha, 0, D, DC)
+            o1 = _pv(VC, row, pb, o1, alpha, 1, D, DC)
+            o2 = _pv(VC, row, pb, o2, alpha, 2, D, DC)
+            o3 = _pv(VC, row, pb, o3, alpha, 3, D, DC)
+            l = l * alpha + tl.sum(p, 0)
+            m = next_m
         base = (r * NCH + c) * H + hk * G + gg
-        tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
-        tl.store(PM + base, m, mask=gg < G)
-        tl.store(PL + base, l, mask=gg < G)
+        _store(PO, base, o0, 0, D, DC, live)
+        _store(PO, base, o1, 1, D, DC, live)
+        _store(PO, base, o2, 2, D, DC, live)
+        _store(PO, base, o3, 3, D, DC, live)
+        tl.store(PM + base, m, mask=live)
+        tl.store(PL + base, l, mask=live)
 
 
 # -- wrappers -------------------------------------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from pathlib import Path
 
 TARGET = ("cuda", 121, 32)
 HIP_TARGET = ("hip", "gfx1151", 32)
+MAX_RANGE = 2**31 - 1             # bytes a buffer-op pointer may address (Triton's is_within_2gb, aot.zig max_range)
 # kernels whose Python wrapper passes num_stages (kept on HIP); every other launch takes the backend's default, as the
 # ROCm JIT does (the spec's options are what the CUDA JIT resolved: its defaults, tf32, CUDA's fp8 list and libdevice)
 HIP_STAGES = {"_b16mm", "_router", "_chunks", "_chunks8", "_chunks_multi"}
@@ -493,12 +494,64 @@ def path_of(name: str, params: list[str]) -> tuple:
 
 
 def hip_options(k: dict) -> dict:
-    """The kwargs the ROCm JIT's parse_options sees for this launch: num_warps, and num_stages where the wrapper sets it."""
+    """The kwargs the ROCm JIT's parse_options sees for this launch: num_warps, num_stages where the wrapper sets it,
+    then the gfx1151 row of tensorfold.cuda.hip_tune (the table the ROCm wrappers launch with)."""
+
+    from tensorfold.cuda import hip_tune
 
     o = {"num_warps": k["options"]["num_warps"]}
     if k["name"] in HIP_STAGES:
         o["num_stages"] = k["options"]["num_stages"]
-    return o
+    return hip_tune.options(k["name"], _ints(k), o)
+
+
+def hip_entries(k: dict) -> list[dict]:
+    """A spec entry as the HIP set holds it: plus its gfx1151 tile (hip_tune.TILES) if the kernel has one, each in
+    both pointer forms."""
+
+    from tensorfold.cuda import hip_tune
+
+    t = hip_tune.tile(k["name"], _ints(k))
+    out = [k] + ([_derived(_with_consts(k, t), f"gfx1151 tile {t}")] if t and _ints(k) != {**_ints(k), **t} else [])
+    sm = hip_tune.slice_major(k["name"], _ints(k))
+    if sm:                                        # the same entries on the slice-major weight's kernel
+        for e in list(out):
+            e = _derived(e, f"slice-major weight ({sm})")
+            e["function"] = e["function"][: -len(k["name"])] + sm
+            e["name"] = sm
+            e["source"] = {"file": e["source"]["file"], "line": None}
+            out.append(e)
+    if k["name"] == "_hc_act":
+        out += _hc_act_sk(k)
+    return [x for e in out for x in (e, ranged(e))]
+
+
+def _hc_act_sk(k: dict) -> list[dict]:
+    """``glue._hc_act_sk`` from an ``_hc_act`` entry: the down projection's 32 K slices summed in it (HIP decode),
+    PART for DN, M a runtime int in each form it takes."""
+
+    e = _derived(k, "glue._hc_act_sk: _reduce fused (SK 32)")
+    e["function"] = k["function"][: -len("_hc_act")] + "_hc_act_sk"
+    e["name"] = "_hc_act_sk"
+    e["source"] = {"file": k["source"]["file"], "line": None}
+    e["params"] = ["PART", "ACT", "XS", "INJ", "M", "SK"] + [n for n in k["params"] if n not in ("DN", "ACT", "XS", "INJ")]
+    sig = {"PART": "*fp32", "M": "i32", "SK": "constexpr", **{n: t for n, t in k["signature"].items() if n != "DN"}}
+    att = {"PART": k["attrs"]["DN"], "M": [], "SK": [], **{n: a for n, a in k["attrs"].items() if n != "DN"}}
+    e["signature"], e["attrs"] = sig, att
+    e["constexprs"] = {"SK": {"int": 32}, **k["constexprs"]}
+    return [_int_form(_reorder(e), "M", form) for form in ("div16", "plain", "one")]
+
+
+def ranged(k: dict) -> dict:
+    """The entry with every pointer built for AMD buffer ops (``tt.pointer_range`` 32: what the ROCm JIT specializes
+    a tensor within 2 GiB to), marked ``range32``."""
+
+    out = json.loads(json.dumps(k))
+    for n, t in out["signature"].items():
+        if t.startswith("*"):
+            out["attrs"][n] = list(out["attrs"].get(n, [])) + [["tt.pointer_range", 32]]
+    out["range32"] = True
+    return out
 
 
 def compile_one(k: dict, cache_dir: Path | None, target: tuple = TARGET):
@@ -516,11 +569,6 @@ def compile_one(k: dict, cache_dir: Path | None, target: tuple = TARGET):
         # Triton 3.6's JIT keys attributes by pointer and int parameters only (3.7, which captured the spec, keys all)
         attrs = {path_of(n, params): v for n, v in k["attrs"].items()
                  if k["signature"].get(n) != "constexpr" and not k["signature"].get(n, "").startswith("fp")}
-        # buffer ops, as the JIT specializes every tensor under 2 GiB: the plain global-load builds miscompile partial
-        # row tiles (_b16mm BM 128 at M 129: its last row wrong or NaN); the set needs each pointer's span < 2 GiB
-        for n, t in k["signature"].items():
-            if t.startswith("*"):
-                attrs[path_of(n, params)] = list(attrs.get(path_of(n, params), [])) + [["tt.pointer_range", 32]]
     else:
         options = {n: tuple(v) if isinstance(v, list) else v for n, v in k["options"].items()}
     src = ASTSource(fn, dict(k["signature"]), constexprs, attrs)
@@ -593,6 +641,8 @@ def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: P
     rows, problems, seen = [], [], set()
     same = 0
     todo = [k for k in kernels if tps & set(k.get("tp", [1])) and (not only or only in k["function"])]
+    if hip:                                       # each specialization in both pointer forms (buffer ops, or not)
+        todo = [x for k in todo for x in hip_entries(k)]
     from concurrent.futures import ProcessPoolExecutor
 
     with ProcessPoolExecutor(max_workers=max(1, jobs)) as pool:
@@ -618,14 +668,16 @@ def build(specs: list[Path], out: Path, tps: set[int], check: list[Path], jit: P
         (out / bin_dir / f"{ck.hash}.{ext}").write_bytes(cubin)
         md = ck.metadata
         runtime = [n for n in k["params"] if k["signature"].get(n) != "constexpr"]
-        div = {n for n, v in k["attrs"].items() if v}
+        div = {n for n, v in k["attrs"].items() if ["tt.divisibility", 16] in v}
         dns = set(nospec.get(k["function"], {}).get("do_not_specialize", []))
         rows.append({
             "fn": md["name"], "hash": ck.hash, "name": md["name"], "num_warps": md["num_warps"],
             "warp_size": md.get("warp_size", 32), "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
             "global_scratch": md.get("global_scratch_size", 0), "global_align": md.get("global_scratch_align", 1),
             "profile_scratch": md.get("profile_scratch_size", 0), "pdl": bool(md.get("launch_pdl", False)),
-            "params": [{"name": n, "type": k["signature"][n], "div16": n in div, "nospec": n in dns} for n in runtime],
+            "params": [{"name": n, "type": k["signature"][n], "div16": n in div, "nospec": n in dns,
+                        **({"range32": True} if k.get("range32") and k["signature"][n].startswith("*") else {})}
+                       for n in runtime],
             "consts": {n: zig_const(v) for n, v in k["constexprs"].items()},
             "function": k["function"], "tp": k.get("tp", [1]), "cubin_sha256": sha,
             "n_regs": ck.n_regs, "n_spills": ck.n_spills, **({"options": hip_options(k), "private_segment": ck.scratch}
