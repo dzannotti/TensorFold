@@ -554,6 +554,9 @@ pub const Forward = struct {
     /// HIP, on unless TF_FLASHNEXT_SHARED_LD=0: the shared expert's down stored straight into its slot of the bf16
     /// expert outputs (fn_qmmf_ld), not through a scratch and a copy
     shared_ld: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_TOPK_PLAN=0: the router's top-k and the experts' plan in one launch
+    /// (fn_ops topk_plan, up to kern.plan_small pairs)
+    topk_plan: bool = false,
     /// two ranks, split prompt glue: the exchanges run on this stream beside the next rows' work (TF_FLASHNEXT_OVERLAP)
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
@@ -1772,23 +1775,27 @@ pub const Forward = struct {
         const es: usize = if (x.y_f32) 4 else 2;
         try f.t.router(b.mixed, D, m.router, b.moe_logits, R, D, E + 1);
         try f.mark(.router);
-        try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
+        // HIP decode: the top-k and the one-block plan (16-pair items: every decode path's tile) in one launch
+        const planned = f.topk_plan and !b.prefill and R * slots <= kern.plan_small and f.splitOf(x, R) == null and !(f.count_experts and f.prof != null);
+        if (planned) {
+            try f.th.topkPlan(b.moe_logits, R, E, E + 1, top, b.moe_pick, b.moe_wts, kern.plan_tile, b.plan_members, b.plan_items, b.plan_counts);
+        } else try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
         if (f.count_experts and f.prof != null and !b.prefill) try f.countExperts(b.moe_pick, R, slots, E);
         if (f.splitOf(x, R)) |q| if (f.cs != null and f.overlap & 2 != 0) {
             // the peer's rows first: their experts and partial, sent while this rank's own rows run
             const yrow = slots * D * es;
-            try f.moeRows(m, x, q.po, @min(q.rh, R - q.po), top);
+            try f.moeRows(m, x, q.po, @min(q.rh, R - q.po), top, false);
             try f.t.moePartial(b.moe_y + q.po * yrow, x.y_f32, b.moe_wts + q.po * slots * 4, b.part_moe, q.rh, D, slots);
             try f.mark(.moe_partial);
             try f.exchangeAsync(b.part_moe, b.g_moe + (1 - q.rank) * q.rh * D * 4, q.rh * D, .f32);
-            try f.moeRows(m, x, q.o, @min(q.rh, R - q.o), top);
+            try f.moeRows(m, x, q.o, @min(q.rh, R - q.o), top, false);
             try f.t.moePartial(b.moe_y + q.o * yrow, x.y_f32, b.moe_wts + q.o * slots * 4, b.g_moe + q.rank * q.rh * D * 4, q.rh, D, slots);
             try f.mark(.moe_partial);
             try f.exchangeWait();
             try f.mark(.moe_gather);
             return .{ .ranks = .{ .part = b.g_moe, .world = 2 } };
         };
-        try f.moeRows(m, x, 0, R, top);
+        try f.moeRows(m, x, 0, R, top, planned);
         if (f.splitOf(x, R)) |q| {
             // the peer's rows' partial first, sent while this rank's own rows' partial runs
             const yrow = slots * D * es;
@@ -1827,9 +1834,9 @@ pub const Forward = struct {
     }
 
     /// The experts, the shared expert and the slots of rows [a0, a0 + n) (the router's picks made for every row), `top`
-    /// routed experts a row.
-    fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
-        if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top);
+    /// routed experts a row; `planned`: the plan is made (topk_plan, 16-pair items).
+    fn moeRows(f: *Forward, m: *const W.MoE, x: *const Bufs, a0: usize, n: usize, top: usize, planned: bool) !void {
+        if (m.int4) |ex4| return f.moeRowsInt4(m, ex4, x, a0, n, top, planned);
         const b = &x.b;
         const g = f.g;
         const D = g.hidden;
@@ -1846,7 +1853,7 @@ pub const Forward = struct {
         // prompt chunks: gate/up and down on cuda_moe_prompt's items from their row counts (the same bits)
         const gu_px: ?*const moep.Prompt4 = if (f.px) |q| (if (R >= @max(moep.min_rows, q.gu_rows)) q else null) else null;
         const dn_px: ?*const moep.Prompt4 = if (f.px) |q| (if (R >= @max(moep.min_rows, q.down_rows)) q else null) else null;
-        if (gu_px) |q| try q.plan(f.ops, pick, R * slots, E + 1, plan) else try f.ops.plan(pick, R * slots, E + 1, kern.plan_tile, plan);
+        if (gu_px) |q| try q.plan(f.ops, pick, R * slots, E + 1, plan) else if (!planned) try f.ops.plan(pick, R * slots, E + 1, kern.plan_tile, plan);
         const ex: kern.Experts4 = .{ .up = m.routed.up, .down = m.routed.down, .up_scale = m.routed.up_scale, .down_scale = m.routed.down_scale, .width = m.routed.width, .dims = m.routed.dims };
         if (ex.width != ni or ex.dims != D) return error.ExpertShape;
         const skip: c_int = @intCast(E);
@@ -1893,7 +1900,7 @@ pub const Forward = struct {
     /// INT4-AutoRound's experts of rows [a0, a0 + n): the GPTQ int4 gate/up SwiGLU, the block-FP8 shared expert's
     /// gate|up and SwiGLU (its own scratch: the healed shared expert is wider than the routed ones), the int4 down,
     /// the shared down into its slot.
-    fn moeRowsInt4(f: *Forward, m: *const W.MoE, ex4: int4.Experts, x: *const Bufs, a0: usize, n: usize, top: usize) !void {
+    fn moeRowsInt4(f: *Forward, m: *const W.MoE, ex4: int4.Experts, x: *const Bufs, a0: usize, n: usize, top: usize, planned: bool) !void {
         const b = &x.b;
         const g = f.g;
         const D = g.hidden;
@@ -1913,7 +1920,7 @@ pub const Forward = struct {
         const skip: c_int = @intCast(E);
         // items of 16 pairs (int4.tileFor; the prompt tile is opt-in, the same bits)
         const tile = int4.tileFor(R * slots);
-        try f.ops.plan(pick, R * slots, E + 1, tile, plan);
+        if (!planned or tile != kern.plan_tile) try f.ops.plan(pick, R * slots, E + 1, tile, plan);
         try f.mark(.topk_plan);
         const sh = m.shared8 orelse return error.NoSharedExpert;
         if (f.side) |sd| {

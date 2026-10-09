@@ -260,3 +260,8 @@ extern "C" cudaError_t tf_fn_nucleus_mass(const void* logits, uint64_t ld, uint6
         static_cast<int64_t*>(mass), static_cast<unsigned long long*>(sums));
     return cudaGetLastError();
 }
+
+// ---- HIP decode: the router's top-k and the experts' one-block plan in one launch (gfx1151 only) ----
+#if defined(__HIP_PLATFORM_AMD__)
+#include "../../hip/topk_plan.hip"
+#endif

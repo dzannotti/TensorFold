@@ -78,6 +78,8 @@ pub const Functions = struct {
     swiglu: cuda.Function,
     /// null in a build whose fn_ops predates it (the forward then keeps `_reduce` and the strided copy)
     reduce_ld: ?cuda.Function,
+    /// HIP: `_topk_rows` + the one-block plan in one launch (topk_plan.hip); null elsewhere
+    topk_plan: ?cuda.Function,
     fill64: cuda.Function,
     draft_pick: cuda.Function,
     draft_pack: cuda.Function,
@@ -106,6 +108,7 @@ pub const Functions = struct {
             .gather = try m[i(.movement)].function("tf_gather_rows_kernel"),
             .swiglu = try m[i(.ops)].function("tf_fn_shared_swiglu_kernel"),
             .reduce_ld = m[i(.ops)].function("tf_fn_reduce_ld_kernel") catch null,
+            .topk_plan = m[i(.ops)].function("tf_fn_topk_plan_kernel") catch null,
             .fill64 = try m[i(.ops)].function("tf_fn_fill_u64_kernel"),
             .draft_pick = try m[i(.ops)].function("tf_fn_draft_pick_kernel"),
             .draft_pack = try m[i(.ops)].function("tf_fn_draft_pack_kernel"),
@@ -320,6 +323,20 @@ pub const Torch = struct {
         a.add(out);
         for ([_]u64{ rows, n, sk, ldo }) |v| a.add(v);
         try t.go(t.f.reduce_ld orelse return error.NoReduceLd, .{ blocks(rows * n, 256), 1 }, 256, &a);
+    }
+
+    /// moe.select_rows + the one-block plan (pairs <= 1024): logits [rows, nl] (ne routed, the shared gate) -> picks
+    /// and weights [rows, top + 1], members, items of `tile` pairs and counts (topk_plan.hip, the same bytes).
+    pub fn topkPlan(t: Torch, logits: u64, rows: usize, ne: usize, nl: usize, top: usize, pick: u64, wts: u64, tile: usize, members: u64, items: u64, counts: u64) !void {
+        if (rows * (top + 1) > 1024 or ne > 512 or top >= 32) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        for ([_]usize{ rows, ne, nl, top }) |v| a.add(@as(c_int, @intCast(v)));
+        a.add(pick);
+        a.add(wts);
+        a.add(@as(c_int, @intCast(tile)));
+        for ([_]u64{ members, items, counts }) |v| a.add(v);
+        try t.go(t.f.topk_plan orelse return error.NoTopkPlan, .{ 1, 1 }, 1024, &a);
     }
 
     pub fn sharedSwiglu(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize) !void {

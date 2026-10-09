@@ -7,6 +7,8 @@ const cuda = @import("cuda");
 const aot = cuda.aot;
 const tri = @import("cuda_triton.zig");
 const prompt = @import("cuda_prompt.zig");
+const tops = @import("cuda_torch_ops.zig");
+const kern = @import("cuda_kernels.zig");
 
 const bf16 = "*bf16";
 const f32p = "*fp32";
@@ -72,7 +74,7 @@ fn same(gpa: std.mem.Allocator, a: cuda.DeviceBuffer, b: cuda.DeviceBuffer, n: u
 }
 
 /// Every decode fusion against its separate kernels (bytes), then both timed in graphs. Returns whether all equal.
-pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
+pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch, ops: kern.Ops) !bool {
     var bs: Bufs = .{};
     defer bs.free();
     const h0 = try bs.get(d, max_m * S * D * 2);
@@ -188,6 +190,8 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
             }
         }
     }
+    if (!try reduceCheck(gpa, d, t, th)) all = false;
+    if (!try topkCheck(gpa, d, t, th, ops)) all = false;
     for ([_]usize{ 1, 4, 16 }) |m| try bench(d, t, m, .{ .h = ha.ptr, .pss = pa.ptr, .inj = inj.ptr, .y = yb.ptr, .wts = wts.ptr, .scale = scale.ptr, .normed = na.ptr, .xs = xs.ptr, .wdn = wdn.ptr, .wup = wup.ptr, .part = parta.ptr, .act = acta.ptr, .ij = ija.ptr, .up = up.ptr, .mixed = nb.ptr, .tick = tick.ptr });
     return all;
 }
@@ -232,4 +236,80 @@ fn bench(d: *const cuda.Driver, t: tri.Tri, m: usize, p: Ptrs) !void {
         ms[i] = try cuda.Event.elapsedMs(e0, e1) / 20;
     }
     std.debug.print("bench 96 read-outs in a graph, {d} rows: 6 launches each {d:.3} ms, fused 3 {d:.3} ms (saves {d:.3} ms)\n", .{ m, ms[0], ms[1], ms[0] - ms[1] });
+}
+
+/// fn_ops reduce_ld against `_reduce` + the strided copy: a projection's split bf16 columns (DeltaNet b|a 96, the
+/// indexer's 640 at K 2560) into their place in wider rows; the whole rows' bytes compared.
+fn reduceCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch) !bool {
+    var bs: Bufs = .{};
+    defer bs.free();
+    const K: usize = 2560;
+    const ldo: usize = 17000;
+    const x = try bs.get(d, max_m * K * 2);
+    const w = try bs.get(d, 640 * K * 2);
+    const part = try bs.get(d, 8 * max_m * 640 * 4);
+    const pb = try bs.get(d, max_m * 640 * 2);
+    const oa = try bs.get(d, max_m * ldo * 2);
+    const ob = try bs.get(d, max_m * ldo * 2);
+    var prng = std.Random.DefaultPrng.init(0x72_6c_64);
+    const r = prng.random();
+    var all = true;
+    for ([_]prompt.Fill{ .normal, .wide, .cancel, .edge, .special }) |fill| {
+        try prompt.fillBuf(gpa, x, max_m * K, r, fill);
+        try prompt.fillBuf(gpa, w, 640 * K, r, if (fill == .special) .normal else fill);
+        for ([_]usize{ 96, 640 }) |n| for (rows_checked) |m| {
+            const sk = tri.b16SplitK(n, K);
+            try oa.fill8(0x11, t.s.handle);
+            try ob.fill8(0x11, t.s.handle);
+            try t.b16mm(x.ptr, K, w.ptr, pb.ptr, false, part.ptr, m, n, K);
+            try th.slotCopy(pb.ptr, n * 2, oa.ptr + 1000 * 2, ldo * 2, n * 2, m);
+            try prompt.b16Slices("_b16mm", t, x.ptr, K, w.ptr, part.ptr, false, m, n, K);
+            try th.reduceLd(part.ptr, ob.ptr + 1000 * 2, m, n, sk, ldo);
+            try t.s.synchronize();
+            const ok = try same(gpa, oa, ob, m * ldo * 2);
+            if (!ok) all = false;
+            if (!ok or m == 1 or m == 128) std.debug.print("{s} reduce_ld N {d} SK {d} rows {d} {s}: rows bytes\n", .{ if (ok) "EQUAL" else "DIFFER", n, sk, m, @tagName(fill) });
+        };
+    }
+    return all;
+}
+
+/// fn_ops topk_plan against `_topk_rows` + the one-block plan: picks, weights, members, items and counts bytes, top-k
+/// 10 and 5 of 512 routed logits; logits normal, spread wide (exp's small-input path), and tied.
+fn topkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch, ops: kern.Ops) !bool {
+    var bs: Bufs = .{};
+    defer bs.free();
+    const E: usize = 512;
+    const rows_max: usize = 93;
+    const logits = try bs.get(d, rows_max * (E + 1) * 4);
+    var out: [2][5]cuda.DeviceBuffer = undefined;
+    const sizes = [5]usize{ 1024 * 4, 1024 * 4, 1024 * 4, (1024 + E + 1) * 3 * 4, 64 };
+    for (&out) |*o| for (o, sizes) |*b, n| {
+        b.* = try bs.get(d, n);
+    };
+    var prng = std.Random.DefaultPrng.init(0x74_6b_70);
+    const r = prng.random();
+    const host = try gpa.alloc(f32, rows_max * (E + 1));
+    defer gpa.free(host);
+    var all = true;
+    for ([_][]const u8{ "normal", "wide", "tied" }) |kind| {
+        for (host) |*v| v.* = if (std.mem.eql(u8, kind, "normal")) r.floatNorm(f32) * 2 else if (std.mem.eql(u8, kind, "wide")) r.floatNorm(f32) * 60 else @floatFromInt(@as(i32, @intCast(r.uintLessThan(u32, 7))) - 3);
+        try logits.upload(0, std.mem.sliceAsBytes(host));
+        for ([_]usize{ 10, 5 }) |top| for (rows_checked) |m| {
+            if (m * (top + 1) > 1024) continue;
+            for (&out) |*o| for (o) |b| try b.fill8(0xA5, t.s.handle);
+            const plan_a: kern.Plan = .{ .members = out[0][2].ptr, .items = out[0][3].ptr, .counts = out[0][4].ptr, .rank = 0, .hist = 0 };
+            try t.topkRows(logits.ptr, out[0][0].ptr, out[0][1].ptr, m, E, top);
+            try ops.plan(out[0][0].ptr, m * (top + 1), E + 1, kern.plan_tile, plan_a);
+            try th.topkPlan(logits.ptr, m, E, E + 1, top, out[1][0].ptr, out[1][1].ptr, kern.plan_tile, out[1][2].ptr, out[1][3].ptr, out[1][4].ptr);
+            try t.s.synchronize();
+            var ok = true;
+            const pairs = m * (top + 1);
+            const used = [5]usize{ pairs * 4, pairs * 4, pairs * 4, kern.maxItems(pairs, E + 1, kern.plan_tile) * 3 * 4, 8 };
+            for (out[0], out[1], used) |a, b, n| ok = ok and try same(gpa, a, b, n);
+            if (!ok) all = false;
+            if (!ok or m == 1 or m == 64) std.debug.print("{s} topk_plan top {d} rows {d} {s}: picks, weights, members, items, counts bytes\n", .{ if (ok) "EQUAL" else "DIFFER", top, m, kind });
+        };
+    }
+    return all;
 }

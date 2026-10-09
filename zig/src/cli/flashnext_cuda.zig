@@ -1638,7 +1638,11 @@ fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []co
     const t: flashnext.triton.Tri = .{ .set = &set, .s = stream };
     const up = try flashnext.prompt.glueCheck(gpa, ctx.d, t);
     const wb = try flashnext.prompt.wbNormCheck(gpa, ctx.d, t);
-    const dec = !cuda.hip or try flashnext.glue_dec.check(gpa, ctx.d, t);
+    var ops = try flashnext.torch_ops.Ops.load(ctx);
+    defer ops.deinit();
+    var k = try flashnext.kernels.Kernels.load(ctx);
+    defer k.deinit();
+    const dec = !cuda.hip or try flashnext.glue_dec.check(gpa, ctx.d, t, ops.on(stream), .{ .k = &k, .s = stream });
     const ok = wb and up and dec;
     std.debug.print("{s} glue-check\n", .{if (ok) "PASS" else "FAIL"});
     return if (ok) 0 else 1;
