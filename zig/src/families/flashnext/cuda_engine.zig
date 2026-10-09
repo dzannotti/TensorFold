@@ -560,7 +560,8 @@ pub const Engine = struct {
             e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_count != 0) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .tp = e.tp, .nsc = e.nsc };
         }
         errdefer gpa.free(e.draft_host);
-        if (o.vmm) {
+        // TF_FLASHNEXT_VMM=0: caches grow by copying (the same bits; HIP's retained-PM4 graphs need it)
+        if (o.vmm and !envOff("TF_FLASHNEXT_VMM")) {
             e.vm = vmm.Vmm.init(ctx) catch |err| blk: {
                 std.log.warn("CUDA VMM unavailable ({s}): caches grow by copying", .{@errorName(err)});
                 break :blk null;
