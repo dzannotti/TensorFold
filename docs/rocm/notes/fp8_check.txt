@@ -27,3 +27,4 @@ bench shared_down n 2560 k 1280: m1 19/21us 179/164GB/s, m8 22/22us 162/161GB/s,
 # decode "16 rows = 2x 8 rows" (previous log): not reproducible. Same bm=16 kernel, same code for 8 and 16 rows; A/B alternated, 4 runs under prod load and 1 clean: m16 = m8 within 3% (gdn_qkvz 218-243 vs 222-240 us, attn_qkv 180-211 vs 180-200 us). The earlier 460/386/649 us were co-tenant bursts.
 # wide tile limits (gfx1151): compute core alone (no global loads or staging) ~39 TF; one LDS barrier a group costs ~15% (a microbench with a barrier every 2 groups is free, but 2 groups of a 128x128 tile need 128 KiB of LDS); WGP -> CU mode +10-30%.
 # tensorfold fp8-check (HIP build, cuda_fp8.zig dispatch): PASS all 10 cases, rows 1..4096 equal one-row calls, matmulLd byte-equal at 17 row counts.
+# perf-fp8dec (nontemporal weight loads in the 16/32-row tiles): rerun fp8_check.py on random shapes PASS, worst-case numbers identical to the above (same bits); decode GB/s in notes/fp8dec.md
