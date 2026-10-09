@@ -1406,7 +1406,8 @@ pub const Forward = struct {
         return true;
     }
 
-    /// _readout_b16 (norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix) of rows whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
+    /// _readout_b16 (norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix) of rows
+    /// whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
     fn readoutAt(f: *Forward, hc: *const W.Hc, x: *const Bufs, h: u64, pss: u64, R: usize, inject: ?u64, mixed: u64, xs: u64, normed_done: bool) !void {
         const b = &x.b;
         const g = f.g;
