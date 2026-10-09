@@ -305,6 +305,9 @@ pub const Engine = struct {
     cand_have: u64 = std.math.maxInt(u64),
     /// one rank, greedy windows: the round's argmax over every row, read once (sampleWindow)
     ids_host: std.ArrayList(i32) = .empty,
+    /// freed sequences kept with their captured graphs for the next requests (TF_FLASHNEXT_SEQ_POOL=0: none)
+    pool: std.ArrayList(*Seq) = .empty,
+    pool_cap: usize = 0,
     ids_have: u64 = std.math.maxInt(u64),
     /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again, and one rank's draws
     /// wait a window or a draft at a time (the old way)
@@ -446,6 +449,7 @@ pub const Engine = struct {
         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
         e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
         e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
+        e.pool_cap = if (envOff("TF_FLASHNEXT_SEQ_POOL")) 0 else @max(1, o.streams);
         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
         if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
@@ -655,7 +659,10 @@ pub const Engine = struct {
         e.multi = .empty;
         e.seen.deinit(e.gpa);
         e.seen = .empty;
+        e.pool_cap = 0;
         e.freeSeq(e.own);
+        for (e.pool.items) |s| e.destroySeq(s);
+        e.pool.deinit(e.gpa);
         e.gpa.free(e.draft_host);
         e.gpa.free(e.round_segs);
         e.extra.buf.free();
@@ -692,17 +699,31 @@ pub const Engine = struct {
     /// A new empty sequence whose caches grow up to `limit_rows` (at most the engine's max_len).
     pub fn newSeq(e: *Engine, limit_rows: usize) !*Seq {
         const limit = @min(limit_rows, e.max_len);
+        // a pooled sequence is as a new one: zeroed caches at one growth step, reset state, its graphs kept
+        const poolable = e.vm != null and e.pool_cap > 0 and limit >= state.grow_step;
+        if (poolable) if (e.pool.pop()) |s| {
+            errdefer e.destroySeq(s);
+            s.st.limit = limit;
+            try s.st.fixed.buf.fill8(0, null);
+            for (s.regions.items) |*r| try e.f.th.zero(r.base, if (r.ring) e.ringBytes(r.v) else r.mapped);
+            s.window.clearRetainingCapacity();
+            try e.f.register(s);
+            try e.f.reset(s);
+            return s;
+        };
         const s = try e.gpa.create(Seq);
         errdefer e.gpa.destroy(s);
         // caches start at one growth step and grow with the stream (State.ensure), up to `limit`
         const first = @min(limit, state.grow_step);
         if (!e.fits(first)) return error.NoRoom;
-        s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, limit) };
+        // a poolable one reserves the whole window's address space, so it serves any later request
+        s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, if (poolable) e.max_len else limit), .poolable = poolable };
         errdefer s.deinit(e.gpa);
         s.charged = s.st.fixed.buf.len + (if (s.st.ctx) |c| c.buf.len else 0) + e.g.wide() * 2;
         e.budget.used += s.charged;
         errdefer e.budget.used -|= s.charged;
         if (e.vm) |*v| try e.mapSeq(s, v, first);
+        s.st.limit = limit;
         try e.f.register(s);
         errdefer e.f.unregister(s);
         s.last_streams = try cuda.DeviceBuffer.alloc(e.ctx.d, e.g.wide() * 2);
@@ -749,6 +770,42 @@ pub const Engine = struct {
 
     pub fn freeSeq(e: *Engine, s: *Seq) void {
         if (e.bound == s and s != e.own) e.bound = e.own;
+        if (e.toPool(s)) return;
+        e.destroySeq(s);
+    }
+
+    /// Into the pool when it has room: the caches trimmed back to one growth step (their memory given back), the
+    /// graphs at the first context bucket kept (the ones a new request replays), the others dropped.
+    fn toPool(e: *Engine, s: *Seq) bool {
+        if (!s.poolable or s == e.own or s.media != null or e.pool.items.len >= e.pool_cap) return false;
+        e.pool.ensureUnusedCapacity(e.gpa, 1) catch return false;
+        // launches in flight may still read the caches being unmapped
+        e.stream.synchronize() catch return false;
+        const g = e.g;
+        const step = state.grow_step;
+        var freed: usize = 0;
+        const layers = s.regions.items.len / 4;
+        for (0..layers) |i| {
+            const r = s.regions.items[4 * i ..][0..4];
+            for ([_]usize{ 0, 1, 3 }, [_]usize{ step * g.kRow(), step * g.vRow(), g.blocks(step) * g.index_dim * 2 }) |j, bytes| freed += r[j].trimTo(bytes);
+        }
+        s.st.capacity = step;
+        e.budget.used -|= freed;
+        s.charged -|= freed;
+        e.f.unregister(s);
+        while (true) {
+            var it = e.graphs.iterator();
+            const found = while (it.next()) |kv| {
+                if (kv.key_ptr.seq == @intFromPtr(s) and kv.key_ptr.ctx > step) break kv.key_ptr.*;
+            } else null;
+            var gr = e.graphs.fetchRemove(found orelse break).?.value;
+            gr.deinit();
+        }
+        e.pool.appendAssumeCapacity(s);
+        return true;
+    }
+
+    fn destroySeq(e: *Engine, s: *Seq) void {
         e.budget.used -|= s.charged;
         e.f.unregister(s);
         e.dropGraphs(@intFromPtr(s), null);
