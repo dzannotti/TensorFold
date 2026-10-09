@@ -23,6 +23,7 @@ const comms = @import("cuda_comm.zig");
 const vmm = @import("cuda_vmm.zig");
 const profs = @import("cuda_prof.zig");
 const prompt = @import("cuda_prompt.zig");
+const glue_dec = @import("cuda_glue_dec.zig");
 const moep = @import("cuda_moe_prompt.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
@@ -208,8 +209,9 @@ pub const Scratch = struct {
     sh_a: u64, // [rows, shared width] bf16
 
     qsa_pos: u64, // [1] int32: a row-split indexer block's first own row position (cuda_prompt.zig)
+    tick: u64, // [glue_dec.tick_words] int32, zero between launches: `_b16mm_sm_act`'s finished programs
 
-    fn sizes(g: state.Geometry, rows: usize, part: usize) [24]usize {
+    fn sizes(g: state.Geometry, rows: usize, part: usize) [25]usize {
         const ni = g.moe_width;
         const two = g.world > 1;
         const emb: usize = if (two) rows * g.ple_dim * 2 else 0;
@@ -218,7 +220,7 @@ pub const Scratch = struct {
         const face8 = @max(g.gdnConv() + g.nv * state.gdn_dv, g.heads * 2 * g.head_dim + 2 * g.kv_heads * g.head_dim);
         const faceb = @max(2 * g.nv, (g.index_heads + 1) * g.index_dim);
         const sw = g.sharedWidth();
-        return .{ part, rows * (g.low + g.streams) * 4, rows * 2 * ni * 2, rows * g.hidden * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nv * state.gdn_dv * 2, rows * g.nv * 4, rows * g.nv * 4, rows * g.nv * state.gdn_dv * 2, 256, 256, 256, g.nv * state.gdn_dv * state.gdn_dk * 4, if (two) rows * g.pleHeads() * 8 else 0, emb, xs, emb, xs, 256, if (on4) rows * face8 * 2 else 0, if (on4) rows * faceb * 2 else 0, if (on4) rows * 2 * sw * 2 else 0, if (on4) rows * sw * 2 else 0 };
+        return .{ part, rows * (g.low + g.streams) * 4, rows * 2 * ni * 2, rows * g.hidden * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nk * state.gdn_dk * 4, rows * g.nv * state.gdn_dv * 2, rows * g.nv * 4, rows * g.nv * 4, rows * g.nv * state.gdn_dv * 2, 256, 256, 256, g.nv * state.gdn_dv * state.gdn_dk * 4, if (two) rows * g.pleHeads() * 8 else 0, emb, xs, emb, xs, 256, if (on4) rows * face8 * 2 else 0, if (on4) rows * faceb * 2 else 0, if (on4) rows * 2 * sw * 2 else 0, if (on4) rows * sw * 2 else 0, glue_dec.tick_words * 4 };
     }
 
     pub fn init(d: *const cuda.Driver, g: state.Geometry, rows: usize, part: usize) !Scratch {
@@ -229,7 +231,7 @@ pub const Scratch = struct {
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer s.arena.buf.free();
         try s.arena.buf.fill8(0, null);
-        const ptrs = [_]*u64{ &s.part, &s.dn, &s.shared_g, &s.shared_y, &s.gq, &s.gk, &s.gv, &s.gg, &s.gb, &s.gy, &s.kv_scale, &s.invalid, &s.vote, &s.gdn_t, &s.ngram_ids, &s.ple_half, &s.xs_half, &s.ple_all, &s.xs_all, &s.qsa_pos, &s.p8, &s.pb, &s.sh_g, &s.sh_a };
+        const ptrs = [_]*u64{ &s.part, &s.dn, &s.shared_g, &s.shared_y, &s.gq, &s.gk, &s.gv, &s.gg, &s.gb, &s.gy, &s.kv_scale, &s.invalid, &s.vote, &s.gdn_t, &s.ngram_ids, &s.ple_half, &s.xs_half, &s.ple_all, &s.xs_all, &s.qsa_pos, &s.p8, &s.pb, &s.sh_g, &s.sh_a, &s.tick };
         for (ptrs, sz) |p, n| p.* = s.arena.take(n);
         return s;
     }
@@ -538,6 +540,20 @@ pub const Forward = struct {
     wb_norm: bool = false,
     /// HIP, on unless TF_FLASHNEXT_GLUE_FUSE=0: decode read-outs sum the down projection's K slices in `_hc_act_sk`
     act_sk: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_DEC_WBN=0: read-outs' write-back and norm in one launch (`_hc_wbn`)
+    dec_wbn: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_DEC_ACT=0: the down projection runs `_hc_act_sk` in its last program
+    dec_act: bool = false,
+    /// HIP decode, on unless TF_FLASHNEXT_DEC_UPMIX=0: the up projection and mix in one launch, `dec_bd` columns a
+    /// program (TF_FLASHNEXT_DEC_BD, 16 or 32)
+    dec_upmix: bool = false,
+    dec_bd: usize = glue_dec.bd_default,
+    /// HIP decode, on unless TF_FLASHNEXT_REDUCE_LD=0: a projection's split bf16 columns summed straight into their
+    /// place (fn_ops reduce_ld: `_reduce` + the strided copy in one launch)
+    reduce_ld: bool = false,
+    /// HIP, on unless TF_FLASHNEXT_SHARED_LD=0: the shared expert's down stored straight into its slot of the bf16
+    /// expert outputs (fn_qmmf_ld), not through a scratch and a copy
+    shared_ld: bool = false,
     /// two ranks, split prompt glue: the exchanges run on this stream beside the next rows' work (TF_FLASHNEXT_OVERLAP)
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
@@ -865,9 +881,15 @@ pub const Forward = struct {
             try fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, x, x_stride, l, f.sc.p8, false, m);
             try f.th.slotCopy(f.sc.p8, l.n * 2, out, out_w * 2, l.n * 2, m);
         }
-        try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
-        try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
         if (l.n + rb.n != out_w) return error.ProjectionWidth;
+        const sk = tri.b16SplitK(rb.n, rb.k);
+        if (f.reduce_ld and sk > 1 and rb.slices == 0 and !prompt.b16Takes(f.prompt_mm, m, rb.n, rb.k)) {
+            try prompt.b16Slices("_b16mm", f.t, x, x_stride, rb.weight, f.sc.part, false, m, rb.n, rb.k);
+            try f.th.reduceLd(f.sc.part, out + l.n * 2, m, rb.n, sk, out_w);
+        } else {
+            try f.mmAt(null, x, x_stride, rb, f.sc.pb, false, m);
+            try f.th.slotCopy(f.sc.pb, rb.n * 2, out + l.n * 2, out_w * 2, rb.n * 2, m);
+        }
         try f.mark(part);
     }
 
@@ -1346,12 +1368,13 @@ pub const Forward = struct {
             return;
         }
         const fuse = f.fusesNorm(hc, b, pending);
-        const nm: ?tri.Tri.NormOut = if (fuse) .{ .scale = hc.scale, .normed = b.normed, .eps = f.eps } else null;
+        const dec = !fuse and f.decWbn(b, pending);
+        const nm: ?tri.Tri.NormOut = if (fuse or dec) .{ .scale = hc.scale, .normed = b.normed, .eps = f.eps, .streams = dec } else null;
         if (pending) |p| {
             try f.t.hcWritebackNorm(h, h, x.b.pss, p.inject, p.branch, R, g.hidden, g.streams, nm);
         } else try f.t.hcWritebackNorm(h, h, x.b.pss, null, .none, R, g.hidden, g.streams, nm);
         try f.mark(.hc_writeback);
-        try f.readoutAt(hc, x, h, x.b.pss, R, if (hc.inject) inject_out else null, x.b.mixed, x.b.xs_mixed, fuse);
+        try f.readoutAt(hc, x, h, x.b.pss, R, if (hc.inject) inject_out else null, x.b.mixed, x.b.xs_mixed, fuse or dec);
     }
 
     /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP
@@ -1366,12 +1389,18 @@ pub const Forward = struct {
         return true;
     }
 
-    /// _readout_b16: norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix.
-    fn readout(f: *Forward, hc: *const W.Hc, x: *const Bufs, h: u64, R: usize, inject: ?u64) !void {
-        try f.readoutAt(hc, x, h, x.b.pss, R, inject, x.b.mixed, x.b.xs_mixed, false);
+    /// Whether a decode write-back also makes the read-out's normed rows (`_hc_wbn`, a (row, stream) a program): no
+    /// 4-bit MTP matrices (the only readers of normed's 32-group sums) and a branch the kernel set has an entry for.
+    fn decWbn(f: *const Forward, b: *const state.Buffers, pending: ?Pending) bool {
+        if (!f.dec_wbn or b.prefill or f.mtp_q4 != null) return false;
+        if (pending) |p| switch (p.branch) {
+            .slices => return false,
+            else => {},
+        };
+        return true;
     }
 
-    /// `readout` of rows whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
+    /// _readout_b16 (norm, the down projection in fp32, SiLU and the inject gates, the up projection, the mix) of rows whose squared sums are at `pss`, the mix into `mixed` / `xs` (the scratch from row 0).
     fn readoutAt(f: *Forward, hc: *const W.Hc, x: *const Bufs, h: u64, pss: u64, R: usize, inject: ?u64, mixed: u64, xs: u64, normed_done: bool) !void {
         const b = &x.b;
         const g = f.g;
@@ -1393,18 +1422,29 @@ pub const Forward = struct {
                 try f.th.slotCopy(f.sc.pb, hc.down.n * 4, f.sc.dn + d8.n * 4, dn_n * 4, hc.down.n * 4, R);
             }
             try f.mark(.hc_down);
+        } else if (act_sk and f.dec_act and !b.prefill and hc.down.slices != 0) {
+            // HIP decode: `_hc_act_sk` in the down projection's last program (no 32-group sums of act: mtp_q4 is off)
+            try glue_dec.downAct(f.t, b.normed, Wd, hc.down.weight, f.sc.part, b.act, inject, f.sc.tick, R, hc.down.n, hc.down.k, g.streams, g.low);
+            try f.mark(.hc_down);
         } else if (act_sk) {
             try prompt.b16Slices(if (hc.down.slices != 0) "_b16mm_sm" else "_b16mm", f.t, b.normed, Wd, hc.down.weight, f.sc.part, true, R, hc.down.n, hc.down.k);
             try f.mark(.hc_down);
-        } else try f.mmxAt(.hc_down, b.normed, Wd, b.xs_normed, hc.down, f.sc.dn, true, R);
-        if (act_sk) {
             try f.t.hcActSk(f.sc.part, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low, 32);
-        } else try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
+        } else {
+            try f.mmxAt(.hc_down, b.normed, Wd, b.xs_normed, hc.down, f.sc.dn, true, R);
+            try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
+        }
         try f.mark(.hc_act);
         // prompt chunks: the up projection and the mix in one pass (cuda_prompt.zig upMix, the same mixed bytes; no
         // 32-group sums of mixed, which only the 4-bit MTP draft matrices read)
         if (f.up_mix and b.prefill and R >= 16 and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
             try prompt.upMix(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 64);
+            try f.mark(.hc_mix);
+            return;
+        }
+        // HIP decode: the same in one launch on 16-row tiles (no 32-group sums of mixed: no 4-bit draft head reads them)
+        if (f.dec_upmix and !b.prefill and f.w.draft_head == null and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0 and g.hidden % f.dec_bd == 0) {
+            try prompt.upMixTile(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, 16, f.dec_bd);
             try f.mark(.hc_mix);
             return;
         }
@@ -1885,8 +1925,10 @@ pub const Forward = struct {
             th2.s = sd.s;
             try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.sh_g, false, R);
             try th2.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
-            try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
-            try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+            if (f.shared_ld and !x.y_f32) try fp8.matmulLd(k8, sd.s, f.sc.sh_a, sh.width, sh.down, y + top * D * es, slots * D, R) else {
+                try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
+                try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+            }
             try sd.join.record(sd.s);
             try int4.gateUp(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip, tile);
             try f.mark(.experts_gate_up);
@@ -1903,6 +1945,11 @@ pub const Forward = struct {
         try f.mark(.shared_swiglu);
         try f.int4Down(k4, pick, act, ex4, plan, slots, E, y, x.y_f32, R, skip, tile);
         try f.mark(.experts_down);
+        if (f.shared_ld and !x.y_f32) {
+            try fp8.matmulLd(k8, f.s, f.sc.sh_a, sh.width, sh.down, y + top * D * es, slots * D, R);
+            try f.mark(.shared_down);
+            return;
+        }
         try fp8.matmul(k8, f.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
         try f.mark(.shared_down);
         try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
@@ -1931,6 +1978,7 @@ pub const Forward = struct {
         const b = &x.b;
         const g = f.g;
         const Wd = g.wide();
+        var normed = false;
         try f.mark(.other);
         if (f.splitOf(x, R)) |q| {
             // this rank's rows written back, then both halves of the streams and their squared sums gathered
@@ -1938,6 +1986,10 @@ pub const Forward = struct {
             try f.writebackRows(b.streams, x, R, pending, q);
             try f.gatherRows(b.streams, q, Wd * 2, .bf16, 2);
             try f.gatherRows(b.pss, q, pssRow(g), .f32, 4);
+        } else if (f.decWbn(b, pending) and pending.branch != .none) {
+            // decode: the write-back from h straight into the streams' copy with the read-out's norm (h unchanged)
+            try f.t.hcWritebackNorm(b.h, b.streams, b.pss, pending.inject, pending.branch, R, g.hidden, g.streams, .{ .scale = mixer.scale, .normed = b.normed, .eps = f.eps, .streams = true });
+            normed = true;
         } else {
             try f.th.copy(b.streams, b.h, R * Wd * 2);
             try f.writeback(b.streams, x, R, pending);
@@ -1963,7 +2015,7 @@ pub const Forward = struct {
                 n = 1;
             }
         }
-        try f.readout(mixer, x, rows, n, null);
+        try f.readoutAt(mixer, x, rows, x.b.pss, n, null, x.b.mixed, x.b.xs_mixed, normed);
         try f.put("final_streams", b.streams, R * Wd * 2);
         try f.put("final_mixed", b.mixed, n * g.hidden * 2);
         if (!logits) return null;

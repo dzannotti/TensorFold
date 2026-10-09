@@ -27,6 +27,22 @@ extern "C" __global__ void tf_fn_shared_swiglu_kernel(const __nv_bfloat16* g, __
     }
 }
 
+// bf16._reduce of a split matmul's K slices (part [sk, rows, n] fp32: slices added in order, one rounding to bf16 as
+// Triton rounds: nearest-even, NaN -> 0x7FFF), row r stored at out + r * ldo: `_reduce` and the strided copy after it
+// in one launch, the same bytes (a projection's bf16 columns into their place in the wider rows).
+extern "C" __global__ void tf_fn_reduce_ld_kernel(const float* part, uint16_t* out, uint64_t rows, uint64_t n,
+                                                  uint64_t sk, uint64_t ldo) {
+    const uint64_t count = rows * n;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        float acc = part[i];
+        for (uint64_t s = 1; s < sk; ++s) acc = __fadd_rn(acc, part[s * count + i]);
+        const uint32_t u = __float_as_uint(acc);
+        const uint64_t r = i / n;
+        out[r * ldo + (i - r * n)] = acc != acc ? 0x7FFF : uint16_t((u + ((u >> 16) & 1u) + 0x7FFFu) >> 16);
+    }
+}
+
 // Tensor.fill_ of `count` 64-bit words.
 extern "C" __global__ void tf_fn_fill_u64_kernel(uint64_t* out, uint64_t value, uint64_t count) {
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;

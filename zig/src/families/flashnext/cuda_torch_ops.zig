@@ -76,6 +76,8 @@ pub const Functions = struct {
     strided: cuda.Function,
     gather: cuda.Function,
     swiglu: cuda.Function,
+    /// null in a build whose fn_ops predates it (the forward then keeps `_reduce` and the strided copy)
+    reduce_ld: ?cuda.Function,
     fill64: cuda.Function,
     draft_pick: cuda.Function,
     draft_pack: cuda.Function,
@@ -103,6 +105,7 @@ pub const Functions = struct {
             .strided = try m[i(.movement)].function("tf_strided_copy_kernel"),
             .gather = try m[i(.movement)].function("tf_gather_rows_kernel"),
             .swiglu = try m[i(.ops)].function("tf_fn_shared_swiglu_kernel"),
+            .reduce_ld = m[i(.ops)].function("tf_fn_reduce_ld_kernel") catch null,
             .fill64 = try m[i(.ops)].function("tf_fn_fill_u64_kernel"),
             .draft_pick = try m[i(.ops)].function("tf_fn_draft_pick_kernel"),
             .draft_pack = try m[i(.ops)].function("tf_fn_draft_pack_kernel"),
@@ -308,6 +311,17 @@ pub const Torch = struct {
 
     /// MoE4.shared_act into its slot: g [rows, 2 ni] bf16 (gate | up) -> out rows `out_stride` elements apart
     /// (buf.act[:, top_k]: (top_k + 1) * ni).
+    /// bf16 `_reduce` of `sk` fp32 slices part [sk, rows, n] into rows `ldo` elements apart (fn_ops.cu, the same bytes as
+    /// `_reduce` + slotCopy).
+    pub fn reduceLd(t: Torch, part: u64, out: u64, rows: usize, n: usize, sk: usize, ldo: usize) !void {
+        if (rows * n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(part);
+        a.add(out);
+        for ([_]u64{ rows, n, sk, ldo }) |v| a.add(v);
+        try t.go(t.f.reduce_ld orelse return error.NoReduceLd, .{ blocks(rows * n, 256), 1 }, 256, &a);
+    }
+
     pub fn sharedSwiglu(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize) !void {
         if (rows * ni == 0) return;
         var a: cuda.Args = .{};

@@ -304,7 +304,7 @@ pub const Tri = struct {
     /// the variants already picked (null: `find` every launch)
     memo: ?*Memo = null,
 
-    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
+    pub fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
         const g: [3]u32 = .{ u(grid[0]), u(grid[1]), u(grid[2]) };
         if (t.rec) |r| return r.add(name, g, args, consts);
         const set = t.set.?;
@@ -346,8 +346,9 @@ pub const Tri = struct {
         return t.hcWritebackNorm(h, hout, pss, inject, branch, rows, d, streams, null);
     }
 
-    /// The scale (fp32 [S*D]), the normed rows [R, S*D] bf16 and eps of `_hc_wb_norm`.
-    pub const NormOut = struct { scale: u64, normed: u64, eps: f32 };
+    /// The scale (fp32 [S*D]), the normed rows [R, S*D] bf16 and eps of `_hc_wb_norm`; `streams`: decode's
+    /// `_hc_wbn` (glue_dec.py: a (row, stream) a program, the same bits).
+    pub const NormOut = struct { scale: u64, normed: u64, eps: f32, streams: bool = false };
 
     /// hcWriteback and, with `norm`, hcNormed's rows (no 32-group sums) in the same launch, a row a program
     /// (prompt_mm._hc_wb_norm: the same bits as the two kernels).
@@ -388,6 +389,7 @@ pub const Tri = struct {
         const inj = p("INJ", bf16, inject orelse h);
         const consts = [_]aot.Const{ ci("D", d), ci("S", streams), ci("MODE", mode), ci("TOPK", top), ci("SLOTS", slots), ci("BLOCK", block), ci("WORLD", world) };
         if (norm) |nm| {
+            if (nm.streams) return t.run("_hc_wbn", .{ rows, streams, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d), p("SCALE", f32p, nm.scale), p("NORMED", bf16, nm.normed), aot.float("eps", nm.eps) }, &consts);
             try t.run("_hc_wb_norm", .{ rows, 1, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d), p("SCALE", f32p, nm.scale), p("NORMED", bf16, nm.normed), aot.float("eps", nm.eps) }, &consts);
             return;
         }

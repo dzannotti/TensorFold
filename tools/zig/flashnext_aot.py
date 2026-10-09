@@ -523,7 +523,54 @@ def hip_entries(k: dict) -> list[dict]:
             out.append(e)
     if k["name"] == "_hc_act":
         out += _hc_act_sk(k)
+    out += _dec_entries(k, out)
     return [x for e in out for x in (e, ranged(e))]
+
+
+DEC = "tensorfold.families.qwen4_exp.cuda.glue_dec"
+UP_MIX_DEC = (16, 32)      # _hc_up_mix decode tiles: BM 16, BD 16 or 32
+
+
+def _dec_entries(k: dict, made: list[dict]) -> list[dict]:
+    """HIP decode fusions (glue_dec.py): ``_hc_wbn`` from each ``_hc_writeback`` entry (SCALE, NORMED, eps added),
+    ``_b16mm_sm_act`` from each 16-row ``_b16mm_sm`` entry of the read-out's down rows (N 320 / 324: OUT and F32
+    dropped, ACT, INJ, TICK and _hc_act's constexprs added), ``_hc_up_mix`` at 16 rows from its 64-row entries
+    (every M form)."""
+
+    out = []
+    if k["name"] == "_hc_writeback":
+        e = _derived(k, "glue_dec._hc_wbn: write-back + norm, a (row, stream) a program")
+        e["function"], e["name"], e["source"] = f"{DEC}._hc_wbn", "_hc_wbn", {"file": k["source"]["file"], "line": None}
+        head = [n for n in k["params"] if n not in k["constexprs"]]
+        e["params"] = head + ["SCALE", "NORMED", "eps"] + [n for n in k["params"] if n in k["constexprs"]]
+        e["signature"].update({"SCALE": "*fp32", "NORMED": "*bf16", "eps": "fp32"})
+        e["attrs"].update({"SCALE": [["tt.divisibility", 16]], "NORMED": [["tt.divisibility", 16]], "eps": []})
+        out.append(_reorder(e))
+    if k["name"] == "_hc_up_mix" and _ints(k)["BM"] == 64 and _ints(k)["BD"] == 64:
+        forms = ("div16",) if k["attrs"].get("M") else ("plain", "one")
+        for bd in UP_MIX_DEC:
+            for form in forms:
+                e = _derived(_with_consts(k, {"BM": 16, "BD": bd}), f"decode up + mix, BM 16 BD {bd}")
+                out.append(_int_form(e, "M", form))
+    for s in made:
+        c = _ints(s)
+        if s["name"] != "_b16mm_sm" or c.get("BM") != 16 or c.get("N") not in (320, 324) or c.get("SK", 1) <= 1:
+            continue
+        e = _derived(s, "glue_dec._b16mm_sm_act: _hc_act_sk in the last program")
+        e["function"], e["name"], e["source"] = f"{DEC}._b16mm_sm_act", "_b16mm_sm_act", {"file": s["source"]["file"], "line": None}
+        rt = [n for n in s["params"] if n not in ("OUT", "F32") and n in ("X", "W", "PART", "M", "x_stride")]
+        e["params"] = rt[:3] + ["ACT", "INJ", "TICK"] + rt[3:] + ["N", "K", "SK", "BM", "BLOCK_N", "BK", "S", "LOW", "LOWP", "HAS_INJ"]
+        for n in ("OUT", "F32"):
+            e["signature"].pop(n, None)
+            e["attrs"].pop(n, None)
+            e["constexprs"].pop(n, None)
+        e["signature"].update({"ACT": "*bf16", "INJ": "*bf16", "TICK": "*i32", "S": "constexpr", "LOW": "constexpr",
+                               "LOWP": "constexpr", "HAS_INJ": "constexpr"})
+        e["attrs"].update({n: [["tt.divisibility", 16]] for n in ("ACT", "INJ", "TICK")})
+        e["constexprs"].update({"S": {"int": 4}, "LOW": {"int": 320}, "LOWP": {"int": 512},
+                                "HAS_INJ": {"bool": c["N"] == 324}})
+        out.append(_reorder(e))
+    return out
 
 
 def _hc_act_sk(k: dict) -> list[dict]:

@@ -115,7 +115,7 @@ pub const cases = [_]Case{
     .{ .n = 2560, .k = 320, .fp32 = true, .fp4 = true, .tp = 2 },
 };
 
-const Fill = enum { normal, wide, cancel, edge, special, slices };
+pub const Fill = enum { normal, wide, cancel, edge, special, slices };
 
 fn bf16Bits(x: f32) u16 {
     const b: u32 = @bitCast(x);
@@ -163,7 +163,7 @@ fn sample(r: std.Random, fill: Fill, i: usize) u16 {
     };
 }
 
-fn fillBuf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
+pub fn fillBuf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
     const h = try gpa.alloc(u16, count);
     defer gpa.free(h);
     for (h, 0..) |*v, i| v.* = sample(r, fill, i);
@@ -585,7 +585,12 @@ pub fn wbNormAvailable(set: *const aot.Set) bool {
 /// `_hc_up_mix`: mixed [M, D] = hc_mix(b16mm(act [M, K], up [S D, K]), normed [M, S D]) without the up rows (and
 /// without the 32-group sums of mixed).
 pub fn upMix(t: tri.Tri, act: u64, w: u64, normed: u64, mixed: u64, m: usize, d: usize, streams: usize, k: usize, bm: usize) !void {
-    try run(t, "_hc_up_mix", .{ cdiv(m, bm), d / 64, 1 }, &.{ aot.ptr("ACT", bf16, act), aot.ptr("W", bf16, w), aot.ptr("NORMED", bf16, normed), aot.ptr("MIXED", bf16, mixed), int("M", m) }, &.{ ci("D", d), ci("S", streams), ci("K", k), ci("BM", bm), ci("BD", 64), ci("BK", 64) });
+    return upMixTile(t, act, w, normed, mixed, m, d, streams, k, bm, 64);
+}
+
+/// `upMix` on a (bm, bd) tile (decode: 16 rows, glue_dec's tiles; the same bits).
+pub fn upMixTile(t: tri.Tri, act: u64, w: u64, normed: u64, mixed: u64, m: usize, d: usize, streams: usize, k: usize, bm: usize, bd: usize) !void {
+    try t.run("_hc_up_mix", .{ cdiv(m, bm), d / bd, 1 }, &.{ aot.ptr("ACT", bf16, act), aot.ptr("W", bf16, w), aot.ptr("NORMED", bf16, normed), aot.ptr("MIXED", bf16, mixed), int("M", m) }, &.{ ci("D", d), ci("S", streams), ci("K", k), ci("BM", bm), ci("BD", bd), ci("BK", 64) });
 }
 
 /// `glue-check`: `_hc_up_mix` against `_b16mm` + `_hc_mix` (mixed bytes) on random and edge inputs, timed.
@@ -660,7 +665,7 @@ pub fn glueCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !boo
 }
 
 /// bf16 samples as the fp32 values they stand for (the fp32 branch inputs).
-fn fillF32(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
+pub fn fillF32(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
     const h = try gpa.alloc(u32, count);
     defer gpa.free(h);
     for (h, 0..) |*v, i| v.* = @as(u32, sample(r, fill, i)) << 16;

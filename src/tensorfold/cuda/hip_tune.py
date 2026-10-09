@@ -20,6 +20,8 @@ TABLE = (
     ("_b16mm_ks_sm", {"BM": 64}, {"num_warps": 4, "num_stages": 1}),
     ("_b16mm_ks_sm", {}, {"num_warps": 8, "num_stages": 1}),
     ("_b16mm_sm", {"BM": 16}, {"num_warps": 2, "num_stages": 1}),
+    ("_b16mm_sm_act", {"BM": 16}, {"num_warps": 2, "num_stages": 1}),
+    ("_hc_up_mix", {"BM": 16}, {"num_warps": 4, "num_stages": 1}),
     ("_b16mm_sm", {}, {"num_warps": 4, "num_stages": 1}),
     ("_b16mm_ks", {}, {"num_warps": 8, "num_stages": 1}),
     ("_hc_up_mix", {}, {"num_warps": 8, "num_stages": 1}),
