@@ -133,6 +133,8 @@ pub const NgramTable = struct {
     lut: [256]u16 = @splat(0),
     /// on the GPU: rows [base, base + count) as stored, the LUT ([256] bf16 bits), heads [head0, head0 + heads)
     gpu: ?struct { rows: u64, lut: u64, base: u64, count: u64, head0: u32, heads: u32 } = null,
+    /// host threads a prompt chunk's gather runs on (Options.threads)
+    threads: u32 = 1,
 
     pub fn deinit(t: *NgramTable) void {
         for (t.files.items) |*f| f.close(t.io);
@@ -152,8 +154,29 @@ pub const NgramTable = struct {
     }
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
+    /// A prompt chunk's lookups run on `threads` threads: on a cold page cache each is a disk read (the rows are
+    /// hashed n-grams spread over the whole table), and parallel faults keep the disk's queue full.
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
+        const per = 256;
+        if (t.threads <= 1 or ids.len < 4 * per) return t.gatherSome(ids, out);
+        const Ctx = struct {
+            t: *const NgramTable,
+            ids: []const i64,
+            out: []u16,
+            failed: *std.atomic.Value(bool),
+            fn run(c: @This(), i: usize) void {
+                const a = i * per;
+                const b = @min(a + per, c.ids.len);
+                c.t.gatherSome(c.ids[a..b], c.out[a * c.t.width .. b * c.t.width]) catch c.failed.store(true, .monotonic);
+            }
+        };
+        var failed = std.atomic.Value(bool).init(false);
+        parallel(t.threads, (ids.len + per - 1) / per, Ctx{ .t = t, .ids = ids, .out = out, .failed = &failed }, Ctx.run);
+        if (failed.load(.monotonic)) return error.NgramIdOutOfRange;
+    }
+
+    fn gatherSome(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
             const src = t.row(@intCast(id));
@@ -1328,9 +1351,15 @@ const Loader = struct {
             if (t.width == 0) t.width = @intCast(tensor.dim(1));
             if (tensor.dim(1) != t.width) return error.NgramShardsDiffer;
             try t.shards.append(L.gpa, tensor.bytes);
+            // lookups are random: fault in the page, not the 2-4 MiB read-around (~1.1 ms a cold lookup, ~0.12 random)
+            const lo = std.mem.alignBackward(usize, @intFromPtr(tensor.bytes.ptr), std.heap.pageSize());
+            const hi = std.mem.alignForward(usize, @intFromPtr(tensor.bytes.ptr) + tensor.bytes.len, std.heap.pageSize());
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
+            std.posix.madvise(p, hi - lo, std.posix.MADV.RANDOM) catch {};
             try t.starts.append(L.gpa, t.starts.items[t.starts.items.len - 1] + tensor.dim(0));
         }
         t.rows = t.starts.items[t.starts.items.len - 1];
+        t.threads = L.o.threads;
         t.fp8 = kind.? == .f8_e4m3;
         var b: [256]u8 = undefined;
         const sname = try std.fmt.bufPrint(&b, "{s}ngram_embedding.weight_scale", .{base});
