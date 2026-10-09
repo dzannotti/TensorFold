@@ -161,7 +161,10 @@ pub const NgramTable = struct {
     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
         const per = 256;
-        if (t.threads <= 1 or ids.len < 4 * per) return t.gatherSome(ids, out);
+        if (t.threads <= 1 or ids.len < 4 * per) {
+            t.prefetch(ids);
+            return t.gatherSome(ids, out);
+        }
         const Ctx = struct {
             t: *const NgramTable,
             ids: []const i64,
@@ -176,6 +179,20 @@ pub const NgramTable = struct {
         var failed = std.atomic.Value(bool).init(false);
         parallel(t.threads, (ids.len + per - 1) / per, Ctx{ .t = t, .ids = ids, .out = out, .failed = &failed }, Ctx.run);
         if (failed.load(.monotonic)) return error.NgramIdOutOfRange;
+    }
+
+    /// A decode window's rows asked of the disk at once (MADV_WILLNEED reads them asynchronously), so its cold
+    /// lookups overlap instead of faulting one by one (~2-4 ms each with the table mostly out of the page cache).
+    fn prefetch(t: *const NgramTable, ids: []const i64) void {
+        const page = std.heap.pageSize();
+        for (ids) |id| {
+            if (id < 0 or id >= t.rows) continue;
+            const src = t.row(@intCast(id));
+            const lo = std.mem.alignBackward(usize, @intFromPtr(src.ptr), page);
+            const hi = std.mem.alignForward(usize, @intFromPtr(src.ptr) + src.len, page);
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
+            std.posix.madvise(p, hi - lo, std.posix.MADV.WILLNEED) catch {};
+        }
     }
 
     fn gatherSome(t: *const NgramTable, ids: []const i64, out: []u16) !void {
