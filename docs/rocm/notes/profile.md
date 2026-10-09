@@ -15,8 +15,8 @@ EOS ignored, sparkDash prompts (`bench-many --kind dash-prose,dash-code`, the sa
 - Our env matches Mia's served env except vision: engine defaults are TF_FLASHNEXT_PRODUCT_STREAMS=2 and
   TF_FLASHNEXT_PREFILL_TAIL=512 (cuda_engine.zig), DEPTH=15 set. Differences: TENSORFOLD_MEMORY_RESERVE_GIB 12 (engine
   default) vs Mia 10 (only sizes the pool), no TF_FLASHNEXT_YARN (=0, same).
-- Our build warns `no groups-of-32 4-bit kernels in this build: MTP drafts use the full head` (aot-hip2 lacks the
-  draft-head slice kernels): drafts read the full 0.31 GiB int4 head, ~1.3 ms a draft level.
+- The load warning `no groups-of-32 4-bit kernels in this build: MTP drafts use the full head` is misleading: the
+  server also logs `MTP draft head: the int4 lm_head's 79591 draft columns (105.1 MB)`, i.e. the int4 slice is used.
 
 ## 1a. Single-stream decode, graphed (CLI bench-many, steady reps)
 
@@ -297,3 +297,46 @@ Achieved rates (FLOPs from shapes; active ~4.7 B params => ~19 TFLOP of matmul a
 So the 5.5x gap to Mia's 2.6k (and the ~1.3x gap to thorim's 635) is, in order: (1) `_chunks8` sparse attention at
 <1 TF = 40-55% of prefill; (2) the bf16 hyper-connection mixes at ~3 TF = 22-25%; (3) FP8/int4 matmuls at 15-17 TF
 = 23%. Fixing (1) and (2) alone takes a chunk from ~3.7 s to ~1.6 s (~1,280 tok/s); all of it to ~1.06 s (~1,900).
+
+## 2. Prose vs code, and env vs Mia
+
+- Calibrated against thorim (same engine, GB10, same bench.py): prose 1-req 65.2, dash-code 122.7 tok/s. Ours (CLI,
+  clean): prose 49.6, code 86-91.5 => **0.76x and 0.70-0.75x**. Prose and code are equally slow; "code faster than
+  Mia" came from Mia's README code table using a different prompt.
+- Acceptance is deterministic (greedy, bit-equal drafts): prose 155/192 drafts kept, 100 rounds, 2.55 tok/round; code
+  217/251, 38 rounds, 6.71 tok/round (server log == CLI). Round cost: prose 51 ms (verify 44 + drafting 7), code
+  73 ms (verify 55 + drafting 18: ~6.7 draft levels at ~1-3 ms each). At 2.55 tok/round prose pays the fixed verify
+  cost (dense weights read once) over few tokens: prose is the bandwidth-bound case, code amortizes it.
+- Code verify is close to host-bound in graph mode: host enqueue 34 ms of a 55 ms verify (prose 4.7 of 44), and code
+  varied 86-92 tok/s between clean runs while CPU was busy with other agents' builds. Eager is not slower (94.8 tok/s
+  under rocprofv3). Worth a look by the engine agent (graph re-capture or per-round re-instantiation for new row
+  counts?).
+- Env: our served env equals Mia's apart from vision: TF_FLASHNEXT_PRODUCT_STREAMS=2 and TF_FLASHNEXT_PREFILL_TAIL=512
+  are the engine defaults (cuda_engine.zig), DEPTH=15 set, YARN 0, fp8 KV. Only TENSORFOLD_MEMORY_RESERVE_GIB differs
+  (12 default vs Mia 10; pool size only). Not used by either: TF_FLASHNEXT_INT4AR_FAST=1 (fast-fp8/ overlay: block-FP8
+  hyper-connections, would halve the 1.17 GiB bf16 hc bytes a decode round; lossy, different weights).
+
+## 3a. rocm vs rocm-next (7ec5235, set aot-hip3), clean A/B, CLI, runtime ROCm 10.0
+
+Gate: CLI sky drafted == plain (accepted 50/69 fp8 KV); tokens bit-identical to rocm (bf16 KV and fp8 KV); server
+contracts a,b,c 50 pass / 0 fail / 6 unchecked; agreement on 7 prompts 1002/1010 (99.21%) identical row-for-row to
+rocm's. (Note: with --kv-dtype fp8 the sky reply differs from thorim's bf16 reference at token 0 on both trees.)
+
+| (CLI, steady reps, no other GPU user) | rocm | rocm-next |
+|---|---:|---:|
+| prose x1 tok/s (verify ms) | 49.6 (44.3) | **51.3 (42.7)** |
+| code x1 tok/s | 86-91.5 | **92.6** |
+| 8k prefill s, reps 1/2/3 | 16.7 / 17.9 / 17.4 | 14.1 / 17.3 / 17.3 |
+| 8k prefill, part profile, ms per 2048 rows | 3,723 | 3,548 (rep 1), 4,513 (rep 2) |
+
+Prefill parts, ms per 2048 rows (rocm -> next): hc_down 482 -> 193, hc_mix 329 -> 171, gdn_proj 241 -> 171,
+out_proj 140 -> 107, attn_proj 69 -> 49, router 33 -> 12, experts_gate_up 234 -> 180 (but experts_down 89 -> 148).
+~620 ms a chunk saved, then eaten by **attention: 1,511 -> 1,909 (rep 1) and 2,940 (rep 2)**.
+
+`_chunks8` attention is the noisy, dominant term: within one prompt it is stable per chunk (chunk 0 ~0.9-1.1 s, chunks
+1-3 ~1.7-2.3 s: the 2048-key budget fills after chunk 0), but between reps of the same binary it moves 1.5x
+(next: 2.12 -> 3.14 s for chunk 1). Same bits, same prompt, different sequence slot. Hypothesis for the attention
+agent: KV/indexer caches sit in reserved address space at 4 KiB granularity (`caches in reserved address space (4 KiB
+granularity)`), so the sparse key gather is TLB-bound and depends on where the slot's pages landed; check with 2 MiB
+mappings or a contiguous slot. Also check whether rocm-next's hip_tune changed `_chunks8`'s warps/stages (next is
+slower on rep 1 too). The repeated-prompt prefill slowdown (rep 1 fast, reps 2-3 slower, both trees) points the same way.
