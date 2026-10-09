@@ -19,6 +19,7 @@ namespace TF_NS {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f __attribute__((ext_vector_type(8)));
+typedef uint32_t u4v __attribute__((ext_vector_type(4)));
 
 constexpr int GS = 64;                                    // inputs a group (one fp32 scale a column)
 constexpr int MAX_SLICES = 4;                             // the host's split_k on gfx1151 (<= 512 threads)
@@ -51,6 +52,14 @@ __device__ __forceinline__ v16s afrag(const uint4 (&a)[8], int q) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) r.u[i] = q == 0 ? a[i].x : q == 1 ? a[i].y : q == 2 ? a[i].z : a[i].w;
     return r.v;
+}
+
+// 16 weight bytes; NT: a nontemporal load (decode tiles read each byte once: +8-12% GB/s at 1-32 rows, notes/fp8dec.md)
+template <bool NT>
+__device__ __forceinline__ uint4 wload(const unsigned char* p) {
+    if constexpr (!NT) return *reinterpret_cast<const uint4*>(p);
+    const u4v v = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(p));
+    return make_uint4(v[0], v[1], v[2], v[3]);
 }
 
 __device__ __forceinline__ int2 tile_of(int b, int M, int N, int BM, int BN, int group) {
@@ -93,7 +102,7 @@ __global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
         float sn;
         auto fetch = [&](int g) {
 #pragma unroll
-            for (int q = 0; q < 4; ++q) wn_[q] = *reinterpret_cast<const uint4*>(wc + static_cast<size_t>(g) * 4096 + q * 16);
+            for (int q = 0; q < 4; ++q) wn_[q] = wload<(PA > 0)>(wc + static_cast<size_t>(g) * 4096 + q * 16);
             sn = sc[static_cast<size_t>(g) * 64];
 #pragma unroll
             for (int i = 0; i < PA; ++i)
