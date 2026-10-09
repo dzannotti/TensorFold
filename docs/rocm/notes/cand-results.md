@@ -74,3 +74,52 @@ prose x8: cand quick accepted fewer drafts (1179 vs 1232; 874 vs 818 streamed pi
 
 Thorim calibration (same engine on GB10, our harness): prose 65.2 / dash-code 122.7 tok/s at 1 request, prefill 8k
 635 tok/s. Cand is at 85% / 86% of thorim's decode and 1.6x thorim's 8k prefill.
+
+# Re-run on rocm-cand @ 5074bde (+ perf-pool, + perf-hc)
+
+Triton set `aot-final` rebuilt from 5074bde (988 kernels, 2,445 range32 params; hash set equal to perf-hc's aot-hc7).
+Previous cand binary (8eed266 + aot-cand) kept in `~/tf-window/cand/oldbin` for the A/B. Logs: `~/tf-window/cand2/`.
+
+- hipcc misses the same 8; `zig build test -Dgpu=hip -Daot-set=aot-final`: 21/21 steps, 104/104 tests;
+  `triton_parity.py hash`: 1100/1100 equal.
+- CLI sky: drafted == plain, sha de8d7a445fe7 (= 8eed266 = rocm-next), accepted 51 of 69.
+- contracts a-d: 54 pass, 0 fail, 6 unchecked. agreement: 3071/3101 (99.03%), 8/20 free-run identical: the same
+  count as 8eed266.
+- Same bits in the server too: every decode stream's token_sha (54 of 54: prose/code x1/x8, 3 reps) is equal across
+  both old runs and all three new ones. Drafts accepted at x8 vary a little run to run in both builds (scheduling).
+
+## A/B quick bench (order: new full, new quick, old quick, new quick; each session after an 8k warm-up)
+
+| | 8eed266 (2 runs) | 5074bde (3 runs) | x (medians) | thorim |
+|---|---|---|---:|---:|
+| first 8k prefill (warm-up) | 974, 917 | 1,005, 972, 989 | 1.04 | |
+| prefill 8k | 1,044, 967 | 1,079, 1,063, 1,082 | 1.07 | 635 |
+| prefill 32k | 1,100, 1,048 | 1,187, 1,149, 1,117 | 1.08 | |
+| prose x1 | 55.4, 55.4 | 57.1, 57.1, 57.7 | 1.03 | 65.2 |
+| prose x8 agg | 178.6, 161.3 | 197.1, 188.4, 177.9 | ~1.1 (noisy) | |
+| code x1 | 106.1, 105.6 | 109.4, 108.7, 109.9 | 1.03 | 122.7 |
+| code x8 agg | 246.9, 247.8 | 254.0, 259.2, 261.9 | 1.05 | |
+
+The old binary's second prose x8 (161.3) is an outlier with normal acceptance (2,475 pieces vs 2,439-2,580), i.e.
+timing noise; prose x8 swings ~10% between sessions in both builds.
+
+## Full bench (Mia's method) on 5074bde
+
+| Prefill | Tokens | 5074bde | TTFT | 8eed266 | Mia GB10 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4k | 4,092 | 1,077 tok/s | 3.80 s | 974 | 2,526 |
+| 8k | 8,216 | 1,079 tok/s | 7.61 s | 994 | 2,606 |
+| 16k | 16,394 | 1,096 tok/s | 14.96 s | 1,064 | 2,643 |
+| 32k | 32,776 | 1,187 tok/s | 27.60 s | 1,076 | 2,630 |
+| 64k | 65,533 | 1,124 tok/s | 58.32 s | 1,062 | 2,564 |
+| 128k | 131,093 | 1,115 tok/s | 117.59 s | 1,032 | 2,415 |
+
+| Requests | prose agg (per req, TTFT) | 8eed266 | Mia | code agg (per req, TTFT) | 8eed266 | Mia |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 57.1 (57.1, 98 ms) | 55.4 | 64.4 | 109.4 (109.4, 128 ms) | 105.5 | 57.5 |
+| 2 | 85.6 (42.8, 260 ms) | 81.4 | 89.0 | 130.3 (69.4, 324 ms) | 129.3 | 92.7 |
+| 4 | 146.6 (38.0, 329 ms) | 139.0 | 140.7 | 175.4 (50.3, 436 ms) | 180.0 | 130.8 |
+| 8 | 197.1 (26.1, 469 ms) | 188.5 | 200.9 | 254.0 (36.7, 662 ms) | 241.7 | 189.3 |
+
+vs thorim (65.2 / 122.7 / 635): prose x1 88%, code x1 89%, prefill 8k 1.7x. Prose matches Mia's GB10 at 4 requests and
+is within 2% at 8; code beats it at every level.
