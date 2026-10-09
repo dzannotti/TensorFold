@@ -406,6 +406,11 @@ pub const Tri = struct {
         try t.run("_hc_act", .{ rows, 1, 1 }, &.{ p("DN", f32p, dn), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act) }, &.{ ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
     }
 
+    /// glue.hc_act_sk: hcAct of the down projection's `sk` fp32 K slices part [sk, R, ndn], summed in slice order.
+    pub fn hcActSk(t: Tri, part: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize, sk: usize) !void {
+        try t.run("_hc_act_sk", .{ rows, 1, 1 }, &.{ p("PART", f32p, part), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act), int("M", rows) }, &.{ ci("SK", sk), ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
+    }
+
     /// glue.hc_mix: mixed [R, D] = bf16(sum_s bf16(sigmoid(up_s) * normed_s) / S) and its group sums.
     pub fn hcMix(t: Tri, up: u64, normed: u64, mixed: u64, xs: u64, rows: usize, d: usize, streams: usize) !void {
         try t.run("_hc_mix", .{ rows, d / 256, 1 }, &.{ p("UP", bf16, up), p("NORMED", bf16, normed), p("MIXED", bf16, mixed), p("XS", f32p, xs) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });

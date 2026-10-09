@@ -536,6 +536,8 @@ pub const Forward = struct {
     up_mix: bool = false,
     /// on unless TF_FLASHNEXT_WB_NORM=0: prompt chunks' write-back and norm in one pass (`_hc_wb_norm`)
     wb_norm: bool = false,
+    /// HIP, on unless TF_FLASHNEXT_GLUE_FUSE=0: decode read-outs sum the down projection's K slices in `_hc_act_sk`
+    act_sk: bool = false,
     /// two ranks, split prompt glue: the exchanges run on this stream beside the next rows' work (TF_FLASHNEXT_OVERLAP)
     cs: ?cuda.Stream = null,
     cs_ev: [4]cuda.Event = undefined,
@@ -1379,6 +1381,9 @@ pub const Forward = struct {
             try f.mark(.hc_normed);
         }
         const dn_n: usize = hc.downN();
+        // HIP decode rows: the down projection's K slices summed in `_hc_act_sk` (`_reduce` + `_hc_act`'s bits)
+        const act_sk = f.act_sk and hc.down8 == null and f.mtp_q4 == null and tri.b16SplitK(hc.down.n, hc.down.k) == 32 and
+            !prompt.b16Takes(f.prompt_mm, R, hc.down.n, hc.down.k);
         if (hc.down8) |d8| {
             // fast-fp8: the low-rank rows on block FP8 and the inject rows bf16, each into its columns of dn (fp32)
             try fp8.matmul(f.k8 orelse return error.NoFp8Kernels, f.s, b.normed, Wd, d8, f.sc.p8, true, R);
@@ -1388,8 +1393,13 @@ pub const Forward = struct {
                 try f.th.slotCopy(f.sc.pb, hc.down.n * 4, f.sc.dn + d8.n * 4, dn_n * 4, hc.down.n * 4, R);
             }
             try f.mark(.hc_down);
+        } else if (act_sk) {
+            try prompt.b16Slices(if (hc.down.slices != 0) "_b16mm_sm" else "_b16mm", f.t, b.normed, Wd, hc.down.weight, f.sc.part, true, R, hc.down.n, hc.down.k);
+            try f.mark(.hc_down);
         } else try f.mmxAt(.hc_down, b.normed, Wd, b.xs_normed, hc.down, f.sc.dn, true, R);
-        try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
+        if (act_sk) {
+            try f.t.hcActSk(f.sc.part, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low, 32);
+        } else try f.t.hcAct(f.sc.dn, b.act, b.xs_act, inject, R, dn_n, g.streams, g.low);
         try f.mark(.hc_act);
         // prompt chunks: the up projection and the mix in one pass (cuda_prompt.zig upMix, the same mixed bytes; no
         // 32-group sums of mixed, which only the 4-bit MTP draft matrices read)

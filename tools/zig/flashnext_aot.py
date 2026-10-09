@@ -521,7 +521,25 @@ def hip_entries(k: dict) -> list[dict]:
             e["name"] = sm
             e["source"] = {"file": e["source"]["file"], "line": None}
             out.append(e)
+    if k["name"] == "_hc_act":
+        out += _hc_act_sk(k)
     return [x for e in out for x in (e, ranged(e))]
+
+
+def _hc_act_sk(k: dict) -> list[dict]:
+    """``glue._hc_act_sk`` from an ``_hc_act`` entry: the down projection's 32 K slices summed in it (HIP decode),
+    PART for DN, M a runtime int in each form it takes."""
+
+    e = _derived(k, "glue._hc_act_sk: _reduce fused (SK 32)")
+    e["function"] = k["function"][: -len("_hc_act")] + "_hc_act_sk"
+    e["name"] = "_hc_act_sk"
+    e["source"] = {"file": k["source"]["file"], "line": None}
+    e["params"] = ["PART", "ACT", "XS", "INJ", "M", "SK"] + [n for n in k["params"] if n not in ("DN", "ACT", "XS", "INJ")]
+    sig = {"PART": "*fp32", "M": "i32", "SK": "constexpr", **{n: t for n, t in k["signature"].items() if n != "DN"}}
+    att = {"PART": k["attrs"]["DN"], "M": [], "SK": [], **{n: a for n, a in k["attrs"].items() if n != "DN"}}
+    e["signature"], e["attrs"] = sig, att
+    e["constexprs"] = {"SK": {"int": 32}, **k["constexprs"]}
+    return [_int_form(_reorder(e), "M", form) for form in ("div16", "plain", "one")]
 
 
 def ranged(k: dict) -> dict:

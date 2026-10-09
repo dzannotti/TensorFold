@@ -572,6 +572,11 @@ pub fn upMixAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_hc_up_mix", "BM", 0) != null;
 }
 
+/// Whether the kernel set holds `_hc_act_sk` (HIP sets from perf-hc on).
+pub fn actSkAvailable(set: *const aot.Set) bool {
+    return set.smallestConst("_hc_act_sk", "SK", 0) != null;
+}
+
 /// Whether the kernel set holds `_hc_wb_norm` (an older set: `_hc_writeback` and `_hc_normed`).
 pub fn wbNormAvailable(set: *const aot.Set) bool {
     return set.smallestConst("_hc_wb_norm", "MODE", 0) != null;

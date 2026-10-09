@@ -6,6 +6,7 @@
   _b16mm_ks at the 64x128 tile          == the 128x64 tile
   _hc_up_mix (one dot over the streams) == the per-stream form (git HEAD~ source, inlined below) and == _b16mm + _hc_mix
   _b16mm at BK 256 (decode, long slices) == BK 64
+  _hc_act_sk on the 32 slices           == _reduce + _hc_act
 
     PYTHONPATH=src python tools/rocm/hc_bits.py
 """
@@ -110,6 +111,24 @@ def main() -> int:
         for m in (1, 3, 16):
             x = rnd(m, k)
             check(f"_b16mm BK256 N{n} K{k} M{m}", b16(x, w, n, k, sk, False), b16(x, w, n, k, sk, False, bk=256, warps=4))
+    for ndn, inj in ((324, True), (320, False)):
+        for m in (1, 3, 16, 17, 48):
+            part = torch.randn(32, m, ndn, device="cuda") * 4
+            dn = torch.empty(m, ndn, device="cuda")
+            bf16._reduce[(triton.cdiv(m * ndn, 1024),)](part, dn, m * ndn, SK=32, BLOCK=1024, F32=True, num_warps=4)
+            outs = []
+            for fused in (False, True):
+                act = torch.empty(m, 320, device="cuda", dtype=torch.bfloat16)
+                xs = torch.empty(m, 10, device="cuda")
+                ij = torch.empty(m, 4, device="cuda", dtype=torch.bfloat16)
+                a = dict(S=4, LOW=320, LOWP=512, HAS_INJ=inj, NDN=ndn, num_warps=4)
+                if fused:
+                    glue._hc_act_sk[(m,)](part, act, xs, ij if inj else act, m, SK=32, **a)
+                else:
+                    glue._hc_act[(m,)](dn, act, xs, ij if inj else act, **a)
+                outs.append((act, xs, ij) if inj else (act, xs))
+            for x, y in zip(*outs):
+                check(f"_hc_act_sk NDN{ndn} M{m}", x, y)
     D, S, K = 2560, 4, 320
     w = rnd(S * D, K, scale=0.05)
     for m in ROWS:
