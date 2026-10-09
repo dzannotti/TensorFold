@@ -496,6 +496,8 @@ pub const Forward = struct {
     seqs: std.ArrayList(*Seq) = .empty,
     /// two ranks: the n-gram table's GPU gather of this rank's heads (fn_pack.cu)
     gather: ?W.Gather = null,
+    /// a stage's host-gathered n-gram rows (bf16 bits), gathered before the stage waits on the pinned buffer
+    ple_host: std.ArrayList(u16) = .empty,
     eps: f32,
     vocab_offset: i64 = 0,
     /// the sampling scratch (cuda_engine.zig sizes it for the head rows); `candidates` reads it at two ranks
@@ -772,6 +774,7 @@ pub const Forward = struct {
         }
         if (f.round) |*r| r.deinit();
         f.seqs.deinit(f.gpa);
+        f.ple_host.deinit(f.gpa);
         if (f.gather) |*g| g.deinit();
         f.staged.deinit();
         f.pin.free();
@@ -1202,6 +1205,23 @@ pub const Forward = struct {
         }
         // a prompt chunk runs from the committed DeltaNet state: last round's kept rows folded in first
         if (x.b.prefill) for (windows) |w| try f.flush(w.seq);
+        // the n-gram row ids (one PLE layer: Forward.init), and a host table's rows gathered before the wait below:
+        // a prompt chunk's lookups (disk reads when cold) run while the chunk before it computes
+        const ple: ?*const W.Ple = for (f.w.layers) |*l| {
+            if (l.ple) |*p| break p;
+        } else null;
+        var nid: []i64 = &.{};
+        defer f.gpa.free(nid);
+        if (ple) |p| {
+            const heads = p.ngram.heads;
+            const table = &(f.w.table orelse return error.NoNgramTable);
+            nid = try f.gpa.alloc(i64, R * heads);
+            for (segs[0..windows.len]) |sg| try p.ngram.ids(sg.seq.st.history[0 .. p.ngram.n - 1], sg.seq.window.items, nid[sg.a0 * heads .. sg.a1 * heads]);
+            if (table.gpu == null) {
+                try f.ple_host.resize(f.gpa, R * heads * table.width);
+                try table.gather(nid, f.ple_host.items);
+            }
+        }
         // the previous step's copies out of the pinned buffer are done
         try f.staged.synchronize();
         const ids = std.mem.bytesAsSlice(i32, f.pin.bytes[0 .. R * 4]);
@@ -1210,27 +1230,38 @@ pub const Forward = struct {
         };
         try f.upload(x.b.ids, 0, R * 4);
         const rows_at = std.mem.alignForward(usize, f.pin_rows * 4, 256);
-        for (f.w.layers) |l| if (l.ple) |p| {
+        if (ple) |p| {
             const heads = p.ngram.heads;
-            const nid = try f.gpa.alloc(i64, R * heads);
-            defer f.gpa.free(nid);
-            for (segs[0..windows.len]) |sg| try p.ngram.ids(sg.seq.st.history[0 .. p.ngram.n - 1], sg.seq.window.items, nid[sg.a0 * heads .. sg.a1 * heads]);
-            const table = &(f.w.table orelse return error.NoNgramTable);
+            const table = &f.w.table.?;
             if (table.gpu != null) {
                 // the ids on the device, then the rank's heads' rows gathered there (W4's Gather, the host bits)
                 @memcpy(std.mem.bytesAsSlice(i64, f.pin.bytes[rows_at..][0 .. R * heads * 8]), nid);
                 try f.upload(f.sc.ngram_ids, rows_at, R * heads * 8);
                 try f.gather.?.run(f.s, table, f.sc.ngram_ids, heads, @intCast(R), x.b.ple_v);
-                continue;
+            } else {
+                @memcpy(std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * table.width * 2]), f.ple_host.items);
+                try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
             }
-            const out = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * table.width * 2]);
-            try table.gather(nid, @alignCast(out));
-            try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
-        };
+        }
         for (windows) |w| w.seq.staged = true;
         try f.staged.record(f.s);
         if (!x.b.prefill and f.round != null and f.g.linear_layers > 0) try f.roundTables(segs[0..windows.len], 1 - f.cur_par);
         return R;
+    }
+
+    /// The n-gram rows a stage of window `tokens` (the stream's next, after its committed history) gathers, rows
+    /// `from` on, read ahead (NgramTable.warm) while the GPU works on. A hint: the stage's bits are the same either way.
+    pub fn warmWindow(f: *Forward, seq: *const Seq, tokens: []const u32, from: usize) void {
+        const table = &(f.w.table orelse return);
+        for (f.w.layers) |l| if (l.ple) |p| {
+            const h = p.ngram.heads;
+            var tok: [32]i64 = undefined;
+            var nid: [32 * 32]i64 = undefined;
+            if (tokens.len > tok.len or from >= tokens.len or h > 32) return;
+            for (tok[0..tokens.len], tokens) |*a, t| a.* = t;
+            p.ngram.ids(seq.st.history[0 .. p.ngram.n - 1], tok[0..tokens.len], nid[0 .. tokens.len * h]) catch return;
+            table.warm(nid[from * h .. tokens.len * h]);
+        };
     }
 
     /// forward.stage for one stream (its rows from 0).

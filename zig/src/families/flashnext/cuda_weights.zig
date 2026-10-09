@@ -24,6 +24,7 @@ const core = @import("core");
 const cfgs = @import("cuda_config.zig");
 const lay = @import("cuda_layouts.zig");
 const ngram = @import("cuda_ngram.zig");
+const nc = @import("cuda_ngram_cache.zig");
 const ropes = @import("cuda_rope.zig");
 const fp8 = @import("cuda_fp8.zig");
 const int4 = @import("cuda_int4.zig");
@@ -50,6 +51,8 @@ pub const Options = struct {
     draft_q4: bool = true,
     /// the n-gram table's rows on the GPU (a rank's heads); null: on the GPU at two ranks, host-mapped at one
     ngram_on_gpu: ?bool = null,
+    /// a host-mapped table's hot rows held in this many bytes of engine memory (cuda_ngram_cache.zig); 0: none
+    ngram_cache: usize = 0,
     mode: Mode = .device,
     /// the CUDA driver (its context current) for `.device`
     driver: ?*const cuda.Driver = null,
@@ -141,8 +144,19 @@ pub const NgramTable = struct {
     gpu: ?struct { rows: u64, lut: u64, base: u64, count: u64, head0: u32, heads: u32 } = null,
     /// host threads a prompt chunk's gather runs on (Options.threads)
     threads: u32 = 1,
+    /// hot rows in engine memory and the threads reading rows into them ahead of a stage (enableCache)
+    cache: ?*nc.RowCache = null,
+    warmer: ?*nc.Warmer = null,
 
     pub fn deinit(t: *NgramTable) void {
+        if (t.warmer) |w| {
+            w.stop();
+            t.gpa.destroy(w);
+        }
+        if (t.cache) |c| {
+            c.deinit();
+            t.gpa.destroy(c);
+        }
         for (t.files.items) |*f| f.close(t.io);
         t.files.deinit(t.gpa);
         t.shards.deinit(t.gpa);
@@ -150,13 +164,30 @@ pub const NgramTable = struct {
         t.* = undefined;
     }
 
-    fn row(t: *const NgramTable, id: u64) []const u8 {
-        // shards are equal but for the last: a division finds the shard, a step corrects it
-        var s: usize = @intCast(@min(id / (t.starts.items[1] - t.starts.items[0]), t.shards.items.len - 1));
-        while (t.starts.items[s] > id) s -= 1;
-        while (t.starts.items[s + 1] <= id) s += 1;
-        const bytes: usize = if (t.fp8) t.width else 2 * t.width;
-        return t.shards.items[s][@intCast((id - t.starts.items[s]) * bytes)..][0..bytes];
+    /// The mapped rows (the shards' lists are fixed once the table is open).
+    pub fn view(t: *const NgramTable) nc.Rows {
+        return .{ .shards = t.shards.items, .starts = t.starts.items, .bytes = if (t.fp8) t.width else 2 * t.width };
+    }
+
+    /// Hot rows held in `bytes` of engine memory, and `threads` threads reading `warm`'s rows into them.
+    pub fn enableCache(t: *NgramTable, bytes: usize, threads: usize) !void {
+        if (t.view().bytes > 4096) return; // gatherSome's and the warmer's stack buffers take rows up to 4 KiB
+        const c = try t.gpa.create(nc.RowCache);
+        errdefer t.gpa.destroy(c);
+        c.* = try nc.RowCache.init(t.gpa, t.io, t.view().bytes, bytes);
+        errdefer c.deinit();
+        const w = try t.gpa.create(nc.Warmer);
+        w.* = .{ .io = t.io, .rows = t.view(), .cache = c };
+        w.start(threads);
+        t.cache = c;
+        t.warmer = w;
+    }
+
+    /// Rows a stage will gather soon (a window's next n-grams): read into the cache on the warmer's threads, else
+    /// their pages asked of the disk. A hint; never changes what a gather returns.
+    pub fn warm(t: *const NgramTable, ids: []const i64) void {
+        if (t.gpu != null) return;
+        if (t.warmer) |w| w.push(ids) else t.prefetch(ids);
     }
 
     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
@@ -166,7 +197,7 @@ pub const NgramTable = struct {
         if (out.len != ids.len * t.width) return error.NgramOutLength;
         const per = 256;
         if (t.threads <= 1 or ids.len < 4 * per) {
-            t.prefetch(ids);
+            if (t.cache == null) t.prefetch(ids);
             return t.gatherSome(ids, out);
         }
         const Ctx = struct {
@@ -188,27 +219,35 @@ pub const NgramTable = struct {
     /// A decode window's rows asked of the disk at once (MADV_WILLNEED reads them asynchronously), so its cold
     /// lookups overlap instead of faulting one by one (~2-4 ms each with the table mostly out of the page cache).
     fn prefetch(t: *const NgramTable, ids: []const i64) void {
-        const page = std.heap.pageSize();
-        for (ids) |id| {
-            if (id < 0 or id >= t.rows) continue;
-            const src = t.row(@intCast(id));
-            const lo = std.mem.alignBackward(usize, @intFromPtr(src.ptr), page);
-            const hi = std.mem.alignForward(usize, @intFromPtr(src.ptr) + src.len, page);
-            const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(lo);
-            std.posix.madvise(p, hi - lo, std.posix.MADV.WILLNEED) catch {};
-        }
+        t.view().prefetch(ids);
     }
 
     fn gatherSome(t: *const NgramTable, ids: []const i64, out: []u16) !void {
+        const v = t.view();
+        if (t.cache) |c| if (v.bytes <= 4096) {
+            // the rows as stored through the cache, a stack buffer's worth at a time, then decoded as below
+            var raw: [16384]u8 = undefined;
+            const per = raw.len / v.bytes;
+            var i: usize = 0;
+            while (i < ids.len) : (i += per) {
+                const n = @min(per, ids.len - i);
+                try c.gather(v, ids[i..][0..n], raw[0 .. n * v.bytes]);
+                for (0..n) |k| t.decode(raw[k * v.bytes ..][0..v.bytes], out[(i + k) * t.width ..][0..t.width]);
+            }
+            return;
+        };
         for (ids, 0..) |id, i| {
             if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
-            const src = t.row(@intCast(id));
-            const dst = out[i * t.width ..][0..t.width];
-            if (t.fp8) {
-                for (dst, src) |*d, c| d.* = t.lut[c];
-            } else {
-                for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
-            }
+            t.decode(v.row(@intCast(id)), out[i * t.width ..][0..t.width]);
+        }
+    }
+
+    /// A stored row -> bf16 bits (FP8 through the LUT, bf16 as stored).
+    fn decode(t: *const NgramTable, src: []const u8, dst: []u16) void {
+        if (t.fp8) {
+            for (dst, src) |*d, c| d.* = t.lut[c];
+        } else {
+            for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
         }
     }
 };
@@ -1369,7 +1408,11 @@ const Loader = struct {
         if (w.table != null) return error.UnsupportedModel; // one PLE layer's table (this checkpoint has one)
         w.table = try L.openTable(base, g);
         const gpu = L.o.ngram_on_gpu orelse (L.o.world > 1);
-        if (gpu) try L.tableToGpu(path, &w.table.?, g);
+        if (gpu) try L.tableToGpu(path, &w.table.?, g) else if (L.o.ngram_cache > 0) {
+            const t = &w.table.?;
+            try t.enableCache(L.o.ngram_cache, 2);
+            if (t.cache) |rc| std.log.info("n-gram row cache: {d:.2} GiB, {d} rows of {d} bytes (TF_FLASHNEXT_NGRAM_CACHE_GIB)", .{ @as(f64, @floatFromInt(rc.heldBytes())) / (1 << 30), rc.capacity(), rc.bytes });
+        }
         var pb: [192]u8 = undefined;
         const sd = c.streams * c.hidden;
         p.key = try L.b16(try std.fmt.bufPrint(&pb, "{s}.key.b.weight", .{path}), try L.nameOf("{s}.key_proj", .{name}), sd, c.ple_dim);

@@ -5,6 +5,7 @@
 
 pub const native = @import("cuda_native.zig");
 pub const ngram = @import("cuda_ngram.zig");
+pub const ngram_cache = @import("cuda_ngram_cache.zig");
 pub const rope = @import("cuda_rope.zig");
 pub const sampler = @import("cuda_sampler.zig");
 pub const link = @import("cuda_link.zig");
@@ -36,6 +37,7 @@ pub const Engine = engine.Engine;
 test {
     _ = native;
     _ = ngram;
+    _ = ngram_cache;
     _ = rope;
     _ = sampler;
     _ = link;
