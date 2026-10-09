@@ -1,3 +1,32 @@
+# TensorFold for ROCm (AMD Strix Halo)
+
+A ROCm/HIP-focused fork of [TensorFold](https://github.com/ashhart/TensorFold). It ports the Zig Flash Next CUDA engine
+from [MiaAI-Lab's DGX Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) to AMD
+GPUs, qualified on a Ryzen AI MAX+ 395 (Radeon 8060S, gfx1151, 128 GB unified memory). The CUDA build still compiles;
+HIP is selected with `zig build -Dgpu=hip`. Branch `rocm` = TensorFold db28187 + MiaAI-Lab patches 0001-0009 + the HIP port.
+
+**What the port keeps:** drafted output equals `"draft": false` token for token, concurrent equals solo, resumed equals
+fresh (tools/rocm/e2e/contracts.py: 54 pass, 0 fail), and teacher-forced top-1 agreement with the CUDA engine on a GB10
+is ~99% (agreement.py). Kernels are checked against fp64 or same-backend Triton/ATen references (docs/rocm/notes/).
+
+**Speed** (Qwen3.8 Flash Next INT4-AutoRound, fp8 KV, 262k context, 8 parallel, MiaAI-Lab's benchmark method,
+tools/rocm/e2e/bench.py; aggregate tok/s):
+
+| | Strix Halo (this fork) | DGX Spark GB10 (Mia README) |
+| --- | ---: | ---: |
+| Prose decode, 1 / 8 requests | 75.5 / 213.4 | 64.4 / 200.9 |
+| Code decode, 1 / 8 requests | 117.9 / 271.4 | (different prompt) |
+| Prefill 8k / 32k | 1,234 / 1,272 | 2,606 / 2,630 |
+
+Same harness against the same engine on a GB10 (thorim): prose 65.2, code 122.7, warm prefill 756 (8k) / 1,298 (32k).
+
+Build, serve and the checks to run after a change: [docs/rocm/SERVE.md](docs/rocm/SERVE.md). Port notes and every
+measurement: [docs/rocm/](docs/rocm/). Optional: pwilkin's retained-PM4 HIP runtime (+5-7% single-stream decode).
+
+---
+
+*Upstream TensorFold README follows.*
+
 # TensorFold
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
