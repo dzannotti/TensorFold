@@ -1642,7 +1642,9 @@ fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []co
     defer ops.deinit();
     var k = try flashnext.kernels.Kernels.load(ctx);
     defer k.deinit();
-    const dec = !cuda.hip or try flashnext.glue_dec.check(gpa, ctx.d, t, ops.on(stream), .{ .k = &k, .s = stream });
+    var k8 = try flashnext.fp8.Kernels.load(ctx);
+    defer k8.deinit();
+    const dec = !cuda.hip or try flashnext.glue_dec.check(gpa, ctx.d, t, ops.on(stream), .{ .k = &k, .s = stream }, &k8);
     const ok = wb and up and dec;
     std.debug.print("{s} glue-check\n", .{if (ok) "PASS" else "FAIL"});
     return if (ok) 0 else 1;

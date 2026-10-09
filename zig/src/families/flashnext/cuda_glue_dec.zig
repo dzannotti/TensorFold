@@ -9,6 +9,7 @@ const tri = @import("cuda_triton.zig");
 const prompt = @import("cuda_prompt.zig");
 const tops = @import("cuda_torch_ops.zig");
 const kern = @import("cuda_kernels.zig");
+const fp8 = @import("cuda_fp8.zig");
 
 const bf16 = "*bf16";
 const f32p = "*fp32";
@@ -79,7 +80,7 @@ fn same(gpa: std.mem.Allocator, a: cuda.DeviceBuffer, b: cuda.DeviceBuffer, n: u
 }
 
 /// Every decode fusion against its separate kernels (bytes), then both timed in graphs. Returns whether all equal.
-pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch, ops: kern.Ops) !bool {
+pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch, ops: kern.Ops, k8: *const fp8.Kernels) !bool {
     var bs: Bufs = .{};
     defer bs.free();
     const h0 = try bs.get(d, max_m * S * D * 2);
@@ -198,6 +199,7 @@ pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops
     if (!try reduceCheck(gpa, d, t, th)) all = false;
     if (!try topkCheck(gpa, d, t, th, ops)) all = false;
     if (!try tkCheck(gpa, d, t)) all = false;
+    if (!try swigluCheck(gpa, d, t, th, k8)) all = false;
     for ([_]usize{ 1, 4, 16 }) |m| try bench(d, t, m, .{ .h = ha.ptr, .pss = pa.ptr, .inj = inj.ptr, .y = yb.ptr, .wts = wts.ptr, .scale = scale.ptr, .normed = na.ptr, .xs = xs.ptr, .wdn = wdn.ptr, .wup = wup.ptr, .part = parta.ptr, .act = acta.ptr, .ij = ija.ptr, .up = up.ptr, .mixed = nb.ptr, .tick = tick.ptr });
     return all;
 }
@@ -367,6 +369,77 @@ fn tkCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
             if (!ok) all = false;
             if (!ok or m == 1 or m == 128) std.debug.print("{s} _b16mm_tk N {d} K {d} ldo {d} {s} rows {d} {s}: rows bytes, ticks back at 0\n", .{ if (ok) "EQUAL" else "DIFFER", c.n, c.k, c.ldo, if (c.fp32) "fp32" else "bf16", m, @tagName(fill) });
         };
+    }
+    return all;
+}
+
+/// The shared expert's gate|up and SwiGLU: fp8.matmulSwiglu (16/32-row tiles) and fp8.matmul + fn_ops' interleaved
+/// SwiGLU, both on interleaved rows, against fp8.matmul + tf_fn_shared_swiglu on the plain rows (act bytes); random
+/// e4m3 weights and column scales, n 2560 / 1280 (one rank / two), K 2560.
+fn swigluCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch, k8: *const fp8.Kernels) !bool {
+    var bs: Bufs = .{};
+    defer bs.free();
+    const K: usize = 2560;
+    const x = try bs.get(d, max_m * K * 2);
+    const w8 = [2]cuda.DeviceBuffer{ try bs.get(d, 2560 * K), try bs.get(d, 2560 * K) };
+    const sc = [2]cuda.DeviceBuffer{ try bs.get(d, 2560 * (K / 64) * 4), try bs.get(d, 2560 * (K / 64) * 4) };
+    const g = try bs.get(d, max_m * 2560 * 2);
+    const acts = [3]cuda.DeviceBuffer{ try bs.get(d, max_m * 1280 * 2), try bs.get(d, max_m * 1280 * 2), try bs.get(d, max_m * 1280 * 2) };
+    var prng = std.Random.DefaultPrng.init(0x73_77_67);
+    const r = prng.random();
+    var all = true;
+    for ([_]usize{ 2560, 1280 }) |n| {
+        const w = n / 2;
+        const codes = try gpa.alloc(u8, n * K);
+        defer gpa.free(codes);
+        const cols = try gpa.alloc(f32, n * (K / 64));
+        defer gpa.free(cols);
+        for (codes) |*c| c.* = blk: {
+            const v = r.int(u8);
+            break :blk if (v & 0x7F == 0x7F) v - 1 else v; // no NaN codes
+        };
+        for (cols) |*c| c.* = std.math.ldexp(@as(f32, 1.0) + r.float(f32), r.intRangeAtMost(i32, -12, -6));
+        const packed_w = try gpa.alloc(u8, n * K);
+        defer gpa.free(packed_w);
+        const packed_s = try gpa.alloc(f32, n * (K / 64));
+        defer gpa.free(packed_s);
+        var lin: [2]fp8.Linear = undefined;
+        for (0..2) |v| {
+            if (v == 1) {
+                // runs of 32: gate rows 32 j .. 32 j + 31, then up rows w + 32 j .., as weights.interleave lays them
+                const c2 = try gpa.dupe(u8, codes);
+                defer gpa.free(c2);
+                const s2 = try gpa.dupe(f32, cols);
+                defer gpa.free(s2);
+                for (0..n) |j| {
+                    const src = (j / 64) * 32 + j % 32 + (if (j % 64 >= 32) w else 0);
+                    @memcpy(codes[j * K ..][0..K], c2[src * K ..][0..K]);
+                    @memcpy(cols[j * (K / 64) ..][0 .. K / 64], s2[src * (K / 64) ..][0 .. K / 64]);
+                }
+            }
+            try fp8.fragmentOrder(codes, n, K, n, packed_w);
+            try fp8.tileScales(cols, n, K, n, packed_s);
+            try w8[v].upload(0, packed_w);
+            try sc[v].upload(0, std.mem.sliceAsBytes(packed_s));
+            lin[v] = .{ .w8 = w8[v].ptr, .bs = sc[v].ptr, .n = @intCast(n), .k = @intCast(K), .npad = @intCast(n) };
+        }
+        for ([_]prompt.Fill{ .normal, .wide, .edge }) |fill| {
+            try prompt.fillBuf(gpa, x, max_m * K, r, fill);
+            for (rows_checked) |m| {
+                for (acts) |a| try a.fill8(0x5A, t.s.handle);
+                try fp8.matmul(k8, t.s, x.ptr, K, lin[0], g.ptr, false, m);
+                try th.sharedSwiglu(g.ptr, acts[0].ptr, m, w, w);
+                try fp8.matmul(k8, t.s, x.ptr, K, lin[1], g.ptr, false, m);
+                try th.sharedSwigluIl(g.ptr, acts[1].ptr, m, w, w, 32);
+                const fused = fp8.swigluRows(k8, m);
+                if (fused) try fp8.matmulSwiglu(k8, t.s, x.ptr, K, lin[1], acts[2].ptr, m);
+                try t.s.synchronize();
+                var ok = try same(gpa, acts[0], acts[1], m * w * 2);
+                if (fused) ok = ok and try same(gpa, acts[0], acts[2], m * w * 2);
+                if (!ok) all = false;
+                if (!ok or m == 1 or m == 32 or m == 128) std.debug.print("{s} shared SwiGLU n {d} rows {d} {s}: act bytes (interleaved + fn_ops{s})\n", .{ if (ok) "EQUAL" else "DIFFER", n, m, @tagName(fill), if (fused) ", matmulSwiglu" else "" });
+            }
+        }
     }
     return all;
 }

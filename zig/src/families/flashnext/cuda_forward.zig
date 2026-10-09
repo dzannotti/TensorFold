@@ -1934,8 +1934,7 @@ pub const Forward = struct {
             try sd.s.wait(sd.fork);
             var th2 = f.th;
             th2.s = sd.s;
-            try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.sh_g, false, R);
-            try th2.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
+            try f.sharedGateUp(k8, sd.s, th2, sh, xin, R);
             if (f.shared_ld and !x.y_f32) try fp8.matmulLd(k8, sd.s, f.sc.sh_a, sh.width, sh.down, y + top * D * es, slots * D, R) else {
                 try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
                 try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
@@ -1951,8 +1950,7 @@ pub const Forward = struct {
         }
         try int4.gateUp(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip, tile);
         try f.mark(.experts_gate_up);
-        try fp8.matmul(k8, f.s, xin, D, sh.gu, f.sc.sh_g, false, R);
-        try f.th.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
+        try f.sharedGateUp(k8, f.s, f.th, sh, xin, R);
         try f.mark(.shared_swiglu);
         try f.int4Down(k4, pick, act, ex4, plan, slots, E, y, x.y_f32, R, skip, tile);
         try f.mark(.experts_down);
@@ -1965,6 +1963,15 @@ pub const Forward = struct {
         try f.mark(.shared_down);
         try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
         try f.mark(.slot_copy);
+    }
+
+    /// The healed shared expert's gate|up and SwiGLU into f.sc.sh_a: one launch on interleaved rows (fp8.matmulSwiglu,
+    /// the 16/32-row tiles), else the matmul and fn_ops' SwiGLU (on the interleaved or plain rows).
+    fn sharedGateUp(f: *Forward, k8: *const fp8.Kernels, s: cuda.Stream, th: tops.Torch, sh: W.Shared8, xin: u64, R: usize) !void {
+        if (sh.il > 0 and fp8.swigluRows(k8, R)) return fp8.matmulSwiglu(k8, s, xin, f.g.hidden, sh.gu, f.sc.sh_a, R);
+        try fp8.matmul(k8, s, xin, f.g.hidden, sh.gu, f.sc.sh_g, false, R);
+        if (sh.il > 0) return th.sharedSwigluIl(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width, sh.il);
+        try th.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
     }
 
     /// The routed int4 down of rows' pairs: prompt calls on int4_prompt_kernel from a plan of 64-pair items (made

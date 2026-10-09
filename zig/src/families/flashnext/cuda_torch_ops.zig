@@ -76,6 +76,8 @@ pub const Functions = struct {
     strided: cuda.Function,
     gather: cuda.Function,
     swiglu: cuda.Function,
+    /// interleaved gate|up (weights.interleave); null in a build without it
+    swiglu_il: ?cuda.Function,
     /// null in a build whose fn_ops predates it (the forward then keeps `_reduce` and the strided copy)
     reduce_ld: ?cuda.Function,
     /// HIP: `_topk_rows` + the one-block plan in one launch (topk_plan.hip); null elsewhere
@@ -107,6 +109,7 @@ pub const Functions = struct {
             .strided = try m[i(.movement)].function("tf_strided_copy_kernel"),
             .gather = try m[i(.movement)].function("tf_gather_rows_kernel"),
             .swiglu = try m[i(.ops)].function("tf_fn_shared_swiglu_kernel"),
+            .swiglu_il = m[i(.ops)].function("tf_fn_shared_swiglu_il_kernel") catch null,
             .reduce_ld = m[i(.ops)].function("tf_fn_reduce_ld_kernel") catch null,
             .topk_plan = m[i(.ops)].function("tf_fn_topk_plan_kernel") catch null,
             .fill64 = try m[i(.ops)].function("tf_fn_fill_u64_kernel"),
@@ -337,6 +340,16 @@ pub const Torch = struct {
         a.add(@as(c_int, @intCast(tile)));
         for ([_]u64{ members, items, counts }) |v| a.add(v);
         try t.go(t.f.topk_plan orelse return error.NoTopkPlan, .{ 1, 1 }, 1024, &a);
+    }
+
+    /// `sharedSwiglu` of gate|up rows interleaved in runs of `il` (fn_ops.cu, the same bytes on the same pairs).
+    pub fn sharedSwigluIl(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize, il: usize) !void {
+        if (rows * ni == 0) return;
+        var a: cuda.Args = .{};
+        a.add(g);
+        a.add(out);
+        for ([_]u64{ rows, ni, out_stride, il }) |v| a.add(v);
+        try t.go(t.f.swiglu_il orelse return error.NoSwigluIl, .{ blocks(rows * ni, 256), 1 }, 256, &a);
     }
 
     pub fn sharedSwiglu(t: Torch, g: u64, out: u64, rows: usize, ni: usize, out_stride: usize) !void {

@@ -43,6 +43,25 @@ extern "C" __global__ void tf_fn_reduce_ld_kernel(const float* part, uint16_t* o
     }
 }
 
+// tf_fn_shared_swiglu_kernel on gate|up rows interleaved in runs of `il` (32 gate columns, then the same 32 up
+// columns): the same operations on the same pairs (weights.interleave; the wide windows' path beside matmulSwiglu).
+extern "C" __global__ void tf_fn_shared_swiglu_il_kernel(const __nv_bfloat16* g, __nv_bfloat16* out, uint64_t rows,
+                                                         uint64_t ni, uint64_t out_stride, uint64_t il) {
+    const uint64_t count = rows * ni;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const uint64_t r = i / ni;
+        const uint64_t c = i - r * ni;
+        const uint64_t at = r * 2 * ni + (c / il) * 2 * il + c % il;
+        const float gate = __bfloat162float(g[at]);
+        const float up = __bfloat162float(g[at + il]);
+        const float e = expf(-gate);
+        const float act = __fdiv_rn(gate, __fadd_rn(e, 1.0f));
+        const float rounded = __bfloat162float(__float2bfloat16_rn(act));
+        out[r * out_stride + c] = __float2bfloat16_rn(__fmul_rn(rounded, up));
+    }
+}
+
 // Tensor.fill_ of `count` 64-bit words.
 extern "C" __global__ void tf_fn_fill_u64_kernel(uint64_t* out, uint64_t value, uint64_t count) {
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;

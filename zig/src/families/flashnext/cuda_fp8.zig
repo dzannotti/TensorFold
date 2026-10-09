@@ -106,6 +106,8 @@ pub const sym = struct {
         };
         break :blk out;
     };
+    /// fn_qmmf.hip's SwiGLU tiles (16, 32 rows; HIP builds only): the shared expert's interleaved gate|up into its act
+    pub const swiglu = [2][:0]const u8{ "_ZN10tf_fn_qmmf18qmmf_swiglu_kernelILi16EEEvPK13__nv_bfloat16PKhS5_fPviiiiii", "_ZN10tf_fn_qmmf18qmmf_swiglu_kernelILi32EEEvPK13__nv_bfloat16PKhS5_fPviiiiii" };
     pub const ld_wide = blk: {
         var out: [4][:0]const u8 = undefined;
         for (0..4) |i| out[i] = wideName("13tf_fn_qmmf_ld", 64 << (i / 2), 128 >> (i % 2), false, "i");
@@ -124,6 +126,8 @@ pub const Kernels = struct {
     /// HIP: the wide tile, [bf16, fp32][wideIndex] and its `ldo` form
     wide: [2][4]cuda.Function = undefined,
     ld_wide: [4]cuda.Function = undefined,
+    /// HIP: `matmulSwiglu`'s 16- and 32-row tiles (null: a build without them)
+    swiglu: [2]?cuda.Function = .{ null, null },
     major: c_int,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -151,6 +155,10 @@ pub const Kernels = struct {
         if (hip_build) for (0..4) |i| {
             for (0..2) |f| k.wide[f][i] = try k.module.function(sym.wide[f][i]);
             k.ld_wide[i] = try k.ld_module.function(sym.ld_wide[i]);
+        };
+        k.swiglu = .{ null, null };
+        if (hip_build) for (0..2) |i| {
+            k.swiglu[i] = k.module.function(sym.swiglu[i]) catch null;
         };
         k.major = try ctx.attribute(.compute_capability_major);
         return k;
@@ -217,6 +225,29 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
         .shared = if (hip_build) 0 else smem(tile),
         .cluster = if (cluster) .{ .x = 1, .y = 1, .z = @intCast(sk) } else null,
     }, s, &a);
+}
+
+/// The rows `matmulSwiglu` takes (its 16- and 32-row tiles; wider windows run `matmul` and fn_ops' interleaved SwiGLU).
+pub fn swigluRows(k: *const Kernels, m: usize) bool {
+    return hip_build and m >= 1 and m < wide_rows and k.swiglu[bucketIndex(bucket(m))] != null;
+}
+
+/// The shared expert's gate|up `l` (its rows interleaved: 32 gate rows, then the same 32 up rows, a 64-row tile;
+/// weights.interleave) with fn_ops' SwiGLU in the epilogue: act [m, n / 2] bf16 = the bytes `matmul` then
+/// tf_fn_shared_swiglu give on the plain rows. `swigluRows(m)` first.
+pub fn matmulSwiglu(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linear, act: u64, m: usize) !void {
+    if (!swigluRows(k, m) or l.n % 64 != 0 or l.k % 64 != 0) return error.Invalid;
+    const sk = splitKHip(l.n, l.k);
+    const bm = bucket(m);
+    const rows_t = (m + bm - 1) / bm;
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(l.w8);
+    a.add(l.bs);
+    a.add(@as(f32, 1.0));
+    a.add(act);
+    for ([_]usize{ m, l.n, l.k, sk, if (m == 1) l.k else x_stride, l2Group(rows_t, bm, l.k) }) |v| a.add(@as(c_int, @intCast(v)));
+    try cuda.launch.launch(k.swiglu[bucketIndex(bm)].?, .{ .grid = .{ .x = @intCast(rows_t * (l.n / 64)), .y = 1, .z = 1 }, .block = .{ .x = @intCast(128 * sk) } }, s, &a);
 }
 
 /// HIP's wide tile: a block of 2 * rows threads, static LDS, the L2 band over its row tiles.

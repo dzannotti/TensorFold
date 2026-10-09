@@ -68,20 +68,24 @@ __device__ __forceinline__ int2 tile_of(int b, int M, int N, int BM, int BN, int
     return make_int2((first + in_band % height) * BM, in_band / height * BN);
 }
 
-template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false>
-__global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
+// fn_ops.cu's tf_fn_shared_swiglu_kernel on one (gate, up) pair of bf16 values: the same operations, uncontracted
+__device__ __forceinline__ __hip_bfloat16 shared_swiglu(float gate, float up) {
+#pragma clang fp contract(off)
+    const float e = expf(-gate);
+    const float act = __fdiv_rn(gate, __fadd_rn(e, 1.0f));
+    const float rounded = __bfloat162float(__float2bfloat16_rn(act));
+    return __float2bfloat16_rn(__fmul_rn(rounded, up));
+}
+
+// SWIGLU (the shared expert's gate|up, its rows interleaved 32 gate then 32 up a 64-column tile; one slice tile, no
+// FUSE): the epilogue rounds both to bf16 as the matmul stores them and writes the SwiGLU act [M, N / 2] instead
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE, bool SWIGLU>
+__device__ __forceinline__ void qmmf_body(
         const __hip_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
-        float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
-        int group
-#ifdef TF_QMMF_LD
-        , int ldo
-#endif
-        ) {
+        float scale, void* __restrict__ out, int M, int N, int K, int SK, int ldx, int group, int ldo) {
     static_assert(MODE == 3 && BN == 64 && WN == 4 && !CLUSTER, "gfx1151: block FP8 on 64-column tiles, no clusters");
+    static_assert(!SWIGLU || (!FUSE && !F32), "SwiGLU: one slice tile, bf16");
     constexpr int MT = BM / 16, PA = MT <= 2 ? MT : 0;   // row tiles; PA > 0: the next group's loads in flight
-#ifndef TF_QMMF_LD
-    const int ldo = N;
-#endif
     __shared__ float red[FUSE ? 1 : 4 * MT * 8 * 32];     // a slice's sums, parked for slice 0
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, wn = wave & 3;
     const int KG = K / GS, per = KG / SK, slice = FUSE ? 0 : wave >> 2;
@@ -152,6 +156,27 @@ __global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
                     for (int e = 0; e < 8; ++e) tot[i][e] = tot[i][e] + red[((wn * MT + i) * 8 + e) * 32 + lane];
             __syncthreads();
         }
+        if constexpr (SWIGLU) {                           // the up waves (2, 3) hand bf16(up) to the gate waves (0, 1)
+            if (slice == 0 && wn >= 2)
+#pragma unroll
+                for (int i = 0; i < MT; ++i)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e)
+                        red[(((wn - 2) * MT + i) * 8 + e) * 32 + lane] = __bfloat162float(__float2bfloat16(tot[i][e] * scale));
+            __syncthreads();
+            if (slice != 0 || wn >= 2) return;
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int row = m0 + i * 16 + 2 * e + (lane >> 4);
+                    if (row >= M) continue;
+                    const float gate = __bfloat162float(__float2bfloat16(tot[i][e] * scale));
+                    const float up = red[((wn * MT + i) * 8 + e) * 32 + lane];
+                    reinterpret_cast<__hip_bfloat16*>(out)[static_cast<size_t>(row) * (N / 2) + n0 / 2 + c] = shared_swiglu(gate, up);
+                }
+            return;
+        }
         if (slice != 0) return;
     }
     const int col = n0 + c;
@@ -167,6 +192,31 @@ __global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
             else reinterpret_cast<__hip_bfloat16*>(out)[static_cast<size_t>(row) * ldo + col] = __float2bfloat16(v);
         }
 }
+
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false>
+__global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_kernel(
+        const __hip_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
+        int group
+#ifdef TF_QMMF_LD
+        , int ldo
+#endif
+        ) {
+#ifndef TF_QMMF_LD
+    const int ldo = N;
+#endif
+    qmmf_body<MODE, BM, BN, WM, WN, STAGES, F32, CLUSTER, FUSE, false>(x, w, bs, scale, out, M, N, K, SK, ldx, group, ldo);
+}
+
+#ifndef TF_QMMF_LD
+// qmmf_kernel's 16/32-row tile on the shared expert's interleaved gate|up rows, its SwiGLU act [M, N / 2] out (bf16)
+template <int BM>
+__global__ void __launch_bounds__(128 * MAX_SLICES) qmmf_swiglu_kernel(
+        const __hip_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, int M, int N, int K, int SK, int ldx, int group) {
+    qmmf_body<3, BM, 64, 1, 4, 4, false, false, false, true>(x, w, bs, scale, out, M, N, K, SK, ldx, group, N / 2);
+}
+#endif
 
 
 // The wide tile: BM x BN outputs a block of WR x WC waves (each MT x NT WMMA tiles; 2 BM threads), the group's inputs
@@ -372,4 +422,8 @@ TF_QMMW(128, 128, true)
 TF_QMMW(128, 64, true)
 TF_QMMW(64, 128, true)
 TF_QMMW(64, 64, true)
+template __global__ void tf_fn_qmmf::qmmf_swiglu_kernel<16>(const __hip_bfloat16*, const unsigned char*, const uint8_t*,
+    float, void*, int, int, int, int, int, int);
+template __global__ void tf_fn_qmmf::qmmf_swiglu_kernel<32>(const __hip_bfloat16*, const unsigned char*, const uint8_t*,
+    float, void*, int, int, int, int, int, int);
 #endif

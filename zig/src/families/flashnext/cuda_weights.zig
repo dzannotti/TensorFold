@@ -56,6 +56,9 @@ pub const Options = struct {
     /// a directory whose safetensors take precedence over the checkpoint's for the names they hold (INT4-AutoRound's
     /// fast-fp8/: block-FP8 hyper-connections and MTP experts); the shadowed checkpoint tensors are read as nothing
     overlay: ?[]const u8 = null,
+    /// the healed shared expert's gate|up rows interleaved in runs of this many (32 gate rows, then the same 32 up
+    /// rows) for fp8.matmulSwiglu's epilogue (HIP, TF_FLASHNEXT_SHARED_SWIGLU); 0: gate rows, then up rows
+    shared_il: u32 = 0,
     threads: u32 = 16,
     /// drop the checkpoint's pages once a layer's tensors are on the device (Python's reader.release)
     release_pages: bool = true,
@@ -92,7 +95,8 @@ pub const Hc = struct {
 pub const Gdn = struct { proj: Rows = .{}, conv: u64 = 0, a_log: u64 = 0, dt_bias: u64 = 0, norm: u64 = 0, out: Rows = .{}, proj8: ?fp8.Linear = null, out8: ?fp8.Linear = null };
 pub const Attn = struct { proj: Rows = .{}, q_scale: u64 = 0, k_scale: u64 = 0, iq_scale: u64 = 0, ik_scale: u64 = 0, o: Rows = .{}, proj8: ?fp8.Linear = null, o8: ?fp8.Linear = null };
 /// INT4-AutoRound's healed shared expert: block FP8 gate|up rows [2 w, D] and down [D, w] (w its rank's width).
-pub const Shared8 = struct { gu: fp8.Linear, down: fp8.Linear, width: u32 };
+/// `il`: gu's rows interleaved in runs of il (Options.shared_il), 0: plain
+pub const Shared8 = struct { gu: fp8.Linear, down: fp8.Linear, width: u32, il: u32 = 0 };
 pub const Ple = struct { key: Rows = .{}, value: Rows = .{}, norm_key: u64 = 0, norm_query: u64 = 0, norm_conv: u64 = 0, conv: u64 = 0, ngram: ngram.NGram };
 pub const Layer = struct { index: i32, linear: bool, attn_hc: Hc = .{}, mlp_hc: Hc = .{}, gdn: ?Gdn = null, attn: ?Attn = null, moe: MoE = .{}, ple: ?Ple = null };
 pub const Mtp = struct { norm_e: u64 = 0, norm_h: u64 = 0, fc_e: Rows = .{}, fc_h: Rows = .{}, layer: Layer, mixer: Hc = .{} };
@@ -389,6 +393,33 @@ const Out = struct {
         o.w.named.items[o.w.named.items.len - 1].oracle = false;
     }
 };
+
+/// Rows [0, n / 2) and [n / 2, n) (k codes and k / 64 scales a row) in runs of `il` taken in turn: row j is half
+/// (j / il) % 2's row (j / (2 il)) il + j % il.
+fn interleave(gpa: std.mem.Allocator, codes: []u8, cols: []f32, n: usize, k: usize, il: usize) !void {
+    const w = n / 2;
+    if (n % 2 != 0 or w % il != 0) return error.UnexpectedTensor;
+    const kg = k / 64;
+    const c2 = try gpa.dupe(u8, codes);
+    defer gpa.free(c2);
+    const s2 = try gpa.dupe(f32, cols);
+    defer gpa.free(s2);
+    for (0..n) |j| {
+        const src = (j / (2 * il)) * il + j % il + (if (j % (2 * il) >= il) w else 0);
+        @memcpy(codes[j * k ..][0..k], c2[src * k ..][0..k]);
+        @memcpy(cols[j * kg ..][0..kg], s2[src * kg ..][0..kg]);
+    }
+}
+
+test "interleave: runs of il rows from each half in turn" {
+    // 8 rows of k 64 (one scale a row): gate rows 0..3, up rows 10..13, runs of 2
+    var cols = [_]f32{ 0, 1, 2, 3, 10, 11, 12, 13 };
+    var big: [8 * 64]u8 = undefined;
+    for (0..8) |r| @memset(big[r * 64 ..][0..64], @intFromFloat(cols[r]));
+    try interleave(std.testing.allocator, &big, &cols, 8, 64, 2);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 10, 11, 2, 3, 12, 13 }, &cols);
+    for (0..8) |r| try std.testing.expectEqual(@as(u8, @intFromFloat(cols[r])), big[r * 64]);
+}
 
 fn dsize(dtype: []const u8) usize {
     const two = [_][]const u8{ "bfloat16", "uint16", "int16", "float16" };
@@ -906,6 +937,11 @@ const Loader = struct {
     /// Fp8BlockLinear.from_rows of the parts' rows stacked (each row's fp32 scale per 64 inputs from its 128x128
     /// block), in the FP8G lane matmul's fragment order: "<path>.w8" and "<path>.bs".
     fn fp8Face(L: *Loader, path: []const u8, parts: []const Part8) !fp8.Linear {
+        return L.fp8FaceIl(path, parts, 0);
+    }
+
+    /// `fp8Face`, its rows (two halves) interleaved in runs of `il` when il > 0 (each row keeps its codes and scales).
+    fn fp8FaceIl(L: *Loader, path: []const u8, parts: []const Part8, il: usize) !fp8.Linear {
         var n: usize = 0;
         var k: usize = 0;
         var ts: [4]Tensor = undefined;
@@ -959,6 +995,7 @@ const Loader = struct {
                 at += 1;
             };
         }
+        if (il > 0) try interleave(L.gpa, codes, cols, n, k, il);
         const npad = fp8.npadOf(n);
         const w8 = try L.staging(npad * k);
         try fp8.fragmentOrder(codes, n, k, npad, w8);
@@ -1059,12 +1096,13 @@ const Loader = struct {
         const slo = r * sw / world;
         const shi = (r + 1) * sw / world;
         const srows = [1][2]usize{.{ slo, shi }};
-        const gu = try L.fp8Face(try std.fmt.bufPrint(&pb, "{s}.shared8.gu", .{path}), &.{
+        const il: u32 = if (L.o.shared_il > 0 and (shi - slo) % L.o.shared_il == 0) L.o.shared_il else 0;
+        const gu = try L.fp8FaceIl(try std.fmt.bufPrint(&pb, "{s}.shared8.gu", .{path}), &.{
             .{ .name = try L.nameOf("{s}.shared_expert.gate_proj", .{name}), .rows = &srows },
             .{ .name = try L.nameOf("{s}.shared_expert.up_proj", .{name}), .rows = &srows },
-        });
+        }, il);
         const dn = try L.fp8Face(try std.fmt.bufPrint(&pb, "{s}.shared8.down", .{path}), &.{.{ .name = try L.nameOf("{s}.shared_expert.down_proj", .{name}), .cols = .{ slo, shi } }});
-        m.shared8 = .{ .gu = gu, .down = dn, .width = @intCast(shi - slo) };
+        m.shared8 = .{ .gu = gu, .down = dn, .width = @intCast(shi - slo), .il = il };
         m.int4 = try L.int4Experts(path, name, r * c.moe_width / world, (r + 1) * c.moe_width / world);
         m.routed = .{ .count = e, .width = @intCast(m.int4.?.width), .dims = d };
         return m;
