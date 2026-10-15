@@ -220,6 +220,92 @@ gated_delta_tile(const float* __restrict__ q, const float* __restrict__ k, const
                                            blockIdx.z);
 }
 
+// A tree window's recurrence (at most 32 rows): each row from its parent's state, rebuilt from the round's state
+// through the parent's ancestors when the row before was not the parent, by the tile's very steps (no shared memory,
+// so the chains' launch keeps its occupancy). A replay (no q) runs the rows of `path` and writes the state back.
+template <int DK, int ROWS>
+__device__ __forceinline__ void
+gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+                      const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
+                      float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
+                      const unsigned* __restrict__ anc, unsigned path) {
+    constexpr int SPAN = (DK + 31) / 32;
+    const int lane = threadIdx.x;
+    const int row = blockIdx.x * ROWS + threadIdx.y;
+    const int head = blockIdx.y;
+    const int key_head = head / (value_heads / key_heads);
+    const int n = min(32, length);
+
+    float s[4] = {0.f, 0.f, 0.f, 0.f};
+    const size_t state_row = (static_cast<size_t>(head) * dv + row) * DK;
+#pragma unroll
+    for (int i = 0; i < SPAN; ++i) {
+        const int idx = lane + i * 32;
+        if (idx < DK) s[i] = state[state_row + idx];
+    }
+    int prev = -1;  // the row the registers' state follows
+    for (int tt = 0; tt < n; ++tt) {
+        unsigned todo;  // the rows to step through, ascending: a replay's path, or a branch's ancestors and itself
+        if (q == nullptr) {
+            if (tt > 0) break;
+            todo = path;
+        } else {
+            const unsigned up = anc[tt] & ~(1u << tt);
+            const int parent = up == 0 ? -1 : 31 - __clz(up);
+            todo = 1u << tt;
+            if (parent != prev) {
+#pragma unroll
+                for (int i = 0; i < SPAN; ++i) {
+                    const int idx = lane + i * 32;
+                    if (idx < DK) s[i] = state[state_row + idx];
+                }
+                todo |= up;
+            }
+            prev = tt;
+        }
+        while (todo != 0) {
+            const int at = __ffs(todo) - 1;
+            todo &= todo - 1;
+            const float decay = gate[static_cast<size_t>(at) * value_heads + head];
+            const float step_beta = beta[static_cast<size_t>(at) * value_heads + head];
+            const float value = v[(static_cast<size_t>(at) * value_heads + head) * dv + row];
+            const float* key = k + (static_cast<size_t>(at) * key_heads + key_head) * DK;
+            float remembered = 0.f;
+            float held[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int i = 0; i < SPAN; ++i) {
+                const int idx = lane + i * 32;
+                if (idx < DK) {
+                    held[i] = key[idx];
+                    s[i] = s[i] * decay;
+                    remembered = remembered + s[i] * held[i];
+                }
+            }
+            const float delta = (value - lane0_sum(remembered)) * step_beta;
+#pragma unroll
+            for (int i = 0; i < SPAN; ++i) {
+                const int idx = lane + i * 32;
+                if (idx < DK) s[i] = s[i] + held[i] * delta;
+            }
+        }
+        if (q == nullptr) continue;
+        float readout = 0.f;
+#pragma unroll
+        for (int i = 0; i < SPAN; ++i) {
+            const int idx = lane + i * 32;
+            if (idx < DK) readout = readout + s[i] * q[(static_cast<size_t>(tt) * key_heads + key_head) * DK + idx];
+        }
+        readout = lane0_sum(readout);
+        if (lane == 0) y[(static_cast<size_t>(tt) * value_heads + head) * dv + row] = readout;
+    }
+    if (q != nullptr) return;
+#pragma unroll
+    for (int i = 0; i < SPAN; ++i) {
+        const int idx = lane + i * 32;
+        if (idx < DK) state[state_row + idx] = s[i];
+    }
+}
+
 // A round's windows in one launch, a grid plane a slot; rows, state and snapshots come from the plan, same scan.
 template <int DK>
 __device__ __forceinline__ void
@@ -233,6 +319,12 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     float* state = reinterpret_cast<float*>(desc[plan_second(layer)]);
     // a window of rows leaves the state as the round found it, for its keep to replay (padding rows keep nothing)
     const bool replayed = length > 1 && slot + 1 < static_cast<int>(gridDim.z);
+    if (replayed && plan.anc[row0] != 0) {
+        gated_delta_tree_body<DK, 8>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+                                     gate + row0 * value_heads, beta + row0 * value_heads, state,
+                                     y + row0 * value_heads * dv, length, key_heads, value_heads, dv, plan.anc + row0, 0);
+        return;
+    }
     gated_delta_tile_body<DK, 8, 16>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state,
                                      y + row0 * value_heads * dv, length, key_heads, value_heads, dv, nullptr, 0,
@@ -253,6 +345,13 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
     const float* gate = v + static_cast<long long>(rows) * value_heads * dv;
     const float* beta = gate + static_cast<long long>(rows) * value_heads;
     float* state = reinterpret_cast<float*>(plan_desc(plan, slot)[plan_second(layer)]);
+    const unsigned path = plan.anc[row0 + n - 1];
+    if (path != 0) {
+        gated_delta_tree_body<DK, 8>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+                                     gate + row0 * value_heads, beta + row0 * value_heads, state, nullptr,
+                                     plan.count[slot], key_heads, value_heads, dv, nullptr, path);
+        return;
+    }
     gated_delta_tile_body<DK, 8, 16>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state, nullptr, n, key_heads,
                                      value_heads, dv, nullptr, 0);

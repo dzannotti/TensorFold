@@ -174,6 +174,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     __shared__ float inv_s;
     ConvArgs c = launch;
     float* samples = nullptr;
+    const unsigned* anc = nullptr;  // a tree slot's rows' ancestor bits: each row's taps from its own path
     const int conv_blocks = (c.channels + 127) / 128;
     if (launch.plan.count != nullptr) {
         const int slot = blockIdx.y;
@@ -193,6 +194,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
             const bool replayed = rows > 1 && slot + 1 < static_cast<int>(gridDim.y);
             c.states = nullptr;
             samples = replayed ? reinterpret_cast<float*>(launch.plan.snaps[2 * launch.layer]) + row0 * c.channels : nullptr;
+            if (launch.plan.anc[row0] != 0) anc = launch.plan.anc + row0;
         }
     }
     if (blockIdx.x >= conv_blocks) {
@@ -217,6 +219,23 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     for (int r = 0; r < c.rows; ++r) {
         float y = 0.f;
         float sample = 0.f;
+        if (live && anc != nullptr && r > 0) {
+            // the newest taps from the row's ancestors (nearest last), the older from the window the round found
+            unsigned up = anc[r] & ~(1u << r);
+            int used = 0;
+#pragma unroll
+            for (int tap = 6; tap >= 0; --tap) {
+                if (tap >= kept) continue;
+                if (up != 0) {
+                    const int a = 31 - __clz(up);
+                    up &= ~(1u << a);
+                    history[tap] = load_kind(c.x, c.kind, static_cast<long long>(a) * c.channels + channel);
+                    ++used;
+                } else {
+                    history[tap] = c.state[static_cast<long long>(tap + used) * c.channels + channel];
+                }
+            }
+        }
         if (live) {
             float acc = 0.f;
             for (int tap = 0; tap < kept; ++tap) acc += history[tap] * taps[tap];

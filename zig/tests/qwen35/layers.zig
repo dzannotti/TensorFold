@@ -126,7 +126,7 @@ pub fn run(g: Gpu, model_dir: []const u8, dir: []const u8, group: Group) !void {
         const pos = len + step;
         const shape: qwen35.plan.Shape = .{ .rows = 1, .slots = 2, .span = @intCast(qwen35.plan.spanOf(pos + 1)) };
         const layout = qwen35.plan.Layout.of(1, 2, s.n_layers);
-        plan_buf.fill(layout, shape, &.{.{ .desc = caches.desc.base(), .pos = pos, .tokens = &.{token} }}, scratch.desc.base(), inputs);
+        try plan_buf.fill(layout, shape, &.{.{ .desc = caches.desc.base(), .pos = pos, .tokens = &.{token} }}, scratch.desc.base(), inputs);
         try plan_buf.send(stream.handle, layout);
         const round: qwen35.window.Round = .{ .plan = .{ .args = plan_buf.args(layout), .rows = 1, .slots = 2 }, .tokens = plan_buf.dev.base() + 4 * layout.tokens, .span = shape.span, .inputs = inputs };
         var name_buf: [32]u8 = undefined;

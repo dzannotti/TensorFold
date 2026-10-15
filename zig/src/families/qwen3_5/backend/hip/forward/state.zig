@@ -26,6 +26,8 @@ pub const Caches = struct {
     table: std.ArrayList(u32) = .empty,
     /// Pages promised to this stream, not yet taken (the pool's reservation).
     promised: usize = 0,
+    /// A drafter's tap ring the forwards write this stream's tapped residuals into (0: none; the owner frees it).
+    tap: u64 = 0,
 
     /// Device bytes the caches of `total` positions hold beside their pages: linear state and the descriptor.
     pub fn deviceBytes(m: *const view.Model, total: usize) usize {

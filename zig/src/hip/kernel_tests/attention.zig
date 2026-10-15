@@ -137,7 +137,7 @@ fn decode(t: *Rig, rng: *rig.Rng, heads: usize, kv_heads: usize, d: usize, pos: 
     defer for (&outs) |*o| o.free();
     const s = t.stream.handle;
     try t.on.tf_causal(@ptrFromInt(at(q)), @ptrFromInt(at(k)), @ptrFromInt(at(v)), @ptrFromInt(at(outs[0])), @intCast(rows), 1, @intCast(span), @intCast(heads), @intCast(kv_heads), @intCast(d), scale, 0, 0, @intCast(span * d), @intCast(d), 0, @intCast(span * d), @intCast(d), if (t.bf16) 1 else 0, @ptrFromInt(at(scores)), @ptrFromInt(at(stats)), @ptrFromInt(at(partials)), s, @ptrFromInt(at(dev_pos)));
-    const p: plan.PlanRef = .{ .rows = rows, .slots = 1, .args = .{ .pos = at(dev_pos), .slot = at(slot), .first = at(dev_first), .count = at(dev_count), .desc = at(descs), .pages = words, .pool = @intCast(c.table.len) } };
+    const p: plan.PlanRef = .{ .rows = rows, .slots = 1, .args = .{ .pos = at(dev_pos), .slot = at(slot), .first = at(dev_first), .count = at(dev_count), .desc = at(descs), .anc = at(slot), .pages = words, .pool = @intCast(c.table.len) } };
     try t.on.planCausal(at(q), at(outs[1]), at(scores), at(stats), at(partials), p, 0, heads, kv_heads, d, span, scale, t.kind(), s);
     try t.stream.synchronize();
     const flat = try rig.download(f32, outs[0]);
