@@ -54,6 +54,9 @@ pub const Pick = lane_round.Pick;
 /// Streams the pool of an engine opened without a memory plan holds whole.
 pub const default_streams = 12;
 
+/// Rows a stream's tap ring holds: a drafter's window and the most rows of a round (the row at position p at p % tap_rows).
+pub const tap_rows = 2048 + plan.buckets[plan.buckets.len - 1];
+
 fn gib(bytes: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 30);
 }
@@ -90,6 +93,9 @@ pub const Engine = struct {
     graphs: round_graphs.Graphs,
     /// The lane rounds' plan, graph choice and keep.
     round: lane_round.State = undefined,
+    /// A drafter's tapped layers (`setTaps`): forwards over caches with a tap ring write those layers' residual rows.
+    taps: [8]u32 = undefined,
+    n_taps: usize = 0,
 
     /// The model on the device, its scratch not yet sized: `size` takes the capacity the memory plan fits.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options) !*Engine {
@@ -98,6 +104,7 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.o = o;
         e.sized = false;
+        e.n_taps = 0;
         // rounds and the draft head's batches replay graphs unless the policy says `graphs=off`, at any world size
         e.o.graphs = o.graphs and o.policy.graphsOn();
         e.graphs = round_graphs.Graphs.init(gpa);
@@ -347,6 +354,44 @@ pub const Engine = struct {
         return .{ .ctx = p, .layer = Poll.layer };
     }
 
+    /// The layers a drafter taps, told before any stream's caches hold a ring.
+    pub fn setTaps(e: *Engine, taps: []const u32) !void {
+        if (taps.len > e.taps.len) return error.TooManyTaps;
+        for (taps) |t| if (t >= e.model().spec.n_layers) return error.BadTap;
+        if (e.model().spec.hidden % 8 != 0 or e.act.size() != 2) return error.BadTap;
+        @memcpy(e.taps[0..taps.len], taps);
+        e.n_taps = taps.len;
+    }
+
+    /// Device bytes a stream's tap ring holds (none before `setTaps`).
+    pub fn tapBytes(e: *const Engine) usize {
+        return tap_rows * e.n_taps * e.model().spec.hidden * e.act.size();
+    }
+
+    /// After each layer of a prompt pass: a tapped layer's rows (the ring's last rows at most) into it, then the poll.
+    const Tapper = struct {
+        e: *Engine,
+        ring: u64,
+        pos0: usize,
+        poll: ?fwd.Trace,
+
+        fn layer(ctx: *anyopaque, index: usize, x: hip.ops.Tensor, rows: usize) anyerror!void {
+            const t: *Tapper = @ptrCast(@alignCast(ctx));
+            const e = t.e;
+            for (e.taps[0..e.n_taps], 0..) |l, i| if (l == index) {
+                try hip.plan_ops.tapRows(e.ops(&e.prompts), x, t.ring, rows -| tap_rows, rows, t.pos0, e.model().spec.hidden, i, e.n_taps, tap_rows);
+            };
+            if (t.poll) |p| try p.layer(p.ctx, index, x, rows);
+        }
+    };
+
+    /// `poll` with the taps written first when the caches hold a ring.
+    fn tapped(e: *Engine, caches: *const state.Caches, pos0: usize, inner: ?fwd.Trace, t: *Tapper) ?fwd.Trace {
+        if (caches.tap == 0 or e.n_taps == 0) return inner;
+        t.* = .{ .e = e, .ring = caches.tap, .pos0 = pos0, .poll = inner };
+        return .{ .ctx = t, .layer = Tapper.layer };
+    }
+
     /// Run `prompt[pos0..end]` into `caches`, its logits not read: a cut where the caches are kept.
     pub fn advance(e: *Engine, caches: *state.Caches, prompt: []const u32, pos0: usize, end: usize, cancel: ?Cancel) !void {
         if (end <= pos0 or end > caches.total or end - pos0 > e.o.prompt_rows) return error.PromptTooLong;
@@ -355,7 +400,8 @@ pub const Engine = struct {
         @memcpy(ids, prompt[pos0..end]);
         try e.ids_dev.uploadAsync(0, e.ids.view(0, 4 * ids.len), e.stream);
         var p: Poll = undefined;
-        _ = try fwd.span(e.ops(&e.prompts), e.model(), caches, e.ids_dev.base(), end - pos0, pos0, e.poll(cancel, end - pos0, &p));
+        var t: Tapper = undefined;
+        _ = try fwd.span(e.ops(&e.prompts), e.model(), caches, e.ids_dev.base(), end - pos0, pos0, e.tapped(caches, pos0, e.poll(cancel, end - pos0, &p), &t));
         try e.stream.synchronize();
     }
 
@@ -370,7 +416,8 @@ pub const Engine = struct {
         try e.ids_dev.uploadAsync(0, e.ids.view(0, 4 * ids.len), e.stream);
         const o = e.ops(&e.prompts);
         var p: Poll = undefined;
-        const hidden = try fwd.span(o, m, caches, e.ids_dev.base(), len, pos0, e.poll(cancel, len, &p));
+        var t: Tapper = undefined;
+        const hidden = try fwd.span(o, m, caches, e.ids_dev.base(), len, pos0, e.tapped(caches, pos0, e.poll(cancel, len, &p), &t));
         const row = fwd.at(hidden, (len - 1) * m.spec.hidden);
         if (last) |b| try hip.raw.copy(b, 0, row.ptr, m.spec.hidden * m.act.size(), e.stream.handle);
         var token: [1]u32 = undefined;
@@ -388,7 +435,7 @@ pub const Engine = struct {
         return lane_round.choose(e, rows, forced);
     }
 
-    /// Marks a slot of the last verify to keep its first `rows` rows at the next `flush`.
+    /// Marks a slot of the last verify to keep its first `rows` rows at the next `flush` (a tree: the path to row `rows` - 1).
     pub fn keep(e: *Engine, slot: usize, rows: usize) void {
         lane_round.mark(e, slot, rows);
     }

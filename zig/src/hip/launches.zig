@@ -92,6 +92,8 @@ pub const Launcher = struct {
         gdn_replay: [2]Function, // dk 128, 16
         page_write: Function,
         page_gather: Function,
+        tap: Function,
+        tap_rows: Function,
     };
 
     const Decode = struct {
@@ -166,6 +168,8 @@ pub const Launcher = struct {
             .gdn_replay = .{ try gd.function("tf_gdn_replay_128"), try gd.function("tf_gdn_replay_16") },
             .page_write = try pl.function("tf_page_write"),
             .page_gather = try pl.function("tf_page_gather"),
+            .tap = try pl.function("tf_plan_tap"),
+            .tap_rows = try pl.function("tf_tap_rows"),
         };
         l.fa_wide = .{ try pre.function("tf_fa_wide_f16"), try pre.function("tf_fa_wide_bf16") };
         l.fa_paged = .{ try pre.function("tf_fa_paged_f16"), try pre.function("tf_fa_paged_bf16") };
@@ -309,6 +313,8 @@ pub const Launcher = struct {
     pub const pagesWrite = plan.pagesWrite;
     pub const pagesGather = plan.pagesGather;
     pub const planGather = plan.planGather;
+    pub const planTap = plan.planTap;
+    pub const tapRows = plan.tapRows;
     pub const tf_gdn_gate_prefill = recurrence.tf_gdn_gate_prefill;
     pub const tf_gnorm_silu = recurrence.tf_gnorm_silu;
     pub const tf_embed_rows = elementwise.tf_embed_rows;

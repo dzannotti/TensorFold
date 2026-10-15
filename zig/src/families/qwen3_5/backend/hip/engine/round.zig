@@ -17,8 +17,9 @@ pub const Pick = enum(u32) { eager, replay, capture };
 /// What a verify hands back: the round's final rows, padding included.
 pub const Verified = struct { hidden: hip.ops.Tensor };
 
-/// One stream's rows of a round: tokens (the pending one, then drafts) from slot `pos` over its caches.
-pub const Rows = struct { caches: *state.Caches, pos: usize, tokens: []const u32 };
+/// One stream's rows of a round: tokens (the pending one, then drafts) from slot `pos` over its caches; for a tree,
+/// each row's parent row (row 0: -1), a row then keyed at its depth and seeing only its ancestors.
+pub const Rows = struct { caches: *state.Caches, pos: usize, tokens: []const u32, parents: ?[]const i32 = null };
 
 const Chosen = struct { pick: Pick, entry: ?*round_graphs.Entry, shape: plan.Shape };
 
@@ -128,17 +129,17 @@ pub fn verify(e: *Engine, rows: []const Rows, reqs: []const draw.Request, out: [
     var total: usize = 0;
     for (rows, 0..) |r, i| {
         if (r.pos + r.tokens.len > r.caches.covered()) return error.ContextFull;
-        st.wins[i] = .{ .desc = r.caches.desc.base(), .pos = r.pos, .tokens = r.tokens };
+        st.wins[i] = .{ .desc = r.caches.desc.base(), .pos = r.pos, .tokens = r.tokens, .parents = r.parents, .ring = r.caches.tap };
         total += r.tokens.len;
     }
     e.rounds.reset();
     const o = e.ops(&e.rounds);
     try win.kept(o, m, c.shape.rows, st.snaps);
     const l = plan.Layout.of(c.shape.rows, c.shape.slots, m.spec.n_layers);
-    st.buffer.fill(l, c.shape, st.wins[0..rows.len], st.scratch.desc.base(), st.snaps);
+    try st.buffer.fill(l, c.shape, st.wins[0..rows.len], st.scratch.desc.base(), st.snaps);
     st.layout = l;
     const p: hip.plan_ops.Plan = .{ .args = st.buffer.args(l), .rows = c.shape.rows, .slots = c.shape.slots };
-    const r: win.Round = .{ .plan = p, .tokens = st.buffer.dev.base() + 4 * l.tokens, .span = c.shape.span, .inputs = st.snaps };
+    const r: win.Round = .{ .plan = p, .tokens = st.buffer.dev.base() + 4 * l.tokens, .span = c.shape.span, .inputs = st.snaps, .taps = e.taps[0..e.n_taps], .rings = st.buffer.dev.base() + 4 * l.rings, .ring_rows = @import("engine.zig").tap_rows };
     const done = try run(e, c, r);
     e.graphs.rounds += 1;
     e.graphs.submit_ns += nowNs() - began;
@@ -237,9 +238,10 @@ fn agreed(e: *Engine, yes: bool) !bool {
     return true;
 }
 
-/// Marks slot `slot` of the last verify to keep its first `rows` rows at the next `flush`.
-pub fn mark(e: *Engine, slot: usize, rows: usize) void {
-    e.round.staging[slot] = @intCast(rows);
+/// Marks slot `slot` of the last verify to keep, at the next `flush`, the path to its row `last` - 1 (a chain's first
+/// `last` rows, a tree's ancestors of that row).
+pub fn mark(e: *Engine, slot: usize, last: usize) void {
+    e.round.staging[slot] = @intCast(last);
 }
 
 /// Keeps every marked slot of the last verify in one launch: linear states after the kept rows, last kept final rows.

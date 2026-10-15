@@ -98,3 +98,15 @@ pub fn gdnReplay(o: Ops, keep_counts: u64, p: Plan, key_heads: usize, value_head
 pub fn gather(o: Ops, srcs: u64, dst: u64, words: usize, rows: usize) Error!void {
     try (try launcher(o)).planGather(srcs, dst, words, rows, o.stream);
 }
+
+/// A tapped layer's residual rows into each row's slot's ring (see `launches.planTap`).
+pub fn tap(o: Ops, x: Tensor, p: Plan, rings: u64, width: usize, index: usize, taps: usize, ring_rows: usize) Error!void {
+    if (x.kind == .f32) return error.BadShape;
+    try (try launcher(o)).planTap(x.ptr, p, rings, width, index, taps, ring_rows, o.stream);
+}
+
+/// A prompt pass's tapped rows into a stream's ring (see `launches.tapRows`).
+pub fn tapRows(o: Ops, x: Tensor, ring: u64, from: usize, rows: usize, pos0: usize, width: usize, index: usize, taps: usize, ring_rows: usize) Error!void {
+    if (x.kind == .f32) return error.BadShape;
+    try (try launcher(o)).tapRows(x.ptr, ring, from, rows, pos0, width, index, taps, ring_rows, o.stream);
+}

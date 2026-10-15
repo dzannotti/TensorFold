@@ -11,7 +11,7 @@ __device__ __forceinline__ float wave_sum(float x) {
     return __shfl(x, 0, 32);
 }
 
-// Row r's keys (already rotated, fp32) and values (the activation kind) into its slot's pages at its position.
+// Row r's keys (already rotated, fp32) and values (the activation kind) into its slot's pages at its cache slot.
 __device__ void plan_kv_write_body(const float* keys, const void* values, int kind, int rows, int kv_heads, int d,
                                      PlanArgs plan, int layer) {
     const long long i = gid();
@@ -20,7 +20,7 @@ __device__ void plan_kv_write_body(const float* keys, const void* values, int ki
     const int h = static_cast<int>((i / d) % kv_heads);
     const int r = static_cast<int>(i / (static_cast<long long>(d) * kv_heads));
     const unsigned long long* desc = plan_desc(plan, plan.slot[r]);
-    const long long to = page_at(plan_pages(plan, desc), plan.pool, h, plan.pos[r], d) + j;
+    const long long to = page_at(plan_pages(plan, desc), plan.pool, h, plan_at(plan, r), d) + j;
     store(reinterpret_cast<void*>(desc[plan_first(layer)]), kind, to, keys[i]);
     static_cast<uint16_t*>(reinterpret_cast<void*>(desc[plan_second(layer)]))[to] = static_cast<const uint16_t*>(values)[i];
 }
@@ -44,9 +44,12 @@ __device__ void plan_score_body(const float* __restrict__ q, float* __restrict__
     const int key = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     float kreg[8] = {};
     if (key < visible) {
-        const unsigned long long* desc = plan_desc(plan, plan.slot[batch]);
+        const int slot = plan.slot[batch];
+        const unsigned long long* desc = plan_desc(plan, slot);
         const void* keys = reinterpret_cast<const void*>(desc[plan_first(layer)]);
-        const long long base = page_at(plan_pages(plan, desc), plan.pool, head0 / (heads / kv_heads), key, d);
+        // a tree row's keys past the stream's are its ancestors' slots, in the order its serial step sees them
+        const int at = plan_key(plan.anc[batch], plan_len(plan, slot), key);
+        const long long base = page_at(plan_pages(plan, desc), plan.pool, head0 / (heads / kv_heads), at, d);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int idx = lane + i * 32;
@@ -106,9 +109,14 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
     const unsigned* table = plan_pages(plan, desc);
     const int kv = head0 / (heads / kv_heads);
     float acc[kMaxGroup] = {};
+    // a tree row's keys past the stream's are its ancestors' slots: summed in the same order, a key at a time
+    const unsigned anc = plan.anc[batch];
+    const int len = plan_len(plan, plan.slot[batch]);
+    const int split = anc == 0 ? stop : min(max(len, key0), stop);
     // a page at a time: its table entry is read once, and the keys are summed in order
-    for (int key = key0; key < stop;) {
-        const int edge = min((key / kPageTokens + 1) * kPageTokens, stop);
+    int key = key0;
+    while (key < split) {
+        const int edge = min((key / kPageTokens + 1) * kPageTokens, split);
         const long long slot0 = page_row(table[key / kPageTokens], plan.pool, kv, 0, d) + lane;
         for (; key < edge; ++key) {
             const float value = load(values, KIND, slot0 + static_cast<long long>(key % kPageTokens) * d);
@@ -116,6 +124,13 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
             for (int g = 0; g < kMaxGroup; ++g) {
                 if (g < group) acc[g] += weights[g * 128 + key - key0] * value;
             }
+        }
+    }
+    for (; key < stop; ++key) {
+        const float value = load(values, KIND, page_at(table, plan.pool, kv, plan_key(anc, len, key), d) + lane);
+#pragma unroll
+        for (int g = 0; g < kMaxGroup; ++g) {
+            if (g < group) acc[g] += weights[g * 128 + key - key0] * value;
         }
     }
 #pragma unroll
@@ -128,6 +143,13 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
 __device__ __forceinline__ void copy_words(unsigned int* to, const unsigned int* from, int words) {
     const int stride = gridDim.x * blockDim.x;
     for (int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4; i < words; i += stride * 4) {
+        *reinterpret_cast<uint4*>(to + i) = *reinterpret_cast<const uint4*>(from + i);
+    }
+}
+
+// The words of a row copied by one block, four at a time.
+__device__ __forceinline__ void block_words(unsigned int* to, const unsigned int* from, int words) {
+    for (int i = threadIdx.x * 4; i < words; i += blockDim.x * 4) {
         *reinterpret_cast<uint4*>(to + i) = *reinterpret_cast<const uint4*>(from + i);
     }
 }
@@ -191,29 +213,75 @@ __global__ void __launch_bounds__(256) tf_plan_gather(const unsigned long long* 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x) to[i] = from[i];
 }
 
-// Each slot's conv window and last final row after its first keep[slot] rows (negative: none); states: tf_gdn_replay.
+// Each slot's conv window and last final row after the path to its row keep[slot] - 1 (negative: none): a chain's
+// first keep[slot] rows, a tree's that row's ancestors, their keys and values moved down; states: tf_gdn_replay.
 __global__ void __launch_bounds__(256)
-tf_plan_keep(PlanArgs plan, const int* keep, const unsigned int* hidden, int hidden_words, int channels, int taps, int layers) {
+tf_plan_keep(PlanArgs plan, const int* keep, const unsigned int* hidden, int hidden_words, int channels, int taps, int layers,
+             int kv_heads, int head_dim) {
     const int slot = blockIdx.z;
-    const int n = keep[slot];
-    if (n < 0) return;
+    const int last = keep[slot];
+    if (last < 0) return;
     const unsigned long long* desc = plan_desc(plan, slot);
     if (blockIdx.y == layers) {
-        const int row = plan.first[slot] + n - 1;
+        const int row = plan.first[slot] + last - 1;
         if (desc[1] != 0) copy_words(reinterpret_cast<unsigned int*>(desc[1]), hidden + static_cast<long long>(row) * hidden_words, hidden_words);
         return;
     }
     const int layer = blockIdx.y;
-    if (plan.count[slot] <= 1 || plan.snaps[2 * layer] == 0) return;
+    if (plan.count[slot] <= 1) return;
+    const unsigned path = plan.anc[plan.first[slot] + last - 1];
+    const int n = path == 0 ? last : __popc(path);
+    if (plan.snaps[2 * layer] == 0) {
+        // an attention layer: a tree path's keys and values to the slots after the stream's, in order (sources lie above)
+        if (path == 0 || path + 1 == 1u << n) return;
+        uint16_t* keys = reinterpret_cast<uint16_t*>(desc[plan_first(layer)]);
+        uint16_t* values = reinterpret_cast<uint16_t*>(desc[plan_second(layer)]);
+        const unsigned* table = plan_pages(plan, desc);
+        const int len = plan_len(plan, slot);
+        for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < kv_heads * head_dim; e += gridDim.x * blockDim.x) {
+            const int h = e / head_dim;
+            const int j = e % head_dim;
+            unsigned rest = path;
+            for (int i = 0; i < n; ++i) {
+                const int from = __ffs(rest) - 1;
+                rest &= rest - 1;
+                if (from == i) continue;
+                const long long src = page_at(table, plan.pool, h, len + from, head_dim) + j;
+                const long long dst = page_at(table, plan.pool, h, len + i, head_dim) + j;
+                keys[dst] = keys[src];
+                values[dst] = values[src];
+            }
+        }
+        return;
+    }
     float* window = reinterpret_cast<float*>(desc[plan_first(layer)]);
     const float* samples = reinterpret_cast<const float*>(plan.snaps[2 * layer]) + static_cast<long long>(plan.first[slot]) * channels;
-    // tap t takes position n - taps + t of the round's first window followed by its rows: ascending taps read ahead
+    // tap t takes the path's position n - taps + t after the round's first window: ascending taps read ahead
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
         for (int t = 0; t < taps; ++t) {
             const int at = n - taps + t;
-            window[static_cast<long long>(t) * channels + c] = at < 0 ? window[static_cast<long long>(taps + at) * channels + c] : samples[static_cast<long long>(at) * channels + c];
+            const int row = path == 0 ? at : nth_bit(path, at < 0 ? 0 : at);
+            window[static_cast<long long>(t) * channels + c] = at < 0 ? window[static_cast<long long>(taps + at) * channels + c] : samples[static_cast<long long>(row) * channels + c];
         }
     }
+}
+
+// A tapped layer's residual rows (16-bit) into each row's slot's ring (none: skipped) at its cache slot, a block a row.
+__global__ void __launch_bounds__(256)
+tf_plan_tap(const uint16_t* x, PlanArgs plan, const unsigned long long* rings, int width, int tap, int taps, int ring_rows) {
+    const int r = blockIdx.x;
+    const unsigned long long ring = rings[plan.slot[r]];
+    if (ring == 0) return;
+    const long long at = (static_cast<long long>(plan_at(plan, r) % ring_rows) * taps + tap) * width;
+    block_words(reinterpret_cast<unsigned int*>(reinterpret_cast<uint16_t*>(ring) + at), reinterpret_cast<const unsigned int*>(x + static_cast<long long>(r) * width), width / 2);
+}
+
+// A prompt pass's tapped residual rows from row `from` on into a stream's ring, the row at position p at p % ring_rows.
+__global__ void __launch_bounds__(256)
+tf_tap_rows(const uint16_t* x, uint16_t* ring, int from, long long pos0, int width, int tap, int taps, int ring_rows) {
+    const long long r = from + blockIdx.x;
+    const long long at = (((pos0 + r) % ring_rows) * taps + tap) * width;
+    block_words(reinterpret_cast<unsigned int*>(ring + at), reinterpret_cast<const unsigned int*>(x + r * width), width / 2);
 }
 
 }  // extern "C"

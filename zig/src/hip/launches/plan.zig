@@ -17,6 +17,7 @@ pub const PlanArgs = extern struct {
     count: u64 = 0,
     desc: u64 = 0,
     snaps: u64 = 0,
+    anc: u64 = 0,
     pages: u32 = 0,
     pool: u32 = 0,
 };
@@ -155,8 +156,9 @@ pub fn pagesGather(l: *const Launcher, pool: u64, table: u64, dst: u64, len: usi
     try l.flat(l.plan.page_gather, @intCast(len * kv_heads * d), s, &a);
 }
 
-/// What a keep reads: the plan, kept rows a slot (negative: unlisted), final rows, word counts (of four), layers.
-pub const Keep = struct { keep: u64, hidden: u64, hidden_words: usize, channels: usize, taps: usize, layers: usize };
+/// What a keep reads: the plan, a slot's last kept row + 1 (negative: unlisted), final rows, word counts (of four),
+/// layers, and the attention's heads a tree path's keys and values move with.
+pub const Keep = struct { keep: u64, hidden: u64, hidden_words: usize, channels: usize, taps: usize, layers: usize, kv_heads: usize = 0, head_dim: usize = 0 };
 
 /// Keeps the listed slots' rows: conv windows from the round's first window and the kept rows' inputs, final rows.
 pub fn planKeep(l: *const Launcher, p: PlanRef, k: Keep, s: S) Error!void {
@@ -169,6 +171,8 @@ pub fn planKeep(l: *const Launcher, p: PlanRef, k: Keep, s: S) Error!void {
     try a.add(@as(c_int, @intCast(k.channels)));
     try a.add(@as(c_int, @intCast(k.taps)));
     try a.add(@as(c_int, @intCast(k.layers)));
+    try a.add(@as(c_int, @intCast(k.kv_heads)));
+    try a.add(@as(c_int, @intCast(k.head_dim)));
     try l.go(l.plan.keep, dim(64, k.layers + 1, p.slots), dim(256, 1, 1), 0, s, &a);
 }
 
@@ -185,4 +189,33 @@ pub fn planGdnReplay(l: *const Launcher, keep: u64, p: PlanRef, key_heads: usize
     try a.add(@as(c_int, @intCast(p.slots)));
     const wide: usize = if (dk == 128) 0 else 1;
     try l.go(l.plan.gdn_replay[wide], dim(@divExact(dv, 8), value_heads, p.slots * layers), dim(32, 8, 1), 0, s, &a);
+}
+
+/// A tapped layer's residual rows (16-bit, `width` wide) into each row's slot's ring (`rings`: a device u64 a slot).
+pub fn planTap(l: *const Launcher, x: u64, p: PlanRef, rings: u64, width: usize, tap: usize, taps: usize, ring_rows: usize, s: S) Error!void {
+    if (width % 8 != 0) return invalid("planned tap");
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(p.args);
+    try a.add(rings);
+    try a.add(@as(c_int, @intCast(width)));
+    try a.add(@as(c_int, @intCast(tap)));
+    try a.add(@as(c_int, @intCast(taps)));
+    try a.add(@as(c_int, @intCast(ring_rows)));
+    try l.go(l.plan.tap, dim(p.rows, 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// A prompt pass's tapped rows `from` .. `rows` (16-bit) into a stream's ring, position pos0 + r at its ring row.
+pub fn tapRows(l: *const Launcher, x: u64, ring: u64, from: usize, rows: usize, pos0: usize, width: usize, tap: usize, taps: usize, ring_rows: usize, s: S) Error!void {
+    if (width % 8 != 0 or rows <= from) return invalid("tapped rows");
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(ring);
+    try a.add(@as(c_int, @intCast(from)));
+    try a.add(@as(c_longlong, @intCast(pos0)));
+    try a.add(@as(c_int, @intCast(width)));
+    try a.add(@as(c_int, @intCast(tap)));
+    try a.add(@as(c_int, @intCast(taps)));
+    try a.add(@as(c_int, @intCast(ring_rows)));
+    try l.go(l.plan.tap_rows, dim(rows - from, 1, 1), dim(256, 1, 1), 0, s, &a);
 }

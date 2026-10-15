@@ -12,6 +12,7 @@ const prefix = @import("prefix.zig");
 const hip_prefix = @import("hip_prefix.zig");
 const radix = @import("engine_api").prompt_radix;
 const pages = @import("../forward/pages.zig");
+const window_plan = @import("../forward/plan.zig");
 const worker = @import("worker.zig");
 
 const be = lanes.backend;
@@ -24,6 +25,12 @@ const Fill = struct { at: usize, stops: [16]u32, count: usize, next: usize };
 
 /// Most chains one draft request runs (the head batches as many as the engine has rows, up to this).
 const max_jobs = mtp.max_chains;
+
+/// Rows a stream's tap ring holds: `Features.offset` is the first row's position, the row at p at ring row p % tap_rows.
+pub const tap_rows = @import("engine.zig").tap_rows;
+
+/// A window's rows in order, the path a chain keeps whole.
+const all_rows: [Hip.max_window]u32 = std.simd.iota(u32, Hip.max_window);
 
 pub const Lane = struct {
     caches: state.Caches,
@@ -38,8 +45,12 @@ pub const Lane = struct {
     id: u32 = 0,
     /// The prompt pass in progress, a chunk a call (null once it is in).
     fill: ?Fill = null,
-    /// The last verify's slot and rows: kept whole unless keep drops some first.
-    pending: ?struct { window: usize, rows: usize } = null,
+    /// The last verify's slot and rows, and a tree's parents: a chain is kept whole unless keep drops some first.
+    pending: ?struct { window: usize, rows: usize, tree: bool = false, parents: [Hip.max_window]i8 = undefined } = null,
+    /// A drafter's tap ring (`prepare_features`): the tapped layers' residual rows by position, `tap_rows` of them.
+    taps: ?hip.DeviceBuffer = null,
+    /// Positions the newest forward wrote up to: the ring holds them until the next one, whatever a keep lands.
+    written: usize = 0,
     /// A structured reply's prompt row, kept for its masked first draw (null for the others).
     first_row: ?[]u16 = null,
 };
@@ -165,6 +176,8 @@ pub const Hip = struct {
             .keep = keepFn,
             .draft = draftFn,
             .tree = heldFn,
+            .prepare_features = prepareFeaturesFn,
+            .features = featuresFn,
             .release = releaseFn,
         } };
     }
@@ -199,6 +212,7 @@ pub const Hip = struct {
         h.e.drain();
         l.caches.deinit(h.gpa);
         l.hidden.free();
+        if (l.taps) |*t| t.free();
         if (l.first_row) |row| h.gpa.free(row);
         h.gpa.destroy(l);
     }
@@ -227,18 +241,25 @@ pub const Hip = struct {
         return at;
     }
 
-    /// A verify the round loop did not trim keeps every row (the core keeps only on drops).
+    /// A verify the round loop did not trim keeps every row (the core keeps only on drops; a tree is always kept).
     fn settle(h: *Hip, lane: *Lane) !void {
         const p = lane.pending orelse return;
-        try h.mark(lane, p.rows);
+        if (p.tree) return error.TreeNotKept;
+        try h.mark(lane, all_rows[0..p.rows]);
     }
 
-    /// Marks the pending window's first `rows` rows kept (the stream's length moves on); `flush` lands them.
-    fn mark(h: *Hip, lane: *Lane, rows: usize) !void {
+    /// Marks the pending window's `path` kept (the stream's length moves on by its rows); `flush` lands them.
+    fn mark(h: *Hip, lane: *Lane, path: []const u32) !void {
         const p = lane.pending.?;
-        try h.marked.append(h.gpa, .{ lane.id, @intCast(rows) });
-        h.e.keep(p.window, rows);
-        lane.len += rows;
+        if (path.len == 0 or path.len > p.rows or path[0] != 0) return error.BadPath;
+        for (path[1..], path[0 .. path.len - 1]) |r, before| {
+            const parent: i64 = if (r >= p.rows) -2 else if (p.tree) p.parents[r] else @as(i64, r) - 1;
+            if (parent != before) return error.BadPath;
+        }
+        const last = path[path.len - 1] + 1;
+        try h.marked.append(h.gpa, .{ lane.id, last });
+        h.e.keep(p.window, last);
+        lane.len += path.len;
         lane.pending = null;
     }
 
@@ -291,8 +312,11 @@ pub const Hip = struct {
             var hidden = try hip.DeviceBuffer.alloc(&h.e.driver, h.e.model().spec.hidden * h.e.model().act.size());
             errdefer hidden.free();
             try caches.setHidden(hidden.base());
+            var taps: ?hip.DeviceBuffer = if (h.e.n_taps > 0) try hip.DeviceBuffer.alloc(&h.e.driver, h.e.tapBytes()) else null;
+            errdefer if (taps) |*t| t.free();
+            if (taps) |t| caches.tap = t.base();
             const l = try h.gpa.create(Lane);
-            l.* = .{ .caches = caches, .hidden = hidden, .len = prompt.len };
+            l.* = .{ .caches = caches, .hidden = hidden, .len = prompt.len, .taps = taps };
             break :blk l;
         };
         errdefer h.free(lane);
@@ -349,10 +373,12 @@ pub const Hip = struct {
             const keep = if (s.grammar != null) lane.first_row else null;
             _ = h.take(try h.e.prefill(&lane.caches, prompt, f.at, lane.hidden, .{ .sampling = sampling(s), .position = prompt.len, .keep = keep }, null));
             lane.fill = null;
+            lane.written = prompt.len;
             return true;
         }
         try h.e.advance(&lane.caches, prompt, f.at, to, null);
         f.at = to;
+        lane.written = to;
         if (f.next < f.count and to == f.stops[f.next]) {
             var owner: hip_prefix.Owner = .{ .caches = &lane.caches, .id = lane.id };
             h.prefix.keep(&owner, prompt, to) catch |err| std.log.warn("prefix not kept: {s}", .{@errorName(err)});
@@ -402,7 +428,8 @@ pub const Hip = struct {
         return h.drawn[handle % ring];
     }
 
-    /// Each stream's window from its kept length: the pending token, then the host's drafts; one forward for all.
+    /// Each stream's window from its kept length: the pending token, then the host's drafts (a tree's rows each keyed at
+    /// its depth); one forward for all.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const h = of(ptr);
         const began = costs.nowNs();
@@ -417,20 +444,28 @@ pub const Hip = struct {
         }
         var rows: [64]Engine.Rows = undefined;
         var tokens: [64][16]u32 = undefined;
+        var trees: [64]bool = undefined;
         if (windows.len > rows.len) return error.WindowTooWide;
         for (windows, 0..) |w, i| {
-            if (w.parents != null) return error.TreesNotBuilt;
             const lane = h.lanes.get(w.stream) orelse return error.UnknownStream;
             if (w.held > lane.held_n or (w.held > 0 and w.tokens.len > 0)) return error.NoHeldDrafts;
             const n = w.rows();
             if (n > tokens[i].len) return error.WindowTooWide;
-            for (w.positions, 0..) |p, r| if (p != lane.len + 1 + r) {
+            trees[i] = if (w.parents) |ps| !window_plan.isChain(ps) else false;
+            // the other ranks are told tokens alone
+            if (trees[i] and h.link != null) return error.TreesNotBuilt;
+            var anc: [max_window]u32 = undefined;
+            if (trees[i]) {
+                if (w.parents.?.len != n) return error.BadParents;
+                try window_plan.ancestors(w.parents.?, &anc);
+            }
+            for (w.positions, 0..) |p, r| if (p != lane.len + 1 + if (trees[i]) @popCount(anc[r]) - 1 else r) {
                 std.log.err("row {d} keyed at {d}, the stream holds {d} slots", .{ r, p, lane.len });
                 return error.PositionMismatch;
             };
             tokens[i][0] = w.pending;
             if (w.held > 0) @memcpy(tokens[i][1..n], lane.held[0..w.held]) else @memcpy(tokens[i][1..n], w.tokens);
-            rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = tokens[i][0..n] };
+            rows[i] = .{ .caches = &lane.caches, .pos = lane.len, .tokens = tokens[i][0..n], .parents = if (trees[i]) w.parents else null };
             h.order[i] = w.stream;
         }
         var reqs: [256]draw.Request = undefined;
@@ -463,24 +498,47 @@ pub const Hip = struct {
             const lane = h.lanes.get(w.stream).?;
             @memcpy(o.drafts, if (w.held > 0) lane.held[0..w.held] else w.tokens);
             lane.held_n = 0;
-            lane.pending = .{ .window = i, .rows = w.rows() };
+            lane.pending = .{ .window = i, .rows = w.rows(), .tree = trees[i] };
+            if (trees[i]) for (w.parents.?, 0..) |p, r| {
+                lane.pending.?.parents[r] = @intCast(p);
+            };
+            lane.written = lane.len + w.rows();
             at += w.rows();
         }
     }
 
-    /// Keep each stream's accepted prefix: lengths, and the linear states of its last kept row.
+    /// Keep each stream's accepted path (a prefix, or a tree's root-to-node path): lengths, the path's keys and values
+    /// at the next slots, and the linear states of its last row.
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const h = of(ptr);
         const began = costs.nowNs();
         defer h.timed(1, began);
         for (windows, paths) |w, path| {
             const lane = h.lanes.get(w.stream) orelse return error.UnknownStream;
-            for (path, 0..) |r, j| if (r != j) return error.TreesNotBuilt;
             // the draft request of the same round may have kept these rows already
             if (lane.pending == null) continue;
-            try h.mark(lane, path.len);
+            try h.mark(lane, path);
         }
         try h.flush();
+    }
+
+    /// The drafter's layers: every stream begun after this holds a tap ring the forwards write them into.
+    fn prepareFeaturesFn(ptr: *anyopaque, taps: []const u32) anyerror!void {
+        const h = of(ptr);
+        if (h.lanes.count() != 0) return error.TapsAfterStreams;
+        try h.e.setTaps(taps);
+    }
+
+    /// Rows [start, start + count) of the stream's tap ring, by position (a tree's window rows at start + row).
+    fn featuresFn(ptr: *anyopaque, s: *lanes.Stream, taps: []const u32, start: u64, count: u32) anyerror!be.Features {
+        const h = of(ptr);
+        const e = h.e;
+        if (!std.mem.eql(u32, taps, e.taps[0..e.n_taps])) return error.TapsMismatch;
+        const lane = h.lanes.get(s) orelse return error.UnknownStream;
+        const buf = lane.taps orelse return error.NoTaps;
+        // a long prompt asks for more rows than the ring keeps; the drafter reads only its window of the newest
+        if (count == 0 or start + count > lane.written or start + count <= lane.written -| tap_rows) return error.RowsNotHeld;
+        return .{ .buffer = buf.base(), .offset = start, .rows = count, .row_bytes = @intCast(e.n_taps * e.model().spec.hidden * e.act.size()), .space = .device, .device = e.o.device, .dtype = if (e.act == .bf16) .bf16 else .f16 };
     }
 
     /// The head drafts `depth` from each stream's last kept row and its pending token, one head forward a step for all.
@@ -497,7 +555,7 @@ pub const Hip = struct {
         for (requests) |r| {
             const lane = h.lanes.get(r.stream) orelse return error.UnknownStream;
             if (lane.pending != null) {
-                if (r.rows) |kept| try h.mark(lane, kept.len) else try h.settle(lane);
+                if (r.rows) |kept| try h.mark(lane, kept) else try h.settle(lane);
             }
         }
         try h.flush();

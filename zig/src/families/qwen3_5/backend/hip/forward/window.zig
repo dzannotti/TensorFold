@@ -10,8 +10,9 @@ const Ops = hip.ops.Ops;
 const Tensor = hip.ops.Tensor;
 const pops = hip.plan_ops;
 
-/// A round's launches: the device plan, its token ids, the keys the attention walk covers, each layer's kept inputs.
-pub const Round = struct { plan: pops.Plan, tokens: u64, span: usize, inputs: []const [2]u64 };
+/// A round's launches: the device plan, its token ids, the keys the attention walk covers, each layer's kept inputs,
+/// and a drafter's tapped layers with each slot's tap ring of `ring_rows` rows (none: no tap launches).
+pub const Round = struct { plan: pops.Plan, tokens: u64, span: usize, inputs: []const [2]u64, taps: []const u32 = &.{}, rings: u64 = 0, ring_rows: usize = 0 };
 
 /// Whether this build and model run lane rounds: the merged decode launches, and shapes the plan kernels take.
 pub fn supported(o: Ops, m: *const view.Model) bool {
@@ -84,6 +85,7 @@ pub fn forward(ops: Ops, m: *const view.Model, r: Round, trace: ?fwd.Trace) fwd.
                 }
             },
         }
+        for (r.taps, 0..) |t, i| if (t == index) try pops.tap(o, x, r.plan, r.rings, s.hidden, i, r.taps.len, r.ring_rows);
         if (trace) |t| t.layer(t.ctx, index, x, total) catch return error.HipFailed;
     }
     return out;
@@ -96,7 +98,8 @@ fn inputNorm(layer: view.Layer) u64 {
     };
 }
 
-/// Keeps the slots `counts` lists (negative: none): linear layers replay their kept rows, `hidden` gets the last.
+/// Keeps the paths `counts` names, each by its last row + 1 (negative: none): linear layers replay the path's rows,
+/// a tree's keys and values move down to the stream's next slots, `hidden` gets the last.
 pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64) hip.ops.Error!void {
     const s = m.spec;
     try pops.keep(o, p, .{
@@ -106,6 +109,8 @@ pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64
         .channels = view.convChannels(s),
         .taps = s.conv - 1,
         .layers = s.n_layers,
+        .kv_heads = s.kv_heads,
+        .head_dim = s.head_dim,
     });
     try pops.gdnReplay(o, counts, p, s.key_heads, s.value_heads, s.key_dim, s.value_dim, s.n_layers);
 }
