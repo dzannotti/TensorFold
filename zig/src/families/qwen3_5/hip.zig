@@ -25,6 +25,8 @@ pub const prefix = @import("backend/hip/engine/prefix.zig");
 pub const radix = @import("engine_api").prompt_radix;
 pub const hip_lanes = @import("backend/hip/engine/hip_lanes.zig");
 pub const mtp = @import("backend/hip/engine/mtp.zig");
+/// The DFlash2 drafter --drafter loads beside the dense checkpoints.
+pub const draft = @import("backend/hip/draft/draft.zig");
 pub const worker = @import("backend/hip/engine/worker.zig");
 pub const slicing = @import("weights/slicing.zig");
 pub const reduce = @import("hip").reduce;
@@ -49,8 +51,12 @@ test {
     _ = pages;
     _ = plan;
     _ = slicing;
+    _ = @import("backend/hip/draft/config.zig");
+    _ = @import("backend/hip/draft/weights.zig");
+    _ = draft;
     // the engine and its workers compile on a host with no GPU
     @import("std").testing.refAllDecls(hip_lanes.Hip);
     @import("std").testing.refAllDecls(worker.Worker);
     @import("std").testing.refAllDecls(engine.Engine);
+    @import("std").testing.refAllDecls(draft.Draft);
 }

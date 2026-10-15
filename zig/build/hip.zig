@@ -82,8 +82,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     kernel_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
     kernel_module.addImport("hip_kernels", objects);
     kernel_module.addImport("core", coreModule(b, target));
-    const kernel_filter = b.option([]const u8, "hip-test-filter", "Run only the GPU kernel tests whose names contain this");
-    const kernel_test = b.addTest(.{ .root_module = kernel_module, .filters = if (kernel_filter) |f| b.dupeStrings(&.{f}) else &.{} });
+    const kernel_filters = b.option([]const []const u8, "hip-test-filter", "Run only the GPU kernel tests whose names hold this") orelse &.{};
+    const kernel_test = b.addTest(.{ .root_module = kernel_module, .filters = kernel_filters });
     b.step("hip-kernel-build", "Compile the model-free kernels and their GPU tests without running them").dependOn(&kernel_test.step);
     b.step("hip-kernel-test", "Every model-free kernel against its host reference on the GPU").dependOn(&b.addRunArtifact(kernel_test).step);
     const stub_kernels = b.createModule(.{ .root_source_file = b.addWriteFiles().add("kernels.zig", stub) });
@@ -117,7 +117,7 @@ fn checksExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "hip", .module = e.hip }, .{ .name = "qwen3_5", .module = e.family }, .{ .name = "lanes", .module = e.lanes }, .{ .name = "npy", .module = b.createModule(.{ .root_source_file = b.path("zig/src/core/npy.zig"), .target = target, .optimize = optimize }) } },
+        .imports = &.{ .{ .name = "hip", .module = e.hip }, .{ .name = "qwen3_5", .module = e.family }, .{ .name = "lanes", .module = e.lanes }, .{ .name = "tokenizer", .module = e.hip.import_table.get("core").?.import_table.get("tokenizer").? }, .{ .name = "npy", .module = b.createModule(.{ .root_source_file = b.path("zig/src/core/npy.zig"), .target = target, .optimize = optimize }) } },
     }) });
 }
 
@@ -185,7 +185,7 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget, e: Engine, build_opti
 }
 
 /// The model-free kernels' source groups, in zig/src/hip/kernels.zig's Group order.
-const groups = [_][]const u8{ "ops/ops.hip", "ops/act.hip", "attention/attention.hip", "recurrence/gated_delta.hip", "attention/prefill.hip", "decode/decode.hip", "decode/plan.hip", "tiles/dot2_tiles.hip", "tiles/dot2.hip", "flashnext/flashnext.hip" };
+const groups = [_][]const u8{ "ops/ops.hip", "ops/act.hip", "attention/attention.hip", "recurrence/gated_delta.hip", "attention/prefill.hip", "decode/decode.hip", "decode/plan.hip", "tiles/dot2_tiles.hip", "tiles/dot2.hip", "flashnext/flashnext.hip", "draft/draft.hip" };
 
 /// What the group sources include, so an edit to one rebuilds them.
 const headers = [_][]const u8{
@@ -202,7 +202,7 @@ const headers = [_][]const u8{
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
 
-const stub = "pub const arch = \"\";\npub const images: [10][]align(8) const u8 = @splat(&.{});\n";
+const stub = "pub const arch = \"\";\npub const images: [11][]align(8) const u8 = @splat(&.{});\n";
 
 /// One code object a group for `arch`, built with the caps table's instruction switches, as the `hip_kernels` module.
 fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, arch: []const u8) *std.Build.Module {
