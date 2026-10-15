@@ -93,7 +93,7 @@ const stream_rows = [_]u8{ 1, 2, 4 }; // its row counts: columns * rows <= 16
 const stream_waves = 4; // kStreamWaves
 const streams_wanted = 3000; // kStreamWavesWanted
 const stream_code_words = 32; // kStreamCodeWords
-const verify_tiles = [_]c_int{ 1, 2, 4 }; // VerifyShape's MT: 16-row tiles a block (8 spills to scratch)
+const verify_tiles = [_]c_int{ 1, 2 }; // VerifyShape's MT: 16-row tiles a block (past 32 rows, more 32-row blocks beat 4 and 8)
 const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
 const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for at most 6144 columns of at most 8192 K, else 4 (the bits are the same)
 
@@ -134,7 +134,7 @@ pub const Kernels = struct {
     pairs: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     /// Off keeps the decode tiles before the stream tile (the policy's reference switch).
     stream_on: bool,
-    /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2, 4); gfx11 only.
+    /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2); gfx11 only.
     verify: [bit_widths.len][verify_groups.len][verify_waves.len][verify_tiles.len]Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
@@ -355,7 +355,7 @@ pub const Kernels = struct {
     /// The WMMA verify tile on `total_n` columns (a group's sum, counted off side by side): every row in one pass.
     pub fn verifyGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
         const b = bitIndex(a.bits) orelse return refuse("bits");
-        const t: usize = if (a.m <= 16) 0 else if (a.m <= 32) 1 else 2;
+        const t: usize = if (a.m <= 16) 0 else 1;
         const wi: usize = if (total_n <= 6144 and a.k <= 8192) 0 else 1;
         const cols: c_int = 16 * verify_waves[wi];
         var sides = sides_in;

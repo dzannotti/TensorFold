@@ -300,8 +300,7 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
 #if TF_MATRIX
 #define TF_VERIFY_W(BITS, G, WV)                                                     \
     template __global__ void affine_wmma_verify<BITS, 1, G, WV>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 2, G, WV>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 4, G, WV>(Affine, StreamSides);
+    template __global__ void affine_wmma_verify<BITS, 2, G, WV>(Affine, StreamSides);
 #define TF_VERIFY_G(BITS, G) TF_VERIFY_W(BITS, G, 2) TF_VERIFY_W(BITS, G, 4)
 #define TF_VERIFY(BITS) TF_VERIFY_G(BITS, 32) TF_VERIFY_G(BITS, 64) TF_VERIFY_G(BITS, 128)
 TF_VERIFY(2)

@@ -52,7 +52,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void
     const e = try qwen35.engine.Engine.open(gpa, io, args[0], .{ .capacity = 1024, .prompt_rows = 1024, .streams = 2, .batch_rows = 64, .policy = (try @import("group.zig").resolve("", 0)).policy });
     defer e.deinit();
     const t0 = std.Io.Clock.awake.now(io);
-    const d = try Draft.init(gpa, io, e, args[1], bits, cap);
+    const d = try Draft.init(gpa, io, e, args[1], bits, cap + 1); // the acceptance pass keeps its stream open
     defer d.deinit();
     std.debug.print("RESULT drafter loaded in {d:.1} s ({d}-bit), hold {d:.2} ms wall / {d:.2} ms GPU, 16-lane tree {d:.2} ms, step_ms {d:.3}\n", .{ @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9, bits, d.step_ms * @as(f64, @floatFromInt(d.c.block - 1)), d.gpu_ms, d.tree_ms, d.step_ms });
     const dr = d.drafter();

@@ -17,7 +17,7 @@ const reps = 5;
 const window = 4;
 const at = 16;
 /// The total rows timed in shared forwards.
-pub const shared_rows = [_]u32{ 2, 4, 8, 12, 16 };
+pub const shared_rows = [_]u32{ 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128 };
 pub const most_streams = 8;
 
 pub const Costs = struct {
@@ -39,9 +39,9 @@ const Rig = struct {
     e: *Engine,
     caches: [most_streams]state.Caches = undefined,
     made: usize = 0,
-    tokens: [64]u32 = @splat(1),
-    reqs: [64]draw.Request = undefined,
-    out: [64]u32 = undefined,
+    tokens: [128]u32 = @splat(1),
+    reqs: [128]draw.Request = undefined,
+    out: [128]u32 = undefined,
 
     fn deinit(r: *Rig) void {
         r.e.drain();
@@ -73,7 +73,7 @@ pub fn measure(gpa: std.mem.Allocator, e: *Engine, head: ?*mtp.Head, out: *Costs
     defer r.deinit();
     // the rig runs before any request, on the caches of streams the memory plan holds and none uses yet
     const streams = @min(most_streams, e.o.streams);
-    while (r.made < streams) : (r.made += 1) r.caches[r.made] = try e.newCaches(at + 2 * window * 4);
+    while (r.made < streams) : (r.made += 1) r.caches[r.made] = try e.newCaches(at + 2 * 16 * 4);
     out.windows = 0;
     for (1..out.window.len + 1) |w| {
         if (w > e.o.batch_rows) break;
@@ -83,14 +83,15 @@ pub fn measure(gpa: std.mem.Allocator, e: *Engine, head: ?*mtp.Head, out: *Costs
     out.shareds = 0;
     for (shared_rows) |total| {
         if (total > e.o.batch_rows) break;
+        // the rows spread over as many streams as take them, each window at most the backend's widest
         var widths: [most_streams]usize = undefined;
-        var n: usize = 0;
+        const n: usize = @min(streams, total);
         var left: usize = total;
-        while (left > 0 and n < streams) : (n += 1) {
-            widths[n] = @min(window, left);
-            left -= widths[n];
+        for (0..n) |i| {
+            widths[i] = left / (n - i);
+            left -= widths[i];
         }
-        if (left > 0) continue;
+        if (widths[0] > 16 or widths[n - 1] > 16) continue;
         out.shared[out.shareds] = .{ .width = total, .ms = try r.time(widths[0..n]) };
         out.shareds += 1;
     }
