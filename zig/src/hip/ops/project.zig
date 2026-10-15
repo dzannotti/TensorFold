@@ -90,6 +90,7 @@ fn shapeOf(o: Ops, x: Tensor, w: Affine, m: usize) registry.Shape {
         },
         .x_aligned = x.ptr % 16 == 0,
         .words_aligned = w.words % affine_launch.Kernels.gemmAlign(w.bits) == 0,
+        .terms_aligned = (w.scale | w.bias) % 16 == 0,
         .round = o.window,
     };
 }
@@ -145,7 +146,9 @@ pub fn affineGroup(o: Ops, x: Tensor, ws: []const Affine, m: usize, outs: []Tens
     const kind = ws[0].tables.table();
     var widest_w = ws[0];
     widest_w.n = widest;
-    if (z.affine.choose(.group, .decode, shapeOf(o, x, widest_w, m)) == null) return false;
+    var shape = shapeOf(o, x, widest_w, m);
+    for (ws) |w| shape.terms_aligned = shape.terms_aligned and (w.scale | w.bias) % 16 == 0;
+    if (z.affine.choose(.group, .decode, shape) == null) return false;
     var sides: [4]affine_launch.Side = undefined;
     for (ws, outs[0..ws.len], sides[0..ws.len]) |w, *out, *side| {
         out.* = .{ .ptr = try o.arena.take(m * w.n * 2), .kind = x.kind };

@@ -93,6 +93,9 @@ const stream_rows = [_]u8{ 1, 2, 4 }; // its row counts: columns * rows <= 16
 const stream_waves = 4; // kStreamWaves
 const streams_wanted = 3000; // kStreamWavesWanted
 const stream_code_words = 32; // kStreamCodeWords
+const verify_tiles = [_]c_int{ 1, 2, 4 }; // VerifyShape's MT: 16-row tiles a block (8 spills to scratch)
+const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
+const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for at most 6144 columns of at most 8192 K, else 4 (the bits are the same)
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -131,6 +134,8 @@ pub const Kernels = struct {
     pairs: [bit_widths.len][stream_rows.len][stream_cbs.len]?Function,
     /// Off keeps the decode tiles before the stream tile (the policy's reference switch).
     stream_on: bool,
+    /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2, 4); gfx11 only.
+    verify: [bit_widths.len][verify_groups.len][verify_waves.len][verify_tiles.len]Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -168,10 +173,13 @@ pub const Kernels = struct {
     }
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(1_000_000);
         inline for (bit_widths, 0..) |bits, b| {
             k.block[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_dot2_blockINS0_{s}ELi{d}EEEvNS0_6AffineE", .{ dot, bits }));
             if (k.matrix) k.wmma_gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm16affine_wmma_gemmILi{d}EEEvNS0_6AffineE", .{bits}));
+            if (k.matrix) inline for (verify_groups, 0..) |g, gi| inline for (verify_waves, 0..) |wv, wi| inline for (verify_tiles, 0..) |mt, i| {
+                k.verify[b][gi][wi][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_wmma_verifyILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, mt, g, wv }));
+            };
             k.gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_gemm_blockINS0_{s}ELi{d}E{s}EEvNS0_6AffineE", .{ dot, bits, shape }));
             inline for (kp_tiles, 0..) |t, i| {
                 k.kp[b][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm14affine_gemm_kpINS0_{s}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELb{d}EEEvNS0_6AffineE", .{ dot, bits, t.cb, t.r, t.waves, t.rb, @intFromBool(t.loop) }));
@@ -268,11 +276,12 @@ pub const Kernels = struct {
         return k.reg.select(k.env(), .mlx, op, path, shape);
     }
 
-    /// The costs of the GPU's generation: RDNA2's, or the gfx11 ones (RDNA4 takes them for its dot2 tiles).
-    fn tableFor(caps: Caps) *const tuning.Table {
+    /// The costs of the GPU's generation: RDNA2's, RDNA3.5's, or the gfx11 ones (RDNA4 takes them for its dot2 tiles).
+    pub fn tableFor(caps: Caps) *const tuning.Table {
         return switch (caps.generation) {
             .rdna2 => &tuning.gfx1030,
-            .rdna3, .rdna3_5, .rdna4 => &tuning.gfx1100,
+            .rdna3_5 => &tuning.gfx1151,
+            .rdna3, .rdna4 => &tuning.gfx1100,
         };
     }
 
@@ -294,6 +303,7 @@ pub const Kernels = struct {
             .tables_alike = a.scale.kind == a.bias.kind,
             .x_aligned = a.x % 16 == 0,
             .words_aligned = a.words % gemmAlign(a.bits) == 0,
+            .terms_aligned = (a.scale.p | a.bias.p) % 16 == 0,
             .items = if (a.route.items != 0) @intCast(@max(items, 0)) else 0,
         };
     }
@@ -340,6 +350,53 @@ pub const Kernels = struct {
         }));
         const f = (if (sides.pair_cols > 0) k.pairs[b][ri][pick] else k.stream[b][ri][pick]).?;
         try go(r, f, .{ .x = blocks, .y = cdiv(a.m, stream_rows[ri]), .z = @intCast(items) }, .{ .x = 32 * stream_waves }, s, &args);
+    }
+
+    /// The WMMA verify tile on `total_n` columns (a group's sum, counted off side by side): every row in one pass.
+    pub fn verifyGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
+        const b = bitIndex(a.bits) orelse return refuse("bits");
+        const t: usize = if (a.m <= 16) 0 else if (a.m <= 32) 1 else 2;
+        const wi: usize = if (total_n <= 6144 and a.k <= 8192) 0 else 1;
+        const cols: c_int = 16 * verify_waves[wi];
+        var sides = sides_in;
+        var blocks: c_uint = cdiv(total_n, cols);
+        if (sides.count > 0) {
+            blocks = 0;
+            for (0..@intCast(sides.count)) |i| {
+                sides.first[i] = @intCast(blocks);
+                blocks += cdiv(sides.n[i], cols);
+            }
+            sides.first[@intCast(sides.count)] = @intCast(blocks);
+        }
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(sides);
+        const gi: usize = switch (a.group) {
+            32 => 0,
+            64 => 1,
+            128 => 2,
+            else => return refuse("group"),
+        };
+        try go(r, k.verify[b][gi][wi][t], .{ .x = blocks, .y = cdiv(a.m, 16 * verify_tiles[t]) }, .{ .x = @intCast(cols * 2) }, s, &args);
+    }
+
+    /// The verify tile over a group: the sides' addresses and widths in one launch.
+    pub fn verifyGroupGo(k: *const Kernels, r: *const runtime.Runtime, arg: Arg, group: []const Side, out_half: bool, s: abi.Stream) Error!void {
+        var a = arg;
+        var sides: StreamSides = .{ .count = @intCast(group.len), .out_half = @intFromBool(out_half) };
+        for (group, 0..) |side, i| {
+            sides.words[i] = side.words;
+            sides.scale[i] = side.scale;
+            sides.bias[i] = side.bias;
+            sides.out[i] = side.out;
+            sides.n[i] = side.n;
+        }
+        var total: c_int = 0;
+        for (group) |side| total += side.n;
+        a.words = group[0].words;
+        a.scale.p = group[0].scale;
+        a.bias.p = group[0].bias;
+        try k.verifyGo(r, a, sides, total, s);
     }
 
     /// One row on the row tile: a lane owns a group, a wave reads a column's row in one run.
@@ -485,6 +542,7 @@ pub const Kernels = struct {
         for (group) |side| a.n = @max(a.n, side.n);
         var shape = shapeOf(a, 1);
         shape.round = true;
+        for (group) |side| shape.terms_aligned = shape.terms_aligned and (side.scale | side.bias) % 16 == 0;
         const e = k.choose(.group, .decode, shape) orelse return refuse("group shape");
         try e.launch(k, .{ .r = r, .s = s, .arg = a, .sides = group, .out_half = out_half });
     }

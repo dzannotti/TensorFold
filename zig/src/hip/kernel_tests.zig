@@ -26,6 +26,7 @@ test {
     _ = @import("kernel_tests/tp.zig");
     _ = @import("kernel_tests/affine/affine.zig");
     _ = @import("kernel_tests/affine/rows.zig");
+    _ = @import("kernel_tests/affine/bench.zig");
     _ = @import("kernel_tests/graph_split.zig");
     _ = @import("kernel_tests/flashnext.zig");
     _ = @import("kernel_tests/flashnext_attn.zig");

@@ -40,6 +40,10 @@ fn matrixOn(e: Env) bool {
     return e.matrix and e.matrix_on and e.gemm_on;
 }
 
+fn verifyOn(e: Env) bool {
+    return e.matrix and e.matrix_on;
+}
+
 // ---- the shapes the tiles have code for
 
 fn groupOk(s: Shape) bool {
@@ -164,6 +168,11 @@ fn fitsRoutedBlock(s: Shape) bool {
     return routedOk(s) and blockOk(s);
 }
 
+/// The verify tile: the stream tile's shapes in BF16 on 32, 64 or 128 groups, words on their wide loads, no plan.
+fn fitsVerify(s: Shape) bool {
+    return streamShape(s) and !s.fp16 and groupOk(s) and s.words_aligned and s.terms_aligned and s.k % 256 == 0 and s.items == 0;
+}
+
 fn fitsGroup(s: Shape) bool {
     return streamShape(s);
 }
@@ -202,6 +211,14 @@ fn launchStream(k: *const Kernels, c: Call) Error!void {
 
 fn launchPair(k: *const Kernels, c: Call) Error!void {
     try k.streamGo(c.r, c.arg, .{ .pair_cols = @divExact(c.arg.n, 2), .limit = c.limit }, @divExact(c.arg.n, 2), c.items, c.s);
+}
+
+fn launchVerify(k: *const Kernels, c: Call) Error!void {
+    try k.verifyGo(c.r, c.arg, .{}, c.arg.n, c.s);
+}
+
+fn launchVerifyGroup(k: *const Kernels, c: Call) Error!void {
+    try k.verifyGroupGo(c.r, c.arg, c.sides, c.out_half, c.s);
 }
 
 fn launchGroup(k: *const Kernels, c: Call) Error!void {
@@ -279,6 +296,7 @@ fn entry(comptime op: Op, comptime path: registry.Path, comptime name: []const u
 
 const project_decode = [_]Entry{
     entry(.project, .decode, "split", .{ .family = .split, .fits = &fitsSplit, .launch = &launchSplit, .caps = &rdna2 }),
+    entry(.project, .decode, "verify", .{ .family = .gemm, .fits = &fitsVerify, .launch = &launchVerify, .caps = &matrixCores, .policy = &verifyOn, .rounds = .always, .round_any = true }),
     entry(.project, .decode, "stream", .{ .family = .stream, .fits = &fitsStream, .launch = &launchStream, .policy = &streamOn, .rounds = .always, .round_any = true }),
     entry(.project, .decode, "row", .{ .family = .row, .fits = &fitsRow, .launch = &launchRow, .rounds = .fp16 }),
     entry(.project, .decode, "lanes", .{ .family = .lanes, .fits = &fitsLanes, .launch = &launchLanes, .rounds = .fp16 }),
@@ -300,6 +318,7 @@ const routed_decode = [_]Entry{
 };
 
 const other_decode = [_]Entry{
+    entry(.group, .decode, "verify", .{ .family = .gemm, .fits = &fitsVerify, .launch = &launchVerifyGroup, .caps = &matrixCores, .policy = &verifyOn, .round_any = true }),
     entry(.group, .decode, "stream", .{ .family = .stream, .fits = &fitsGroup, .launch = &launchGroup, .policy = &streamOn, .round_any = true }),
     entry(.routed_act, .decode, "stream", .{ .family = .stream, .fits = &fitsPair, .launch = &launchPair, .policy = &streamOn }),
 };
@@ -324,7 +343,7 @@ const Caps = @import("../caps.zig").Caps;
 
 fn kernelsOn(gfx: []const u8) affine.Registry {
     const caps = Caps.of(gfx).?;
-    return affine.Registry.init(if (caps.generation == .rdna2) &tuning.gfx1030 else &tuning.gfx1100, &all);
+    return affine.Registry.init(Kernels.tableFor(caps), &all);
 }
 
 fn envOn(gfx: []const u8, stream_on: bool, gemm_on: bool, matrix_on: bool) Env {
@@ -405,4 +424,23 @@ test "a prompt takes the K-parallel tiles by rows and by items, then the 128-row
     shape.items = 350;
     shape.m = 10;
     try std.testing.expect(std.mem.endsWith(u8, v.select(envOn("gfx1030", true, true, false), .mlx, .routed, .prefill, shape).?.id, "kp1"));
+}
+
+test "on RDNA3.5 the verify tile takes decode at every row count, in a lane round or not, and groups" {
+    const r = kernelsOn("gfx1151");
+    var shape: Shape = .{ .m = 1, .n = 5120, .k = 17408, .bits = 4, .group = 64, .fp16 = false };
+    for ([_]bool{ true, false }) |round| for ([_]u32{ 1, 3, 16, 17, 77, 128, 200 }) |m| {
+        shape.round = round;
+        shape.m = m;
+        try std.testing.expect(std.mem.endsWith(u8, r.select(envOn("gfx1151", true, true, true), .mlx, .project, .decode, shape).?.id, "verify"));
+        try std.testing.expect(std.mem.endsWith(u8, r.select(envOn("gfx1151", true, true, true), .mlx, .group, .decode, shape).?.id, "verify"));
+    };
+    // matrix cores off, or words off their wide loads: the stream tile
+    shape.round = true;
+    try std.testing.expectEqual(registry.Family.stream, r.select(envOn("gfx1151", true, true, false), .mlx, .project, .decode, shape).?.family);
+    shape.words_aligned = false;
+    try std.testing.expectEqual(registry.Family.stream, r.select(envOn("gfx1151", true, true, true), .mlx, .project, .decode, shape).?.family);
+    // gfx1100 keeps its table
+    shape.words_aligned = true;
+    try std.testing.expect(!std.mem.endsWith(u8, kernelsOn("gfx1100").select(envOn("gfx1100", true, true, true), .mlx, .project, .decode, shape).?.id, "verify"));
 }
