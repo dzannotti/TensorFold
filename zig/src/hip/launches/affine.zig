@@ -95,7 +95,7 @@ const streams_wanted = 3000; // kStreamWavesWanted
 const stream_code_words = 32; // kStreamCodeWords
 const verify_tiles = [_]c_int{ 1, 2, 4 }; // VerifyShape's MT: 16-row tiles a block (8 spills to scratch)
 const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
-const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for 6144 columns or fewer, 4 past them (the bits are the same)
+const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for at most 6144 columns of at most 8192 K, else 4 (the bits are the same)
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -356,7 +356,7 @@ pub const Kernels = struct {
     pub fn verifyGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
         const b = bitIndex(a.bits) orelse return refuse("bits");
         const t: usize = if (a.m <= 16) 0 else if (a.m <= 32) 1 else 2;
-        const wi: usize = if (total_n <= 6144) 0 else 1;
+        const wi: usize = if (total_n <= 6144 and a.k <= 8192) 0 else 1;
         const cols: c_int = 16 * verify_waves[wi];
         var sides = sides_in;
         var blocks: c_uint = cdiv(total_n, cols);
