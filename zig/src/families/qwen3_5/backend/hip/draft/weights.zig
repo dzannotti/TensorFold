@@ -10,6 +10,9 @@ const Config = @import("config.zig").Config;
 pub const Q4 = struct { words: u64, scales: u64, biases: u64, n: usize, k: usize };
 
 /// A product's weights: affine-4 through the drafter's row kernel, or bf16 through its bf16 one.
+/// The MLX layout, so the engine's verify tile runs the drafter (TF_DRAFT_MLX=0 keeps draft.hip's tiled row kernel)
+pub var mlx_layout = false;
+
 pub const Linear = union(enum) {
     q4: Q4,
     bf16: struct { w: u64, n: usize, k: usize },
@@ -165,7 +168,11 @@ const Loader = struct {
                 defer l.gpa.free(ts);
                 const tb = try l.gpa.alloc(u16, rows * groups);
                 defer l.gpa.free(tb);
-                tile(u16, rows, k, qw, qs, qb, tw, ts, tb);
+                if (mlx_layout) {
+                    @memcpy(tw, qw);
+                    @memcpy(ts, qs);
+                    @memcpy(tb, qb);
+                } else tile(u16, rows, k, qw, qs, qb, tw, ts, tb);
                 // a part of a stack starts on a whole block (32 rows): its tiled bytes sit where its rows would
                 try l.put(words + row * k / 2, std.mem.sliceAsBytes(tw));
                 try l.put(scales + row * groups * 2, std.mem.sliceAsBytes(ts));
@@ -267,6 +274,7 @@ pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: Confi
 }
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, r: *const hip.Runtime, dir: []const u8, c: Config, bits: u8) !Weights {
+    mlx_layout = if (std.c.getenv("TF_DRAFT_MLX")) |v| v[0] != '0' else true;
     if (bits != 0 and bits != 4) return error.DrafterBitsUnsupported;
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();

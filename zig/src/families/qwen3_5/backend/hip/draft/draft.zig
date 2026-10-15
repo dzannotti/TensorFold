@@ -194,7 +194,11 @@ pub const Draft = struct {
         defer gpa.free(ts);
         const tb = try gpa.alloc(u16, n * groups);
         defer gpa.free(tb);
-        weights.tile(u16, n, k, words, scales, biases, tw, ts, tb);
+        if (weights.mlx_layout) {
+            @memcpy(tw, words);
+            @memcpy(ts, scales);
+            @memcpy(tb, biases);
+        } else weights.tile(u16, n, k, words, scales, biases, tw, ts, tb);
         const scale_at = std.mem.alignForward(usize, n * k / 2, 256);
         const bias_at = std.mem.alignForward(usize, scale_at + n * groups * 2, 256);
         var buf = try hip.DeviceBuffer.alloc(&d.e.driver, bias_at + n * groups * 2);
@@ -651,6 +655,7 @@ pub const Draft = struct {
 pub fn proj(o: Ops, x: Tensor, l: Linear, rows: usize) !Tensor {
     switch (l) {
         .q4 => |p| {
+            if (weights.mlx_layout) return o.affine(x, .{ .words = p.words, .scale = p.scales, .bias = p.biases, .tables = .bf16, .n = @intCast(p.n), .k = @intCast(p.k), .bits = 4, .group = 64 }, rows, false);
             const out = try o.arena.take(rows * p.n * 2);
             try o.l.dftQ4Rows(x.ptr, p.words, p.scales, p.biases, out, rows, p.n, p.k, o.stream);
             return .{ .ptr = out, .kind = .bf16 };
