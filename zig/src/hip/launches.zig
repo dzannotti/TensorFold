@@ -39,12 +39,15 @@ const elementwise = @import("launches/elementwise.zig");
 const draw = @import("launches/draw.zig");
 const tp = @import("launches/tp.zig");
 const flashnext = @import("launches/flashnext.zig");
+const draft = @import("launches/draft.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
 pub const PlanRef = plan.PlanRef;
 pub const PlanKeep = plan.Keep;
 pub const gdn_chunk = recurrence.gdn_chunk;
+/// The drafter launches' argument types (Row, Desc, Attn).
+pub const dft = draft;
 
 pub const Launcher = struct {
     r: *const runtime.Runtime,
@@ -81,6 +84,8 @@ pub const Launcher = struct {
     affine: affine.Kernels,
     /// Flash Next's kernels: its residual streams, n-gram rows, indexer and sparse attention.
     fnx: flashnext.Fns,
+    /// The DFlash2 drafter's kernels: tap rows, rings, dynamic conv and block attention.
+    dft: draft.Fns,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -261,6 +266,7 @@ pub const Launcher = struct {
         l.affine = try affine.Kernels.load(tiles, dot2, caps.Caps.of(kernels.arch) orelse return error.Invalid, choices.products);
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
+        l.dft = try draft.Fns.load(l.mods[@backingInt(kernels.Group.draft)]);
         return l;
     }
 
@@ -331,6 +337,11 @@ pub const Launcher = struct {
     pub const fn_idx_scores = flashnext.idxScores;
     pub const fn_idx_select = flashnext.idxSelect;
     pub const fn_sparse_attention = flashnext.sparseAttention;
+    pub const dftGather = draft.gather;
+    pub const dftRingPut = draft.ringPut;
+    pub const dftNormRope = draft.normRope;
+    pub const dftDynConv = draft.dynConv;
+    pub const dftAttn = draft.attn;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {
