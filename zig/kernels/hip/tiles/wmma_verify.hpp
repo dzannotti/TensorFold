@@ -16,7 +16,7 @@ namespace rocm {
 template <int MT>
 struct VerifyShape {
     static constexpr int rows = 16 * MT;
-    static constexpr int waves = MT <= 2 ? 4 : 8;
+    static constexpr int waves = 8;
     static constexpr int ks = 4096 / rows;
     static constexpr int ld = ks + 8;
 };
@@ -66,7 +66,7 @@ __device__ __forceinline__ void verify_for(F&& f) {
 __device__ inline int verify_sum_at(int r) { return (r & ~15) + (r & 1) * 8 + ((r & 15) >> 1); }
 
 // Columns 16 W bx.. of the product (or of side s of a group) for rows 16 MT blockIdx.y..; x and sums of x in LDS.
-template <int BITS, int MT>
+template <int BITS, int MT, int G>
 __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verify(Affine a, StreamSides sides) {
 #if TF_DEVICE_WMMA_GFX11
     using S = VerifyShape<MT>;
@@ -98,11 +98,11 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
     const int m0 = blockIdx.y * MP;
     const int live = a.m - m0 < MP ? a.m - m0 : MP;
     const int K = a.k;
-    const int G = a.group;
+    constexpr int CPG = G / 32;   // chunks a group
+    constexpr int GPT = 8 / CPG;  // groups a trip of 8 chunks
+    constexpr int cpgm = CPG - 1;
     const int nch = K >> 5;
     const int nslab = (K + KS - 1) / KS;
-    const int cpg_log2 = G == 32 ? 0 : G == 64 ? 1 : 2;
-    const int cpgm = (1 << cpg_log2) - 1;
     const int col = (bx * W + wave) * 16 + (lane & 15);
     const int col_s = col < a.n ? col : a.n - 1;
     const uint32_t* wp = Dec::words(a) + static_cast<long long>(col_s) * nch * BITS;
@@ -113,33 +113,39 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
     const int half = lane >> 4;
     const int ntrips = (nch + 7) >> 3;
     uint32_t ring[D][4][BITS];
-    uint32_t tr[D][8];
-    auto fetch = [&](int t, uint32_t (&w)[4][BITS], uint32_t (&g)[8]) {
+    uint32_t tr[D][GPT];
+    // Every load below is unconditional on clamped addresses, so the compiler can count them and never drains the
+    // prefetch ring (vmcnt(0)); the launch takes K a multiple of 256 and term tables on 2 GPT bytes.
+    auto fetch = [&](int t, uint32_t (&w)[4][BITS], uint32_t (&g)[GPT]) {
+        const int tt = t < ntrips ? t : ntrips - 1;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int c = t * 8 + 4 * half + j;
-            Dec::template load<true>(wp + static_cast<long long>(c < nch ? c : nch - 1) * BITS, w[j]);
-        }
-        // chunk j's own group term, so the chunk loop indexes g by a constant (a group-size shift would put it in scratch)
-        const int last = K / G - 1;
+        for (int j = 0; j < 4; ++j) Dec::template load<true>(wp + static_cast<long long>(tt * 8 + 4 * half + j) * BITS, w[j]);
+        // lane half 0 loads the trip's scales, half 1 its biases; each takes the other's from its partner lane
+        constexpr int NW = GPT / 2 > 0 ? GPT / 2 : 1;
+        uint32_t own[NW];
+        using V = std::conditional_t<GPT == 8, u32x4, std::conditional_t<GPT == 4, uint2, uint32_t>>;
+        *reinterpret_cast<V*>(own) = *reinterpret_cast<const V*>((half ? terms.bias : terms.scale) + tb + tt * GPT);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int q0 = (t * 8 + j) >> cpg_log2;
-            const int q = q0 < last ? q0 : last;
-            g[j] = terms.scale_raw(tb + q) | static_cast<uint32_t>(terms.bias_raw(tb + q)) << 16;
+        for (int v = 0; v < NW; ++v) {
+            const uint32_t other = __builtin_amdgcn_permlanex16(own[v], own[v], 0x76543210u, 0xfedcba98u, false, false);
+            const uint32_t sw = half ? other : own[v];
+            const uint32_t bw = half ? own[v] : other;
+            g[2 * v] = (sw & 0xffffu) | (bw << 16);
+            if (2 * v + 1 < GPT) g[2 * v + 1] = (sw >> 16) | (bw & 0xffff0000u);
         }
     };
 
     // ---- x: a slab of KS a row through registers into one of three LDS buffers ----
     u32x4 xr[NPT];
-    auto xload = [&](int s) {
+    auto xload = [&](int s0) {
+        const int s = s0 < nslab ? s0 : nslab - 1;
 #pragma unroll
         for (int j = 0; j < NPT; ++j) {
             const int p = tid + j * 32 * W;
             const int r = p / (KS / 8);
             const int k = s * KS + (p % (KS / 8)) * 8;
-            xr[j] = u32x4{0, 0, 0, 0};
-            if (r < live && k < K) xr[j] = *reinterpret_cast<const u32x4*>(BF16Act::row(a, m0 + r) + k);
+            // rows past the call read its last row: their outputs are never stored
+            xr[j] = *reinterpret_cast<const u32x4*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(m0 + (r < live ? r : live - 1)) * K + k);
         }
     };
     auto xstore = [&](int buf) {
@@ -210,7 +216,7 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
             d[mt] = T::mma(frag16(xp + 8), b1, d[mt]);
         }
         if ((c & cpgm) == cpgm) {
-            const uint32_t g = tr[RB][J];
+            const uint32_t g = tr[RB][J / CPG];
             const float scale = terms.widen(static_cast<unsigned short>(g & 0xffffu));
             const float bias = terms.widen(static_cast<unsigned short>(g >> 16));
             const int seg = KS >= G ? (i * 32) / G : 0;
@@ -233,31 +239,30 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
     verify_for<D - 1>([&](auto t) { fetch(decltype(t)::value, ring[decltype(t)::value], tr[decltype(t)::value]); });
     xload(0);
     xstore(0);
-    if (nslab > 1) {
-        xload(1);
-        xstore(1);
-    }
+    xload(1);
+    xstore(1);
     __syncthreads();
     sums(0);
     __syncthreads();
+    // whole rounds of D trips: past the last trip the loads repeat it and the work is skipped
     for (int t0 = 0; t0 < ntrips; t0 += D) {
         verify_for<D>([&](auto rb) {
             constexpr int RB = decltype(rb)::value;
             const int t = t0 + RB;
-            if (t >= ntrips) return;
-            fetch(t + D - 1, ring[(RB + D - 1) % D], tr[(RB + D - 1) % D]);
             verify_for<SPT>([&](auto sl) {
                 constexpr int SL = decltype(sl)::value;
                 const int s = t * SPT + SL;
-                if (s >= nslab) return;
-                if (s + 2 < nslab) xload(s + 2);
+                // x before the trip's codes: the in-order load counter then lets xstore wait without draining them
+                xload(s + 2);
+                if constexpr (SL == 0) fetch(t + D - 1, ring[(RB + D - 1) % D], tr[(RB + D - 1) % D]);
                 if (s + 1 < nslab) sums(s + 1);
-                verify_for<CPS>([&](auto i) {
-                    constexpr int I = decltype(i)::value;
-                    const int c = s * CPS + I;
-                    if (c < nch) chunk(rb, std::integral_constant<int, SL * CPS + I>{}, c, s % 3, I);
-                });
-                if (s + 2 < nslab) xstore((s + 2) % 3);
+                if (s < nslab) {
+                    verify_for<CPS>([&](auto i) {
+                        constexpr int I = decltype(i)::value;
+                        chunk(rb, std::integral_constant<int, SL * CPS + I>{}, s * CPS + I, s % 3, I);
+                    });
+                }
+                xstore((s + 2) % 3);
                 __syncthreads();
             });
         });
@@ -285,10 +290,11 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
 }
 
 #if TF_MATRIX
-#define TF_VERIFY(BITS)                                                       \
-    template __global__ void affine_wmma_verify<BITS, 1>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 2>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 4>(Affine, StreamSides);
+#define TF_VERIFY_G(BITS, G)                                                     \
+    template __global__ void affine_wmma_verify<BITS, 1, G>(Affine, StreamSides); \
+    template __global__ void affine_wmma_verify<BITS, 2, G>(Affine, StreamSides); \
+    template __global__ void affine_wmma_verify<BITS, 4, G>(Affine, StreamSides);
+#define TF_VERIFY(BITS) TF_VERIFY_G(BITS, 32) TF_VERIFY_G(BITS, 64) TF_VERIFY_G(BITS, 128)
 TF_VERIFY(2)
 TF_VERIFY(3)
 TF_VERIFY(4)
@@ -296,6 +302,7 @@ TF_VERIFY(5)
 TF_VERIFY(6)
 TF_VERIFY(8)
 #undef TF_VERIFY
+#undef TF_VERIFY_G
 #endif
 
 }  // namespace rocm

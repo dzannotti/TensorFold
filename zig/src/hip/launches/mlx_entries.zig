@@ -170,7 +170,7 @@ fn fitsRoutedBlock(s: Shape) bool {
 
 /// The verify tile: the stream tile's shapes in BF16 on 32, 64 or 128 groups, words on their wide loads, no plan.
 fn fitsVerify(s: Shape) bool {
-    return streamShape(s) and !s.fp16 and groupOk(s) and s.words_aligned and s.items == 0;
+    return streamShape(s) and !s.fp16 and groupOk(s) and s.words_aligned and s.terms_aligned and s.k % 256 == 0 and s.items == 0;
 }
 
 fn fitsGroup(s: Shape) bool {

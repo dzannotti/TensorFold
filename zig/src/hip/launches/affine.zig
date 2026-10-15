@@ -94,6 +94,7 @@ const stream_waves = 4; // kStreamWaves
 const streams_wanted = 3000; // kStreamWavesWanted
 const stream_code_words = 32; // kStreamCodeWords
 const verify_tiles = [_]c_int{ 1, 2, 4 }; // VerifyShape's MT: 16-row tiles a block (8 spills to scratch)
+const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -133,7 +134,7 @@ pub const Kernels = struct {
     /// Off keeps the decode tiles before the stream tile (the policy's reference switch).
     stream_on: bool,
     /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2, 4); gfx11 only.
-    verify: [bit_widths.len][verify_tiles.len]Function,
+    verify: [bit_widths.len][verify_groups.len][verify_tiles.len]Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -171,12 +172,12 @@ pub const Kernels = struct {
     }
 
     fn resolve(k: *Kernels, comptime dot: []const u8, comptime shape: []const u8, m: Module) Error!void {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(1_000_000);
         inline for (bit_widths, 0..) |bits, b| {
             k.block[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_dot2_blockINS0_{s}ELi{d}EEEvNS0_6AffineE", .{ dot, bits }));
             if (k.matrix) k.wmma_gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm16affine_wmma_gemmILi{d}EEEvNS0_6AffineE", .{bits}));
-            if (k.matrix) inline for (verify_tiles, 0..) |mt, i| {
-                k.verify[b][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_wmma_verifyILi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, mt }));
+            if (k.matrix) inline for (verify_groups, 0..) |g, gi| inline for (verify_tiles, 0..) |mt, i| {
+                k.verify[b][gi][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_wmma_verifyILi{d}ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, mt, g }));
             };
             k.gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_gemm_blockINS0_{s}ELi{d}E{s}EEvNS0_6AffineE", .{ dot, bits, shape }));
             inline for (kp_tiles, 0..) |t, i| {
@@ -301,6 +302,7 @@ pub const Kernels = struct {
             .tables_alike = a.scale.kind == a.bias.kind,
             .x_aligned = a.x % 16 == 0,
             .words_aligned = a.words % gemmAlign(a.bits) == 0,
+            .terms_aligned = (a.scale.p | a.bias.p) % 16 == 0,
             .items = if (a.route.items != 0) @intCast(@max(items, 0)) else 0,
         };
     }
@@ -353,7 +355,7 @@ pub const Kernels = struct {
     pub fn verifyGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
         const b = bitIndex(a.bits) orelse return refuse("bits");
         const t: usize = if (a.m <= 16) 0 else if (a.m <= 32) 1 else 2;
-        const cols: c_int = 16 * @as(c_int, if (t < 2) 4 else 8);
+        const cols: c_int = 16 * 8;
         var sides = sides_in;
         var blocks: c_uint = cdiv(total_n, cols);
         if (sides.count > 0) {
@@ -367,7 +369,13 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         try args.add(a);
         try args.add(sides);
-        try go(r, k.verify[b][t], .{ .x = blocks, .y = cdiv(a.m, 16 * verify_tiles[t]) }, .{ .x = @intCast(cols * 2) }, s, &args);
+        const gi: usize = switch (a.group) {
+            32 => 0,
+            64 => 1,
+            128 => 2,
+            else => return refuse("group"),
+        };
+        try go(r, k.verify[b][gi][t], .{ .x = blocks, .y = cdiv(a.m, 16 * verify_tiles[t]) }, .{ .x = @intCast(cols * 2) }, s, &args);
     }
 
     /// The verify tile over a group: the sides' addresses and widths in one launch.
@@ -530,6 +538,7 @@ pub const Kernels = struct {
         for (group) |side| a.n = @max(a.n, side.n);
         var shape = shapeOf(a, 1);
         shape.round = true;
+        for (group) |side| shape.terms_aligned = shape.terms_aligned and (side.scale | side.bias) % 16 == 0;
         const e = k.choose(.group, .decode, shape) orelse return refuse("group shape");
         try e.launch(k, .{ .r = r, .s = s, .arg = a, .sides = group, .out_half = out_half });
     }

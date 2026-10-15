@@ -29,6 +29,8 @@ pub const Shape = struct {
     x_aligned: bool = true,
     /// The words on the load size of their width.
     words_aligned: bool = true,
+    /// The scale and bias tables on 16 bytes.
+    terms_aligned: bool = true,
     /// A plan's items; 0 is a plain product.
     items: u32 = 0,
     /// Parts the groups are split into.
