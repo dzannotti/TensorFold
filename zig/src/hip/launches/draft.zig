@@ -37,7 +37,7 @@ pub const Fns = struct {
 /// The kernels' head width.
 pub const head_dim = 128;
 /// The queries one block attention workgroup takes: a stream's block rows times a key head's query heads.
-pub const queries = 32;
+pub const queries = 64;
 
 /// draft.hip's DftRow: an absorbed row's features, its stream's rings and its position.
 pub const Row = extern struct { src: u64, ring: u64, pos: i64 };
@@ -143,7 +143,7 @@ pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     try a.add(@as(c_int, @intCast(x.window)));
     try a.add(x.part);
     try a.add(stats);
-    try l.go(l.dft.attn, dim(x.streams * x.kv_heads, x.splits, 1), dim(64, 1, 1), 0, s, &a);
+    try l.go(l.dft.attn, dim(x.streams * x.kv_heads, x.splits, 1), dim(2 * queries, 1, 1), 0, s, &a);
     var b: Args = .{};
     try b.add(x.part);
     try b.add(stats);

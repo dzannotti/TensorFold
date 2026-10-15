@@ -158,15 +158,15 @@ __device__ __forceinline__ f32x8 mma(bf16x16 a, bf16x16 b, f32x8 c) {
 }
 
 constexpr int kTile = 16;
-constexpr int kQueries = 32;  // a stream's block rows times the query heads of a key head: two waves of 16
+constexpr int kQueries = 64;  // a stream's block rows times the query heads of a key head: four waves of 16
 
 }  // namespace
 
 // Block attention, split over the keys: query (m, g) of a stream's key head sees ring positions
 // [max(begin, pos0 + m - window + 1), pos0) and every block row. Split y of `splits` walks its share of 16-position tiles,
-// writing unnormalized PART (splits, 32 queries, HD) fp32 and STATS (max, sum) per (stream, key head).
-// Q (rows, heads, HD), KB (rows, kv_heads, HD) packed; VB rows `vstride` apart. Grid (streams * kv_heads, splits), 64 threads.
-extern "C" __global__ void __launch_bounds__(64) tf_dft_attn(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB, long long vstride,
+// writing unnormalized PART (splits, 64 queries, HD) fp32 and STATS (max, sum) per (stream, key head).
+// Q (rows, heads, HD), KB (rows, kv_heads, HD) packed; VB rows `vstride` apart. Grid (streams * kv_heads, splits), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB, long long vstride,
                                                              const DftDesc* desc, int layer, int block, int heads, int kv_heads, int R,
                                                              int window, float* PART, float* STATS) {
     const int stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads;
@@ -301,7 +301,7 @@ extern "C" __global__ void __launch_bounds__(64) tf_dft_attn(const uint16_t* Q, 
     }
 }
 
-// The splits of tf_dft_attn joined: OUT (rows, heads, HD) bf16. Grid (streams * kv_heads, 32 queries), HD threads.
+// The splits of tf_dft_attn joined: OUT (rows, heads, HD) bf16. Grid (streams * kv_heads, 64 queries), HD threads.
 extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
                                              uint16_t* OUT) {
     const int stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads;

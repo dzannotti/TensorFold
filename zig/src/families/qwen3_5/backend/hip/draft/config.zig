@@ -78,6 +78,9 @@ pub const Config = struct {
             .taps = undefined,
             .n_taps = 0,
         };
+        // 16-position blocks, as the Python engine drafted: deeper drafts keep landing on code (TF_DRAFT_BLOCK overrides)
+        c.block = @max(c.block, @min(16, 64 / @max(c.heads / @max(c.kv_heads, 1), 1)));
+        if (std.c.getenv("TF_DRAFT_BLOCK")) |v| c.block = std.fmt.parseInt(usize, std.mem.span(v), 10) catch c.block;
         const taps = d.object.get("target_layer_ids") orelse return error.BadDraftConfig;
         if (taps != .array or taps.array.items.len == 0 or taps.array.items.len > c.taps.len) return error.BadDraftConfig;
         for (taps.array.items, 0..) |t, i| {
@@ -85,8 +88,8 @@ pub const Config = struct {
             c.taps[i] = @intCast(t.integer);
         }
         c.n_taps = taps.array.items.len;
-        // what the kernels fix: 128-wide heads, two-lag convolutions, a block's queries of a key head in one 32-query tile
-        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or c.heads % c.kv_heads != 0 or c.block < 2 or c.block > 16 or c.block * (c.heads / c.kv_heads) > 32) return error.UnsupportedDraftConfig;
+        // what the kernels fix: 128-wide heads, two-lag convolutions, a block's queries of a key head in one 64-query tile
+        if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or c.heads % c.kv_heads != 0 or c.block < 2 or c.block > 16 or c.block * (c.heads / c.kv_heads) > 64) return error.UnsupportedDraftConfig;
         if (c.topk > 64 or c.mask >= c.vocab or c.hidden != target.hidden or c.vocab != target.vocab or c.hidden % 64 != 0 or c.hidden % c.group != 0) return error.UnsupportedDraftConfig;
         if (c.intermediate % 64 != 0 or c.rank % 64 != 0 or c.layers > 16 or c.window < c.block) return error.UnsupportedDraftConfig;
         return c;
