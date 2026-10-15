@@ -311,3 +311,33 @@ test "block attention: each row's window over a wrapped ring, the context's star
         };
     }
 }
+
+test "bf16 rows: products of bf16 weights over every row count a hold takes, fp32 sums rounded once" {
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xd6 };
+    const n = 200; // not a whole number of 128-column blocks
+    const k = 96;
+    const w = try randoms(&rng, n * k, 1);
+    defer gpa.free(w);
+    var dw = try t.upload(w);
+    defer dw.free();
+    for ([_]usize{ 1, 8, 24, 64, 72 }) |rows| {
+        const x = try randoms(&rng, rows * k, 2);
+        defer gpa.free(x);
+        var dx = try t.upload(x);
+        defer dx.free();
+        var out = try t.alloc(rows * n * 2);
+        defer out.free();
+        try t.on.dftBf16Rows(at(dx), at(dw), at(out), rows, n, k, t.stream.handle);
+        try t.stream.synchronize();
+        const got = try rig.download(u16, out);
+        defer gpa.free(got);
+        for (0..rows) |r| for (0..n) |c| {
+            var acc: f64 = 0;
+            for (0..k) |e| acc += @as(f64, bfv(x[r * k + e])) * bfv(w[c * k + e]);
+            const want: f32 = @floatCast(acc);
+            try rig.expect(@abs(bfv(got[r * n + c]) - want) <= 1.0 / 128.0 * @max(@abs(want), 0.25), "rows {d}: ({d}, {d}) {d} vs {d}", .{ rows, r, c, bfv(got[r * n + c]), want });
+        };
+    }
+}

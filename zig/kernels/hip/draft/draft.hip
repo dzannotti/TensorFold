@@ -323,3 +323,53 @@ extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STA
     const int m = q / G, head = kvh * G + q % G;
     OUT[(static_cast<size_t>(stream * block + m) * heads + head) * HD + dim] = tobf(acc / l);
 }
+
+// OUT (rows, n) bf16 = X (rows, k) bf16 times W (n, k) bf16 transposed, rows at most 64, k a multiple of 32:
+// --drafter-bits 0's products. A wave owns 32 columns over every row, so the weights stream once. Grid (n / 128 up), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) tf_dft_bf16_rows(const uint16_t* X, const uint16_t* W, uint16_t* OUT, int rows, int n, int k) {
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int col = lane & 15, half = lane >> 4;
+    const int n0 = (blockIdx.x * 4 + wave) * 32;
+    if (n0 >= n) return;  // a whole wave leaves: the products take the whole wave
+    const int tiles = (rows + 15) / 16;
+    const uint16_t* w0 = W + static_cast<size_t>(min(n0 + col, n - 1)) * k;
+    const uint16_t* w1 = W + static_cast<size_t>(min(n0 + 16 + col, n - 1)) * k;
+    f32x8 acc[4][2];
+#pragma unroll
+    for (int t = 0; t < 4; t++) acc[t][0] = acc[t][1] = f32x8{0, 0, 0, 0, 0, 0, 0, 0};
+    const uint16_t* xr[4];
+#pragma unroll
+    for (int t = 0; t < 4; t++) xr[t] = X + static_cast<size_t>(min(16 * t + col, rows - 1)) * k;
+    for (int kk = 0; kk < k; kk += 32) {
+        bf16x16 b[2][2];
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            b[u][0] = load16(w0 + kk + 16 * u);
+            b[u][1] = load16(w1 + kk + 16 * u);
+        }
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+            if (t < tiles) {
+#pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    const bf16x16 a = load16(xr[t] + kk + 16 * u);
+                    acc[t][0] = mma(a, b[u][0], acc[t][0]);
+                    acc[t][1] = mma(a, b[u][1], acc[t][1]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 4; t++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int r = 16 * t + 2 * i + half;
+            if (t >= tiles || r >= rows) continue;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int c = n0 + 16 * j + col;
+                if (c < n) OUT[static_cast<size_t>(r) * n + c] = tobf(acc[t][j][i]);
+            }
+        }
+    }
+}

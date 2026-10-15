@@ -17,6 +17,7 @@ pub const Fns = struct {
     dyn_conv: Function,
     attn: Function,
     attn_merge: Function,
+    bf16_rows: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -26,6 +27,7 @@ pub const Fns = struct {
             .dyn_conv = try m.function("tf_dft_dyn_conv"),
             .attn = try m.function("tf_dft_attn"),
             .attn_merge = try m.function("tf_dft_attn_merge"),
+            .bf16_rows = try m.function("tf_dft_bf16_rows"),
         };
     }
 };
@@ -149,4 +151,21 @@ pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     try b.add(@as(c_int, @intCast(x.kv_heads)));
     try b.add(x.out);
     try l.go(l.dft.attn_merge, dim(x.streams * x.kv_heads, queries, 1), dim(head_dim, 1, 1), 0, s, &b);
+}
+
+/// out (rows, n) = x (rows, k) times bf16 w (n, k) transposed, rounded to bf16; 64 rows a launch.
+pub fn bf16Rows(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, s: S) Error!void {
+    if (k % 32 != 0 or n == 0) return invalid("dft bf16_rows");
+    var at: usize = 0;
+    while (at < rows) : (at += 64) {
+        const m = @min(64, rows - at);
+        var a: Args = .{};
+        try a.add(x + at * k * 2);
+        try a.add(w);
+        try a.add(out + at * n * 2);
+        try a.add(@as(c_int, @intCast(m)));
+        try a.add(@as(c_int, @intCast(n)));
+        try a.add(@as(c_int, @intCast(k)));
+        try l.go(l.dft.bf16_rows, dim((n + 127) / 128, 1, 1), dim(128, 1, 1), 0, s, &a);
+    }
 }

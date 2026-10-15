@@ -342,6 +342,7 @@ pub const Launcher = struct {
     pub const dftNormRope = draft.normRope;
     pub const dftDynConv = draft.dynConv;
     pub const dftAttn = draft.attn;
+    pub const dftBf16Rows = draft.bf16Rows;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {
