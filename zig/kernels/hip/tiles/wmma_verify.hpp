@@ -12,11 +12,11 @@
 namespace tf {
 namespace rocm {
 
-// MT 16-row tiles a block: its waves, the K of x a staged slab (8 KB) and the slab's row pitch in BF16.
-template <int MT>
+// MT 16-row tiles and WV waves a block: the K of x a staged slab (8 KB) and the slab's row pitch in BF16.
+template <int MT, int WV>
 struct VerifyShape {
     static constexpr int rows = 16 * MT;
-    static constexpr int waves = 8;
+    static constexpr int waves = WV;
     static constexpr int ks = 4096 / rows;
     static constexpr int ld = ks + 8;
 };
@@ -66,10 +66,10 @@ __device__ __forceinline__ void verify_for(F&& f) {
 __device__ inline int verify_sum_at(int r) { return (r & ~15) + (r & 1) * 8 + ((r & 15) >> 1); }
 
 // Columns 16 W bx.. of the product (or of side s of a group) for rows 16 MT blockIdx.y..; x and sums of x in LDS.
-template <int BITS, int MT, int G>
-__global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verify(Affine a, StreamSides sides) {
+template <int BITS, int MT, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSides sides) {
 #if TF_DEVICE_WMMA_GFX11
-    using S = VerifyShape<MT>;
+    using S = VerifyShape<MT, WV>;
     using Dec = MlxDecoder<BITS>;
     using T = WmmaBF16;
     constexpr int MP = S::rows, W = S::waves, KS = S::ks, LD = S::ld, CPS = KS / 32;
@@ -157,30 +157,38 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
     };
     // A row's sum of x over each group, lo then hi of each pair in K order (the GEMM tiles' sumx); a group past the
     // slab carries its run to the next.
+    // a thread may run several chains (fewer threads than rows x segments); the carry only exists when KS < G, one
+    // segment a slab, so a thread owns one row's carry
+    constexpr int LEN = KS < G ? KS : G;
+    constexpr int CHAINS = MP * (KS / LEN);
+    constexpr int CPT = (CHAINS + 32 * W - 1) / (32 * W);
+    static_assert(KS >= G || CHAINS <= 32 * W, "a carried group sum needs a thread a chain");
     float carry = 0.f;
     auto sums = [&](int s) {
-        const int len = KS < G ? KS : G;
-        const int chains = MP * (KS / len);
-        if (tid >= chains) return;
-        const int r = tid % MP;
-        const int seg = tid / MP;
-        const int k0 = s * KS + seg * len;
-        if (r >= live || k0 >= K) return;
-        float run = KS < G && k0 % G != 0 ? carry : 0.f;
-        const u32x4* src = reinterpret_cast<const u32x4*>(&xs[s % 3][r * LD + seg * len]);
-        for (int v = 0; v < len / 8; ++v) {
-            const u32x4 u = src[v];
-            const uint32_t q[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
-            for (int h = 0; h < 4; ++h) {
-                run += __uint_as_float(q[h] << 16);
-                run += __uint_as_float(q[h] & 0xffff0000u);
+        for (int ci = 0; ci < CPT; ++ci) {
+            const int chain = tid + ci * 32 * W;
+            if (chain >= CHAINS) break;
+            const int r = chain % MP;
+            const int seg = chain / MP;
+            const int k0 = s * KS + seg * LEN;
+            if (r >= live || k0 >= K) continue;
+            float run = KS < G && k0 % G != 0 ? carry : 0.f;
+            const u32x4* src = reinterpret_cast<const u32x4*>(&xs[s % 3][r * LD + seg * LEN]);
+            for (int v = 0; v < LEN / 8; ++v) {
+                const u32x4 u = src[v];
+                const uint32_t q[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    run += __uint_as_float(q[h] << 16);
+                    run += __uint_as_float(q[h] & 0xffff0000u);
+                }
             }
-        }
-        if ((k0 + len) % G == 0) {
-            sxs[s % 3][seg][verify_sum_at(r)] = run;
-        } else {
-            carry = run;
+            if ((k0 + LEN) % G == 0) {
+                sxs[s % 3][seg][verify_sum_at(r)] = run;
+            } else {
+                carry = run;
+            }
         }
     };
 
@@ -290,10 +298,11 @@ __global__ void __launch_bounds__(32 * VerifyShape<MT>::waves) affine_wmma_verif
 }
 
 #if TF_MATRIX
-#define TF_VERIFY_G(BITS, G)                                                     \
-    template __global__ void affine_wmma_verify<BITS, 1, G>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 2, G>(Affine, StreamSides); \
-    template __global__ void affine_wmma_verify<BITS, 4, G>(Affine, StreamSides);
+#define TF_VERIFY_W(BITS, G, WV)                                                     \
+    template __global__ void affine_wmma_verify<BITS, 1, G, WV>(Affine, StreamSides); \
+    template __global__ void affine_wmma_verify<BITS, 2, G, WV>(Affine, StreamSides); \
+    template __global__ void affine_wmma_verify<BITS, 4, G, WV>(Affine, StreamSides);
+#define TF_VERIFY_G(BITS, G) TF_VERIFY_W(BITS, G, 2) TF_VERIFY_W(BITS, G, 4)
 #define TF_VERIFY(BITS) TF_VERIFY_G(BITS, 32) TF_VERIFY_G(BITS, 64) TF_VERIFY_G(BITS, 128)
 TF_VERIFY(2)
 TF_VERIFY(3)
@@ -303,6 +312,7 @@ TF_VERIFY(6)
 TF_VERIFY(8)
 #undef TF_VERIFY
 #undef TF_VERIFY_G
+#undef TF_VERIFY_W
 #endif
 
 }  // namespace rocm
