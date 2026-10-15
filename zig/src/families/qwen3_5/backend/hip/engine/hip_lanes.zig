@@ -203,6 +203,7 @@ pub const Hip = struct {
             .draft_streams = drafting,
             .plain_guard = plain_guard,
             .window_costs = h.costs.window[0..h.costs.windows],
+            .lane_costs = h.costs.window[0..h.costs.windows],
             .shared_costs = h.costs.shared[0..h.costs.shareds],
             .mtp_step_ms = h.costs.step_ms,
         };

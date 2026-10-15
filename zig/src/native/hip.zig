@@ -183,6 +183,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.release = loaded.deinit;
     h.cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
     errdefer h.cfg.deinit(gpa);
+    if (loaded.facts.head_trees) { // a drafter's trees: the planner picks a lone stream's lanes, as deep as it drafts
+        h.cfg.head_lanes = loaded.rows - 1;
+        h.cfg.head_depth = @max(1, loaded.facts.drafts);
+    }
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, loaded.backend, h.clock.clock());
     errdefer h.core.deinit();
