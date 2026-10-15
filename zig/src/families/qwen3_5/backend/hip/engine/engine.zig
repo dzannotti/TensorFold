@@ -361,6 +361,10 @@ pub const Engine = struct {
         if (e.model().spec.hidden % 8 != 0 or e.act.size() != 2) return error.BadTap;
         @memcpy(e.taps[0..taps.len], taps);
         e.n_taps = taps.len;
+        // rounds captured before have no tap launches: drop them so the next of each shape records with them
+        e.drain();
+        e.graphs.deinit();
+        e.graphs = round_graphs.Graphs.init(e.gpa);
     }
 
     /// Device bytes a stream's tap ring holds (none before `setTaps`).

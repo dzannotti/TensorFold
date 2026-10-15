@@ -43,6 +43,7 @@ pub const Features = struct {
     device: i32 = 0, // the drafter must run on this device
     dtype: Dtype,
     ready: Fence = .none, // .none: written; else the fence to wait on before reading, kind naming the backend
+    ring: u32 = 0, // nonzero: `buffer` is a ring of this many rows, `offset` the first row's position, row p at ring row p % ring
 };
 
 /// Absorb a stream's kept rows into its draft head and hold `depth` drafts for its next round.

@@ -116,6 +116,8 @@ fn ready(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open
             .world = o.tp,
             .cache_gib = o.prompt_cache_gib,
             .cache_over_cap = o.prompt_cache_over_cap,
+            .drafter = if (o.drafts) o.drafter else null,
+            .drafter_bits = o.drafter_bits,
         },
         .policy_line = policy_line,
     };

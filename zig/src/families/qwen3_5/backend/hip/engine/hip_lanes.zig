@@ -538,7 +538,7 @@ pub const Hip = struct {
         const buf = lane.taps orelse return error.NoTaps;
         // a long prompt asks for more rows than the ring keeps; the drafter reads only its window of the newest
         if (count == 0 or start + count > lane.written or start + count <= lane.written -| tap_rows) return error.RowsNotHeld;
-        return .{ .buffer = buf.base(), .offset = start, .rows = count, .row_bytes = @intCast(e.n_taps * e.model().spec.hidden * e.act.size()), .space = .device, .device = e.o.device, .dtype = if (e.act == .bf16) .bf16 else .f16 };
+        return .{ .buffer = buf.base(), .offset = start, .rows = count, .row_bytes = @intCast(e.n_taps * e.model().spec.hidden * e.act.size()), .space = .device, .device = e.o.device, .dtype = if (e.act == .bf16) .bf16 else .f16, .ring = tap_rows };
     }
 
     /// The head drafts `depth` from each stream's last kept row and its pending token, one head forward a step for all.

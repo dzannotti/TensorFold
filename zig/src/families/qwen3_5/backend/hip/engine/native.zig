@@ -12,6 +12,7 @@ const pages = @import("../forward/pages.zig");
 const state = @import("../forward/state.zig");
 const worker = @import("worker.zig");
 const hip_lanes = @import("hip_lanes.zig");
+const draft_mod = @import("../draft/draft.zig");
 
 /// The MLX affine widths the family loads.
 const mlx_formats: []const []const u8 = &.{ "mlx-q2", "mlx-q3", "mlx-q4", "mlx-q5", "mlx-q6", "mlx-q8" };
@@ -44,6 +45,9 @@ pub const Options = struct {
     cache_gib: ?f64 = null,
     /// A --prompt-cache-gib past what the streams leave is kept, not refused.
     cache_over_cap: bool = false,
+    /// --drafter: a DFlash2 drafter's directory to draft with (null: the MTP head), and --drafter-bits.
+    drafter: ?[]const u8 = null,
+    drafter_bits: u8 = 4,
 };
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
@@ -158,10 +162,18 @@ const Owned = struct {
     e: *Engine,
     backend: *hip_lanes.Hip,
     startup: []const u8,
+    /// --drafter's model and the lane core's wrapper that drafts with it in front of the backend.
+    draft: ?*draft_mod.Draft = null,
+    drafted: ?*lanes.drafted.Drafted = null,
 };
 
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
+    if (own.drafted) |x| {
+        x.deinit();
+        own.gpa.destroy(x);
+    }
+    if (own.draft) |d| d.deinit();
     // the other ranks hear that the rounds are over, then every rank frees its share
     own.backend.deinit();
     own.e.deinit();
@@ -184,10 +196,24 @@ fn openEngine(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip
     if (hip.usage(false).device - before != head) return refuse(a, problem, "the draft head holds {d} device bytes, the plan says {d}", .{ hip.usage(false).device - before, head });
     if (p.cache.pages > 0) own.backend.keepPages(p.cache.pages, p.cache.snaps);
     // a lone rank times its forwards for the depth rule; the ranks of a group draft without costs
+    var backend = own.backend.backend();
+    if (o.drafter) |ddir| {
+        // ponytail: the drafter's buffers come after the memory plan, which does not count them yet
+        const d = draft_mod.Draft.init(gpa, io, p.e, ddir, o.drafter_bits, p.streams) catch |err| return refuse(a, problem, "the drafter {s} does not load ({s})", .{ ddir, @errorName(err) });
+        own.draft = d;
+        const x = try gpa.create(lanes.drafted.Drafted);
+        errdefer gpa.destroy(x);
+        x.* = lanes.drafted.Drafted.init(gpa, backend, d.drafter()) catch |err| return refuse(a, problem, "the drafter {s} cannot attach to this model ({s})", .{ ddir, @errorName(err) });
+        own.drafted = x;
+        backend = x.backend();
+    }
+    // timed after the drafter's taps exist, so the round costs include their launches
     if (dev.group) |g| own.backend.withLink(g.link()) else own.backend.measure();
+    var facts = own.backend.facts();
+    if (own.drafted) |x| facts = x.facts(facts);
     return .{
-        .backend = own.backend.backend(),
-        .facts = own.backend.facts(),
+        .backend = backend,
+        .facts = facts,
         .rows = hip_lanes.Hip.max_window,
         .ctx = own,
         .deinit = release,

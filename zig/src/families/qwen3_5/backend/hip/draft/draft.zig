@@ -312,7 +312,8 @@ pub const Draft = struct {
             for (skip..count) |i| {
                 if (n == table.len) return error.TooManyDraftRows;
                 const src_row: usize = if (it.rows) |rs| rs[i] else i;
-                table[n] = .{ .src = f.buffer + f.offset + src_row * row_bytes, .ring = ctx.ring.base(), .pos = @intCast(it.start + i) };
+                const at = if (f.ring > 0) ((f.offset + src_row) % f.ring) * row_bytes else f.offset + src_row * row_bytes;
+                table[n] = .{ .src = f.buffer + at, .ring = ctx.ring.base(), .pos = @intCast(it.start + i) };
                 n += 1;
             }
             ctx.end = start + (count - skip);
