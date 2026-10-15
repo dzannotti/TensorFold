@@ -341,3 +341,60 @@ test "bf16 rows: products of bf16 weights over every row count a hold takes, fp3
         };
     }
 }
+
+test "q4 rows: a tiled affine-4 group-64 matrix's products over every row count a hold takes, each weight dequantized to bf16" {
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xd7 };
+    const n = 224; // 7 blocks: the last wave of the second grid block has none
+    const k = 192;
+    const groups = k / 64;
+    const words = try gpa.alloc(u32, n * k / 8);
+    defer gpa.free(words);
+    for (words) |*w| w.* = @truncate(rng.next());
+    const scales = try randoms(&rng, n * groups, 0.05);
+    defer gpa.free(scales);
+    const biases = try randoms(&rng, n * groups, 0.4);
+    defer gpa.free(biases);
+    // the row kernel's layout: 32-column blocks, a block's group 32 columns' 8 words back to back, tables likewise
+    const tw = try gpa.alloc(u32, words.len);
+    defer gpa.free(tw);
+    const ts = try gpa.alloc(u16, scales.len);
+    defer gpa.free(ts);
+    const tb = try gpa.alloc(u16, biases.len);
+    defer gpa.free(tb);
+    for (0..n) |c| for (0..groups) |g| {
+        const i = (c / 32 * groups + g) * 32 + c % 32;
+        @memcpy(tw[i * 8 ..][0..8], words[c * (k / 8) + g * 8 ..][0..8]);
+        ts[i] = scales[c * groups + g];
+        tb[i] = biases[c * groups + g];
+    };
+    var dw = try t.upload(tw);
+    defer dw.free();
+    var ds = try t.upload(ts);
+    defer ds.free();
+    var db = try t.upload(tb);
+    defer db.free();
+    for ([_]usize{ 1, 8, 24, 64, 72 }) |rows| {
+        const x = try randoms(&rng, rows * k, 2);
+        defer gpa.free(x);
+        var dx = try t.upload(x);
+        defer dx.free();
+        var out = try t.alloc(rows * n * 2);
+        defer out.free();
+        try t.on.dftQ4Rows(at(dx), at(dw), at(ds), at(db), at(out), rows, n, k, t.stream.handle);
+        try t.stream.synchronize();
+        const got = try rig.download(u16, out);
+        defer gpa.free(got);
+        for (0..rows) |r| for (0..n) |c| {
+            var acc: f64 = 0;
+            for (0..k) |e| {
+                const q: f32 = @floatFromInt((words[(c * k + e) / 8] >> @intCast(4 * (e % 8))) & 15);
+                const g = c * groups + e / 64;
+                acc += @as(f64, bfv(x[r * k + e])) * rbf(q * bfv(scales[g]) + bfv(biases[g]));
+            }
+            const want: f32 = @floatCast(acc);
+            try rig.expect(@abs(bfv(got[r * n + c]) - want) <= 1.0 / 128.0 * @max(@abs(want), 0.25), "rows {d}: ({d}, {d}) {d} vs {d}", .{ rows, r, c, bfv(got[r * n + c]), want });
+        };
+    }
+}

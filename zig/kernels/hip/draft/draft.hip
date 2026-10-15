@@ -324,6 +324,109 @@ extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STA
     OUT[(static_cast<size_t>(stream * block + m) * heads + head) * HD + dim] = tobf(acc / l);
 }
 
+namespace {
+
+// A finite value's bf16 bits, round to nearest even (dequantized weights are never NaN).
+__device__ __forceinline__ uint32_t rne(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+// 16 weights of a column from two code words (low nibble first): scale q + bias, rounded to bf16, two a dword.
+__device__ __forceinline__ u32x8v dequant16(uint32_t w0, uint32_t w1, float s, float b) {
+    u32x8v v;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        v[i] = rne(static_cast<float>((w0 >> (8 * i)) & 15u) * s + b) | (rne(static_cast<float>((w0 >> (8 * i + 4)) & 15u) * s + b) << 16);
+        v[4 + i] = rne(static_cast<float>((w1 >> (8 * i)) & 15u) * s + b) | (rne(static_cast<float>((w1 >> (8 * i + 4)) & 15u) * s + b) << 16);
+    }
+    return v;
+}
+
+}  // namespace
+
+// OUT (rows, n) bf16 = X (rows, k) bf16 times an affine-4 group-64 matrix (n, k) in the drafter's tiled layout, rows at most
+// 64: every weight read once whatever the rows (the target's stream tile reads them once per 4 rows). The layout: blocks of
+// 32 columns, each group of a block 32 lanes x 32 bytes (lane l column 32 b + l, its 64 nibbles low first) back to back, then
+// the scales and biases as (block, group, 32) bf16. A workgroup owns a block, its 4 waves every 4th group (adjacent bytes at
+// once), summed through LDS. Lane l dequantizes column l's group once; the halves trade fragments; the group runs against
+// every row tile. Grid (blocks), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) tf_dft_q4_rows(const uint16_t* X, const uint4* W, const uint16_t* S, const uint16_t* Bz,
+                                                                 uint16_t* OUT, int rows, int n, int k) {
+    constexpr int kWaves = 4;
+    __shared__ float red[kWaves - 1][4][2][8][32];
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int col = lane & 15, half = lane >> 4;
+    const int block = blockIdx.x;
+    const int n0 = block * 32;
+    const int tiles = (rows + 15) / 16;
+    const int groups = k / 64;
+    const uint4* w = W + (static_cast<size_t>(block) * groups * 32 + lane) * 2;
+    const uint16_t* sp = S + static_cast<size_t>(block) * groups * 32 + lane;
+    const uint16_t* bp = Bz + static_cast<size_t>(block) * groups * 32 + lane;
+    f32x8 acc[4][2];
+#pragma unroll
+    for (int t = 0; t < 4; t++) acc[t][0] = acc[t][1] = f32x8{0, 0, 0, 0, 0, 0, 0, 0};
+    const uint16_t* xr[4];
+#pragma unroll
+    for (int t = 0; t < 4; t++) xr[t] = X + static_cast<size_t>(min(16 * t + col, rows - 1)) * k;
+    for (int g = wave; g < groups; g += kWaves) {
+        const uint4 p0 = w[64 * g], p1 = w[64 * g + 1];
+        const float s = bf(sp[32 * g]), b = bf(bp[32 * g]);
+        // 16 k a step: this lane's column (lanes 0-15 the block's first 16, 16-31 the next); the halves trade by a shuffle
+        auto step = [&](int u, uint32_t lo, uint32_t hi) __attribute__((always_inline)) {
+            const u32x8v mine = dequant16(lo, hi, s, b);
+            const u32x8v other = {__shfl_xor(mine[0], 16, 32), __shfl_xor(mine[1], 16, 32), __shfl_xor(mine[2], 16, 32), __shfl_xor(mine[3], 16, 32),
+                                  __shfl_xor(mine[4], 16, 32), __shfl_xor(mine[5], 16, 32), __shfl_xor(mine[6], 16, 32), __shfl_xor(mine[7], 16, 32)};
+            const u32x8v lo16 = half == 0 ? mine : other, hi16 = half == 0 ? other : mine;
+            const bf16x16 fa = __builtin_bit_cast(bf16x16, lo16);
+            const bf16x16 fb = __builtin_bit_cast(bf16x16, hi16);
+#pragma unroll
+            for (int t = 0; t < 4; t++) {
+                if (t < tiles) {
+                    const bf16x16 x = load16(xr[t] + 64 * g + 16 * u);
+                    acc[t][0] = mma(x, fa, acc[t][0]);
+                    acc[t][1] = mma(x, fb, acc[t][1]);
+                }
+            }
+        };
+        step(0, p0.x, p0.y);
+        step(1, p0.z, p0.w);
+        step(2, p1.x, p1.y);
+        step(3, p1.z, p1.w);
+    }
+    if (wave > 0) {
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+            if (t < tiles) {
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+#pragma unroll
+                    for (int i = 0; i < 8; i++) red[wave - 1][t][j][i][lane] = acc[t][j][i];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (wave != 0) return;
+#pragma unroll
+    for (int t = 0; t < 4; t++) {
+        if (t >= tiles) continue;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int r = 16 * t + 2 * i + half;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                float v = acc[t][j][i];
+#pragma unroll
+                for (int x = 0; x < kWaves - 1; x++) v += red[x][t][j][i][lane];
+                const int c = n0 + 16 * j + col;
+                if (r < rows && c < n) OUT[static_cast<size_t>(r) * n + c] = tobf(v);
+            }
+        }
+    }
+}
+
 // OUT (rows, n) bf16 = X (rows, k) bf16 times W (n, k) bf16 transposed, rows at most 64, k a multiple of 32:
 // --drafter-bits 0's products. A wave owns 32 columns over every row, so the weights stream once. Grid (n / 128 up), 128 threads.
 extern "C" __global__ void __launch_bounds__(128) tf_dft_bf16_rows(const uint16_t* X, const uint16_t* W, uint16_t* OUT, int rows, int n, int k) {

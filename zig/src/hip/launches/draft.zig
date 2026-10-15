@@ -18,6 +18,7 @@ pub const Fns = struct {
     attn: Function,
     attn_merge: Function,
     bf16_rows: Function,
+    q4_rows: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -28,6 +29,7 @@ pub const Fns = struct {
             .attn = try m.function("tf_dft_attn"),
             .attn_merge = try m.function("tf_dft_attn_merge"),
             .bf16_rows = try m.function("tf_dft_bf16_rows"),
+            .q4_rows = try m.function("tf_dft_q4_rows"),
         };
     }
 };
@@ -167,5 +169,24 @@ pub fn bf16Rows(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: us
         try a.add(@as(c_int, @intCast(n)));
         try a.add(@as(c_int, @intCast(k)));
         try l.go(l.dft.bf16_rows, dim((n + 127) / 128, 1, 1), dim(128, 1, 1), 0, s, &a);
+    }
+}
+
+/// out (rows, n) = x (rows, k) times an MLX affine-4 group-64 matrix with bf16 tables, rounded to bf16; 64 rows a launch.
+pub fn q4Rows(l: *const Launcher, x: u64, words: u64, scales: u64, biases: u64, out: u64, rows: usize, n: usize, k: usize, s: S) Error!void {
+    if (k % 64 != 0 or n == 0 or words % 16 != 0) return invalid("dft q4_rows");
+    var at: usize = 0;
+    while (at < rows) : (at += 64) {
+        const m = @min(64, rows - at);
+        var a: Args = .{};
+        try a.add(x + at * k * 2);
+        try a.add(words);
+        try a.add(scales);
+        try a.add(biases);
+        try a.add(out + at * n * 2);
+        try a.add(@as(c_int, @intCast(m)));
+        try a.add(@as(c_int, @intCast(n)));
+        try a.add(@as(c_int, @intCast(k)));
+        try l.go(l.dft.q4_rows, dim((n + 31) / 32, 1, 1), dim(128, 1, 1), 0, s, &a);
     }
 }
