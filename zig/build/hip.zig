@@ -82,7 +82,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     kernel_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
     kernel_module.addImport("hip_kernels", objects);
     kernel_module.addImport("core", coreModule(b, target));
-    const kernel_test = b.addTest(.{ .root_module = kernel_module });
+    const kernel_filter = b.option([]const u8, "hip-test-filter", "Run only the GPU kernel tests whose names contain this");
+    const kernel_test = b.addTest(.{ .root_module = kernel_module, .filters = if (kernel_filter) |f| b.dupeStrings(&.{f}) else &.{} });
     b.step("hip-kernel-build", "Compile the model-free kernels and their GPU tests without running them").dependOn(&kernel_test.step);
     b.step("hip-kernel-test", "Every model-free kernel against its host reference on the GPU").dependOn(&b.addRunArtifact(kernel_test).step);
     const stub_kernels = b.createModule(.{ .root_source_file = b.addWriteFiles().add("kernels.zig", stub) });
@@ -194,6 +195,7 @@ const headers = [_][]const u8{
     "common/wmma.hpp",            "quant/act.hpp",        "quant/mlx.hpp",       "quant/mlx_decoder.hpp", "quant/mlx_pieces.hpp",
     "quant/mlx_tiles.hpp",        "tiles/dot2.hpp",       "tiles/epilogue.hpp",  "tiles/gemm.hpp",        "tiles/gemm_kp.hpp",
     "tiles/matrix_gemm.hpp",      "tiles/plan.hpp",       "tiles/stream.hpp",    "flashnext/streams.hpp", "flashnext/ngram.hpp",
+    "tiles/wmma_verify.hpp",
     "flashnext/indexer.hpp",      "flashnext/sparse.hpp",
 };
 

@@ -6,6 +6,7 @@
 #include "tiles/stream.hpp"
 #include "tiles/matrix_gemm.hpp"
 #include "quant/mlx_tiles.hpp"
+#include "tiles/wmma_verify.hpp"
 
 namespace tf {
 namespace rocm {
