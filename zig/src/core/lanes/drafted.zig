@@ -56,6 +56,7 @@ pub const Drafted = struct {
         m.speculate_early = false;
         m.drafts = @min(d.depth, if (target.exact_width > 1) target.exact_width - 1 else 0);
         m.mtp_step_ms = d.step_ms;
+        if (d.fixed_hold) m.lane_step_ms = 0;
         m.draft_prior = d.prior;
         m.plain_guard = d.plain_guard;
         m.draft_streams = d.batched;

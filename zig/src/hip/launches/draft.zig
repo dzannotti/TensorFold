@@ -19,6 +19,7 @@ pub const Fns = struct {
     attn_merge: Function,
     bf16_rows: Function,
     q4_rows: Function,
+    topk_merge: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -30,6 +31,7 @@ pub const Fns = struct {
             .attn_merge = try m.function("tf_dft_attn_merge"),
             .bf16_rows = try m.function("tf_dft_bf16_rows"),
             .q4_rows = try m.function("tf_dft_q4_rows"),
+            .topk_merge = try m.function("tf_dft_topk_merge"),
         };
     }
 };
@@ -99,7 +101,7 @@ pub fn dynConv(l: *const Launcher, x: u64, dyn: u64, base: u64, res: u64, out: u
     try a.add(@as(c_int, @intCast(group)));
     try a.add(@as(c_int, branch));
     try a.add(@as(c_int, @intCast(block)));
-    try l.go(l.dft.dyn_conv, dim(rows, 1, 1), dim(256, 1, 1), 0, s, &a);
+    try l.go(l.dft.dyn_conv, dim(rows, (width + 255) / 256, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// What one block attention launch reads: a layer of each stream's rings by `desc`, and the scratch its splits write.
@@ -118,7 +120,8 @@ pub const Attn = struct {
     window: usize,
     splits: usize,
     part: u64, // partBytes
-    out: u64, // (rows, heads, 128) bf16
+    out: u64, // (rows, heads, 128) bf16, rows `ostride` apart
+    ostride: usize = 0, // elements (0: heads x 128)
 };
 
 /// Scratch the splits of one launch write: partial outputs then their (max, sum).
@@ -152,6 +155,7 @@ pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     try b.add(@as(c_int, @intCast(x.heads)));
     try b.add(@as(c_int, @intCast(x.kv_heads)));
     try b.add(x.out);
+    try b.add(@as(c_longlong, @intCast(if (x.ostride != 0) x.ostride else x.heads * head_dim)));
     try l.go(l.dft.attn_merge, dim(x.streams * x.kv_heads, queries, 1), dim(head_dim, 1, 1), 0, s, &b);
 }
 
@@ -189,4 +193,21 @@ pub fn q4Rows(l: *const Launcher, x: u64, words: u64, scales: u64, biases: u64, 
         try a.add(@as(c_int, @intCast(k)));
         try l.go(l.dft.q4_rows, dim((n + 31) / 32, 1, 1), dim(128, 1, 1), 0, s, &a);
     }
+}
+
+/// Each row's ks[r] best (value desc, id asc) from its `chunks` chunks' top k each (ci, cv: (rows, chunks, k)), ids
+/// as the row's (chunk c's id + c x `chunk`), best first, `stride` apart.
+pub fn topkMerge(l: *const Launcher, ci: u64, cv: u64, rows: usize, chunks: usize, k: usize, chunk: usize, ks: u64, stride: usize, ids: u64, values: u64, s: S) Error!void {
+    if (chunks * k > 1024 or rows == 0) return invalid("dft topk merge");
+    var a: Args = .{};
+    try a.add(ci);
+    try a.add(cv);
+    try a.add(@as(c_int, @intCast(chunks)));
+    try a.add(@as(c_int, @intCast(k)));
+    try a.add(@as(c_int, @intCast(chunk)));
+    try a.add(ks);
+    try a.add(@as(c_int, @intCast(stride)));
+    try a.add(ids);
+    try a.add(values);
+    try l.go(l.dft.topk_merge, dim(rows, 1, 1), dim(chunks * k, 1, 1), 0, s, &a);
 }

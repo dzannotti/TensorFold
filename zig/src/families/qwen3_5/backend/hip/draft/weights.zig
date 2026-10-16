@@ -7,7 +7,14 @@ const Config = @import("config.zig").Config;
 
 
 /// Affine-4 group 64 in draft.hip's tiled layout (tf_dft_q4_rows): words, then bf16 scales and biases, `n` columns.
+/// In the MLX layout `k` may hold zero columns past the matrix's own (`pad`): x then comes `k` wide, zeros past.
 pub const Q4 = struct { words: u64, scales: u64, biases: u64, n: usize, k: usize };
+
+/// Zero columns a K's rows take in the MLX layout: rows a power of two of bytes apart all fall on the same memory
+/// channels (the verify tile reads a 4096-K product at 64 GB/s, at 4352 at 153).
+pub fn pad(k: usize) usize {
+    return if (mlx_layout and std.math.isPowerOfTwo(k)) 256 else 0;
+}
 
 /// A product's weights: affine-4 through the drafter's row kernel, or bf16 through its bf16 one.
 /// The MLX layout, so the engine's verify tile runs the drafter (TF_DRAFT_MLX=0 keeps draft.hip's tiled row kernel)
@@ -144,11 +151,13 @@ const Loader = struct {
             }
             return .{ .bf16 = .{ .w = w, .n = n, .k = k } };
         }
-        const groups = k / 64;
-        const words = l.take(n * k / 2);
         if (k % 64 != 0) return error.UnsupportedDraftConfig;
-        const scales = l.take(n * groups * 2);
-        const biases = l.take(n * groups * 2);
+        const groups = k / 64;
+        const kp = k + pad(k); // the stored rows' K
+        const gp = kp / 64;
+        const words = l.take(n * kp / 2);
+        const scales = l.take(n * gp * 2);
+        const biases = l.take(n * gp * 2);
         if (l.arena != null) {
             var row: usize = 0;
             for (names) |name| {
@@ -162,25 +171,31 @@ const Loader = struct {
                 defer l.gpa.free(qb);
                 if (rows % 32 != 0) return error.UnsupportedDraftConfig;
                 quantize(std.mem.bytesAsSlice(u16, t.bytes), rows, k, qw, qs, qb);
-                const tw = try l.gpa.alloc(u32, rows * k / 8);
+                const tw = try l.gpa.alloc(u32, rows * kp / 8);
                 defer l.gpa.free(tw);
-                const ts = try l.gpa.alloc(u16, rows * groups);
+                const ts = try l.gpa.alloc(u16, rows * gp);
                 defer l.gpa.free(ts);
-                const tb = try l.gpa.alloc(u16, rows * groups);
+                const tb = try l.gpa.alloc(u16, rows * gp);
                 defer l.gpa.free(tb);
                 if (mlx_layout) {
-                    @memcpy(tw, qw);
-                    @memcpy(ts, qs);
-                    @memcpy(tb, qb);
+                    // each row, then its padding's zero codes, scales and biases (zero terms over zero x add nothing)
+                    @memset(tw, 0);
+                    @memset(ts, 0);
+                    @memset(tb, 0);
+                    for (0..rows) |r| {
+                        @memcpy(tw[r * kp / 8 ..][0 .. k / 8], qw[r * k / 8 ..][0 .. k / 8]);
+                        @memcpy(ts[r * gp ..][0..groups], qs[r * groups ..][0..groups]);
+                        @memcpy(tb[r * gp ..][0..groups], qb[r * groups ..][0..groups]);
+                    }
                 } else tile(u16, rows, k, qw, qs, qb, tw, ts, tb);
                 // a part of a stack starts on a whole block (32 rows): its tiled bytes sit where its rows would
-                try l.put(words + row * k / 2, std.mem.sliceAsBytes(tw));
-                try l.put(scales + row * groups * 2, std.mem.sliceAsBytes(ts));
-                try l.put(biases + row * groups * 2, std.mem.sliceAsBytes(tb));
+                try l.put(words + row * kp / 2, std.mem.sliceAsBytes(tw));
+                try l.put(scales + row * gp * 2, std.mem.sliceAsBytes(ts));
+                try l.put(biases + row * gp * 2, std.mem.sliceAsBytes(tb));
                 row += rows;
             }
         }
-        return .{ .q4 = .{ .words = words, .scales = scales, .biases = biases, .n = n, .k = k } };
+        return .{ .q4 = .{ .words = words, .scales = scales, .biases = biases, .n = n, .k = kp } };
     }
 
     /// The bf16 vectors `names` of `len` each, widened to fp32 back to back.
@@ -209,6 +224,10 @@ const Loader = struct {
         return p;
     }
 };
+
+fn mlxLayout() bool {
+    return if (std.c.getenv("TF_DRAFT_MLX")) |v| v[0] != '0' else true;
+}
 
 fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shape: []const usize) ![]u16 {
     const t = try ck.expect(name, .bf16, shape);
@@ -264,6 +283,7 @@ fn place(l: *Loader, c: Config, layers: []Layer) !struct { fc: Linear, hidden_no
 
 /// The device bytes `load` takes for the checkpoint in `dir` at `bits` (4 or 0).
 pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: Config, bits: u8) !usize {
+    mlx_layout = mlxLayout();
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
     var l: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = null };
@@ -274,7 +294,7 @@ pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: Confi
 }
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, r: *const hip.Runtime, dir: []const u8, c: Config, bits: u8) !Weights {
-    mlx_layout = if (std.c.getenv("TF_DRAFT_MLX")) |v| v[0] != '0' else true;
+    mlx_layout = mlxLayout();
     if (bits != 0 and bits != 4) return error.DrafterBitsUnsupported;
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();

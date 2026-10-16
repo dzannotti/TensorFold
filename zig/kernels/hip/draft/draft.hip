@@ -113,13 +113,14 @@ extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope(const uint16_t
 }
 
 // y[t, c] = sum over lags l of (BASE[l, c] + DYN[t, l, c / group]) * x[t - l, c] in bf16 steps, x before a block's first row 0;
-// RES (when given) added last. Grid (rows), 256 threads.
+// RES (when given) added last. Grid (rows, D / 256 rounded up), 256 threads: a channel a thread.
 extern "C" __global__ void tf_dft_dyn_conv(const uint16_t* X, const uint16_t* DYN, const uint16_t* BASE, const uint16_t* RES, uint16_t* OUT,
                                            int D, int group, int branch, int block) {
     const int t = blockIdx.x;
     const int groups = D / group;
     const int lags = t % block == 0 ? 1 : 2;
-    for (int c = threadIdx.x; c < D; c += blockDim.x) {
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c < D) {
         const int g = c / group;
         float total = 0.f;
         for (int l = 0; l < lags; l++) {
@@ -301,9 +302,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
     }
 }
 
-// The splits of tf_dft_attn joined: OUT (rows, heads, HD) bf16. Grid (streams * kv_heads, 64 queries), HD threads.
+// The splits of tf_dft_attn joined: OUT (rows, heads, HD) bf16, rows ostride apart. Grid (streams * kv_heads, 64 queries), HD threads.
 extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
-                                             uint16_t* OUT) {
+                                             uint16_t* OUT, long long ostride) {
     const int stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads;
     const int q = blockIdx.y;
     const int G = heads / kv_heads;
@@ -321,7 +322,7 @@ extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STA
         acc += PART[at * HD + dim] * w;
     }
     const int m = q / G, head = kvh * G + q % G;
-    OUT[(static_cast<size_t>(stream * block + m) * heads + head) * HD + dim] = tobf(acc / l);
+    OUT[static_cast<size_t>(stream * block + m) * ostride + head * HD + dim] = tobf(acc / l);
 }
 
 namespace {
@@ -474,5 +475,39 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_bf16_rows(const uint16_
                 if (c < n) OUT[static_cast<size_t>(r) * n + c] = tobf(acc[t][j][i]);
             }
         }
+    }
+}
+
+namespace {
+
+// A monotone 16-bit key of a value's bits (-0 and +0 share one), as ops/draw.hpp's tf_topk orders them.
+__device__ __forceinline__ uint32_t order_key(uint16_t bits) {
+    if (bits == 0x8000) bits = 0;
+    return (bits & 0x8000) ? (~bits & 0xffffu) : (bits | 0x8000u);
+}
+
+}  // namespace
+
+// Row r's ks[r] largest by (value desc, id asc) out of its S chunks' own top k (tf_topk over the row as S rows of
+// `chunk`): CI/CV (rows, S, k) chunk ids and values, ids returned as the row's. The same set as tf_topk over the whole
+// row, best first. Grid (rows), S x k threads (at most 1024).
+extern "C" __global__ void tf_dft_topk_merge(const int* CI, const uint16_t* CV, int S, int k, int chunk, const int* ks, int stride,
+                                             int* ids, uint16_t* values) {
+    const int r = blockIdx.x, want = ks[r];
+    if (want <= 0) return;
+    __shared__ uint32_t key[1024];
+    __shared__ int id[1024];
+    const int n = S * k, i = threadIdx.x;
+    if (i < n) {
+        key[i] = order_key(CV[static_cast<size_t>(r) * n + i]);
+        id[i] = (i / k) * chunk + CI[static_cast<size_t>(r) * n + i];
+    }
+    __syncthreads();
+    if (i >= n) return;
+    int rank = 0;
+    for (int j = 0; j < n; j++) rank += key[j] > key[i] || (key[j] == key[i] && id[j] < id[i]);
+    if (rank < want) {
+        ids[r * stride + rank] = id[i];
+        values[r * stride + rank] = CV[static_cast<size_t>(r) * n + i];
     }
 }

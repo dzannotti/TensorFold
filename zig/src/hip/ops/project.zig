@@ -134,15 +134,21 @@ pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tenso
         .fp16 = @intFromBool(fp16),
     };
     // a prompt's 4-bit group-64 product on the matrix cores takes the prompt tile, which rounds as the cast below would
-    const prompt = o.prefill and std.mem.endsWith(u8, tile.id, ".prefill.matrix") and z.affine.promptTakes(arg);
+    // (the dequantizing one at every row count, so a prompt's bits never depend on where it is cut)
+    const dq = o.prefill and z.affine.dqTakes(arg);
+    const prompt = dq or (o.prefill and std.mem.endsWith(u8, tile.id, ".prefill.matrix") and z.affine.promptTakes(arg));
     const half = !f32_out and if (prompt) true else !o.prefill and tile.roundsAct(shape);
     const out = try o.arena.take(m * n * @as(usize, if (half) 2 else 4));
     if (half) arg.out16 = out else arg.out = out;
-    if (prompt) {
-        arg.sums = try o.arena.take(m * (@as(usize, w.k) / 64) * 4);
-        try z.affine.sumsGo(z.r, arg, o.stream);
+    if (dq) {
+        try z.affine.dqGo(z.r, arg, o.stream);
+    } else {
+        if (prompt) {
+            arg.sums = try o.arena.take(m * (@as(usize, w.k) / 64) * 4);
+            try z.affine.sumsGo(z.r, arg, o.stream);
+        }
+        try tile.launch(&z.affine, .{ .r = z.r, .s = o.stream, .arg = arg });
     }
-    try tile.launch(&z.affine, .{ .r = z.r, .s = o.stream, .arg = arg });
     if (half) return .{ .ptr = out, .kind = x.kind };
     if (f32_out) return .{ .ptr = out, .kind = .f32 };
     const narrow = try o.arena.take(m * n * 2);

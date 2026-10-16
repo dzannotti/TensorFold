@@ -331,7 +331,68 @@ fn tierProduct(t: *Rig, m: usize, n: usize, k: usize, bits: c_int, group: c_int,
         diff += d;
     }
     if (k_ptr.promptTakes(arg)) diff += try promptProduct(t, arg, outs[big], written);
+    if (k_ptr.promptTakes(arg) and arg.scale.kind == 1) diff += try dqProduct(t, arg, written);
     return diff;
+}
+
+/// The dequantizing prompt tile: rows `sh..` launched from row `sh` at the other block shape are the full launch's
+/// bits (its sums depend on k alone), and every value is within bf16 weight rounding of the 128-row block's exact
+/// fp32 (`want_host`).
+fn dqProduct(t: *Rig, arg_in: affine.Arg, want_host: []const u8) !usize {
+    const m: usize = @intCast(arg_in.m);
+    const n: usize = @intCast(arg_in.n);
+    const sh = m / 3;
+    var outs: [2]Buffer = undefined;
+    for (&outs) |*o| {
+        o.* = try Buffer.alloc(t.base, m * n * 4);
+        try o.fill8(0xA5, null);
+    }
+    defer for (&outs) |*o| o.free();
+    var arg = arg_in;
+    arg.out = outs[0].ptr;
+    try t.kernels.dqShape(&t.base.r, arg, t.base.stream.handle, false);
+    arg.x += sh * @as(usize, @intCast(arg.k)) * 2;
+    arg.m = @intCast(m - sh);
+    arg.out = outs[1].ptr;
+    try t.kernels.dqShape(&t.base.r, arg, t.base.stream.handle, true);
+    try t.base.stream.synchronize();
+    const a = try gpa.alloc(f32, m * n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, m * n);
+    defer gpa.free(b);
+    try outs[0].download(0, std.mem.sliceAsBytes(a));
+    try outs[1].download(0, std.mem.sliceAsBytes(b));
+    const want = std.mem.bytesAsSlice(f32, want_host);
+    var top: f32 = 0;
+    for (want) |w| top = @max(top, @abs(w));
+    var moved: usize = 0;
+    var far: usize = 0;
+    for (0..m * n) |i| {
+        if (i >= sh * n and @as(u32, @bitCast(a[i])) != @as(u32, @bitCast(b[i - sh * n]))) moved += 1;
+        if (!(@abs(a[i] - want[i]) <= 1e-2 * top)) far += 1;
+    }
+    if (moved != 0) std.debug.print("the dq prompt tile's rows from row {d} differ in {d} words (m {d} n {d} k {d})\n", .{ sh, moved, m, n, arg.k });
+    if (far != 0) std.debug.print("the dq prompt tile is off the exact product in {d} values (m {d} n {d} k {d})\n", .{ far, m, n, arg.k });
+    // its bf16 output (the staged epilogue) against the fp32 rounded to nearest even, at both shapes
+    var rounded: usize = 0;
+    const got = try gpa.alloc(u16, m * n);
+    defer gpa.free(got);
+    arg = arg_in;
+    arg.out = 0;
+    arg.out16 = outs[1].ptr;
+    for ([_]bool{ false, true }) |tall| {
+        try outs[1].fill8(0xA5, null);
+        try t.kernels.dqShape(&t.base.r, arg, t.base.stream.handle, tall);
+        try t.base.stream.synchronize();
+        try outs[1].download(0, std.mem.sliceAsBytes(got));
+        for (got, a) |g, v| {
+            const u: u32 = @bitCast(v);
+            const bf: u16 = if (std.math.isNan(v)) 0x7fc0 else @truncate((u + ((u >> 16) & 1) + 0x7fff) >> 16);
+            if (g != bf) rounded += 1;
+        }
+    }
+    if (rounded != 0) std.debug.print("the dq prompt tile's bf16 differs from its rounded fp32 in {d} values (m {d} n {d} k {d})\n", .{ rounded, m, n, arg.k });
+    return moved + far + rounded;
 }
 
 /// The prompt tile (its sums first) against the 128-row block's fp32 words, and its bf16 output against their rounding.

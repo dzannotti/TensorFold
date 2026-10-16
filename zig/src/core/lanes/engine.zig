@@ -241,7 +241,7 @@ pub const Engine = struct {
         if (s.graft_room != null and s.rounds > 1) {
             // the stream's round time beyond its window and head levels, for the lane planner
             if (e.cfg.lane_costs.get(@intCast(rows))) |w| {
-                const over = e.clock.elapsedMs(.cost) - w - e.cfg.mtp_step_ms * @as(f64, @floatFromInt(held_levels));
+                const over = e.clock.elapsedMs(.cost) - w - e.cfg.lane_step_ms * @as(f64, @floatFromInt(held_levels));
                 const kept = if (plan.lanes != null and plan.parents != null) &s.tree_over else &s.round_over;
                 kept.* = if (kept.*) |x| x + 0.25 * (over - x) else over;
             }
@@ -419,7 +419,7 @@ pub const Engine = struct {
             const s = requests[0].stream;
             if (s.odds == null) s.odds = shape.Odds.init(shape.start_odds, shape.start_weight);
             const cap: usize = @intCast(@max(1, @min(@min(shape.max_depth, e.cfg.head_depth), s.draftRoom() - 1)));
-            const costs = plan_lanes.Costs{ .window = &e.cfg.lane_costs, .head_ms = e.cfg.mtp_step_ms, .over_ms = s.round_over orelse 0, .tree_over_ms = s.tree_over, .measured = if (e.cfg.own_prices) &s.measured else null };
+            const costs = plan_lanes.Costs{ .window = &e.cfg.lane_costs, .head_ms = e.cfg.lane_step_ms, .over_ms = s.round_over orelse 0, .tree_over_ms = s.tree_over, .measured = if (e.cfg.own_prices) &s.measured else null };
             // every eighth round one size wider than the best, so the odds of deeper lanes stay measured
             const p = try plan_lanes.pick(e.gpa, s.odds.?, costs, e.cfg.head_lanes, cap, try e.graftProspect(s), s.rounds % 8 == 4);
             s.picks[p.choice] += 1;

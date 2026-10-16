@@ -8,6 +8,7 @@ const Shape = @import("shape.zig").Shape;
 pub const Facts = struct {
     depth: u32, // drafts a round at most
     step_ms: f64, // one more draft's cost (timed at load); the rule prices a round as forward(rows) + step_ms x drafts
+    fixed_hold: bool = false, // a hold costs the same at any depth (the block drafted at once): the lane planner prices no levels
     prior: []const f64 = &.{}, // acceptance by depth until a stream has its own
     plain_guard: bool = true, // plain rounds compete with drafted depths (the rule may choose no drafts)
     batched: bool = false, // hold() runs a shared round's streams as one batch
