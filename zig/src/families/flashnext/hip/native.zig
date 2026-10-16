@@ -56,8 +56,12 @@ pub const Verdict = struct {
 /// Admits `c` with the index text `index_json` on rank `rank` of `world` at `window` positions in `room` bytes.
 pub fn admit(a: std.mem.Allocator, gpa: std.mem.Allocator, c: *const config.Config, index_json: []const u8, world: u32, rank: u32, window: u64, room: u64, problem: *[]const u8) Refused!Verdict {
     const spec = c.global_affine;
-    if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
-    _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
+    // INT4-AutoRound (GPTQ 4-bit groups of 128): its own names, checked as the loader reads them (hip/int4ar.zig);
+    // the plan prices every matrix at 4 bits (its float and FP8 ones are wider: the engine measures what is left)
+    if (!c.gptq) {
+        if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
+        _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
+    }
     const w = plan.weights(c, spec, world) catch |err| return refuse(a, problem, "--tp {d} does not split Flash Next's heads, experts and vocabulary evenly ({s})", .{ world, @errorName(err) });
     const token = plan.tokenBytes(c, world, 2) catch return refuse(a, problem, "Flash Next's layer types are unreadable", .{});
     const stream = plan.streamBytes(c, world) catch return refuse(a, problem, "Flash Next's DeltaNet heads do not split over --tp {d}", .{world});
@@ -81,13 +85,29 @@ fn cardRoom(gpa: std.mem.Allocator, io: std.Io, dev: hip.Device) !u64 {
 }
 
 /// Admission before anything loads: the format, the tensors and whether the rank's share and one stream fit.
-fn check(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip.Device, dir: []const u8, o: anytype, problem: *[]const u8) Refused!void {
+fn check(
+    a: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dev: hip.Device,
+    dir: []const u8,
+    o: anytype,
+    problem: *[]const u8,
+) Refused!void {
     var c = config.Config.read(gpa, io, dir) catch |err| return refuse(a, problem, "{s} is not a Flash Next checkpoint the HIP engine reads ({s})", .{ dir, @errorName(err) });
     defer c.deinit();
     const text = readIndex(a, io, dir) catch |err| return refuse(a, problem, "cannot read {s}/model.safetensors.index.json ({s})", .{ dir, @errorName(err) });
     const bytes = cardRoom(gpa, io, dev) catch |err| return refuse(a, problem, "the native HIP engine cannot read the GPU's memory ({s})", .{@errorName(err)});
     const v = admit(a, gpa, &c, text, o.world, o.rank, o.window, bytes, problem) catch |err| return err;
-    if (!v.fits) return refuse(a, problem, "Flash Next {d}-bit on {d} rank(s) holds {d:.2} GiB of weights a rank ({d:.1} GiB of n-gram tables in host memory) and {d:.1} GiB of scratch, of the {d:.2} GiB this card grants: a {d}-token window does not fit (at most {d}); lower --context, add ranks (--tp), or use a lower-bit checkpoint", .{ v.spec.bits, o.world, gibs(v.weights), gibs(v.host), gibs(scratch_bytes), gibs(bytes), o.window, v.most });
+    if (!v.fits) return refuse(
+        a,
+        problem,
+        "Flash Next {d}-bit on {d} rank(s) holds {d:.2} GiB of weights a rank " ++
+            "({d:.1} GiB of n-gram tables in host memory) and {d:.1} GiB of scratch, " ++
+            "of the {d:.2} GiB this card grants: a {d}-token window does not fit (at most {d}); " ++
+            "lower --context, add ranks (--tp), or use a lower-bit checkpoint",
+        .{ v.spec.bits, o.world, gibs(v.weights), gibs(v.host), gibs(scratch_bytes), gibs(bytes), o.window, v.most },
+    );
 }
 
 /// The positions a stream holds: the window and a verify's rows past it, on 64.
@@ -95,8 +115,78 @@ fn capacity(window: usize) usize {
     return std.mem.alignForward(usize, window + cache.max_window + 1, 64);
 }
 
-fn engineOf(gpa: std.mem.Allocator, io: std.Io, dev: hip.Device, dir: []const u8, o: anytype) !*Engine {
-    return Engine.open(gpa, io, dir, .{ .device = dev.index, .rank = o.rank, .world = o.world, .group = dev.group, .policy = dev.policy, .capacity = capacity(o.window), .chunk = @max(dev.policy.prefill_step, dev.policy.fill_rows) });
+fn engineOf(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dev: hip.Device,
+    dir: []const u8,
+    o: anytype,
+    steps: *hip.Startup,
+) !*Engine {
+    return Engine.load(gpa, io, dir, .{
+        .device = dev.index,
+        .rank = o.rank,
+        .world = o.world,
+        .group = dev.group,
+        .startup = steps,
+        .policy = dev.policy,
+        .capacity = capacity(o.window),
+        .chunk = @max(dev.policy.prefill_step, dev.policy.fill_rows),
+    });
+}
+
+/// One rank's engine at the window every rank took, and the streams every rank's memory holds.
+const Prepared = struct { e: *Engine, window: usize, fit: usize, per: usize, room: u64 };
+
+/// Every rank, in steps over the link: rank 0's window, this rank's admission and engine, then the streams that fit.
+fn prepare(
+    a: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dev: hip.Device,
+    dir: []const u8,
+    o: anytype,
+    steps: *hip.Startup,
+    problem: *[]const u8,
+) (Refused || std.mem.Allocator.Error)!Prepared {
+    // every rank sizes its caches for rank 0's window: the windows rank 0 sends fit them
+    var mine = o;
+    mine.window = @intCast((try steps.together(a, .{ o.window, 0 }, .first, problem))[0]);
+    check(a, gpa, io, dev, dir, mine, problem) catch |err| {
+        steps.refuse(problem.*);
+        return err;
+    };
+    _ = try steps.together(a, .{ 0, 0 }, .first, problem);
+    const e = engineOf(gpa, io, dev, dir, mine, steps) catch |err| return switch (err) {
+        error.PeerRefused, error.LinkFailed => steps.stoppedBy(a, problem),
+        else => steps.refuseAll(
+            a,
+            problem,
+            "the native HIP engine cannot load Flash Next from {s} ({s})",
+            .{ dir, @errorName(err) },
+        ),
+    };
+    errdefer e.deinit();
+    // the streams the memory left after the weights and the scratch holds at the window
+    const pool = hip.admission.budget(gpa, io, e.ctx) catch |err| return steps.refuseAll(
+        a,
+        problem,
+        "the native HIP engine cannot read the GPU's memory ({s})",
+        .{@errorName(err)},
+    );
+    const room = pool.room(hip.usage(false).device);
+    const per = streamBytes(e, capacity(mine.window));
+    // the least over the ranks: a follower takes a stream's caches when rank 0 begins it
+    const fit: usize = @intCast((try steps.together(a, .{ room / per, 0 }, .least, problem))[0]);
+    // every rank holds the same least, so every rank refuses here alike
+    if (fit == 0) return refuse(
+        a,
+        problem,
+        "one stream at a {d}-token window takes {d:.2} GiB and {d:.2} GiB is left after the weights; " ++
+            "lower --context or add ranks (--tp)",
+        .{ mine.window, gibs(per), gibs(room) },
+    );
+    return .{ .e = e, .window = mine.window, .fit = fit, .per = per, .room = room };
 }
 
 const Owned = struct {
@@ -107,38 +197,88 @@ const Owned = struct {
 
     fn release(p: *anyopaque) void {
         const own: *Owned = @ptrCast(@alignCast(p));
+        const e = own.e;
+        own.free();
+        e.deinit();
+    }
+
+    /// Everything but the engine.
+    fn free(own: *Owned) void {
         own.fx.deinit();
-        own.e.deinit();
         own.gpa.free(own.startup);
         own.gpa.destroy(own);
     }
 };
 
-/// The engine for `dir` on `dev`; under tensor parallelism this is rank 0, which serves.
-pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip.Device, dir: []const u8, o: anytype, problem: *[]const u8) anyerror!Loaded {
-    try check(a, gpa, io, dev, dir, o, problem);
-    // the followers size their streams for this window: the page tables rank 0 sends cover that many positions
-    if (dev.group) |g| try g.link().send(&.{@intCast(o.window)});
-    const e = engineOf(gpa, io, dev, dir, o) catch |err| return refuse(a, problem, "the native HIP engine cannot load Flash Next from {s} ({s})", .{ dir, @errorName(err) });
-    errdefer e.deinit();
-    // the streams the memory left after the weights and the scratch holds at the window
-    const room = (hip.admission.budget(gpa, io, e.ctx) catch |err| return refuse(a, problem, "the native HIP engine cannot read the GPU's memory ({s})", .{@errorName(err)})).room(hip.usage(false).device);
-    const per = streamBytes(e, capacity(o.window));
-    // the streams every rank's memory holds: a follower takes a stream's caches when rank 0 begins it
-    const fit = try e.least(room / per);
-    if (fit == 0) return refuse(a, problem, "one stream at a {d}-token window takes {d:.2} GiB and {d:.2} GiB is left after the weights; lower --context or add ranks (--tp)", .{ o.window, gibs(per), gibs(room) });
-    if (fit < o.streams and o.fixed) return refuse(a, problem, "--parallel {d} needs {d:.2} GiB at a {d}-token window and {d:.2} GiB is left: serve --parallel {d}, or lower --context", .{ o.streams, gibs(per * o.streams), o.window, gibs(room), fit });
-    const streams = @min(fit, @max(o.streams, 1));
+/// Rank 0's lanes over `p.e` for `streams` streams, with the server's startup line.
+fn lanesOf(gpa: std.mem.Allocator, dev: hip.Device, o: anytype, p: Prepared, streams: usize) !*Owned {
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
-    const fx = try lanes_mod.Fx.init(gpa, e, streams);
+    const fx = try lanes_mod.Fx.init(gpa, p.e, streams);
     errdefer fx.deinit();
-    if (dev.group) |g| fx.withLink(g.link());
     // kept prompt states live in host memory: --prompt-cache-gib, else 16 GiB
     fx.keepPrompts(@intFromFloat((o.cache_gib orelse 16.0) * (1 << 30)));
-    const startup = try std.fmt.allocPrint(gpa, "HIP {s} device {d}, rank {d} of {d}: Flash Next, {d:.2} GiB on the device, {d} stream{s} of {d} positions, {d:.2} GiB each; prompts in {d}-row chunks", .{ hip.kernels.arch, dev.index, o.rank, o.world, gibs(hip.usage(false).device), streams, if (streams == 1) "" else "s", capacity(o.window), gibs(per), e.o.chunk });
-    own.* = .{ .gpa = gpa, .e = e, .fx = fx, .startup = startup };
-    return .{ .backend = fx.backend(), .facts = fx.facts(), .rows = cache.max_window, .ctx = own, .deinit = Owned.release, .streams = streams, .startup = startup };
+    const startup = try std.fmt.allocPrint(
+        gpa,
+        "HIP {s} device {d}, rank {d} of {d}: Flash Next, {d:.2} GiB on the device, " ++
+            "{d} stream{s} of {d} positions, {d:.2} GiB each; prompts in {d}-row chunks",
+        .{
+            hip.kernels.arch,
+            dev.index,
+            o.rank,
+            o.world,
+            gibs(hip.usage(false).device),
+            streams,
+            if (streams == 1) "" else "s",
+            capacity(p.window),
+            gibs(p.per),
+            p.e.o.chunk,
+        },
+    );
+    own.* = .{ .gpa = gpa, .e = p.e, .fx = fx, .startup = startup };
+    return own;
+}
+
+/// The engine for `dir` on `dev`; under tensor parallelism this is rank 0, which serves.
+pub fn open(
+    a: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dev: hip.Device,
+    dir: []const u8,
+    o: anytype,
+    problem: *[]const u8,
+) anyerror!Loaded {
+    var steps: hip.Startup = .{ .link = if (dev.group) |g| g.link() else null };
+    const p = try prepare(a, gpa, io, dev, dir, o, &steps, problem);
+    errdefer p.e.deinit();
+    if (p.fit < o.streams and o.fixed) return steps.refuseAll(
+        a,
+        problem,
+        "--parallel {d} needs {d:.2} GiB at a {d}-token window and {d:.2} GiB is left: " ++
+            "serve --parallel {d}, or lower --context",
+        .{ o.streams, gibs(p.per * o.streams), p.window, gibs(p.room), p.fit },
+    );
+    const streams = @min(p.fit, @max(o.streams, 1));
+    const own = lanesOf(gpa, dev, o, p, streams) catch |err| return steps.refuseAll(
+        a,
+        problem,
+        "the native HIP engine cannot start Flash Next's lanes ({s})",
+        .{@errorName(err)},
+    );
+    errdefer own.free();
+    // rank 0 serves only once every follower is ready behind it
+    _ = try steps.together(a, .{ 0, 0 }, .first, problem);
+    if (dev.group) |g| own.fx.withLink(g.link());
+    return .{
+        .backend = own.fx.backend(),
+        .facts = own.fx.facts(),
+        .rows = cache.max_window,
+        .ctx = own,
+        .deinit = Owned.release,
+        .streams = streams,
+        .startup = own.startup,
+    };
 }
 
 /// Device bytes a stream takes at `cap` positions: its caches, window snapshots, the head's caches and its rows.
@@ -151,23 +291,25 @@ fn streamBytes(e: *const Engine, cap: usize) usize {
         const hl = cache.Layout.of(h.dims, &.{false}, cap, e.act);
         head = hl.bytes() + hl.cinBytes() + 4;
     }
-    return l.bytes() + l.windowBytes() + l.cinBytes() + head + cache.max_window * e.weights.model.dims.wide() * e.act.size();
+    return l.bytes() + l.windowBytes() + l.cinBytes() + head +
+        cache.max_window * e.weights.model.dims.wide() * e.act.size();
 }
 
 /// A rank above 0: holds its share of the model and runs rank 0's steps until rank 0 stops.
-pub fn follow(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip.Device, dir: []const u8, o: anytype, problem: *[]const u8) anyerror!void {
-    // rank 0's window, whatever this rank's own --context says
-    var msg: std.ArrayList(u32) = .empty;
-    defer msg.deinit(gpa);
-    try dev.group.?.link().recv(gpa, &msg);
-    var mine = o;
-    mine.window = msg.items[0];
-    try check(a, gpa, io, dev, dir, mine, problem);
-    const e = engineOf(gpa, io, dev, dir, mine) catch |err| return refuse(a, problem, "the native HIP engine cannot load Flash Next from {s} ({s})", .{ dir, @errorName(err) });
-    defer e.deinit();
-    const room = (try hip.admission.budget(gpa, io, e.ctx)).room(hip.usage(false).device);
-    _ = try e.least(room / streamBytes(e, capacity(mine.window)));
-    try worker.follow(gpa, e, dev.group.?.link());
+pub fn follow(
+    a: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dev: hip.Device,
+    dir: []const u8,
+    o: anytype,
+    problem: *[]const u8,
+) anyerror!void {
+    var steps: hip.Startup = .{ .link = dev.group.?.link() };
+    const p = try prepare(a, gpa, io, dev, dir, o, &steps, problem);
+    defer p.e.deinit();
+    _ = try steps.together(a, .{ 0, 0 }, .first, problem);
+    try worker.follow(gpa, p.e, dev.group.?.link());
 }
 
 const gib: u64 = 1 << 30;

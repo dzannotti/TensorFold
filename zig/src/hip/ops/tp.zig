@@ -25,6 +25,11 @@ pub fn moeForeignItems(o: Ops, items: u64, count: usize, skip: usize) Error!void
     try o.l.tf_moe_foreign_items(i(items), int(count), int(skip), o.stream);
 }
 
+/// y's slot `slot` of each of `rows` rows (slots a row, d wide, fp32) = src (rows, d) fp32.
+pub fn moePutSlot(o: Ops, y: u64, src: u64, rows: usize, slots: usize, slot: usize, d: usize) Error!void {
+    try o.l.tf_moe_put_slot(f(y), f(src), @intCast(rows), int(slots), int(slot), int(d), o.stream);
+}
+
 /// Zeroes the rows of `y` (pairs, d) fp32 whose pick is `skip`.
 pub fn moeZeroForeign(o: Ops, y: u64, picks: u64, skip: usize, pairs: usize, d: usize) Error!void {
     try o.l.tf_moe_zero_foreign(f(y), i(picks), int(skip), @intCast(pairs), int(d), o.stream);

@@ -18,6 +18,8 @@ pub const Kind = types.Kind;
 pub const Error = types.Error;
 pub const Tensor = types.Tensor;
 pub const Affine = types.Affine;
+/// The gated norm's gate: SiLU or sigmoid.
+pub const Gate = norms.Gate;
 pub const Projection = @import("core").quant.Projection;
 
 pub const Ops = struct {
@@ -87,6 +89,7 @@ pub const Ops = struct {
     pub const addWide = tp.addWide;
     pub const moeLocalize = tp.moeLocalize;
     pub const moeForeignItems = tp.moeForeignItems;
+    pub const moePutSlot = tp.moePutSlot;
     pub const moeZeroForeign = tp.moeZeroForeign;
 };
 

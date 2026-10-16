@@ -18,8 +18,13 @@ pub const Experts = struct {
     limit: f32 = 0,
 };
 
+/// A shared expert apart from the stack (its own format or width): gate then up rows (2 width, D), and down.
+pub const Shared = struct { gate_up: Projection, down: Projection, width: usize };
+
 /// The router's rows in fp32 (E + 1, D), the shared expert's gate last, and the experts.
 pub const Routed = struct {
+    /// Set: the stack holds the E routed experts alone, the shared slot's items are dropped and this fills the slot.
+    shared: ?Shared = null,
     rows32: u64,
     /// The same rows in bf16 (0: none), which decode's router reads.
     rows16: u64 = 0,
@@ -78,6 +83,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     const count: usize = cap;
     var tile: usize = undefined;
     if (r.remap != 0) {
+        if (r.shared != null) return error.BadShape;
         // every rank picks the same pairs, runs the ones it holds (the others group under an id past its experts)
         try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
         const local = try o.arena.of(i32, size * slots);
@@ -135,6 +141,26 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         tile = tileFor(o, rows);
         try o.moeRoute(pick, pairs, r.rows, tile, members, items, cap);
     }
+    if (r.shared) |sh| {
+        // the shared slot's items have no expert in the stack: dropped, the slot filled by the shared expert's rows
+        try o.moeForeignItems(items, count, r.count());
+        const both = try o.project(x, sh.gate_up, rows, true);
+        const act = try o.arena.take(rows * sh.width * kind.size());
+        const act_t: Tensor = .{ .ptr = act, .kind = kind };
+        try o.moeAct(both.ptr, act_t, rows, sh.width, ex.limit);
+        const down = try o.project(act_t, sh.down, rows, true);
+        const y = try routedParts(o, kind, r, x, rows, items, count, members, tile);
+        try o.moePutSlot(y, down.ptr, rows, slots, r.top_k, ex.dims);
+        return .{ .y = y };
+    }
+    return .{ .y = try routedParts(o, kind, r, x, rows, items, count, members, tile) };
+}
+
+/// The routed gate and up, the activation and down over the plan's items: (pairs, D) fp32.
+fn routedParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, items: u64, count: usize, members: u64, tile: usize) ops.Error!u64 {
+    const ex = r.experts;
+    const slots = r.top_k + 1;
+    const pairs = rows * slots;
     // the gate and up's activation is the launch's epilogue when the tile takes the shape
     const act_t: Tensor = if (try o.projectRoutedAct(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows), ex.limit)) |t| t else blk: {
         const both = try o.projectRouted(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows));
@@ -143,8 +169,7 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         try o.moeAct(both, t, pairs, ex.width, ex.limit);
         break :blk t;
     };
-    const y = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows));
-    return .{ .y = y };
+    return o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows));
 }
 
 test "buffer sizes follow moe.run and max_items" {

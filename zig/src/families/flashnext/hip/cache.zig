@@ -70,7 +70,8 @@ pub const Layout = struct {
 
     /// Bytes of the state after `at` positions: the sparse layers' first `at` rows, the rest whole.
     pub fn stateBytes(l: Layout, at: usize) usize {
-        const sparse_rows = 2 * l.kv_heads * at * l.head_dim * l.act + at * l.index_dim * l.act + at / l.ratio * l.index_dim * l.act;
+        const sparse_rows = 2 * l.kv_heads * at * l.head_dim * l.act + at * l.index_dim * l.act +
+            at / l.ratio * l.index_dim * l.act;
         return l.sparse * sparse_rows + l.linear * l.linearBytes() + l.tail_bytes;
     }
 
@@ -103,7 +104,15 @@ pub const Caches = struct {
     /// The slot these caches fill in the engine's pool (every rank's the same): a round's graph is keyed by it.
     id: u32 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const hip.Runtime, dims: Dims, kinds: []const bool, cap: usize, act: model.Kind, eos: i64) !Caches {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        d: *const hip.Runtime,
+        dims: Dims,
+        kinds: []const bool,
+        cap: usize,
+        act: model.Kind,
+        eos: i64,
+    ) !Caches {
         const layout = Layout.of(dims, kinds, cap, act);
         const slot = try gpa.alloc(usize, kinds.len);
         errdefer gpa.free(slot);
@@ -121,7 +130,15 @@ pub const Caches = struct {
         errdefer window.free();
         var cin = try hip.DeviceBuffer.alloc(d, layout.cinBytes());
         errdefer cin.free();
-        return .{ .layout = layout, .slot = slot, .linear = linear, .mem = mem, .window = window, .cin = cin, .history = .{ eos, eos } };
+        return .{
+            .layout = layout,
+            .slot = slot,
+            .linear = linear,
+            .mem = mem,
+            .window = window,
+            .cin = cin,
+            .history = .{ eos, eos },
+        };
     }
 
     /// The state of fresh caches again, the memory kept: zeros, no positions, eos before any row.
@@ -144,7 +161,12 @@ pub const Caches = struct {
     pub fn sparse(c: *const Caches, layer: usize) SparseView {
         const l = c.layout;
         const at = c.mem.base() + c.slot[layer] * l.sparseBytes();
-        return .{ .k = at, .v = at + l.kv_bytes, .raw = at + 2 * l.kv_bytes, .pooled = at + 2 * l.kv_bytes + l.raw_bytes };
+        return .{
+            .k = at,
+            .v = at + l.kv_bytes,
+            .raw = at + 2 * l.kv_bytes,
+            .pooled = at + 2 * l.kv_bytes + l.raw_bytes,
+        };
     }
 
     pub fn linearAt(c: *const Caches, layer: usize) LinearView {
@@ -165,6 +187,44 @@ pub const Caches = struct {
         const n = c.slot[layer] * max_window + row;
         const states = c.window.base() + l.linear * max_window * l.conv_bytes;
         return .{ .conv = c.window.base() + n * l.conv_bytes, .state = states + n * l.state_bytes };
+    }
+};
+
+/// Streams' caches by slot, made once and kept: a slot's buffers never change, so the graphs naming them stay valid.
+pub const Pool = struct {
+    slots: std.ArrayList(?Caches) = .empty,
+
+    /// Slot `slot`'s caches, fresh (`maker.caches(cap)` makes them the first time); a failed reset keeps them there.
+    pub fn lease(
+        p: *Pool,
+        gpa: std.mem.Allocator,
+        slot: u32,
+        s: hip.Stream,
+        eos: i64,
+        cap: usize,
+        maker: anytype,
+    ) !Caches {
+        while (p.slots.items.len <= slot) try p.slots.append(gpa, null);
+        const held = &p.slots.items[slot];
+        if (held.* == null) {
+            held.* = try maker.caches(cap);
+            held.*.?.id = slot;
+        }
+        try s.synchronize();
+        try held.*.?.reset(eos);
+        const c = held.*.?;
+        held.* = null;
+        return c;
+    }
+
+    /// A finished stream's caches back to their slot.
+    pub fn unlease(p: *Pool, c: Caches) void {
+        p.slots.items[c.id] = c;
+    }
+
+    pub fn deinit(p: *Pool, gpa: std.mem.Allocator) void {
+        for (p.slots.items) |*c| if (c.*) |*x| x.deinit(gpa);
+        p.slots.deinit(gpa);
     }
 };
 

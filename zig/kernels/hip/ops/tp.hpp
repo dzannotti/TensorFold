@@ -40,6 +40,14 @@ extern "C" __global__ void tf_moe_foreign_items(int* items, int count, int skip)
     if (i < count && items[i * 3] == skip) items[i * 3 + 2] = 0;
 }
 
+// y[(r slots + slot) d + c] = src[r d + c]: a shared expert computed beside the stack into its slot of each row.
+extern "C" __global__ void tf_moe_put_slot(float* y, const float* src, long long rows, int slots, int slot, int d) {
+    long long i = tp_gid();
+    if (i >= rows * d) return;
+    long long r = i / d;
+    y[(r * slots + slot) * d + (i - r * d)] = src[i];
+}
+
 // A pair another rank's expert answers has zero rows (selected, not multiplied: the buffer holds anything).
 extern "C" __global__ void tf_moe_zero_foreign(float* y, const int* picks, int skip, long long pairs, int d) {
     long long i = tp_gid();

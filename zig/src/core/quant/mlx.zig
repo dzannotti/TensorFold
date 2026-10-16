@@ -78,7 +78,11 @@ pub fn detect(a: Allocator, src: types.Sources) DetectError!?Config {
 }
 
 /// An affine projection as stored: i32 words [N, K * bits / 32], tables [N, K / group]; a stack leads with E + 1.
-pub const Host = struct { words: Tensor, scales: Tensor, biases: Tensor, bits: u8, group: u16 };
+/// How the words read: affine codes, or (the coded decoders, kernels/hip/quant/coded.hpp) block-FP8 bytes with an fp32
+/// scale a column and 128 k split into the scale (low half) and bias (high half) tables, or bf16 values with no terms.
+pub const Code = enum(u8) { affine, fp8, bf16 };
+
+pub const Host = struct { words: Tensor, scales: Tensor, biases: Tensor, bits: u8, group: u16, code: Code = .affine };
 
 /// Whether `key` holds an MLX affine projection (a table of scales beside its words).
 pub fn matches(t: anytype, key: []const u8) bool {
@@ -136,6 +140,7 @@ pub fn halves(a: Allocator, p: Host) ![2]Host {
             .biases = try slice.takeCols(a, p.biases, g[0], g[1]),
             .bits = p.bits,
             .group = p.group,
+            .code = p.code,
         };
     }
     return out;
@@ -143,7 +148,7 @@ pub fn halves(a: Allocator, p: Host) ![2]Host {
 
 /// `_rows`: output rows `spans` of a projection, the share of a column-split one.
 pub fn sliceRows(a: Allocator, p: Host, spans: []const slice.Span) slice.Error!Host {
-    return .{ .words = try slice.takeRows(a, p.words, spans), .scales = try slice.takeRows(a, p.scales, spans), .biases = try slice.takeRows(a, p.biases, spans), .bits = p.bits, .group = p.group };
+    return .{ .words = try slice.takeRows(a, p.words, spans), .scales = try slice.takeRows(a, p.scales, spans), .biases = try slice.takeRows(a, p.biases, spans), .bits = p.bits, .group = p.group, .code = p.code };
 }
 
 /// `_cols`: one rank's whole input groups of a row-split projection, whose fp32 outputs the ranks sum.
@@ -156,24 +161,25 @@ pub fn sliceCols(a: Allocator, p: Host, r: slice.Rank, what: []const u8) slice.E
         .biases = try slice.takeCols(a, p.biases, r.rank * groups, (r.rank + 1) * groups),
         .bits = p.bits,
         .group = p.group,
+        .code = p.code,
     };
 }
 
 /// A stack of E + 1 experts cut to a rank's `part` of them (the shared one last, kept on rank 0).
 pub fn sliceStack(a: Allocator, p: Host, r: slice.Rank, part: usize) slice.Error!Host {
-    return .{ .words = try slice.takeExperts(a, p.words, r, part), .scales = try slice.takeExperts(a, p.scales, r, part), .biases = try slice.takeExperts(a, p.biases, r, part), .bits = p.bits, .group = p.group };
+    return .{ .words = try slice.takeExperts(a, p.words, r, part), .scales = try slice.takeExperts(a, p.scales, r, part), .biases = try slice.takeExperts(a, p.biases, r, part), .bits = p.bits, .group = p.group, .code = p.code };
 }
 
 /// An uploaded projection (or stack of them): the same tensors on the device.
-pub const Device = struct { words: types.Buf, scales: types.Buf, biases: types.Buf, bits: u8, group: u16 };
+pub const Device = struct { words: types.Buf, scales: types.Buf, biases: types.Buf, bits: u8, group: u16, code: Code = .affine };
 
 /// The checkpoint's words and tables on the device as stored: this format keeps its layout.
 pub fn upload(u: types.Uploader, h: Host) !Device {
-    return .{ .words = try u.tensor(h.words), .scales = try u.tensor(h.scales), .biases = try u.tensor(h.biases), .bits = h.bits, .group = h.group };
+    return .{ .words = try u.tensor(h.words), .scales = try u.tensor(h.scales), .biases = try u.tensor(h.biases), .bits = h.bits, .group = h.group, .code = h.code };
 }
 
 /// What the kernels read of an MLX projection: the three addresses, the tables' type and the width.
-pub const Matrix = struct { words: u64, scale: u64, bias: u64, tables: types.Tables, bits: u8, group: u16 };
+pub const Matrix = struct { words: u64, scale: u64, bias: u64, tables: types.Tables, bits: u8, group: u16, code: Code = .affine };
 
 pub const View = struct { n: u32, k: u32, matrix: Matrix };
 
@@ -191,7 +197,7 @@ pub fn view(d: Device, stacked: bool) error{UnsupportedTables}!View {
     const lead: usize = @intFromBool(stacked);
     const n = d.words.dim(lead);
     const k = d.words.dim(lead + 1) * 32 / d.bits;
-    const matrix: Matrix = .{ .words = d.words.ptr, .scale = d.scales.ptr, .bias = d.biases.ptr, .tables = try tableKind(d.scales.dtype), .bits = d.bits, .group = d.group };
+    const matrix: Matrix = .{ .words = d.words.ptr, .scale = d.scales.ptr, .bias = d.biases.ptr, .tables = try tableKind(d.scales.dtype), .bits = d.bits, .group = d.group, .code = d.code };
     return .{ .n = @intCast(n), .k = @intCast(k), .matrix = matrix };
 }
 
@@ -246,7 +252,10 @@ pub fn dequant(a: Allocator, words: Tensor, scale: Tensor, bias: Tensor, group: 
         const bit = c * bits;
         const at = r * row_words + (bit >> 5);
         const lo: u64 = std.mem.readInt(u32, words.bytes[4 * at ..][0..4], .little);
-        const hi: u64 = if ((bit & 31) + bits > 32) std.mem.readInt(u32, words.bytes[4 * (at + 1) ..][0..4], .little) else 0;
+        const hi: u64 = if ((bit & 31) + bits > 32)
+            std.mem.readInt(u32, words.bytes[4 * (at + 1) ..][0..4], .little)
+        else
+            0;
         const code: f32 = @floatFromInt(((lo | hi << 32) >> @intCast(bit & 31)) & mask);
         const g = r * scale.shape[1] + c / group;
         const s = convert.load(scale.dtype, scale.bytes, g);

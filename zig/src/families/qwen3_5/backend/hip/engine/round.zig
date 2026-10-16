@@ -49,6 +49,7 @@ pub const State = struct {
     layout: plan.Layout = undefined,
     /// Recorded before each keep's launches (ordering only).
     before_keep: hip.Event,
+    votes: ?hip.Votes = null,
 
     pub fn init(e: *Engine) !State {
         const m = e.model();
@@ -65,13 +66,25 @@ pub const State = struct {
         const staging = try e.gpa.alloc(i32, rows + 1);
         errdefer e.gpa.free(staging);
         @memset(staging, -1);
+        var votes: ?hip.Votes = if (e.o.world > 1) try hip.Votes.init(&e.driver, e.o.world) else null;
+        errdefer if (votes) |*v| v.deinit();
         var keeps = try hip.HostBuffer.alloc(&e.driver, keep_ring * 4 * (rows + 1));
         errdefer keeps.free();
-        return .{ .buffer = buffer, .scratch = scratch, .snaps = snaps, .wins = wins, .staging = staging, .keeps = keeps, .before_keep = try hip.Event.init(&e.driver, false) };
+        return .{
+            .buffer = buffer,
+            .scratch = scratch,
+            .snaps = snaps,
+            .wins = wins,
+            .staging = staging,
+            .keeps = keeps,
+            .votes = votes,
+            .before_keep = try hip.Event.init(&e.driver, false),
+        };
     }
 
     pub fn deinit(s: *State, e: *Engine) void {
         s.before_keep.deinit();
+        if (s.votes) |*v| v.deinit();
         s.keeps.free();
         e.gpa.free(s.staging);
         e.gpa.free(s.wins);
@@ -186,62 +199,40 @@ fn run(e: *Engine, c: Chosen, r: win.Round) !round_graphs.Out {
     }
 }
 
-/// Records the round and launches it; a rank that cannot record makes every rank run it eagerly.
+/// Records the round, then every rank votes: all kept replay it, one decline runs it eagerly, one failure stops all.
 fn capture(e: *Engine, entry: *round_graphs.Entry, r: win.Round) !round_graphs.Out {
     const at = e.rounds.mark();
     const began = nowNs();
-    const kept = try record(e, entry, r);
-    e.graphs.capture_ns += nowNs() - began;
-    const all = if (e.o.world > 1) try agreed(e, kept) else kept;
-    if (!all) {
-        e.graphs.revoke(entry);
-        e.rounds.release(at);
-        return body(e, r);
-    }
-    try entry.exec.?.launchOn(e.stream);
-    return entry.out;
-}
-
-/// The round recorded into `entry` (nothing runs), its collectives left between the graphs: whether this rank kept it.
-fn record(e: *Engine, entry: *round_graphs.Entry, r: win.Round) !bool {
     const m = &e.bridge.model;
-    var rec: hip.graph_split.Recorder = .{ .gpa = e.gpa, .stream = e.stream, .inner = m.tp };
-    rec.begin() catch return false;
-    const tp = m.tp;
-    m.tp = rec.comm();
-    const got = body(e, r);
-    m.tp = tp;
-    var split = (try rec.finish()) orelse return false;
-    const out = got catch |err| {
-        split.deinit();
-        return if (err == error.OutOfDeviceMemory) err else false;
-    };
-    // the policy's `graph_fail` makes that rank's capture fail, to check that every rank falls back
-    if (e.o.policy.graph_fail >= 0 and @as(usize, @intCast(e.o.policy.graph_fail)) == e.o.rank) {
-        split.deinit();
-        return false;
+    const got = hip.vote.record(round_graphs.Out, e.gpa, e.stream, &m.tp, e.o.policy.failsCapture(e.o.rank), Body{
+        .e = e,
+        .r = r,
+    }, Body.run);
+    e.graphs.capture_ns += nowNs() - began;
+    if (got.split) |split| e.graphs.hold(entry, split, got.out);
+    const all = if (e.round.votes) |*v| try v.agree(e.comm, got.vote, e.stream) else got.vote;
+    if (all == .kept) {
+        try entry.exec.?.launchOn(e.stream);
+        return entry.out;
     }
-    e.graphs.hold(entry, split, out);
-    return true;
+    e.graphs.revoke(entry);
+    e.rounds.release(at);
+    if (all == .declined) return body(e, r);
+    if (e.o.world == 1) return error.OutOfDeviceMemory;
+    // no rank runs another collective once one could not take a round
+    e.stopped = true;
+    return error.GroupStopped;
 }
 
-/// Whether every rank says yes (an all-gather of one word each).
-fn agreed(e: *Engine, yes: bool) !bool {
-    const world = e.o.world;
-    var host = try hip.HostBuffer.alloc(&e.driver, 8 * (1 + world));
-    defer host.free();
-    var send = try hip.DeviceBuffer.alloc(&e.driver, 8);
-    defer send.free();
-    var recv = try hip.DeviceBuffer.alloc(&e.driver, 8 * world);
-    defer recv.free();
-    host.slice(u64)[0] = @intFromBool(yes);
-    try hip.raw.upload(send, 0, host.bytes[0..8], e.stream.handle);
-    try e.comm.allGather(send.base(), recv.base(), 1, .i64, e.stream.handle);
-    try hip.raw.download(recv, 0, host.bytes[8 .. 8 * (1 + world)], e.stream.handle);
-    try e.stream.synchronize();
-    for (host.slice(u64)[1 .. 1 + world]) |v| if (v == 0) return false;
-    return true;
-}
+/// A round's forward as the recorder runs it.
+const Body = struct {
+    e: *Engine,
+    r: win.Round,
+
+    fn run(b: Body) anyerror!round_graphs.Out {
+        return body(b.e, b.r);
+    }
+};
 
 /// Marks slot `slot` of the last verify to keep, at the next `flush`, the path to its row `last` - 1 (a chain's first
 /// `last` rows, a tree's ancestors of that row).

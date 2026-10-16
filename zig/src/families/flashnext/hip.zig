@@ -7,6 +7,7 @@ pub const plan = @import("hip/plan.zig");
 pub const ngram = @import("hip/ngram.zig");
 pub const model = @import("hip/model.zig");
 pub const load = @import("hip/load.zig");
+pub const int4ar = @import("hip/int4ar.zig");
 pub const cache = @import("hip/cache.zig");
 pub const tables = @import("hip/tables.zig");
 pub const forward = @import("hip/forward.zig");
@@ -26,6 +27,7 @@ test {
     _ = ngram;
     _ = model;
     _ = cache;
+    _ = int4ar;
     @import("std").testing.refAllDecls(engine.Engine);
     @import("std").testing.refAllDecls(load);
     @import("std").testing.refAllDecls(forward);
@@ -36,4 +38,5 @@ test {
     @import("std").testing.refAllDecls(worker);
     @import("std").testing.refAllDecls(snapshot);
     _ = native;
+    _ = @import("hip/state_test.zig");
 }
