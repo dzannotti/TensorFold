@@ -16,6 +16,21 @@ pub const Experts = struct {
     width: usize,
     dims: usize,
     limit: f32 = 0,
+    /// The stacks read inputs rotated by 128-block Hadamards (ciru_q8): x before gate and up, the activation before down.
+    rotated: bool = false,
+
+    /// x as the gate and up read it: a rotated copy for rotated stacks (the router and the residual keep x).
+    fn input(ex: Experts, o: Ops, x: Tensor, rows: usize) ops.Error!Tensor {
+        if (!ex.rotated) return x;
+        const out = try o.arena.take(rows * ex.dims * x.kind.size());
+        try o.had128(x, out, rows, ex.dims);
+        return .{ .ptr = out, .kind = x.kind };
+    }
+
+    /// The activation rotated in place before the down, for rotated stacks.
+    fn middle(ex: Experts, o: Ops, act: Tensor, pairs: usize) ops.Error!void {
+        if (ex.rotated) try o.had128(act, act.ptr, pairs, ex.width);
+    }
 };
 
 /// The router's rows in fp32 (E + 1, D), the shared expert's gate last, and the experts.
@@ -85,10 +100,11 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
         tile = tileFor(o, rows);
         try o.moeRoute(local, pairs, r.rows, tile, members, items, cap);
         try o.moeForeignItems(items, cap, ex.count);
-        const both = try o.projectRouted(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows));
+        const both = try o.projectRouted(try ex.input(o, x, rows), ex.fused, items, count, members, pairs, slots, @min(tile, rows));
         const act = try o.arena.take(pairs * ex.width * kind.size());
         const act_t: Tensor = .{ .ptr = act, .kind = kind };
         try o.moeAct(both, act_t, pairs, ex.width, ex.limit);
+        try ex.middle(o, act_t, pairs);
         const y = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows));
         try o.moeZeroForeign(y, local, ex.count, pairs, ex.dims);
         const share = try o.arena.of(f32, rows * ex.dims);
@@ -136,13 +152,15 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         try o.moeRoute(pick, pairs, r.rows, tile, members, items, cap);
     }
     // the gate and up's activation is the launch's epilogue when the tile takes the shape
-    const act_t: Tensor = if (try o.projectRoutedAct(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows), ex.limit)) |t| t else blk: {
-        const both = try o.projectRouted(x, ex.fused, items, count, members, pairs, slots, @min(tile, rows));
+    const xin = try ex.input(o, x, rows);
+    const act_t: Tensor = if (try o.projectRoutedAct(xin, ex.fused, items, count, members, pairs, slots, @min(tile, rows), ex.limit)) |t| t else blk: {
+        const both = try o.projectRouted(xin, ex.fused, items, count, members, pairs, slots, @min(tile, rows));
         const act = try o.arena.take(pairs * ex.width * kind.size());
         const t: Tensor = .{ .ptr = act, .kind = kind };
         try o.moeAct(both, t, pairs, ex.width, ex.limit);
         break :blk t;
     };
+    try ex.middle(o, act_t, pairs);
     const y = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows));
     return .{ .y = y };
 }

@@ -119,6 +119,65 @@ __device__ __forceinline__ void dense_rows_body(const void* x, const void* w, vo
     }
 }
 
+// y[r, n] = x[r, :] . w[n, :] over bf16 x and weights, K a multiple of 256 (a ciru_q8 checkpoint's projections): a wave
+// a column, lane l's k at 8 l + 256 s by 16-byte loads, four strides in flight, its products added in k order into
+// one fp32 a row, then the wave's butterfly. A row's bits depend on K alone, never on R or the rows beside it.
+__device__ __forceinline__ float dense_dot8(uint4 x, uint4 w, float acc) {
+    const uint32_t xs[4] = {x.x, x.y, x.z, x.w}, ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        acc = fmaf(__uint_as_float(xs[i] << 16), __uint_as_float(ws[i] << 16), acc);
+        acc = fmaf(__uint_as_float(xs[i] & 0xffff0000u), __uint_as_float(ws[i] & 0xffff0000u), acc);
+    }
+    return acc;
+}
+
+template <int R>
+__device__ __forceinline__ void dense_wave_body(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
+    constexpr int U = 4;
+    const int lane = threadIdx.x & 31;
+    const int col = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (col >= n) return;
+    const int r0 = blockIdx.y * R;
+    const uint4* wr = reinterpret_cast<const uint4*>(w + static_cast<long long>(col) * k) + lane;
+    const uint4* xr[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) xr[j] = reinterpret_cast<const uint4*>(x + static_cast<long long>(min(r0 + j, rows - 1)) * k) + lane;
+    float acc[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) acc[j] = 0.f;
+    const int steps = k >> 8;
+    int s = 0;
+    for (; s + U <= steps; s += U) {
+        uint4 wv[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) wv[u] = wr[32 * (s + u)];
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int j = 0; j < R; ++j) acc[j] = dense_dot8(xr[j][32 * (s + u)], wv[u], acc[j]);
+    }
+    for (; s < steps; ++s) {
+        const uint4 wv = wr[32 * s];
+#pragma unroll
+        for (int j = 0; j < R; ++j) acc[j] = dense_dot8(xr[j][32 * s], wv, acc[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_xor(acc[j], off, 32);
+        if (lane == j && r0 + j < rows) out[static_cast<long long>(r0 + j) * n + col] = float_to_bf16(acc[j]);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_dense_wave1(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
+    dense_wave_body<1>(x, w, out, rows, n, k);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_dense_wave4(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
+    dense_wave_body<4>(x, w, out, rows, n, k);
+}
+
 extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
 #define TF_DENSE_W(XK)                                                    \
     if (w_kind == 0) dense_rows_body<XK, 0>(x, w, out, rows, n, k);       \

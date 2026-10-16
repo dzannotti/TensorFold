@@ -52,8 +52,12 @@ pub const Config = struct {
         var declared = try shared.pickObject(doc, tower, "quantization");
         if (declared.count() == 0) declared = try shared.pickObject(doc, tower, "quantization_config");
         const table = try quant.detect(a, .{ .root = doc, .quantization = declared });
-        // an EXL3 tensor's width is its own: the geometry records a nominal one
-        const width: Width = if (table == .exl3) .{ .bits = 4, .group = 128 } else try table.width("");
+        // an EXL3 tensor's width is its own, a ciru_q8 checkpoint's experts are 8-bit: the geometry records a nominal one
+        const width: Width = switch (table) {
+            .exl3 => .{ .bits = 4, .group = 128 },
+            .dense => .{ .bits = 8, .group = 128 },
+            .mlx => try table.width(""),
+        };
         const spec = try shared.geometry(tower, width.bits, width.group);
         const gen = if (generation) |g| (try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{})) else null;
         if (gen) |g| if (g != .object) return error.InvalidConfig;

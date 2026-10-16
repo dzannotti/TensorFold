@@ -11,7 +11,7 @@ const admission = hip.admission;
 const modelContext = admission.modelContext;
 
 /// The HIP families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step`, `open` and `follow`.
-const registry = .{ qwen35.native, qwen35.native_moe, flashnext.native };
+const registry = .{ qwen35.native, qwen35.native_moe, flashnext.native, qwen35.native_minicpm };
 
 pub const backends: []const []const u8 = &.{"hip"};
 /// No per-thread alternate signal stack: its thread-local leaves RCCL's and HIP's threads too little stack to start.

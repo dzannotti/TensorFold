@@ -34,6 +34,8 @@ pub const native_engine = @import("backend/hip/engine/native.zig");
 /// The registry entries of the native server: the dense and the sparse checkpoints.
 pub const native = native_engine.Native("qwen3_5");
 pub const native_moe = native_engine.Native("qwen3_5_moe");
+/// MiniCPM-V 4.7 (ciru_q8): its qwen3_5_moe text tower.
+pub const native_minicpm = native_engine.Native("minicpmv4_7");
 
 test {
     _ = config;

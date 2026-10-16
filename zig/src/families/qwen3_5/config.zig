@@ -316,11 +316,19 @@ pub const Spec = struct {
     }
 };
 
-/// The config's root object, when its model_type is a Qwen3.5 text model, dense or sparse.
+/// The config's root object, when its model_type is a Qwen3.5 text model, dense or sparse, or MiniCPM-V 4.7 (whose
+/// `text_config` is a qwen3_5_moe text tower; its vision tower is not read).
 pub fn declared(a: std.mem.Allocator, bytes: []const u8) Error!std.json.ObjectMap {
     const doc = try objectOf(try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}));
     const kind = doc.get("model_type") orelse return error.UnsupportedModel;
-    if (kind != .string or !(eql(kind.string, "qwen3_5") or eql(kind.string, "qwen3_5_moe"))) return error.UnsupportedModel;
+    if (kind != .string) return error.UnsupportedModel;
+    if (eql(kind.string, "minicpmv4_7")) {
+        const text = doc.get("text_config") orelse return error.UnsupportedModel;
+        const tk = if (text == .object) text.object.get("model_type") else null;
+        if (tk == null or tk.? != .string or !eql(tk.?.string, "qwen3_5_moe_text")) return error.UnsupportedModel;
+        return doc;
+    }
+    if (!(eql(kind.string, "qwen3_5") or eql(kind.string, "qwen3_5_moe"))) return error.UnsupportedModel;
     return doc;
 }
 

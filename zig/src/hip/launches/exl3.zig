@@ -52,12 +52,14 @@ fn built(halves: usize, codebook: usize) bool {
 
 pub const Fns = struct {
     rotate: Function,
+    /// ciru_q8's input rotation: 128-block Hadamards, no signs, in the activation's kind.
+    had: Function,
     /// By half bits, codebook (3inst, mcg, mul1) and tile.
     product: [17][3][tiles.len]?Function,
 
     pub fn load(m: Module) Error!Fns {
         @setEvalBranchQuota(200_000);
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .product = @splat(@splat(@splat(null))) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))) };
         inline for (0..17) |h| inline for (0..3) |cb| {
             if (comptime built(h, cb)) inline for (tiles, 0..) |t, i| {
                 f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, t.rows, t.cols }));
@@ -126,6 +128,20 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
     var a: Args = .{};
     try a.add(arg);
     try l.go(f, dim(cols, sp, blocks), dim(256, 1, 1), 0, s, &a);
+}
+
+/// out [rows, k] = x [rows, k] rotated by 128-block Hadamards in x's kind (`kind`: 1 fp16, 2 bf16); `out` may be `x`.
+pub fn hadamard(l: *const Launcher, x: u64, kind: c_int, out: u64, k: u32, rows: usize, s: S) Error!void {
+    if (k % 128 != 0 or (kind != 1 and kind != 2)) return invalid("hadamard");
+    const waves: i64 = @intCast(rows * (k / 128));
+    if (waves == 0) return;
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(kind);
+    try a.add(out);
+    try a.add(@as(c_int, @intCast(k)));
+    try a.add(waves);
+    try l.go(l.exl3.had, dim(@divFloor(waves + 7, 8), 1, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 test "splits keep whole tile runs and depend on the shape alone" {

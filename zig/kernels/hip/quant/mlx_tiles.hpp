@@ -53,6 +53,12 @@ __global__ void __launch_bounds__(256) affine_wmma_prompt_dq(Affine a) {
     prompt_dq_tile<ActOut<WmmaBF16>, MlxDq4, BM, 32768 / BM>(a);
 }
 
+// The same core over bf16 weights (`a.words` [N, K]): a prompt's dense products, every row count, bf16 out.
+template <int BM>
+__global__ void __launch_bounds__(256) dense_wmma_prompt(Affine a) {
+    prompt_dq_tile<ActOut<WmmaBF16>, DenseBf16, BM, 32768 / BM>(a);
+}
+
 template <int BITS>
 __global__ void __launch_bounds__(256) affine_prompt_sums(Affine a) {
     prompt_sums(a);

@@ -26,6 +26,8 @@ pub const Experts = struct {
     width: usize,
     dims: usize,
     count: usize,
+    /// Inputs rotated by 128-block Hadamards first (ciru_q8).
+    rotated: bool = false,
 };
 
 /// Router rows [E + 1, D], the shared gate row last: bf16 as the Python holds them and `rows32` widened.
@@ -111,6 +113,7 @@ const Uploader = struct {
                         .width = e.width,
                         .dims = e.dims,
                         .count = e.count,
+                        .rotated = e.rotated,
                     },
                     .top_k = r.top_k,
                     .remap = if (r.remap) |t| try u.tensor(t) else null,

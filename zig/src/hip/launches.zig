@@ -135,6 +135,7 @@ pub const Launcher = struct {
         conv_prefill: Function,
         gdn_gate_prefill: Function,
         dense_rows: Function,
+        dense_wave: [2]Function, // 1 and 4 rows a pass
         moe_route: Function,
         router_rows: [2]Function, // fp16, bf16
         router_tile: [2]Function,
@@ -204,6 +205,7 @@ pub const Launcher = struct {
             .conv_prefill = try ops.function("tf_conv_prefill"),
             .gdn_gate_prefill = try ops.function("tf_gdn_gate_prefill"),
             .dense_rows = try ops.function("tf_dense_rows"),
+            .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4") },
             .moe_route = try ops.function("tf_moe_route"),
             .router_rows = .{ try ops.function("tf_router_rows_f16"), try ops.function("tf_router_rows_bf16") },
             .router_tile = .{ try ops.function("tf_router_tile_f16"), try ops.function("tf_router_tile_bf16") },
@@ -342,6 +344,7 @@ pub const Launcher = struct {
     pub const tf_add = elementwise.tf_add;
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
+    pub const denseWave = elementwise.denseWave;
     pub const fn_hc_norm = flashnext.hcNorm;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
     pub const fn_hc_gates = flashnext.hcGates;
@@ -365,6 +368,7 @@ pub const Launcher = struct {
     pub const dftTopkMerge = draft.topkMerge;
     pub const exl3Project = exl3.project;
     pub const exl3Scratch = exl3.scratchBytes;
+    pub const hadamard = exl3.hadamard;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {

@@ -6,6 +6,7 @@ const convert = @import("convert.zig");
 const mlx = @import("mlx.zig");
 const slice = @import("slice.zig");
 const quant = @import("quant.zig");
+const ciru = @import("ciru.zig");
 
 const Tensor = types.Tensor;
 const DType = types.DType;
@@ -24,6 +25,8 @@ pub const Experts = struct {
     dims: usize,
     /// E + 1.
     count: usize,
+    /// The stacks take inputs rotated by 128-block Hadamards (ciru_q8): x before gate and up, the activation before down.
+    rotated: bool = false,
 };
 
 /// The router rows [E + 1, D] with the shared gate last, in bf16 and widened to `rows32`; `remap` is a rank's own ids.
@@ -138,6 +141,19 @@ fn side(a: Allocator, parts: []const Part, w: mlx.Width) !quant.Host {
 
 /// `_experts`: a layer's E + 1 affine experts, the shared one last, gate and up fused per expert.
 pub fn experts(a: Allocator, t: anytype, prefix: []const u8) !Experts {
+    if (ciru.holds(t, prefix)) {
+        const s = try ciru.experts(a, t, prefix);
+        const w: mlx.Width = .{ .bits = 8, .group = ciru.mlx_group };
+        return .{
+            .fused = .{ .mlx = .{ .words = s.fused.words, .scales = s.fused.scales, .biases = s.fused.biases, .bits = w.bits, .group = w.group } },
+            .gated = true,
+            .down = .{ .mlx = .{ .words = s.down.words, .scales = s.down.scales, .biases = s.down.biases, .bits = w.bits, .group = w.group } },
+            .width = s.width,
+            .dims = s.dims,
+            .count = s.count,
+            .rotated = true,
+        };
+    }
     var b: [4][256]u8 = undefined;
     const mine = join(&b[0], &.{ prefix, "switch_mlp." });
     const shared = join(&b[1], &.{ prefix, "shared_expert." });

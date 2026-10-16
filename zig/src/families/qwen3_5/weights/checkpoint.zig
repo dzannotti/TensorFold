@@ -27,6 +27,11 @@ pub const Checkpoint = struct {
         errdefer files.deinit();
         if (files.model.len == 0) return error.NoSafetensors;
         const main = try Table.open(gpa, io, files.model, "", cfg.quant);
+        // a MiniCPM-V checkpoint's vision tower and merger stay on disk: the text tower alone is served
+        var vision: usize = 0;
+        var keys = main.where.keyIterator();
+        while (keys.next()) |k| vision += @intFromBool(std.mem.startsWith(u8, k.*, "model.vision_tower.") or std.mem.startsWith(u8, k.*, "model.merger."));
+        if (vision > 0) std.log.info("{d} vision tensors skipped: the text tower alone is served (image inputs are refused)", .{vision});
         return .{ .gpa = gpa, .io = io, .config = cfg, .files = files, .main = main };
     }
 

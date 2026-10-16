@@ -11,6 +11,8 @@ pub const keys = @import("keys.zig");
 pub const dense = @import("dense.zig");
 pub const exl3 = @import("exl3.zig");
 pub const experts = @import("experts.zig");
+/// ciru_q8's Hadamard-rotated int8 experts, read as MLX 8-bit stacks.
+pub const ciru = @import("ciru.zig");
 /// FP8 and NVFP4 values and fp64 references; host only (no Format: their kernels' layouts are each backend's).
 pub const fp8 = @import("fp8.zig");
 pub const nvfp4 = @import("nvfp4.zig");
@@ -213,6 +215,7 @@ test {
     _ = dense;
     _ = exl3;
     _ = experts;
+    _ = ciru;
     _ = fp8;
     _ = nvfp4;
     _ = widen;

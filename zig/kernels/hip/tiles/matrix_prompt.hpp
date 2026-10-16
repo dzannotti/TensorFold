@@ -324,6 +324,33 @@ struct MlxDq4 {
     }
 };
 
+// The hook of prompt_dq_tile for bf16 weights [N, K] at `a.words` (a ciru_q8 checkpoint's dense projections): a
+// thread's 32 / P k of its column a stage are already the WMMA's operands, staged as loaded.
+template <int P>
+struct DenseBf16 {
+    static_assert(P == 1 || P == 2, "16 or 32 k a thread");
+    static constexpr int kDepth = P == 1 ? 2 : 4;
+    static constexpr int kChunks = 4 / P;  // 16-byte chunks (8 k) a stage
+    __amdgpu_buffer_rsrc_t w;
+    uint32_t wo;  // the lane's byte offset
+    u32x4 W[kDepth][kChunks];
+
+    __device__ DenseBf16(const Affine& a, int col, int part)
+        : w(prompt_rsrc(a.words)), wo(static_cast<uint32_t>(col) * static_cast<uint32_t>(2 * a.k) + part * 16 * kChunks) {}
+
+    template <int J>
+    __device__ void fetch(int s) {
+#pragma unroll
+        for (int c = 0; c < kChunks; ++c) W[J][c] = prompt_load<u32x4>(w, wo + 16 * c, 64 * s);
+    }
+
+    template <int J, class Store>
+    __device__ void put(Store st) const {
+#pragma unroll
+        for (int v = 0; v < kChunks; ++v) st(v, W[J][v]);
+    }
+};
+
 // A staged row is 32 k (64 bytes, four 16-byte chunks) with no pad: chunk c of row r sits at c ^ ((r >> 1) & 3), so
 // each 8 rows of a fragment read (a pass of 128 bytes) hit 8 different bank groups.
 __device__ inline int prompt_at(int r, int c) { return r * 16 + 4 * (c ^ ((r >> 1) & 3)); }

@@ -82,6 +82,20 @@ pub fn tf_copy_cols(l: *const Launcher, src: C, stride: c_longlong, offset: c_in
     try l.flat(l.op.copy_cols, @as(i64, rows) * cols, s, &a);
 }
 
+/// out (rows, n) bf16 = x (rows, k) bf16 times bf16 w (n, k), k a multiple of 256: a wave a column (ops/elementwise.hpp).
+pub fn denseWave(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, s: S) Error!void {
+    if (rows == 0 or k % 256 != 0) return util.invalid("dense wave");
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(w);
+    try a.add(out);
+    try a.add(@as(c_int, @intCast(rows)));
+    try a.add(@as(c_int, @intCast(n)));
+    try a.add(@as(c_int, @intCast(k)));
+    const four = rows > 1;
+    try l.go(l.op.dense_wave[@intFromBool(four)], dim(@divFloor(n + 7, 8), if (four) @divFloor(rows + 3, 4) else 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
 pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int, out: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));

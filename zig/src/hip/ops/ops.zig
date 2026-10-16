@@ -81,6 +81,7 @@ pub const Ops = struct {
     pub const moeRoute = moe.moeRoute;
     pub const moeAct = moe.moeAct;
     pub const moeCombine = moe.moeCombine;
+    pub const had128 = moe.had128;
     pub const argmaxRows = draw.argmaxRows;
     pub const topkRows = draw.topkRows;
     pub const tokenProb = draw.tokenProb;
