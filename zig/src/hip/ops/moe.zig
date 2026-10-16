@@ -16,8 +16,9 @@ pub fn moeTail(o: Ops, x: Tensor, y: u64, wts: u64, weight: u64, normed: Tensor,
     try z.tf_tail(p(x.ptr), f(y), f(wts), f(weight), p(normed.ptr), @backingInt(x.kind), int(rows), int(slots), int(width), eps, o.stream);
 }
 
-pub fn moeRouter(o: Ops, x: Tensor, rows32: u64, logits: u64, r: usize, d: usize, e: usize) Error!void {
-    if (o.window) if (o.l.routerWindow(p(x.ptr), @backingInt(x.kind), f(rows32), f(logits), int(r), int(d), int(e), o.stream)) |ran| {
+/// `rows16` (0: none): the rows in bf16 too, which a round's router reads instead (the same logits).
+pub fn moeRouter(o: Ops, x: Tensor, rows32: u64, rows16: u64, logits: u64, r: usize, d: usize, e: usize) Error!void {
+    if (o.window) if (o.l.routerWindow(p(x.ptr), @backingInt(x.kind), f(rows32), rows16, f(logits), int(r), int(d), int(e), o.stream)) |ran| {
         if (ran) return;
     } else |err| return err;
     if (o.prefill and d % 32 == 0) return o.l.routerTile(p(x.ptr), @backingInt(x.kind), f(rows32), f(logits), int(r), int(d), int(e), o.stream);

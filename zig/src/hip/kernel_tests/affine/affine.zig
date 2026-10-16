@@ -99,6 +99,8 @@ pub fn product(rig: *Rig, c: Case, tot: *Totals) !void {
     var seen: [2][registry.max_entries]Seen = undefined;
     var n_seen: [2]usize = .{ 0, 0 };
     var ran: usize = 0;
+    // the deal tile claims the verify tile's bits: both digests by rounding, when both take the product
+    var twins: [2][2]?u64 = .{ .{ null, null }, .{ null, null } };
     for (rig.kernels.reg.entries) |*e| {
         if (!prod.takes(&p, e)) continue;
         const shape = prod.shapeOf(&p, e);
@@ -113,6 +115,8 @@ pub fn product(rig: *Rig, c: Case, tot: *Totals) !void {
             const digest = try prod.digestOf(out, p.outBytes(rounded));
             rig.digest = std.hash.Wyhash.hash(rig.digest, std.mem.asBytes(&digest));
             const r: usize = @intFromBool(rounded);
+            if (e.op == .project and std.mem.endsWith(u8, e.id, ".verify")) twins[r][0] = digest;
+            if (e.op == .project and std.mem.endsWith(u8, e.id, ".deal")) twins[r][1] = digest;
             if (std.mem.indexOfScalar(*const Entry, pickable_set.items, e) != null) {
                 seen[r][n_seen[r]] = .{ .e = e, .digest = digest };
                 n_seen[r] += 1;
@@ -121,6 +125,7 @@ pub fn product(rig: *Rig, c: Case, tot: *Totals) !void {
         }
     }
     try base.expect(ran > 0, "affine {s}: no registered entry takes the product", .{label});
+    for (twins) |t| if (t[0] != null and t[1] != null) try base.expect(t[0].? == t[1].?, "affine {s}: the deal tile writes other bytes than the verify tile", .{label});
     // entries the registry picks between by rows write one set of bytes; the rows group checks routed decode plans
     if (env.stream_on and env.gemm_on and !(c.routed() and c.path == .decode)) for (seen, n_seen) |picked, n| {
         if (n < 2) continue;

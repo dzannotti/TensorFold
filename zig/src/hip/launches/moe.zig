@@ -40,8 +40,20 @@ pub fn routerWith(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r:
 }
 
 /// A lane round's router at any row count; false (nothing launched) where the shape keeps the other kernels.
-pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
+/// `rows16` (0: none): the rows in bf16, which a bf16 round reads instead of the fp32 rows (the same logits).
+pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, rows16: u64, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
     if (!l.fuse or r < 1 or @rem(d, 4) != 0 or ad(rows) % 16 != 0 or ad(x) % 8 != 0) return false;
+    if (rows16 != 0 and kind == 2 and rows16 % 8 == 0) {
+        var b: Args = .{};
+        try b.add(ad(x));
+        try b.add(rows16);
+        try b.add(ad(logits));
+        try b.add(r);
+        try b.add(d);
+        try b.add(e);
+        try l.go(l.dec.router16, dim(cdiv(e, 4), cdiv(r, 16), 1), dim(128, 1, 1), 0, s, &b);
+        return true;
+    }
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows));

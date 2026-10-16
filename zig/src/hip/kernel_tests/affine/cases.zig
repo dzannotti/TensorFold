@@ -69,6 +69,18 @@ pub const decode = [_]Case{
     .{ .name = "35b routed gate_up x4", .rows = 4, .n = 1024, .k = 2048, .experts = 256 },
     .{ .name = "35b routed gate_up x8", .rows = 8, .n = 1024, .k = 2048, .experts = 256 },
     .{ .name = "35b routed down x4", .rows = 4, .n = 2048, .k = 512, .experts = 256, .down = true },
+    // Flash Next 3-bit, group 32: the hyper-connection down (the deal tile's), qkv, out and the head
+    .{ .name = "fn3 hc down", .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 hc down x4", .rows = 4, .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 hc down x16", .rows = 16, .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 hc down x20", .rows = 20, .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 out x3", .rows = 3, .n = 2560, .k = 6144, .bits = 3, .group = 32 },
+    .{ .name = "fn3 qkv x4", .rows = 4, .n = 16480, .k = 2560, .bits = 3, .group = 32 },
+    .{ .name = "fn3 routed gate_up x4", .rows = 4, .n = 1280, .k = 2560, .bits = 3, .group = 32, .experts = 64, .slots = 11 },
+    .{ .name = "fn3 routed down x4", .rows = 4, .n = 2560, .k = 640, .bits = 3, .group = 32, .experts = 64, .slots = 11, .down = true },
+    .{ .name = "deal 2-bit", .rows = 5, .n = 200, .k = 8192, .bits = 2, .group = 32 },
+    .{ .name = "deal 4-bit", .rows = 2, .n = 77, .k = 16384, .bits = 4, .group = 32 },
+    .{ .name = "deal short k", .rows = 3, .n = 50, .k = 512, .bits = 3, .group = 32 },
 };
 
 // Prefill: a prompt's rows. The routed rows are tokens, 8 experts each over 256, in items of at most 128 rows.

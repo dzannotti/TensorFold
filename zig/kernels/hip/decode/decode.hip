@@ -29,9 +29,29 @@ constexpr int kRouterWaves = 4;
 constexpr int kRouterSteps = 16;  // float4 loads a lane keeps in flight
 constexpr int kRouterRows = 16;
 
+// A router row's four weights at `at` as floats: fp32 rows, or bf16 rows (the fp32 rows' exact values, half the bytes).
+template <typename W>
+struct RouterLoad;
+template <>
+struct RouterLoad<float> {
+    using V = float4;
+    __device__ static V load(const float* w, int at) { return *reinterpret_cast<const float4*>(w + at); }
+    __device__ static V none() { return make_float4(0.f, 0.f, 0.f, 0.f); }
+    __device__ static float4 widen(V v) { return v; }
+};
+template <>
+struct RouterLoad<uint16_t> {
+    using V = uint2;
+    __device__ static V load(const uint16_t* w, int at) { return *reinterpret_cast<const uint2*>(w + at); }
+    __device__ static V none() { return make_uint2(0u, 0u); }
+    __device__ static float4 widen(V v) { return widen4<2>(v); }
+};
+
 // logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned.
-template <int KIND>
-__device__ void router_decode(const void* x, const float* rows, float* logits, int r, int d, int e) {
+// A lane sums elements 128 s + 4 lane + j in s order whatever STEPS is (the loads a lane keeps in flight): same bits.
+template <int KIND, typename W = float, int STEPS = kRouterSteps>
+__device__ void router_decode(const void* x, const W* rows, float* logits, int r, int d, int e) {
+    using L = RouterLoad<W>;
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
     if (expert >= e) return;
@@ -40,30 +60,31 @@ __device__ void router_decode(const void* x, const float* rows, float* logits, i
     x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
     logits += static_cast<long long>(first) * e;
     r = r - first < kRouterRows ? r - first : kRouterRows;
-    const float* w = rows + static_cast<long long>(expert) * d;
+    const W* w = rows + static_cast<long long>(expert) * d;
     float acc[kRouterRows];
 #pragma unroll
     for (int k = 0; k < kRouterRows; ++k) acc[k] = 0.f;
-    for (int base = 0; base < d; base += kRouterSteps * 128) {
-        float4 wv[kRouterSteps];
+    for (int base = 0; base < d; base += STEPS * 128) {
+        typename L::V wr[STEPS];
 #pragma unroll
-        for (int s = 0; s < kRouterSteps; ++s) {
+        for (int s = 0; s < STEPS; ++s) {
             const int at = base + (lane + 32 * s) * 4;
-            wv[s] = at < d ? *reinterpret_cast<const float4*>(w + at) : make_float4(0.f, 0.f, 0.f, 0.f);
+            wr[s] = at < d ? L::load(w, at) : L::none();
         }
 #pragma unroll
         for (int k = 0; k < kRouterRows; ++k) {
             if (k >= r) continue;
             const uint16_t* xr = static_cast<const uint16_t*>(x) + static_cast<long long>(k) * d;
 #pragma unroll
-            for (int s = 0; s < kRouterSteps; ++s) {
+            for (int s = 0; s < STEPS; ++s) {
                 const int at = base + (lane + 32 * s) * 4;
                 if (at >= d) continue;
                 const float4 xv = widen4<KIND>(*reinterpret_cast<const uint2*>(xr + at));
-                acc[k] = fmaf(xv.x, wv[s].x, acc[k]);
-                acc[k] = fmaf(xv.y, wv[s].y, acc[k]);
-                acc[k] = fmaf(xv.z, wv[s].z, acc[k]);
-                acc[k] = fmaf(xv.w, wv[s].w, acc[k]);
+                const float4 wv1 = L::widen(wr[s]);
+                acc[k] = fmaf(xv.x, wv1.x, acc[k]);
+                acc[k] = fmaf(xv.y, wv1.y, acc[k]);
+                acc[k] = fmaf(xv.z, wv1.z, acc[k]);
+                acc[k] = fmaf(xv.w, wv1.w, acc[k]);
             }
         }
     }
@@ -415,6 +436,12 @@ extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_decode_bf16(const void* x, const float* rows, float* logits, int r, int d, int e) {
     router_decode<2>(x, rows, logits, r, d, e);
+}
+
+// The bf16 router rows (the fp32 rows' values): a lane holds 20 loads, all of a 2560-wide row in one trip.
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_decode_bf16_rows16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    router_decode<2, uint16_t, 20>(x, rows, logits, r, d, e);
 }
 
 extern "C" __global__ void __launch_bounds__(kTailThreads)

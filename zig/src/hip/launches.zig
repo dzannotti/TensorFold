@@ -109,6 +109,8 @@ pub const Launcher = struct {
 
     const Decode = struct {
         router: [2]Function, // fp16, bf16
+        /// bf16 x over bf16 router rows (the fp32 rows' values): the same logits, half the bytes.
+        router16: Function,
         tail: Function,
         conv_split: Function,
         rms2: Function,
@@ -168,7 +170,7 @@ pub const Launcher = struct {
         const pl = l.mods[@backingInt(kernels.Group.plan)];
         l.fuse = choices.fuse;
         l.wide = choices.wide;
-        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
+        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router16 = try dec.function("tf_router_decode_bf16_rows16"), .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
         l.plan = .{
             .kv_write = try pl.function("tf_plan_kv_write"),
             .score = .{ try pl.function("tf_plan_score_f16"), try pl.function("tf_plan_score_bf16") },

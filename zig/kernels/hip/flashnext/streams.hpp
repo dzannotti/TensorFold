@@ -86,10 +86,20 @@ extern "C" __global__ void __launch_bounds__(kFnThreads)
 tf_fn_rms_wide(const void* x, const float* scale, void* y, int kind, int width, float eps) {
     __shared__ float scratch[kFnWaves];
     const long long base = static_cast<long long>(blockIdx.x) * width;
+    // eight loads a thread in flight; the sum keeps the thread's order
+    constexpr int U = 8;
     float sum = 0.f;
-    for (int i = threadIdx.x; i < width; i += kFnThreads) {
-        const float v = load(x, kind, base + i);
-        sum += v * v;
+    for (int i0 = threadIdx.x; i0 < width; i0 += kFnThreads * U) {
+        float v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + u * kFnThreads;
+            v[u] = load(x, kind, base + (i < width ? i : width - 1));
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (i0 + u * kFnThreads < width) sum += v[u] * v[u];
+        }
     }
     const float rinv = rsqrtf(fn_block_sum(sum, scratch) / static_cast<float>(width) + eps);
     for (int i = threadIdx.x; i < width; i += kFnThreads) {

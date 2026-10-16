@@ -38,6 +38,43 @@ pub const Lane = struct {
     id: u32 = 0,
 };
 
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// TF_FN_TIMES: a round's host clock by phase (submit, verify and draw, keep and draft, between), logged every 100.
+const Times = struct {
+    on: bool = false,
+    at: [5]u64 = @splat(0),
+    sum: [4]u64 = @splat(0),
+    n: u64 = 0,
+
+    fn mark(t: *Times, i: usize) void {
+        if (!t.on) return;
+        t.at[i] = nowNs();
+    }
+
+    fn round(t: *Times) void {
+        if (!t.on) return;
+        if (t.at[4] != 0) t.sum[3] += t.at[0] -| t.at[4];
+        t.sum[0] += t.at[1] - t.at[0];
+        t.sum[1] += t.at[2] - t.at[1];
+        t.n += 1;
+    }
+
+    fn draft(t: *Times) void {
+        if (!t.on or t.at[3] == 0) return;
+        t.sum[2] += t.at[4] - t.at[3];
+        if (t.n == 100) {
+            const n: f64 = @floatFromInt(t.n * 1000);
+            std.log.info("fn times (us a round): submit {d:.0}, verify+draw {d:.0}, keep+draft {d:.0}, between {d:.0}", .{ @as(f64, @floatFromInt(t.sum[0])) / n, @as(f64, @floatFromInt(t.sum[1])) / n, @as(f64, @floatFromInt(t.sum[2])) / n, @as(f64, @floatFromInt(t.sum[3])) / n });
+            t.* = .{ .on = true };
+        }
+    }
+};
+
 /// The engine this thread's HIP calls go to.
 threadlocal var bound: ?*Engine = null;
 
@@ -59,6 +96,7 @@ pub const Fx = struct {
     /// The kept prompt states (null: no reuse), and the slot the next one takes on every rank.
     store: ?pc.Store = null,
     next_slot: u32 = 0,
+    times: Times = .{},
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, streams: usize) !*Fx {
         const f = try gpa.create(Fx);
@@ -70,6 +108,7 @@ pub const Fx = struct {
         @memset(host, one);
         f.* = .{ .gpa = gpa, .e = e, .streams = streams, .ones = try hip.DeviceBuffer.fromHost(&e.driver, std.mem.sliceAsBytes(host)), .draft_ids = &.{}, .drafts = @min(max_depth, e.o.policy.mtp.drafts) };
         errdefer f.ones.free();
+        f.times.on = std.c.getenv("TF_FN_TIMES") != null;
         if (e.weights.model.mtp != null) f.draft_ids = try load.draftIds(gpa);
         return f;
     }
@@ -342,6 +381,7 @@ pub const Fx = struct {
     /// Every window in one forward, each from its stream's kept length; every row drawn at its position.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const f = of(ptr);
+        f.times.mark(0);
         const e = f.e;
         const m = &e.weights.model;
         if (windows.len > forward.max_segs) return error.WindowTooWide;
@@ -376,6 +416,7 @@ pub const Fx = struct {
             try f.send(f.msg.items);
         }
         const done = try e.round(segs[0..windows.len], pick);
+        f.times.mark(1);
         const fw = done.out;
         const row_bytes = m.dims.wide() * m.act.size();
         var off: usize = 0;
@@ -397,6 +438,8 @@ pub const Fx = struct {
         }
         if (total > e.drawer.rows) return error.WindowTooWide;
         try e.drawer.draw(o, e.stream, logits, reqs[0..total], drawn[0..total], false);
+        f.times.mark(2);
+        f.times.round();
         off = 0;
         for (windows, out, 0..) |w, *v, i| {
             const n = w.rows();
@@ -421,6 +464,11 @@ pub const Fx = struct {
     /// The head absorbs each stream's kept rows (residual streams and the token after each), then chains its drafts.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const f = of(ptr);
+        f.times.mark(3);
+        defer {
+            f.times.mark(4);
+            f.times.draft();
+        }
         const e = f.e;
         const m = &e.weights.model;
         const row_bytes = m.dims.wide() * m.act.size();

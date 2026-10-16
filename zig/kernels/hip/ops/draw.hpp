@@ -23,13 +23,24 @@ __device__ __forceinline__ bool better(float a, int ia, float b, int ib) {
 
 extern "C" __global__ void tf_argmax(const uint16_t* logits, int kind, int n, int* out) {
     const uint16_t* row = logits + static_cast<long long>(blockIdx.x) * n;
+    // eight loads a thread in flight (the winner does not depend on the order a thread scans in)
+    constexpr int U = 8;
     float top = 0.0f;
     int at = -1;
-    for (int i = threadIdx.x; i < n; i += kThreads) {
-        float v = widen(row[i], kind);
-        if (at < 0 || better(v, i, top, at)) {
-            top = v;
-            at = i;
+    for (int i0 = threadIdx.x; i0 < n; i0 += kThreads * U) {
+        float v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + u * kThreads;
+            v[u] = widen(row[i < n ? i : n - 1], kind);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + u * kThreads;
+            if (i < n && (at < 0 || better(v[u], i, top, at))) {
+                top = v[u];
+                at = i;
+            }
         }
     }
     __shared__ float sv[kThreads];

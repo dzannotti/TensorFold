@@ -13,6 +13,12 @@ constexpr int kSparsePer = kSparseMostDims / 32;
 // Keys a block stages at a time, and the padded row of the staged keys (rows read by distinct lanes, no conflicts).
 constexpr int kSparseTile = 32;
 constexpr int kSparseRow = kSparseMostDims + 1;
+// 16-bit caches: a tile's keys and values in 16-byte pieces a thread loads, all in flight before any is stored.
+constexpr int kSparseLoads = kSparseTile * kSparseMostDims / 8 / (kSparseWaves * 32);
+
+__device__ __forceinline__ float sparse_widen(uint16_t b, int kind) {
+    return kind == 1 ? __half2float(__ushort_as_half(b)) : bf16_to_float(b);
+}
 
 // Block (g, r, p): kv head g's query heads (G at most), row r, part p of its keys, 32 keys staged at a time.
 template <int kSparseGroup>
@@ -24,6 +30,8 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
     __shared__ float ps[kSparseGroup][kSparseTile];
     __shared__ float fs[kSparseGroup], m[kSparseGroup], l[kSparseGroup];
     __shared__ long long keys[kSparseTile];
+    __shared__ uint16_t vt[kSparseTile][kSparseMostDims];  // a 16-bit cache's tile of values
+    const bool wide = cache_kind != 0 && dims % 8 == 0;
     const int g = blockIdx.x, r = blockIdx.y, part = blockIdx.z;
     const int group = heads / kv_heads;
     const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
@@ -48,9 +56,30 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
         __syncthreads();
         if (t < tn) keys[t] = listed ? ids[r * id_stride + t0 + t] : t0 + t;
         __syncthreads();
-        for (int i = t; i < tn * dims; i += kSparseWaves * 32) {
-            const int j = i / dims, d = i % dims;
-            kt[j][d] = load(k, cache_kind, head_base + keys[j] * dims + d);
+        if (wide) {
+            uint4 kr[kSparseLoads], vr[kSparseLoads];
+#pragma unroll
+            for (int u = 0; u < kSparseLoads; ++u) {
+                const int i = (t + u * kSparseWaves * 32) * 8;
+                const long long at = head_base + keys[min(i / dims, tn - 1)] * dims + i % dims;
+                kr[u] = *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(k) + at);
+                vr[u] = *reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(v) + at);
+            }
+#pragma unroll
+            for (int u = 0; u < kSparseLoads; ++u) {
+                const int i = (t + u * kSparseWaves * 32) * 8;
+                if (i >= tn * dims) continue;
+                const int j = i / dims, d = i % dims;
+                *reinterpret_cast<uint4*>(&vt[j][d]) = vr[u];
+                const uint32_t w[4] = {kr[u].x, kr[u].y, kr[u].z, kr[u].w};
+#pragma unroll
+                for (int e = 0; e < 8; ++e) kt[j][d + e] = sparse_widen(static_cast<uint16_t>(w[e >> 1] >> (16 * (e & 1))), cache_kind);
+            }
+        } else {
+            for (int i = t; i < tn * dims; i += kSparseWaves * 32) {
+                const int j = i / dims, d = i % dims;
+                kt[j][d] = load(k, cache_kind, head_base + keys[j] * dims + d);
+            }
         }
         __syncthreads();
         // scores: a lane a key, a wave a head; then that head's softmax over the tile, folded into its running max
@@ -81,7 +110,7 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
 #pragma unroll
             for (int h = 0; h < kSparseGroup; ++h) o[h] *= h < group ? fs[h] : 1.f;
             for (int j = 0; j < tn; ++j) {
-                const float vd = load(v, cache_kind, head_base + keys[j] * dims + d);
+                const float vd = wide ? sparse_widen(vt[j][d], cache_kind) : load(v, cache_kind, head_base + keys[j] * dims + d);
 #pragma unroll
                 for (int h = 0; h < kSparseGroup; ++h) {
                     if (h < group) o[h] += ps[h][j] * vd;

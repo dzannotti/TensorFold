@@ -12,6 +12,9 @@
     .entries = .{
         // decode at any row count: the WMMA verify tile reads each weight once for up to 128 rows (the stream tile's
         // and the matrix rows below stay for the shapes it does not take)
+        // few columns over a long K: the verify tile's sums with K dealt across a block's waves (the same bits)
+        .{ .id = "mlx.project.decode.deal", .cost = 0.4 },
+        .{ .id = "mlx.group.decode.deal", .cost = 0.4 },
         .{ .id = "mlx.project.decode.verify", .cost = 0.5 },
         .{ .id = "mlx.group.decode.verify", .cost = 0.5 },
         // a lane round, or a call of few rows: the stream tile takes every product it can; the matrix cores take 16 rows and more

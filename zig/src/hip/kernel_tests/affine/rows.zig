@@ -26,6 +26,9 @@ const cases = [_]Case{
     .{ .name = "5-bit", .n = 4096, .k = 2048, .bits = 5 },
     .{ .name = "6-bit group 32", .n = 4096, .k = 2048, .bits = 6, .group = 32 },
     .{ .name = "8-bit group 128", .n = 4096, .k = 2048, .bits = 8, .group = 128 },
+    // Flash Next 3-bit group 32: the hyper-connection down (the deal tile) and out
+    .{ .name = "fn3 hc down", .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 out", .n = 2560, .k = 6144, .bits = 3, .group = 32 },
 };
 
 /// Row counts launched together: every count of a lane round up to 16, then wider rounds.
@@ -459,6 +462,39 @@ fn routerProduct(t: *Rig, r: usize, d: usize, e: usize) !usize {
     return data.sameOnDevice(outs[0], outs[1], r * e * 4);
 }
 
+/// A round's router over fp32 rows and over the same rows in bf16 at `r` rows: the words that differ (0 when skipped).
+fn routerWindowProduct(t: *Rig, r: usize, d: usize, e: usize) !usize {
+    if (t.fp16) return 0;
+    const hx = try data.fill(gpa, u16, r * d, &t.rng, data.makeXB);
+    defer gpa.free(hx);
+    const h16 = try gpa.alloc(u16, e * d);
+    defer gpa.free(h16);
+    const h32 = try gpa.alloc(u32, e * d);
+    defer gpa.free(h32);
+    for (h16, h32) |*b, *f| {
+        b.* = @truncate(@as(u32, @bitCast(data.fine(&t.rng))) >> 16);
+        f.* = @as(u32, b.*) << 16;
+    }
+    var x = try Buffer.fromHost(t.base, hx);
+    defer x.free();
+    var w16 = try Buffer.fromHost(t.base, h16);
+    defer w16.free();
+    var w32 = try Buffer.fromHost(t.base, h32);
+    defer w32.free();
+    var outs: [2]Buffer = undefined;
+    for (&outs, 0..) |*o, i| {
+        o.* = try Buffer.alloc(t.base, r * e * 4);
+        errdefer for (outs[0..i]) |*f| f.free();
+        try o.fill8(0xA5, null);
+    }
+    defer for (&outs) |*o| o.free();
+    for (outs, [_]u64{ 0, w16.ptr }) |o, rows16| {
+        if (!try t.base.on.routerWindow(@ptrFromInt(x.ptr), 2, @ptrFromInt(w32.ptr), rows16, @ptrFromInt(o.ptr), @intCast(r), @intCast(d), @intCast(e), t.base.stream.handle)) return 0;
+    }
+    try t.base.stream.synchronize();
+    return data.sameOnDevice(outs[0], outs[1], r * e * 4);
+}
+
 /// Prefill's short blocks against the 128-row one at every `tier_rows`, dense and routed: any differing word fails.
 fn tiers(t: *Rig) !usize {
     var ran: usize = 0;
@@ -495,6 +531,10 @@ pub fn decode(t: *Rig) !void {
         bad += try routedProduct(t, &rng, c, pair);
     };
     try base.expect(bad == 0, "rows decode: {d} rows differ from the same row alone", .{bad});
+    for ([_]usize{ 1, 3, 16, 17 }) |r| for ([_]usize{ 2560, 2048, 4100 }) |d| {
+        const diff = try routerWindowProduct(t, r, d, 513);
+        try base.expect(diff == 0, "router window r{d} d{d}: {d} words differ between the fp32 and the bf16 rows", .{ r, d, diff });
+    };
 }
 
 /// Prefill: every tile the registry picks between by rows, at every row count, width and group.
