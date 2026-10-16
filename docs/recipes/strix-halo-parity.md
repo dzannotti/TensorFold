@@ -25,10 +25,10 @@ Columns:
 | Greedy chat, repeatable | works | works | works | works | – |
 | temperature / top_k / top_p / min_p / seed | works: same seed gives the same text, another seed differs | works | works | works | – |
 | Malformed sampling gets 400 | works | works | works | works | – |
-| presence / frequency / repetition penalty | missing: silently ignored (n.a.-native: no native backend has them) | missing (same) | missing (same) | missing (same) | – |
-| logit_bias | missing: silently ignored (n.a.-native) | missing | missing | missing | – |
-| logprobs / top_logprobs (chat + completions) | **missing**: 400 "logprobs are not supported by this model or backend" (CUDA Nemotron has them) | **missing** | **missing** | **missing** | – |
-| prompt_logprobs | **missing**: 400 | **missing** | **missing** | **missing** | – |
+| presence / frequency / repetition penalty | **fixed** (strix/api): applied on the host before the draw (vLLM order); greedy picks are the penalized argmax (64/64 rows), drafted == `draft:false` greedy and T=0.8. Other native backends now refuse them with a 400 | works (same code path as 27B-M4) | **fixed**: drafted == `draft:false` (MTP) | **fixed**: same checks pass | – |
+| logit_bias | **fixed**: -100 bans a token, +100 forces it, drafted == `draft:false`; out-of-range values are a 400 | works (same path) | **fixed** | **fixed** | – |
+| logprobs / top_logprobs (chat + completions) | **fixed**: raw log-softmax of the target row; top_logprobs sum ≤ 1, the pick equals its entry, greedy is the argmax; drafted (DFlash2) == `draft:false` bit for bit at T=0 and T=0.8 | works (same path) | **fixed**: same checks with MTP drafts | **fixed**: same checks with MTP drafts | – |
+| prompt_logprobs | **fixed**: every prompt row from 0 (prefix reuse skipped), ranked; the prompt row of a token equals its reply row (` Paris` -0.4612 both). Off under `--tp` | works (same path) | **fixed** | **fixed** (` Paris` -0.1516 both) | – |
 | /v1/completions, raw prompt | works | works | works | works | – |
 | json_schema / response_format | **fixed**: was 400 "cannot load libtfgrammar.so"; works with the lib installed (one test reply was cut by max_tokens 80) | works | works | works | – |
 | guided_regex / guided_choice / guided_grammar | **fixed**: lib, plus the DFlash2 wrapper's `held` hook (it failed with 500 `HeldDraftsUnreadable`) | works (+DFlash2 after the fix) | works | works | – |
@@ -67,12 +67,20 @@ Columns:
 | Vision: 50 images / video | **missing** (same) | **missing** | **missing** | **missing** (old branch: `--vision-max-videos`) | – |
 | Tensor parallel (`--tp` 2/4/8 over RCCL) | untested: code present (`native/hip.zig`, `hip/comm`). Flag checks work. Needs a second box | untested | untested | untested: Flash Next has `tp.zig` | – |
 | Sliding / Living Weights (`--slide`) | **fixed → refused**: it was silently ignored. Upstream: Nemotron only (CUDA/Metal), so n.a. for Qwen | refused | refused | refused | – |
-| Checkpoint formats | MLX affine q2–q8 g64 | EXL3: works but is missing from the `capabilities` formats list | MLX q4 (q8 gates) | MLX q3/q4/q6 g32. EXL3 Flash Next is in code but untested (no checkpoint) | GPTQ/INT4-AR, NVFP4: missing (porting) |
-| bf16 checkpoint (Qwen3.8-27B reference) | **missing**: `cannot load … (UnsupportedQuantization)`. The KL quality reference cannot be served on HIP | – | – | – | – |
+| Checkpoint formats | MLX affine q2–q8 g64 | EXL3: works; **fixed**: `capabilities --json` lists `exl3` for qwen3_5 | MLX q4 (q8 gates) | MLX q3/q4/q6 g32. EXL3 Flash Next is in code but untested (no checkpoint) | GPTQ/INT4-AR, NVFP4: missing (porting) |
+| bf16 checkpoint (Qwen3.8-27B reference) | **fixed**: a config with no quantization loads as dense bf16 (the existing dense product). 50.9 GiB, loads in 517 s, greedy replies coherent; `quality.py` vs the torch bf16 reference over 8 x 4,096: KL 0.00132, top-1 99.29%, PPL 3.0353 vs 3.0337 (MLX4 floor: KL 0.112). **Above the 0.001 target**: on sequence 2 the first 2,048-row chunk is at KL 0.0004 but the second at 0.0082, 91% of it in 1% of rows (worst row 3.9). The loader is not the cause; the second prompt chunk's numerics (attention over the first chunk's keys, or the recurrent-state hand-off) are the open item | – | – | – | – |
 | FP8 checkpoint | missing: no native family reads FP8 weights (n.a.-native) | – | – | – | – |
 | `--chat-template`, `--alias`, `--api-key`, `--dashboard` | works: shared server code, not smoke-tested per model | ” | ” | ” | – |
 | `serve --help` lists the HIP flags | **fixed**: it now prints `--tp --policy --mtp-drafts …` | | | | |
 | Desktop app on Linux | **missing**: Electron app with only macOS packaging (`pack:mac`/`dist:mac`, darwin onnxruntime); node 22 is pinned (box has 26). The old branch has no app changes, only Docker deploy (`docker/rocm-serve`, PM4 from source), which was **not run** per the no-docker rule | | | | |
+
+## strix/api (on main a39074ab)
+
+1. `92afe89c` small items: `capabilities --json` lists `exl3` for qwen3_5, `serve --help` lists `rocm` among the backends, and the env list names `TENSORFOLD_HIP_MEMORY_LIMIT_GB`, `TENSORFOLD_MEMORY_RESERVE_GIB` and `TF_POLICY`.
+2. `d8c78a35` logprobs, top_logprobs and prompt_logprobs on HIP (host log-softmax of each drawn row, `Backend.first_row`, `Backend.prompt_rows`; the drafter wrapper passes them through). The Anthropic API has no logprobs upstream.
+3. `f0775c90` presence, frequency and repetition penalties and logit_bias on HIP (`lanes/penalty.zig`, host rows); other native engines now refuse them with a 400.
+4. `84ef998b` + `e3bffee1` the bf16 27B loads (dense projections) and gives fp32 logits for the quality gate.
+5. Checks: `smoke.py` (session scratchpad, api/) on 27B MLX4 + DFlash2, 27B EXL3 + DFlash2, A3B MTP and Flash Next MLX3 MTP: every logprob and penalty check passes (on the A3B, presence 1.5 and frequency 1.0 happen not to change its 64-token greedy story; every pick is still the penalized argmax). `bench_concurrent --levels 1,4 --tokens 128 --alone --serial` all equal on the 27B MLX4 + DFlash2 and the A3B MTP after the merge. 27B EXL3 + DFlash2 `bench.sh`: prose C1 57.8 → 57.5, code C1 129.5 → 128.9, prefill 8k 433 → 434 tok/s (noise; streams without logprobs or penalties take the same path).
 
 ## Fixes on strix/audit (4 commits)
 
@@ -83,12 +91,12 @@ Columns:
 
 ## Prioritized work items (non-trivial)
 
-1. **logprobs / top_logprobs / prompt_logprobs on HIP**, for qwen3_5, qwen3_5_moe and Flash Next. The user asked for it explicitly. Implement `Backend.first_row`, `Verified.rows` and `prompt_rows` from the verify and prefill logits: a log-softmax and top-20 per row in `hip_serve/draw.zig`. Wire it in `qwen3_5/backend/hip/engine/hip_lanes.zig` and `flashnext/hip/lanes.zig`, and set `Info.logprobs` / `prompt_logprobs` in `native/hip.zig`. The model to copy is CUDA Nemotron (`families/nemotron/cuda_lanes.zig`). Rows must be the raw target distribution, equal with drafts on or off. **Est. 3–5 days.**
+1. ~~**logprobs / top_logprobs / prompt_logprobs on HIP**~~ done on strix/api., for qwen3_5, qwen3_5_moe and Flash Next. The user asked for it explicitly. Implement `Backend.first_row`, `Verified.rows` and `prompt_rows` from the verify and prefill logits: a log-softmax and top-20 per row in `hip_serve/draw.zig`. Wire it in `qwen3_5/backend/hip/engine/hip_lanes.zig` and `flashnext/hip/lanes.zig`, and set `Info.logprobs` / `prompt_logprobs` in `native/hip.zig`. The model to copy is CUDA Nemotron (`families/nemotron/cuda_lanes.zig`). Rows must be the raw target distribution, equal with drafts on or off. **Est. 3–5 days.**
 2. **FP8 KV cache (`--kv-dtype fp8`)**, a prerequisite for useful 1M context and for more streams. Files: `qwen3_5/backend/hip/forward/pages.zig` (pool dtype), the decode/prefill attention kernels (`zig/kernels/hip/attention/*`), the Flash Next attention, the admission byte counts (`plan.zig` already takes a `kv_dtype` byte count), and the cli `native_values`. Old-branch kv8 notes and kernels are a reference. Needs a KL check against bf16. **Est. 1–1.5 weeks.**
 3. **YaRN / 1M context.** Read `rope_scaling` (yarn, factor 4, original 262144) in `qwen3_5/config.zig` and `flashnext/config.zig`. Compute YaRN inv_freq and the attention factor on the host (port the old branch's `cuda_rope.zig`, which has Python bits). Let `hip/admission.zig` grant the scaled window. Validate with a needle at 300k+. Depends on item 2 for memory: 1M bf16 KV is 64 GB per 27B stream. **Est. 2–3 days**, plus item 2.
 4. **Vision: images, 50 images, video.** The server must accept media parts, render them through the template, run a vision tower and inject the embeddings plus 3-D mrope positions into the prompt rows (`api.Media`). Fastest route: port the old branch's `server/vision.zig` Python-helper design to qwen3_5. A native tower comes later. Files: `server/fields.zig`/`messages.zig` (the 400 today), `server/cli.zig` (`--vision*` native), the qwen3_5 HIP prefill (embedding injection, mrope sections). **Est. 1 week with the helper; 2–3 weeks native.**
 5. **EXL3 DFlash2 drafter** (Mia's 5.0 bpw). The drafter loader expects `fc.weight` and similar; the EXL3 file stores trellis/suh/svh/mul1. Reuse `quant/exl3.hip` products in `qwen3_5/backend/hip/draft/weights.zig` and `draft.zig`. **Est. 2–4 days.**
-6. **bf16 27B checkpoint** (`UnsupportedQuantization`): needed to measure KL on HIP itself. A bf16 product exists for the drafter, so extend the qwen3_5 weight table (`weights/table.zig`) to bf16 linears. **Est. 1–2 days.**
+6. ~~**bf16 27B checkpoint**~~ done on strix/api. (`UnsupportedQuantization`): needed to measure KL on HIP itself. A bf16 product exists for the drafter, so extend the qwen3_5 weight table (`weights/table.zig`) to bf16 linears. **Est. 1–2 days.**
 7. **Flash Next INT4-AR and NVFP4** (`UnsupportedAffineMode`): already owned by another agent. Tracked here only.
 8. **DFlash v1 drafter** (Qwen3.6-35B-A3B-DFlash, `BadDraftConfig`): a v1 config/architecture reader and its forward beside DFlash2 in `qwen3_5/backend/hip/draft/`. **Est. 3–5 days.**
 9. **Tensor parallel across two Strix boxes**: the code exists (RCCL, `--tp`/`--master`). It needs a two-host run (27B, A3B, Flash Next), exactness against one rank, and link throughput. **Est. 1–2 days** once a second box is available.
@@ -96,9 +104,9 @@ Columns:
 11. **Desktop app on Linux**: add electron-builder linux targets (AppImage/deb), a linux-hip engine fetch in `scripts/fetch-engine.mjs` and a linux onnxruntime. Node 22 is required. **Est. 1–2 days.**
 12. **On-disk learned prompt states (`--learn`) on HIP**: port `core/prompt_imprint.zig` usage, as `native/metal.zig` does, to `native/hip.zig` and the HIP prefix caches. It is now refused rather than ignored. **Est. 2–3 days.**
 13. **Spill to disk, `--prefill-fp8`, `--decode-share`**: these are Python-0.6.6 features with no native implementation upstream. The old branch has Flash Next spill and FP8 prefill for its CUDA-hipified engine. Port them if wanted; `--prefill-fp8` is really a performance item. **Est. 2–4 days each.**
-14. **Penalties, logit_bias, /v1/decisions (Engine.score)**: missing in every native backend upstream. Penalties and logit_bias are currently ignored *silently*. The cheapest honest step is to reject them with a 400, a small server change; the full version goes in `hip_serve/sample.zig` and must keep draft equality. **Est. 1–2 days.**
+14. ~~**Penalties, logit_bias**~~ done on strix/api (HIP applies them, other native backends refuse them). Still open: **/v1/decisions (Engine.score)**: missing in every native backend upstream. Penalties and logit_bias are currently ignored *silently*. The cheapest honest step is to reject them with a 400, a small server change; the full version goes in `hip_serve/sample.zig` and must keep draft equality. **Est. 1–2 days.**
 15. **Sliding / Living Weights on HIP**: upstream has it for Nemotron only (CUDA/Metal trainer). It does not apply to the Qwen families until upstream extends it. Now refused.
-16. Small items:
+16. Small items (all done on strix/api):
     - Add `exl3` to the qwen3_5 `formats` list in `capabilities --json`.
     - The HIP help/usage still says `--backend {auto,mlx,cuda}`.
     - The `capabilities` env list names CUDA variables, not `TENSORFOLD_HIP_MEMORY_LIMIT_GB` / `TF_POLICY`.
