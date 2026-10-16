@@ -3,13 +3,46 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 
+const agreement = @import("agree.zig");
+
 pub const Error = error{CollectiveFailed};
 pub const LinkError = error{LinkFailed} || std.mem.Allocator.Error;
-/// Why a rank could not join its group: no tensor parallelism in this build, no RCCL, or the link between the ranks.
-pub const JoinError = error{ NoTensorParallel, NoRccl, NoId, SocketFailed, BindFailed, ConnectFailed, LinkClosed, BadRank, MixedGpus } || std.mem.Allocator.Error;
+/// Why a rank could not join its group: no tensor parallelism in this build, no RCCL, the link, or a rank that differs.
+pub const JoinError = error{
+    NoTensorParallel,
+    NoRccl,
+    NoId,
+    SocketFailed,
+    BindFailed,
+    ConnectFailed,
+    LinkClosed,
+    BadRank,
+    RanksDiffer,
+} || std.mem.Allocator.Error;
+
+pub const Identity = agreement.Identity;
+pub const Field = agreement.Field;
+pub const Fault = agreement.Fault;
+pub const Step = agreement.Step;
+pub const Verdict = agreement.Verdict;
+pub const How = agreement.How;
+pub const Vote = agreement.Vote;
+pub const tally = agreement.tally;
+
+/// What a rank brings to its join: its place, its GPU and policy, what it runs, and where a differing rank is named.
+pub const Join = struct {
+    rank: u32,
+    world: u32,
+    master: []const u8,
+    port: u16,
+    caps: @import("caps.zig").Caps,
+    policy: *@import("policy.zig").Policy,
+    ident: Identity,
+    fault: *Fault,
+};
 
 /// The join of a build without a collectives backend: one rank only.
-pub fn noGroup(_: std.mem.Allocator, _: std.Io, _: u32, _: u32, _: []const u8, _: u16, _: @import("caps.zig").Caps, _: *@import("policy.zig").Policy) JoinError!Group {
+pub fn noGroup(_: std.mem.Allocator, _: std.Io, _: Join) JoinError!Group {
     return error.NoTensorParallel;
 }
 
@@ -58,6 +91,7 @@ pub const Link = struct {
     pub const VTable = struct {
         send: *const fn (ptr: *anyopaque, words: []const u32) LinkError!void,
         recv: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, out: *std.ArrayList(u32)) LinkError!void,
+        agree: *const fn (ptr: *anyopaque, mine: Step, how: How) LinkError!Verdict,
     };
 
     /// Rank 0: `words` to every follower.
@@ -69,7 +103,20 @@ pub const Link = struct {
     pub fn recv(l: Link, gpa: std.mem.Allocator, out: *std.ArrayList(u32)) LinkError!void {
         return l.vtable.recv(l.ptr, gpa, out);
     }
+
+    /// A startup step every rank takes: this rank's outcome in, every rank's verdict out (a closed link refuses).
+    pub fn agree(l: Link, mine: Step, how: How) LinkError!Verdict {
+        return l.vtable.agree(l.ptr, mine, how);
+    }
 };
+
+/// Whether `mine` and every other rank's went through, as one step over `link` (null: this rank's alone; lost: no).
+pub fn everyRank(link: ?Link, mine: anyerror!void) bool {
+    const step: Step = if (mine) |_| .ok(.{ 1, 0 }) else |err| .refuse(@errorName(err));
+    const l = link orelse return step.refused == 0;
+    const v = l.agree(step, .first) catch return false;
+    return v.refused == 0;
+}
 
 /// What a rank holds once it joined its group: the link, and its communicator opened when the engine's GPU is current.
 pub const Group = struct {

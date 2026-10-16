@@ -274,7 +274,11 @@ fn aroundOne(a: Allocator, t: *const Tables, layers: usize) !bool {
     const means = try a.alloc(f64, layers);
     for (means, 0..) |*m, i| {
         var buf: [128]u8 = undefined;
-        const k = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ try tensors.layer(&buf, i), tensors.hc.attn, tensors.hc.norm });
+        const k = try std.fmt.allocPrint(
+            a,
+            "{s}.{s}.{s}",
+            .{ try tensors.layer(&buf, i), tensors.hc.attn, tensors.hc.norm },
+        );
         const v = try floats(a, try quant.convert.float32(a, try t.get(k)));
         var sum: f64 = 0;
         for (v) |x| sum += x;

@@ -38,7 +38,28 @@ fn parse(args: []const [:0]const u8) !Args {
         i += 1;
         if (i >= args.len) return error.MissingArgument;
         const v = args[i];
-        if (std.mem.eql(u8, name, "--tp")) a.world = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, name, "--rank")) a.rank = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, name, "--master")) a.master = v else if (std.mem.eql(u8, name, "--port")) a.port = try std.fmt.parseInt(u16, v, 10) else if (std.mem.eql(u8, name, "--policy")) a.policy = v else if (std.mem.eql(u8, name, "--text")) a.text = v else if (std.mem.eql(u8, name, "--max")) a.max = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, name, "--capacity")) a.capacity = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, name, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, name, "--chunk")) a.chunk = try std.fmt.parseInt(usize, v, 10) else return error.UnknownOption;
+        if (std.mem.eql(u8, name, "--tp"))
+            a.world = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, name, "--rank"))
+            a.rank = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, name, "--master"))
+            a.master = v
+        else if (std.mem.eql(u8, name, "--port"))
+            a.port = try std.fmt.parseInt(u16, v, 10)
+        else if (std.mem.eql(u8, name, "--policy"))
+            a.policy = v
+        else if (std.mem.eql(u8, name, "--text"))
+            a.text = v
+        else if (std.mem.eql(u8, name, "--max"))
+            a.max = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, name, "--capacity"))
+            a.capacity = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, name, "--repeat"))
+            a.repeat = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, name, "--chunk"))
+            a.chunk = try std.fmt.parseInt(usize, v, 10)
+        else
+            return error.UnknownOption;
     }
     return a;
 }
@@ -55,7 +76,17 @@ fn generate(gpa: std.mem.Allocator, io: std.Io, a: Args) !void {
     driver.close();
     var notes: hip.Policy.Notes = .{};
     var policy = try hip.Policy.resolve(a.policy, .current, &notes);
-    const group: ?hip.collective.Group = if (a.world > 1) try hip.joinGroup(gpa, io, @intCast(a.rank), @intCast(a.world), a.master, a.port, caps, &policy) else null;
+    const group: ?hip.collective.Group = if (a.world > 1) try hip.joinRun(
+        gpa,
+        io,
+        @intCast(a.rank),
+        @intCast(a.world),
+        a.master,
+        a.port,
+        caps,
+        &policy,
+        a.dir,
+    ) else null;
     defer if (group) |g| g.close(gpa);
     const t0 = nowNs(io);
     const e = try fx.engine.Engine.open(gpa, io, a.dir, .{ .device = device, .rank = a.rank, .world = a.world, .group = group, .policy = policy, .capacity = a.capacity, .chunk = a.chunk });
@@ -66,7 +97,11 @@ fn generate(gpa: std.mem.Allocator, io: std.Io, a: Args) !void {
     defer arena.deinit();
     const tk_path = try std.fs.path.join(arena.allocator(), &.{ a.dir, "tokenizer.json" });
     var tok = try tokenizer.loadTokenizer(io, arena.allocator(), tk_path);
-    const text = if (a.chat) try std.fmt.allocPrint(arena.allocator(), "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{a.text}) else a.text;
+    const text = if (a.chat) try std.fmt.allocPrint(
+        arena.allocator(),
+        "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        .{a.text},
+    ) else a.text;
     const prompt = try tok.encode(arena.allocator(), text);
     for (0..a.repeat) |_| {
         var c = try e.caches(a.capacity);
@@ -108,7 +143,17 @@ fn generate(gpa: std.mem.Allocator, io: std.Io, a: Args) !void {
         const words = try tok.decode(arena.allocator(), reply.items, false);
         const pre = @as(f64, @floatFromInt(p1 - p0)) / 1e9;
         const dec = @as(f64, @floatFromInt(p2 - p1)) / 1e9;
-        std.debug.print("prompt {d} tokens in {d:.3} s ({d:.1} tok/s); {d} tokens in {d:.3} s ({d:.2} tok/s)\n", .{ prompt.len, pre, @as(f64, @floatFromInt(prompt.len)) / pre, a.max - 1, dec, @as(f64, @floatFromInt(a.max - 1)) / dec });
+        std.debug.print(
+            "prompt {d} tokens in {d:.3} s ({d:.1} tok/s); {d} tokens in {d:.3} s ({d:.2} tok/s)\n",
+            .{
+                prompt.len,
+                pre,
+                @as(f64, @floatFromInt(prompt.len)) / pre,
+                a.max - 1,
+                dec,
+                @as(f64, @floatFromInt(a.max - 1)) / dec,
+            },
+        );
         if (a.hash) std.debug.print("logits hash {x:0>16}\n", .{digest.final()});
         std.debug.print("ids {any}\n---\n{s}{s}\n---\n", .{ reply.items, text, words });
     }
@@ -135,7 +180,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     generate(init.gpa, init.io, a) catch |err| {
         std.debug.print("FAIL {t}\n", .{err});
-        if (@errorReturnTrace()) |t| std.debug.dumpStackTrace(t);
+        if (@errorReturnTrace()) |t| std.debug.dumpErrorReturnTrace(t);
         return 1;
     };
     return 0;

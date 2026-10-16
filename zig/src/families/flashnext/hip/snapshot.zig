@@ -48,27 +48,50 @@ fn copyOut(d: *const hip.Runtime, c: *const cache.Caches, at: usize, ratio: usiz
     errdefer gpa.free(out);
     var off: usize = 0;
     for (list.items) |r| {
-        if (r.len > 0) try hip.runtime.check(d.api.hipMemcpyDtoH(out[off..].ptr, @ptrFromInt(c.mem.base() + r.offset), r.len));
+        if (r.len > 0) try hip.runtime.check(d.api.hipMemcpyDtoH(
+            out[off..].ptr,
+            @ptrFromInt(c.mem.base() + r.offset),
+            r.len,
+        ));
         off += r.len;
     }
     return out;
 }
 
-fn copyIn(d: *const hip.Runtime, c: *const cache.Caches, at: usize, ratio: usize, bytes: []const u8, gpa: std.mem.Allocator) !void {
+fn copyIn(
+    d: *const hip.Runtime,
+    c: *const cache.Caches,
+    at: usize,
+    ratio: usize,
+    bytes: []const u8,
+    gpa: std.mem.Allocator,
+) !void {
     var list: std.ArrayList(Region) = .empty;
     defer list.deinit(gpa);
     try regions(c, at, ratio, &list, gpa);
     var off: usize = 0;
     for (list.items) |r| {
         if (off + r.len > bytes.len) return error.SnapshotMismatch;
-        if (r.len > 0) try hip.runtime.check(d.api.hipMemcpyHtoD(@ptrFromInt(c.mem.base() + r.offset), @constCast(bytes[off..].ptr), r.len));
+        if (r.len > 0) try hip.runtime.check(d.api.hipMemcpyHtoD(
+            @ptrFromInt(c.mem.base() + r.offset),
+            @constCast(bytes[off..].ptr),
+            r.len,
+        ));
         off += r.len;
     }
     if (off != bytes.len) return error.SnapshotMismatch;
 }
 
 /// The state of `c` (and the head's `head`) after `at` prompt tokens, copied to host memory; the stream is idle.
-pub fn save(gpa: std.mem.Allocator, d: *const hip.Runtime, s: hip.Stream, c: *const cache.Caches, head: ?*const cache.Caches, at: usize, ratio: usize) !*Saved {
+pub fn save(
+    gpa: std.mem.Allocator,
+    d: *const hip.Runtime,
+    s: hip.Stream,
+    c: *const cache.Caches,
+    head: ?*const cache.Caches,
+    at: usize,
+    ratio: usize,
+) !*Saved {
     try s.synchronize();
     if (c.len != at) return error.SnapshotNotAtMark;
     const out = try gpa.create(Saved);
@@ -80,8 +103,16 @@ pub fn save(gpa: std.mem.Allocator, d: *const hip.Runtime, s: hip.Stream, c: *co
     return out;
 }
 
-/// `saved` made the live state of `c` and `head`: the next prompt chunk starts at its position.
-pub fn restore(gpa: std.mem.Allocator, d: *const hip.Runtime, s: hip.Stream, saved: *const Saved, c: *cache.Caches, head: ?*cache.Caches, ratio: usize) !void {
+/// `saved` made the live state of `c` and `head`, or a failure part way through that leaves either changed.
+fn restore(
+    gpa: std.mem.Allocator,
+    d: *const hip.Runtime,
+    s: hip.Stream,
+    saved: *const Saved,
+    c: *cache.Caches,
+    head: ?*cache.Caches,
+    ratio: usize,
+) !void {
     try s.synchronize();
     if (saved.at + 1 > c.layout.cap) return error.SnapshotTooLong;
     try copyIn(d, c, saved.at, ratio, saved.main, gpa);
@@ -93,6 +124,32 @@ pub fn restore(gpa: std.mem.Allocator, d: *const hip.Runtime, s: hip.Stream, sav
         h.len = saved.at;
         h.pooled = saved.at / ratio;
     }
+}
+
+/// `saved` (null: no copy here) restored on every rank or none: all resume from it, or all start over (RestoreRefused).
+pub fn restoreAgreed(
+    gpa: std.mem.Allocator,
+    d: *const hip.Runtime,
+    s: hip.Stream,
+    saved: ?*const Saved,
+    c: *cache.Caches,
+    head: ?*cache.Caches,
+    ratio: usize,
+    eos: i64,
+    link: ?hip.collective.Link,
+) !void {
+    const mine = if (saved) |x| restore(gpa, d, s, x, c, head, ratio) else error.UnknownSnapshot;
+    if (hip.collective.everyRank(link, mine)) return;
+    // a part-restored rank, and every rank that restored beside one that failed, starts the prompt over from zero
+    if (!hip.collective.everyRank(link, fresh(s, c, head, eos))) return error.GroupStopped;
+    return error.RestoreRefused;
+}
+
+/// `c` and `head` as a new stream's: zeros, no positions, eos before any row.
+fn fresh(s: hip.Stream, c: *cache.Caches, head: ?*cache.Caches, eos: i64) !void {
+    try s.synchronize();
+    try c.reset(eos);
+    if (head) |h| try h.reset(eos);
 }
 
 pub fn drop(gpa: std.mem.Allocator, saved: *Saved) void {

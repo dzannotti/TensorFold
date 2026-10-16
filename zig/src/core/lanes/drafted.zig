@@ -44,7 +44,19 @@ pub const Drafted = struct {
     }
 
     pub fn backend(x: *Drafted) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = heldTokens, .release = release } };
+    }
+
+    /// A stream's held drafts as host tokens, for a grammar to walk before the verify (fillers: the pending token).
+    fn heldTokens(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
+        const x = self(ptr);
+        const lane = x.lanes.getPtr(s) orelse return error.NotDrafting;
+        if (lane.filler > 0) {
+            @memset(out, s.pending.?);
+            lane.filler = 0;
+            return;
+        }
+        try x.drafter.held(&.{s}, &.{out});
     }
 
     /// The target's facts with the drafter's depth, step cost, prior, plain guard and batching; chains drafted late.
