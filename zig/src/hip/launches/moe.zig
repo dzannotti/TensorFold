@@ -53,6 +53,21 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, 
     return true;
 }
 
+/// Decode's or a round's router over the bf16 rows at up to 16 rows, the decode kernel's logits; false where the
+/// shape keeps the fp32 kernels.
+pub fn routerRows16(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
+    if (!l.fuse or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
+    var a: Args = .{};
+    try a.add(ad(x));
+    try a.add(ad(rows16));
+    try a.add(ad(logits));
+    try a.add(r);
+    try a.add(d);
+    try a.add(e);
+    try l.go(l.dec.router16[if (kind == 1) 0 else 1], dim(cdiv(e, 4), r, 1), dim(128, 1, 1), 0, s, &a);
+    return true;
+}
+
 pub fn tf_moe_router(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!void {
     // a prompt's rows take the 64 x 64 tiles, a round's few rows a wave an expert; each logit's sum is the same
     var a: Args = .{};

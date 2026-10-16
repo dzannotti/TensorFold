@@ -115,13 +115,13 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
             sc[c] = live ? terms.widen(sr[c]) : 0.f;
             bi[c] = live ? terms.widen(br[c]) : 0.f;
         }
+        // RGX of a pass's rows from acc row g RG: a plan's item often holds fewer rows than the tile, and a row's sums
+        // do not depend on the rows beside it, so the rows past the item's last are not run
+        auto pass = [&]<int RGX>(std::integral_constant<int, RGX>, int g) {
+            pair xp[RGX][16];
+            float sx[RGX];
 #pragma unroll
-        for (int g = 0; g < NG; ++g) {
-            if (row0 + g * RG >= a.m) break;
-            pair xp[RG][16];
-            float sx[RG];
-#pragma unroll
-            for (int r = 0; r < RG; ++r) {
+            for (int r = 0; r < RGX; ++r) {
                 uint32_t xn[16];
                 const u32x4* src =
                     reinterpret_cast<const u32x4*>(xr[g * RG + r] + static_cast<long long>(q) * 32);
@@ -143,16 +143,34 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
             }
 #pragma unroll
             for (int c = 0; c < CB; ++c) {
-                float d[RG];
+                float d[RGX];
 #pragma unroll
-                for (int r = 0; r < RG; ++r) d[r] = 0.f;
-                stream_dots<Dec, T, RG>(xp, w[c], d, std::make_integer_sequence<int, 16>{});
+                for (int r = 0; r < RGX; ++r) d[r] = 0.f;
+                stream_dots<Dec, T, RGX>(xp, w[c], d, std::make_integer_sequence<int, 16>{});
 #pragma unroll
-                for (int r = 0; r < RG; ++r) {
+                for (int r = 0; r < RGX; ++r) {
                     acc[g * RG + r][c] = Dec::fold_scale(acc[g * RG + r][c], d[r], sc[c]);
                     acc[g * RG + r][c] = Dec::fold_bias(acc[g * RG + r][c], sx[r], bi[c]);
                 }
             }
+        };
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            const int here = a.m - row0 - g * RG;
+            if (here <= 0) break;
+            if constexpr (RG >= 2) {
+                if (here == 1) {
+                    pass(std::integral_constant<int, 1>{}, g);
+                    continue;
+                }
+            }
+            if constexpr (RG >= 4) {
+                if (here == 2) {
+                    pass(std::integral_constant<int, 2>{}, g);
+                    continue;
+                }
+            }
+            pass(std::integral_constant<int, RG>{}, g);
         }
     };
 

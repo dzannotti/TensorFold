@@ -123,6 +123,46 @@ test "the merged router launch is no further from float64 than twice the launch 
     for ([_]usize{ 1, 2, 4, 8 }) |rows| try router(t, &rng, rows, 2048, 257);
 }
 
+test "the router over bf16 rows writes the fp32 rows' logits bit for bit, at 1 to 16 rows" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    if (!t.on.fuse) return;
+    var rng: rig.Rng = .{ .state = 0x9E3779B97F4A7C15 };
+    const d = 2048;
+    const experts = 257;
+    const hx = try gpa.alloc(u16, 16 * d);
+    defer gpa.free(hx);
+    for (hx) |*v| v.* = t.bits(rng.unit());
+    const h16 = try gpa.alloc(u16, experts * d);
+    defer gpa.free(h16);
+    const h32 = try gpa.alloc(f32, experts * d);
+    defer gpa.free(h32);
+    for (h16, h32) |*b, *f| {
+        b.* = @truncate(@as(u32, @bitCast(rng.unit() / 8.0)) >> 16);
+        f.* = @bitCast(@as(u32, b.*) << 16);
+    }
+    var x = try t.upload(hx);
+    defer x.free();
+    var w16 = try t.upload(h16);
+    defer w16.free();
+    var w32 = try t.upload(h32);
+    defer w32.free();
+    for ([_]usize{ 1, 3, 4, 8, 16 }) |rows| {
+        var a = try t.alloc(rows * experts * 4);
+        defer a.free();
+        var b = try t.alloc(rows * experts * 4);
+        defer b.free();
+        try t.on.tf_moe_router(p(x), t.kind(), @ptrFromInt(at(w32)), @ptrFromInt(at(a)), @intCast(rows), d, experts, t.stream.handle);
+        try std.testing.expect(try t.on.routerRows16(p(x), t.kind(), p(w16), @ptrFromInt(at(b)), @intCast(rows), d, experts, t.stream.handle));
+        try t.stream.synchronize();
+        const ga = try rig.download(u32, a);
+        defer gpa.free(ga);
+        const gb = try rig.download(u32, b);
+        defer gpa.free(gb);
+        try std.testing.expectEqualSlices(u32, ga, gb);
+    }
+}
+
 test "the merged residual-and-norm tails are no further from float64 than twice the launches they replace" {
     const t = try Rig.open(1 << 20);
     defer t.close();
