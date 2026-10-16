@@ -26,6 +26,7 @@ pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");
 pub const logprob = @import("logprob.zig");
 pub const grammar = @import("grammar.zig");
+pub const penalty = @import("penalty.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
@@ -34,6 +35,7 @@ pub const Stream = stream.Stream;
 pub const Sampling = sampling.Sampling;
 pub const SuffixLookup = proposer.SuffixLookup;
 pub const LogprobRow = logprob.Row;
+pub const Penalties = penalty.Penalties;
 
 test {
     std.testing.refAllDecls(@This());

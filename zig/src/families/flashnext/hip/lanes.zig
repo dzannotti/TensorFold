@@ -356,7 +356,7 @@ pub const Fx = struct {
         const o = e.ops(&e.arena);
         const logits = try e.logits(o, forward.at(out.mixed, (rows - 1) * m.dims.hidden), 1);
         var token: [1]u32 = undefined;
-        try e.drawer.draw(o, e.stream, logits, &.{.{ .sampling = sampling(s), .position = prompt.len, .keep = if (s.grammar != null) lane.first_row else null, .logprob = if (s.logprobs) |k| .{ .k = k, .out = &lane.first_lp } else null }}, &token, false);
+        try e.drawer.draw(o, e.stream, logits, &.{.{ .sampling = sampling(s), .position = prompt.len, .keep = if (s.grammar != null) lane.first_row else null, .logprob = if (s.logprobs) |k| .{ .k = k, .out = &lane.first_lp } else null, .penalty = draw.penaltyFor(s, &.{}) }}, &token, false);
         _ = f.take(token[0]);
         lane.fill = null;
         return true;
@@ -404,7 +404,7 @@ pub const Fx = struct {
         const kept = lane.first_row orelse return error.StructuresUnsupported;
         const row = try f.gpa.dupe(u16, kept);
         defer f.gpa.free(row);
-        return f.take(try f.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits }));
+        return f.take(try f.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits, .penalty = draw.penaltyFor(s, &.{}) }));
     }
 
     fn heldTokensFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
@@ -475,10 +475,10 @@ pub const Fx = struct {
         var reqs: [forward.max_segs * cache.max_window]draw.Request = undefined;
         var drawn: [forward.max_segs * cache.max_window]u32 = undefined;
         off = 0;
-        for (windows, out) |w, v| {
+        for (windows, out, 0..) |w, v, i| {
             const n = w.rows();
             const words = if (w.masks.len > 0) w.masks.len / n else 0;
-            for (w.positions, 0..) |p, r| reqs[off + r] = .{ .sampling = sampling(w.stream), .position = p, .mask = w.masks[r * words ..][0..words], .logprob = if (w.stream.logprobs) |k| .{ .k = k, .out = &v.rows[r] } else null };
+            for (w.positions, 0..) |p, r| reqs[off + r] = .{ .sampling = sampling(w.stream), .position = p, .mask = w.masks[r * words ..][0..words], .logprob = if (w.stream.logprobs) |k| .{ .k = k, .out = &v.rows[r] } else null, .penalty = draw.penaltyFor(w.stream, tokens[i][1 .. r + 1]) };
             off += n;
         }
         if (total > e.drawer.rows) return error.WindowTooWide;

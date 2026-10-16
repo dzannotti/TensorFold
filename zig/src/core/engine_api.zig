@@ -14,6 +14,8 @@ pub const seedFor = lanes.sampling.seedFor;
 
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
+pub const Penalties = lanes.Penalties;
+pub const Bias = lanes.penalty.Bias;
 
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct {
@@ -88,6 +90,8 @@ pub const Request = struct {
     logprobs: ?u8 = null,
     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
     prompt_logprobs: ?u8 = null,
+    /// Presence, frequency and repetition penalties and logit_bias, when ``Info.penalties``; null: none.
+    penalties: ?lanes.Penalties = null,
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -146,6 +150,8 @@ pub const Info = struct {
     logprobs: bool = false,
     /// Requests may ask for ``prompt_logprobs`` (a prompt pass from 0 that reads every row).
     prompt_logprobs: bool = false,
+    /// Requests may carry penalties and logit_bias (the engine applies them to every row it draws).
+    penalties: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.

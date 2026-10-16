@@ -145,7 +145,7 @@ pub const Engine = struct {
         } else {
             for (live.items) |s| {
                 // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
-                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
+                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null or s.penalties != null;
                 const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
             }

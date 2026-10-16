@@ -1,6 +1,7 @@
 //! Request field checks shared by every route: numbers, stops, thinking switches, efforts, probabilities.
 const std = @import("std");
 const json = @import("json.zig");
+const api = @import("engine_api");
 const errors = @import("errors.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -310,6 +311,34 @@ pub fn promptLogprobs(cx: *Cx, body: Value, completions: bool, streamed: bool, s
     return @intCast(n.?);
 }
 
+/// presence_penalty and frequency_penalty (OpenAI: -2 through 2), repetition_penalty (vLLM: above 0) and logit_bias
+/// (token id to -100 through 100); null when none changes a row, a 400 when the engine cannot apply them.
+pub fn penalties(cx: *Cx, body: Value, supported: bool) errors.Refused!?api.Penalties {
+    var p: api.Penalties = .{};
+    for ([_][]const u8{ "presence_penalty", "frequency_penalty", "repetition_penalty" }, [_]*f32{ &p.presence, &p.frequency, &p.repetition }) |name, slot| {
+        const v = body.field(name) orelse continue;
+        const f = (toFloat(v) orelse return cx.fail(.request, "{s} must be a finite number or null", .{name})).float;
+        const repetition = slot == &p.repetition;
+        if (repetition and !(f > 0)) return cx.refuse("repetition_penalty must be above 0, or null");
+        if (!repetition and !(f >= -2 and f <= 2)) return cx.fail(.request, "{s} must be between -2 and 2, or null", .{name});
+        slot.* = @floatCast(f);
+    }
+    if (body.field("logit_bias")) |b| {
+        if (b != .object) return cx.refuse("logit_bias must be an object of token ids to numbers, or null");
+        const list = try cx.a.alloc(api.Bias, b.object.count());
+        for (b.object.keys(), b.object.values(), list) |k, v, *slot| {
+            const token = std.fmt.parseInt(u32, k, 10) catch return cx.fail(.request, "logit_bias: {s} is not a token id", .{k});
+            const f = (toFloat(v) orelse return cx.refuse("logit_bias values must be numbers between -100 and 100")).float;
+            if (!(f >= -100 and f <= 100)) return cx.refuse("logit_bias values must be numbers between -100 and 100");
+            slot.* = .{ .token = token, .value = @floatCast(f) };
+        }
+        p.bias = list;
+    }
+    if (!p.active()) return null;
+    if (!supported) return cx.refuse("presence_penalty, frequency_penalty, repetition_penalty and logit_bias are not supported by this engine yet");
+    return p;
+}
+
 const media = [_][]const u8{ "image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url" };
 
 /// ``validate_modalities``: text in, text out.
@@ -336,4 +365,22 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "penalties: read, range-checked, null when inert, refused where the engine cannot apply them" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    const body = (try json.parse(a, "{\"presence_penalty\":0.5,\"repetition_penalty\":1.1,\"logit_bias\":{\"7\":-100}}")).ok;
+    const p = (try penalties(&cx, body, true)).?;
+    try std.testing.expectEqual(@as(f32, 0.5), p.presence);
+    try std.testing.expectEqual(@as(f32, 0), p.frequency);
+    try std.testing.expectEqual(@as(u32, 7), p.bias[0].token);
+    try std.testing.expectEqual(@as(f32, -100), p.bias[0].value);
+    try std.testing.expect(try penalties(&cx, (try json.parse(a, "{\"presence_penalty\":0,\"repetition_penalty\":1}")).ok, false) == null);
+    try std.testing.expectError(error.Refused, penalties(&cx, body, false));
+    try std.testing.expectError(error.Refused, penalties(&cx, (try json.parse(a, "{\"frequency_penalty\":3}")).ok, true));
+    try std.testing.expectError(error.Refused, penalties(&cx, (try json.parse(a, "{\"repetition_penalty\":0}")).ok, true));
+    try std.testing.expectError(error.Refused, penalties(&cx, (try json.parse(a, "{\"logit_bias\":{\"x\":1}}")).ok, true));
 }

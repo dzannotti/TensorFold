@@ -18,17 +18,7 @@ pub fn widen(row: []const u16, dtype: Dtype, i: usize) f32 {
 
 /// torch.argmax over the widened row: the first index of the largest value (a NaN wins, as torch's).
 pub fn argmax(row: []const u16, dtype: Dtype) u32 {
-    var best: usize = 0;
-    var top = widen(row, dtype, 0);
-    for (1..row.len) |i| {
-        const v = widen(row, dtype, i);
-        if (std.math.isNan(top)) break;
-        if (std.math.isNan(v) or v > top) {
-            best = i;
-            top = v;
-        }
-    }
-    return @intCast(best);
+    return argmaxBy(Wide{ .row = row, .dtype = dtype });
 }
 
 /// Structured output: every token whose bit is clear in `bits` (32 a word, token i in word i / 32) becomes -inf.
@@ -52,19 +42,64 @@ fn larger(_: void, a: Candidate, b: Candidate) bool {
 
 /// draw(): greedy (no sampling or temperature <= 0) is the argmax; else `choose` at `position` over the candidates.
 pub fn draw(gpa: Allocator, row: []const u16, dtype: Dtype, sampling: ?lanes.Sampling, position: u64) !u32 {
-    const s = sampling orelse return argmax(row, dtype);
-    if (s.temperature <= 0.0) return argmax(row, dtype);
-    const width = row.len;
+    return drawBy(gpa, Wide{ .row = row, .dtype = dtype }, sampling, position);
+}
+
+/// `draw` over a row already widened (and penalized) on the host.
+pub fn drawFloats(gpa: Allocator, row: []const f32, sampling: ?lanes.Sampling, position: u64) !u32 {
+    return drawBy(gpa, Floats{ .row = row }, sampling, position);
+}
+
+const Wide = struct {
+    row: []const u16,
+    dtype: Dtype,
+    fn len(w: Wide) usize {
+        return w.row.len;
+    }
+    fn at(w: Wide, i: usize) f32 {
+        return widen(w.row, w.dtype, i);
+    }
+};
+
+const Floats = struct {
+    row: []const f32,
+    fn len(w: Floats) usize {
+        return w.row.len;
+    }
+    fn at(w: Floats, i: usize) f32 {
+        return w.row[i];
+    }
+};
+
+/// argmax over any row source (torch's: the first largest, a NaN wins).
+fn argmaxBy(src: anytype) u32 {
+    var best: usize = 0;
+    var top = src.at(0);
+    for (1..src.len()) |i| {
+        const v = src.at(i);
+        if (std.math.isNan(top)) break;
+        if (std.math.isNan(v) or v > top) {
+            best = i;
+            top = v;
+        }
+    }
+    return @intCast(best);
+}
+
+fn drawBy(gpa: Allocator, src: anytype, sampling: ?lanes.Sampling, position: u64) !u32 {
+    const s = sampling orelse return argmaxBy(src);
+    if (s.temperature <= 0.0) return argmaxBy(src);
+    const width = src.len();
     const count = if (s.top_k != 0) @min(width, @as(usize, s.top_k) + MARGIN) else width;
     const best = try gpa.alloc(Candidate, count);
     defer gpa.free(best);
     var filled: usize = 0;
     // the whole row when top_k is 0 (choose orders it), else the top `count` by value then id in one pass
     if (count == width) {
-        for (best, 0..) |*c, i| c.* = .{ .value = widen(row, dtype, i), .id = @intCast(i) };
+        for (best, 0..) |*c, i| c.* = .{ .value = src.at(i), .id = @intCast(i) };
         filled = width;
     } else for (0..width) |i| {
-        const c: Candidate = .{ .value = widen(row, dtype, i), .id = @intCast(i) };
+        const c: Candidate = .{ .value = src.at(i), .id = @intCast(i) };
         if (filled == count and !larger({}, c, best[count - 1])) continue;
         var at = if (filled < count) filled else count - 1;
         if (filled < count) filled += 1;
