@@ -29,29 +29,9 @@ constexpr int kRouterWaves = 4;
 constexpr int kRouterSteps = 16;  // float4 loads a lane keeps in flight
 constexpr int kRouterRows = 16;
 
-// A router row's four weights at `at` as floats: fp32 rows, or bf16 rows (the fp32 rows' exact values, half the bytes).
-template <typename W>
-struct RouterLoad;
-template <>
-struct RouterLoad<float> {
-    using V = float4;
-    __device__ static V load(const float* w, int at) { return *reinterpret_cast<const float4*>(w + at); }
-    __device__ static V none() { return make_float4(0.f, 0.f, 0.f, 0.f); }
-    __device__ static float4 widen(V v) { return v; }
-};
-template <>
-struct RouterLoad<uint16_t> {
-    using V = uint2;
-    __device__ static V load(const uint16_t* w, int at) { return *reinterpret_cast<const uint2*>(w + at); }
-    __device__ static V none() { return make_uint2(0u, 0u); }
-    __device__ static float4 widen(V v) { return widen4<2>(v); }
-};
-
 // logits[r, e] = x[r] . rows[e], 16 rows a block, a wave an expert; d is a multiple of 4, weight rows 16-byte aligned.
-// A lane sums elements 128 s + 4 lane + j in s order whatever STEPS is (the loads a lane keeps in flight): same bits.
-template <int KIND, typename W = float, int STEPS = kRouterSteps>
-__device__ void router_decode(const void* x, const W* rows, float* logits, int r, int d, int e) {
-    using L = RouterLoad<W>;
+template <int KIND>
+__device__ void router_decode(const void* x, const float* rows, float* logits, int r, int d, int e) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
     if (expert >= e) return;
@@ -60,31 +40,30 @@ __device__ void router_decode(const void* x, const W* rows, float* logits, int r
     x = static_cast<const uint16_t*>(x) + static_cast<long long>(first) * d;
     logits += static_cast<long long>(first) * e;
     r = r - first < kRouterRows ? r - first : kRouterRows;
-    const W* w = rows + static_cast<long long>(expert) * d;
+    const float* w = rows + static_cast<long long>(expert) * d;
     float acc[kRouterRows];
 #pragma unroll
     for (int k = 0; k < kRouterRows; ++k) acc[k] = 0.f;
-    for (int base = 0; base < d; base += STEPS * 128) {
-        typename L::V wr[STEPS];
+    for (int base = 0; base < d; base += kRouterSteps * 128) {
+        float4 wv[kRouterSteps];
 #pragma unroll
-        for (int s = 0; s < STEPS; ++s) {
+        for (int s = 0; s < kRouterSteps; ++s) {
             const int at = base + (lane + 32 * s) * 4;
-            wr[s] = at < d ? L::load(w, at) : L::none();
+            wv[s] = at < d ? *reinterpret_cast<const float4*>(w + at) : make_float4(0.f, 0.f, 0.f, 0.f);
         }
 #pragma unroll
         for (int k = 0; k < kRouterRows; ++k) {
             if (k >= r) continue;
             const uint16_t* xr = static_cast<const uint16_t*>(x) + static_cast<long long>(k) * d;
 #pragma unroll
-            for (int s = 0; s < STEPS; ++s) {
+            for (int s = 0; s < kRouterSteps; ++s) {
                 const int at = base + (lane + 32 * s) * 4;
                 if (at >= d) continue;
                 const float4 xv = widen4<KIND>(*reinterpret_cast<const uint2*>(xr + at));
-                const float4 wv1 = L::widen(wr[s]);
-                acc[k] = fmaf(xv.x, wv1.x, acc[k]);
-                acc[k] = fmaf(xv.y, wv1.y, acc[k]);
-                acc[k] = fmaf(xv.z, wv1.z, acc[k]);
-                acc[k] = fmaf(xv.w, wv1.w, acc[k]);
+                acc[k] = fmaf(xv.x, wv[s].x, acc[k]);
+                acc[k] = fmaf(xv.y, wv[s].y, acc[k]);
+                acc[k] = fmaf(xv.z, wv[s].z, acc[k]);
+                acc[k] = fmaf(xv.w, wv[s].w, acc[k]);
             }
         }
     }
@@ -97,6 +76,41 @@ __device__ void router_decode(const void* x, const W* rows, float* logits, int r
     }
 }
 
+// router_decode's logits from the router's bf16 rows (rows32 is them widened, so each product is the same): a wave a
+// (row, expert), half the weight bytes and r times the waves; each logit is router_decode's chain and butterfly.
+template <int KIND>
+__device__ void router_rows16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    const int lane = threadIdx.x & 31;
+    const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
+    const int k = blockIdx.y;
+    if (expert >= e || k >= r) return;
+    const uint16_t* xr = static_cast<const uint16_t*>(x) + static_cast<long long>(k) * d;
+    const uint16_t* w = rows + static_cast<long long>(expert) * d;
+    float acc = 0.f;
+    for (int base = 0; base < d; base += kRouterSteps * 128) {
+        uint2 wv[kRouterSteps], xv[kRouterSteps];
+#pragma unroll
+        for (int s = 0; s < kRouterSteps; ++s) {
+            const int at = base + (lane + 32 * s) * 4;
+            wv[s] = at < d ? *reinterpret_cast<const uint2*>(w + at) : make_uint2(0, 0);
+            xv[s] = at < d ? *reinterpret_cast<const uint2*>(xr + at) : make_uint2(0, 0);
+        }
+#pragma unroll
+        for (int s = 0; s < kRouterSteps; ++s) {
+            const int at = base + (lane + 32 * s) * 4;
+            if (at >= d) continue;
+            const float4 xf = widen4<KIND>(xv[s]);
+            const float4 wf = widen4<2>(wv[s]);
+            acc = fmaf(xf.x, wf.x, acc);
+            acc = fmaf(xf.y, wf.y, acc);
+            acc = fmaf(xf.z, wf.z, acc);
+            acc = fmaf(xf.w, wf.w, acc);
+        }
+    }
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) acc += __shfl_xor(acc, mask, 32);
+    if (lane == 0) logits[static_cast<long long>(k) * e + expert] = acc;
+}
 
 __device__ __forceinline__ float load_kind(const void* p, int kind, long long i) {
     return kind == 1 ? __half2float(static_cast<const __half*>(p)[i]) : bf16_up(static_cast<const uint16_t*>(p)[i]);
@@ -122,31 +136,44 @@ __device__ __forceinline__ void store_kind(void* p, int kind, long long i, float
 constexpr int kTailThreads = 512;
 constexpr int kTailWidth = 8192;
 
-// One row a block, one launch: x = round(x + t), t = y or the slot-ordered weighted sum; normed = rms(x) * weight.
-__device__ void tail_body(void* x, const void* y, const float* wts, const float* weight, void* normed, int kind,
-                          int slots, int width, float eps) {
-    __shared__ float row_v[kTailWidth];
-    __shared__ float part[kTailThreads / 32];
+// One row a block, one launch: x = round(x + t), t = y or the slot-ordered weighted sum; normed = rms(x) * weight. The
+// kind fixed and U strides' loads in flight before their sums, which run in stride order.
+template <int KIND>
+__device__ __forceinline__ void tail_kind(void* x, const void* y, const float* wts, const float* weight, void* normed,
+                                          int slots, int width, float eps, float* row_v, float* part) {
+    constexpr int kind = KIND, U = 8;
     const int row = blockIdx.x;
     const long long at = static_cast<long long>(row) * width;
-    float sum = 0.f;
-    for (int i = threadIdx.x; i < width; i += kTailThreads) {
-        float t;
+    const auto term = [&](int i) {
         if (slots > 0) {
             float acc = 0.f;
             for (int s = 0; s < slots; ++s) {
                 acc += static_cast<const float*>(y)[(static_cast<long long>(row) * slots + s) * width + i] *
                        wts[row * slots + s];
             }
-            t = round_kind(acc, kind);
-        } else {
-            t = load_kind(y, kind, at + i);
+            return round_kind(acc, kind);
         }
-        const float v = round_kind(load_kind(x, kind, at + i) + t, kind);
+        return load_kind(y, kind, at + i);
+    };
+    const auto add = [&](int i, float xv, float t, float& sum) {
+        const float v = round_kind(xv + t, kind);
         store_kind(x, kind, at + i, v);
         row_v[i] = v;
         sum += v * v;
+    };
+    float sum = 0.f;
+    int i0 = threadIdx.x;
+    for (; i0 + kTailThreads * (U - 1) < width; i0 += kTailThreads * U) {
+        float ts[U], xs[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            ts[u] = term(i0 + kTailThreads * u);
+            xs[u] = load_kind(x, kind, at + i0 + kTailThreads * u);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) add(i0 + kTailThreads * u, xs[u], ts[u], sum);
     }
+    for (; i0 < width; i0 += kTailThreads) add(i0, load_kind(x, kind, at + i0), term(i0), sum);
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sum;
@@ -160,6 +187,14 @@ __device__ void tail_body(void* x, const void* y, const float* wts, const float*
         if (weight != nullptr) value *= weight[i];
         store_kind(normed, kind, at + i, value);
     }
+}
+
+__device__ void tail_body(void* x, const void* y, const float* wts, const float* weight, void* normed, int kind,
+                          int slots, int width, float eps) {
+    __shared__ float row_v[kTailWidth];
+    __shared__ float part[kTailThreads / 32];
+    if (kind == 1) tail_kind<1>(x, y, wts, weight, normed, slots, width, eps, row_v, part);
+    else tail_kind<2>(x, y, wts, weight, normed, slots, width, eps, row_v, part);
 }
 
 // Conv launch arguments: x (rows, channels), taps, state, snapshots; q, k (rows, kw), v (rows, vw) out; norm, gate.
@@ -237,6 +272,14 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     if (live) {
         for (int tap = 0; tap < kept; ++tap) history[tap] = c.state[static_cast<long long>(tap) * c.channels + channel];
     }
+    // a round's inputs (32 rows at most) fetched at once, each thread's own column of them: the row walk waits on none
+    __shared__ float inputs[32][128];
+    const bool staged = c.rows <= 32;
+    const auto input = [&](int r) { return staged ? inputs[r][threadIdx.x] : load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel); };
+    if (live && staged) {
+#pragma unroll 8
+        for (int r = 0; r < c.rows; ++r) inputs[r][threadIdx.x] = load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel);
+    }
     for (int r = 0; r < c.rows; ++r) {
         float y = 0.f;
         float sample = 0.f;
@@ -250,7 +293,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
                 if (up != 0) {
                     const int a = 31 - __clz(up);
                     up &= ~(1u << a);
-                    history[tap] = load_kind(c.x, c.kind, static_cast<long long>(a) * c.channels + channel);
+                    history[tap] = input(a);
                     ++used;
                 } else {
                     history[tap] = c.state[static_cast<long long>(tap + used) * c.channels + channel];
@@ -260,7 +303,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
         if (live) {
             float acc = 0.f;
             for (int tap = 0; tap < kept; ++tap) acc += history[tap] * taps[tap];
-            sample = load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel);
+            sample = input(r);
             acc += sample * taps[kept];
             y = acc * (1.f / (1.f + expf(-acc)));
         }
@@ -438,10 +481,14 @@ extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     router_decode<2>(x, rows, logits, r, d, e);
 }
 
-// The bf16 router rows (the fp32 rows' values): a lane holds 20 loads, all of a 2560-wide row in one trip.
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
-    tf_router_decode_bf16_rows16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
-    router_decode<2, uint16_t, 20>(x, rows, logits, r, d, e);
+    tf_router_rows16_f16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    router_rows16<1>(x, rows, logits, r, d, e);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_rows16_bf16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    router_rows16<2>(x, rows, logits, r, d, e);
 }
 
 extern "C" __global__ void __launch_bounds__(kTailThreads)

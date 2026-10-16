@@ -114,6 +114,8 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
         try a.add(w.suh);
         try a.add(scratch);
         try a.add(@as(c_int, @intCast(k)));
+        // a round's row tiles read x by k steps (quant/exl3.hip)
+        try a.add(@as(c_int, if (tile.rows <= 2) @intCast(m) else 0));
         try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
     const rows = 16 * tile.rows;

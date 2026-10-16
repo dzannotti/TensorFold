@@ -40,20 +40,8 @@ pub fn routerWith(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r:
 }
 
 /// A lane round's router at any row count; false (nothing launched) where the shape keeps the other kernels.
-/// `rows16` (0: none): the rows in bf16, which a bf16 round reads instead of the fp32 rows (the same logits).
-pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, rows16: u64, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
+pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
     if (!l.fuse or r < 1 or @rem(d, 4) != 0 or ad(rows) % 16 != 0 or ad(x) % 8 != 0) return false;
-    if (rows16 != 0 and kind == 2 and rows16 % 8 == 0) {
-        var b: Args = .{};
-        try b.add(ad(x));
-        try b.add(rows16);
-        try b.add(ad(logits));
-        try b.add(r);
-        try b.add(d);
-        try b.add(e);
-        try l.go(l.dec.router16, dim(cdiv(e, 4), cdiv(r, 16), 1), dim(128, 1, 1), 0, s, &b);
-        return true;
-    }
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(ad(rows));
@@ -62,6 +50,21 @@ pub fn routerWindow(l: *const Launcher, x: C, kind: c_int, rows: CF, rows16: u64
     try a.add(d);
     try a.add(e);
     try l.go(l.dec.router[if (kind == 1) 0 else 1], dim(cdiv(e, 4), cdiv(r, 16), 1), dim(128, 1, 1), 0, s, &a);
+    return true;
+}
+
+/// Decode's or a round's router over the bf16 rows at up to 16 rows, the decode kernel's logits; false where the
+/// shape keeps the fp32 kernels.
+pub fn routerRows16(l: *const Launcher, x: C, kind: c_int, rows16: C, logits: F, r: c_int, d: c_int, e: c_int, s: S) Error!bool {
+    if (!l.fuse or r < 1 or r > 16 or @rem(d, 4) != 0 or ad(rows16) % 8 != 0 or ad(x) % 8 != 0) return false;
+    var a: Args = .{};
+    try a.add(ad(x));
+    try a.add(ad(rows16));
+    try a.add(ad(logits));
+    try a.add(r);
+    try a.add(d);
+    try a.add(e);
+    try l.go(l.dec.router16[if (kind == 1) 0 else 1], dim(cdiv(e, 4), r, 1), dim(128, 1, 1), 0, s, &a);
     return true;
 }
 
