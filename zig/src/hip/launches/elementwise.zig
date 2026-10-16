@@ -92,5 +92,6 @@ pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int,
     try a.add(rows);
     try a.add(n);
     try a.add(k);
-    try l.go(l.op.dense_rows, dim(n, rows, 1), dim(256, 1, 1), 0, s, &a);
+    // ops/elementwise.hpp's kDenseRows rows a block
+    try l.go(l.op.dense_rows, dim(n, @divFloor(rows + 3, 4), 1), dim(256, 1, 1), 0, s, &a);
 }

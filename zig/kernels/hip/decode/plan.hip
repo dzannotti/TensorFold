@@ -28,7 +28,48 @@ __device__ void plan_kv_write_body(const float* keys, const void* values, int ki
 // Query heads a block takes together: they share a KV head, so its keys and values are read once for all of them.
 constexpr int kMaxGroup = 16;
 
+// Keys a warp scores in turn (tf_plan_score_*): the block's staged queries serve 4 warps times this many keys.
+constexpr int kScoreKeys = 4;
+
 // score_keys over a plan's rows: a warp scores a key for each of the block's heads (one KV head's), in its order.
+template <int KIND>
+__device__ void plan_score_key(const float* __restrict__ qs, float* __restrict__ scores, int span, int heads,
+                                 int kv_heads, int d, float scale, const PlanArgs& plan, int layer, int batch, int group,
+                                 int head0, int visible, int key) {
+    const int lane = threadIdx.x & 31;
+    if (key >= visible) {  // a key past the row's: -inf for every head, as its sums would store
+        if (lane == 0 && key < span)
+            for (int g = 0; g < group; ++g) scores[(static_cast<long long>(batch) * heads + head0 + g) * span + key] = -INFINITY;
+        return;
+    }
+    float kreg[8] = {};
+    const int slot = plan.slot[batch];
+    const unsigned long long* desc = plan_desc(plan, slot);
+    const void* keys = reinterpret_cast<const void*>(desc[plan_first(layer)]);
+    // a tree row's keys past the stream's are its ancestors' slots, in the order its serial step sees them
+    const int at = plan_key(plan.anc[batch], plan_len(plan, slot), key);
+    const long long base = page_at(plan_pages(plan, desc), plan.pool, head0 / (heads / kv_heads), at, d);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = lane + i * 32;
+        if (idx < d) kreg[i] = load(keys, KIND, base + idx);
+    }
+#pragma unroll
+    for (int g = 0; g < kMaxGroup; ++g) {
+        if (g < group) {  // the same for the whole block, so every lane reaches wave_sum
+            float partial = 0.f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int idx = lane + i * 32;
+                if (idx < d) partial += qs[g * d + idx] * kreg[i];
+            }
+            const float dot = wave_sum(partial);
+            if (lane == 0) scores[(static_cast<long long>(batch) * heads + head0 + g) * span + key] = dot * scale;
+        }
+    }
+}
+
+// A block's 4 warps score kScoreKeys keys each (warp w keys w, w + 4, ...); a block past the row's keys stages no query.
 template <int KIND>
 __device__ void plan_score_body(const float* __restrict__ q, float* __restrict__ scores, int span, int heads,
                                   int kv_heads, int d, float scale, PlanArgs plan, int layer) {
@@ -36,44 +77,16 @@ __device__ void plan_score_body(const float* __restrict__ q, float* __restrict__
     const int batch = blockIdx.z;
     const int group = heads / gridDim.y;
     const int head0 = blockIdx.y * group;
-    const float* qrows = q + (static_cast<long long>(batch) * heads + head0) * d;
-    for (int i = threadIdx.x; i < group * d; i += blockDim.x) qs[i] = qrows[i];
-    __syncthreads();
     const int visible = min(plan.pos[batch] + 1, span);
-    const int lane = threadIdx.x & 31;
-    const int key = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    float kreg[8] = {};
-    if (key < visible) {
-        const int slot = plan.slot[batch];
-        const unsigned long long* desc = plan_desc(plan, slot);
-        const void* keys = reinterpret_cast<const void*>(desc[plan_first(layer)]);
-        // a tree row's keys past the stream's are its ancestors' slots, in the order its serial step sees them
-        const int at = plan_key(plan.anc[batch], plan_len(plan, slot), key);
-        const long long base = page_at(plan_pages(plan, desc), plan.pool, head0 / (heads / kv_heads), at, d);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int idx = lane + i * 32;
-            if (idx < d) kreg[i] = load(keys, KIND, base + idx);
-        }
+    const int warps = blockDim.x >> 5;
+    const int key0 = blockIdx.x * warps * kScoreKeys + (threadIdx.x >> 5);
+    if (blockIdx.x * warps * kScoreKeys < visible) {
+        const float* qrows = q + (static_cast<long long>(batch) * heads + head0) * d;
+        for (int i = threadIdx.x; i < group * d; i += blockDim.x) qs[i] = qrows[i];
+        __syncthreads();
     }
-#pragma unroll
-    for (int g = 0; g < kMaxGroup; ++g) {
-        if (g < group) {  // the same for the whole block, so every lane reaches wave_sum
-            float partial = 0.f;
-            if (key < visible) {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int idx = lane + i * 32;
-                    if (idx < d) partial += qs[g * d + idx] * kreg[i];
-                }
-            }
-            const float dot = wave_sum(partial);
-            if (lane == 0 && key < span) {
-                const float score = key < visible ? dot * scale : -INFINITY;
-                scores[(static_cast<long long>(batch) * heads + head0 + g) * span + key] = score;
-            }
-        }
-    }
+    for (int j = 0; j < kScoreKeys; ++j)
+        plan_score_key<KIND>(qs, scores, span, heads, kv_heads, d, scale, plan, layer, batch, group, head0, visible, key0 + j * warps);
 }
 
 // apply_values over a plan's rows: a 128-key tile of the block's heads, weights worked once a block, in its order.

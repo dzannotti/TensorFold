@@ -284,6 +284,19 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
         const int idx = lane + i * 32;
         if (idx < DK) s[i] = state[state_row + idx];
     }
+    // Rows a later row branches from (its parent, not the row before it) keep their state in registers, the first SAVED
+    // of them: such a row's branch starts from its parent's very state instead of stepping its ancestors again.
+    constexpr int SAVED = 8;
+    unsigned branched = 0;
+    if (q != nullptr) {
+        for (int tt = 1; tt < n; ++tt) {
+            const unsigned up = anc[tt] & ~(1u << tt);
+            const int parent = up == 0 ? -1 : 31 - __clz(up);
+            if (parent >= 0 && parent != tt - 1) branched |= 1u << parent;
+        }
+    }
+    const auto slot = [&](int row) { return __popc(branched & ((1u << row) - 1u)); };
+    float saved[SAVED][4];
     int prev = -1;  // the row the registers' state follows
     for (int tt = 0; tt < n; ++tt) {
         unsigned todo;  // the rows to step through, ascending: a replay's path, or a branch's ancestors and itself
@@ -295,12 +308,21 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
             const int parent = up == 0 ? -1 : 31 - __clz(up);
             todo = 1u << tt;
             if (parent != prev) {
+                if (parent >= 0 && slot(parent) < SAVED) {
+                    const int from = slot(parent);
 #pragma unroll
-                for (int i = 0; i < SPAN; ++i) {
-                    const int idx = lane + i * 32;
-                    if (idx < DK) s[i] = state[state_row + idx];
+                    for (int j = 0; j < SAVED; ++j)
+                        if (j == from)
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) s[i] = saved[j][i];
+                } else {
+#pragma unroll
+                    for (int i = 0; i < SPAN; ++i) {
+                        const int idx = lane + i * 32;
+                        if (idx < DK) s[i] = state[state_row + idx];
+                    }
+                    todo |= up;
                 }
-                todo |= up;
             }
             prev = tt;
         }
@@ -328,6 +350,14 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
                 const int idx = lane + i * 32;
                 if (idx < DK) s[i] = s[i] + held[i] * delta;
             }
+        }
+        if ((branched >> tt) & 1u) {
+            const int to = slot(tt);
+#pragma unroll
+            for (int j = 0; j < SAVED; ++j)
+                if (j == to)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) saved[j][i] = s[i];
         }
         if (q == nullptr) continue;
         float readout = 0.f;
