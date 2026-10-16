@@ -85,7 +85,7 @@ def main():
     p.add_argument("--model", default=os.path.expanduser("~/models/q27/Qwen3.8-27B-MLX-4bit"))
     p.add_argument("--bin", default=os.path.join(ROOT, "zig-out", "bin", "tf-qwen35-test"))
     p.add_argument("--ids", default=os.path.join(HERE, "quality_ids.npy"))
-    p.add_argument("--ref", default=os.path.expanduser("~/tfq/ref"), help="bf16 reference logits (quality_ref.py)")
+    p.add_argument("--ref", default=os.path.expanduser("~/tfq/ref32"), help="reference logits (quality_ref.py; ref32: every layer in fp32 on the bf16 weights)")
     p.add_argument("--base", default=os.path.expanduser("~/tfq/base"), help="baseline engine logits")
     p.add_argument("--baseline", default=os.path.join(HERE, "baselines", "mlx4-hip-gfx1151.json"),
                    help="baseline JSON (the bf16 floor); '' for none")

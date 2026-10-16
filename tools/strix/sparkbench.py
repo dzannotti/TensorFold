@@ -199,12 +199,22 @@ def decode_wave(url, model, c, max_tokens, kind):
         window = max(r["tLast"] for r in ok) - min(r["tFirst"] for r in ok)
         agg = sum(r["decodeTokens"] for r in ok) / window * 1000 if window > 0 else 0
     mean = lambda xs: statistics.fmean(xs) if xs else 0
+    reps = [repetition(r["answer"] + r["reasoning"]) for r in ok]
     return dict(concurrency=c, streamsOk=len(ok), aggregateDecodeTps=round2(agg),
+                repetition=round2(max(reps)) if reps else 0, texts=[r["answer"] + r["reasoning"] for r in ok],
                 meanDecodeTps=round2(mean([r["decodeTps"] for r in ok])),
                 medianDecodeTps=round2(statistics.median([r["decodeTps"] for r in ok])) if ok else 0,
                 meanTtftMs=round2(mean([r["ttftMs"] for r in ok])),
                 totalDecodeTokens=sum(r["decodeTokens"] for r in ok),
                 errors=[r["error"] for r in results if r["error"]])
+
+
+def repetition(text):
+    """Share of the text's word 8-grams that repeat an earlier one: ~0 for prose or code, near 1 for a loop.
+    Not part of sparkDash: a guard that a decode rate is not a looping reply drafted for free."""
+    words = text.split()
+    grams = [tuple(words[i:i + 8]) for i in range(len(words) - 7)]
+    return 1 - len(set(grams)) / len(grams) if grams else 0.0
 
 
 def run_decode(url, model, concs, max_tokens, kind):
@@ -215,7 +225,7 @@ def run_decode(url, model, concs, max_tokens, kind):
         w = decode_wave(url, model, c, max_tokens, kind)
         # UI: "agg" falls back to meanDecodeTps when aggregate is 0 (BenchmarkDialog.tsx:118)
         print(f"decode {kind:5s} C{c:<2d} agg {w['aggregateDecodeTps'] or w['meanDecodeTps']:8.1f}  "
-              f"str {w['meanDecodeTps']:7.1f}  TTFT {w['meanTtftMs']:7.0f} ms  ok {w['streamsOk']}/{c}"
+              f"str {w['meanDecodeTps']:7.1f}  TTFT {w['meanTtftMs']:7.0f} ms  ok {w['streamsOk']}/{c}  rep {w['repetition']:.2f}"
               + (f"  err {w['errors'][0]}" if w["errors"] else ""), flush=True)
         waves.append(w)
     return waves
@@ -707,6 +717,13 @@ def main():
     if a.out:
         with open(a.out, "w") as f:
             json.dump(res, f, indent=2)
+        # each stream's reply as plain text beside the JSON, the same names every run (overwritten), to read by eye
+        stem = a.out[:-5] if a.out.endswith(".json") else a.out
+        for kind, waves in res.get("decode", {}).items():
+            for w in waves:
+                for i, text in enumerate(w["texts"]):
+                    with open(f"{stem}.{kind}.c{w['concurrency']}.s{i}.txt", "w") as f:
+                        f.write(text)
 
 
 if __name__ == "__main__":

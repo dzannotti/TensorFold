@@ -2,7 +2,7 @@
 """The quality gate's fixed inputs: the token set and the bf16 reference logits (torch + transformers).
 
   quality_ref.py ids <tokenizer.json> [--wikitext FILE]   -> tools/strix/quality_ids.npy, int32 (8, 4096)
-  quality_ref.py ref <bf16 model dir> --out DIR           -> DIR/ref_{i}.npy, fp16 (4096, vocab) logits per sequence
+  quality_ref.py ref <bf16 model dir> --out DIR [--fp32]  -> DIR/ref_{i}.npy, fp16 (4096, vocab) logits per sequence
 
 The set (after Mia's AI Lab's Qwen3.8-27B measurement): 4 windows of 4,096 tokens from the wikitext-2-raw-v1
 test split ("\\n\\n".join of its rows, windows 0..3 from the start) and the first 4,096 tokens of 4 CPython
@@ -13,6 +13,11 @@ layer-major: one layer's weights on the GPU at a time (~1 GB), every sequence th
 chunks, the second reading the first's KV, conv and recurrent state from that layer's cache. That is the
 same arithmetic as a token-major chunked forward and keeps GPU memory near 3 GB. The head is computed in
 fp32 from the bf16 final-normed rows, stored as fp16.
+
+--fp32 runs the same layers in fp32 on the bf16 weights (hidden rows, attention, everything): the bf16 run's own
+rounding moves a few rows of a long sequence by KL 1-16 (wikitext row 2's second half), and an engine is judged
+against that noise floor. The fp32 run is the truth either should be measured against (4,096 vs 512-row chunks agree
+to KL 1e-7 in fp32; 4,096 vs 2,048 in bf16 disagree by 2e-3).
 """
 import argparse
 import json
@@ -57,6 +62,7 @@ def reference(a):
     torch.set_grad_enabled(False)
     torch.set_num_threads(16)  # a shared box
     dev = "cuda"
+    dt = torch.float32 if a.fp32 else torch.bfloat16
     cfg = AutoConfig.from_pretrained(a.model).text_config
     cfg._attn_implementation = "sdpa"
     wm = json.load(open(os.path.join(a.model, "model.safetensors.index.json")))["weight_map"]
@@ -66,7 +72,7 @@ def reference(a):
         f = wm[name]
         if f not in files:
             files[f] = safe_open(os.path.join(a.model, f), "pt", device="cpu")
-        return files[f].get_tensor(name)
+        return files[f].get_tensor(name).clone()  # the handles are dropped each layer: mapped shards add up to tens of GB
 
     tensor, names = raw, wm
     quant = json.load(open(os.path.join(a.model, "config.json"))).get("quantization")
@@ -96,11 +102,13 @@ def reference(a):
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     embed = tensor("model.language_model.embed_tokens.weight")
-    hidden = embed[ids].to(dev)  # (n, SEQ, hidden) bf16
+    hidden = embed[ids].to(dev).to(dt)  # (n, SEQ, hidden) bf16, or fp32
     del embed
+    files.clear()
     rope = q.Qwen3_5TextRotaryEmbedding(cfg).to(dev)
     pos = torch.arange(SEQ, device=dev).view(1, 1, -1).expand(3, 1, -1)
     cos, sin = rope(hidden[:1], pos)
+    cos, sin = cos.to(dt), sin.to(dt)
     # chunk 2's rows see every chunk-1 key and their own causal prefix
     mask2 = torch.ones(CHUNK, SEQ, dtype=torch.bool, device=dev).tril(CHUNK)[None, None]
     for i in range(cfg.num_hidden_layers):
@@ -109,6 +117,9 @@ def reference(a):
         with torch.device("meta"):
             layer = q.Qwen3_5DecoderLayer(cfg, i)
         layer.load_state_dict(sd, assign=True, strict=True)
+        files.clear()
+        if a.fp32:
+            layer.float()
         layer.eval()
         full = cfg.layer_types[i] == "full_attention"
         for s in range(n):
@@ -121,6 +132,7 @@ def reference(a):
                 if not torch.isfinite(hidden[s, r]).all():
                     sys.exit(f"non-finite rows: layer {i} ({cfg.layer_types[i]}) seq {s} chunk {c}")
         del layer, sd, cache
+        torch.cuda.empty_cache()
         print(f"layer {i + 1}/{cfg.num_hidden_layers} {time.time() - t0:.0f}s", flush=True)
     norm = q.Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps).to(dev)
     norm.weight.copy_(tensor("model.language_model.norm.weight"))
@@ -140,7 +152,7 @@ def reference(a):
         out.flush()
         del out
     meta = {"model": os.path.abspath(a.model), "ids": os.path.abspath(a.ids), "ppl": float(np.exp(nll / count)),
-            "seconds": round(time.time() - t0, 1), "torch": torch.__version__,
+            "seconds": round(time.time() - t0, 1), "fp32": a.fp32, "torch": torch.__version__,
             "transformers": __import__("transformers").__version__}
     json.dump(meta, open(os.path.join(a.out, "ref.json"), "w"), indent=1)
     print(json.dumps(meta))
@@ -156,6 +168,7 @@ def main():
     r.add_argument("model")
     r.add_argument("--out", required=True)
     r.add_argument("--ids", default=IDS)
+    r.add_argument("--fp32", action="store_true", help="every layer in fp32 on the bf16 weights")
     a = p.parse_args()
     build_ids(a) if a.cmd == "ids" else reference(a)
 
