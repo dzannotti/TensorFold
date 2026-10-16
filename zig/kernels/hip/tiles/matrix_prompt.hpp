@@ -233,25 +233,41 @@ __device__ __forceinline__ void prompt_tile(const Affine& a) {
 }
 
 // x's group sums for the prompt tile: sums[g * m + r] = x[r, 64 g..64 g + 63] added in order from zero, in fp32.
+// A wave a row: 32 groups at a time come in whole lines through LDS, then each lane adds one group.
 __device__ inline void prompt_sums(const Affine& a) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int kLd = 36;  // words a staged group: 32 and 4 of pad
+    __shared__ __attribute__((aligned(16))) uint32_t st[8][32 * kLd];
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int r = blockIdx.x * 8 + wave;
+    const bool live = r < a.m;
     const int groups = a.k >> 6;
-    if (i >= a.m * groups) return;
-    const int r = i / groups;  // a wave reads a row's groups in a run
-    const int g = i % groups;
-    const u32x4* src = reinterpret_cast<const u32x4*>(static_cast<const uint16_t*>(a.x) + static_cast<long long>(r) * a.k + 64 * g);
-    float run = 0.f;
+    const u32x4* src = reinterpret_cast<const u32x4*>(static_cast<const uint16_t*>(a.x) + static_cast<long long>(live ? r : 0) * a.k);
+    uint32_t* mine = st[wave];
+    for (int g0 = 0; g0 < groups; g0 += 32) {
+        const int n = groups - g0 < 32 ? groups - g0 : 32;
 #pragma unroll
-    for (int v = 0; v < 8; ++v) {
-        const u32x4 u = src[v];
-        const uint32_t w[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            run += __uint_as_float(w[j] << 16);
-            run += __uint_as_float(w[j] & 0xffff0000u);
+        for (int j = 0; j < 8; ++j) {
+            const int c = lane + 32 * j;  // chunk c: group c / 8, 16 bytes c % 8
+            if (c < 8 * n) *reinterpret_cast<u32x4*>(mine + (c >> 3) * kLd + 4 * (c & 7)) = src[8 * g0 + c];
         }
+        __syncthreads();
+        if (live && lane < n) {
+            float run = 0.f;
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const u32x4 u = *reinterpret_cast<const u32x4*>(mine + lane * kLd + 4 * v);
+                const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    run += __uint_as_float(w[j] << 16);
+                    run += __uint_as_float(w[j] & 0xffff0000u);
+                }
+            }
+            const_cast<float*>(a.sums)[static_cast<long long>(g0 + lane) * a.m + r] = run;
+        }
+        __syncthreads();
     }
-    const_cast<float*>(a.sums)[static_cast<long long>(g) * a.m + r] = run;
 }
 
 }  // namespace rocm

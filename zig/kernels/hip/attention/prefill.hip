@@ -295,6 +295,7 @@ __device__ __forceinline__ float xmask16(float x, int ln) {
 }
 
 // fa_dot2<hip_bfloat16, true> with q.k and p.v on WMMA, k order kept; the softmax is fa_dot2's, on scores from LDS.
+// Keys and values come 128 dims a chunk, each fetched a chunk ahead; scores, then values, reuse the keys' LDS.
 __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restrict__ k, const hip_bfloat16* __restrict__ v,
                         float* __restrict__ out, int qlen, int span, int heads, int kv_heads, int d, float scale, int q_pos0,
                         const unsigned* table, int count) {
@@ -303,15 +304,16 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
     using tf::rocm::f32x8;
     using elem = __bf16;
     constexpr int kQChunks = 256 / 8;
-    constexpr int kKChunks = kChunk / 8;
-    constexpr int kSLd = kKeys + 4;      // scores, fp32, row-major
-    constexpr int kPLd = kKeys + 8;      // probabilities, bf16, row-major (over the scores)
-    constexpr int kVLd = kKeys / 2 + 4;  // a value chunk transposed: (dim, key pair) words
+    constexpr int kCDims = 128;           // dims a key or value chunk
+    constexpr int kC = kCDims / 8;        // 16-byte pieces of a staged key row
+    constexpr int kSLd = kKeys;           // scores, fp32, row-major
+    constexpr int kPLd = kKeys + 8;       // probabilities, bf16, row-major
+    constexpr int kVLd = kKeys / 2 + 4;   // a value chunk transposed: (dim, key pair) words
     __shared__ uint4 sQ[kRows * kQChunks];
-    __shared__ uint4 sKV[kChunk * kVLd / 4];  // a key chunk (key, 8 dims swizzled) or a transposed value chunk
-    __shared__ alignas(16) float sS[kRows * kSLd];
+    __shared__ uint4 sKV[kCDims * kVLd / 4];  // a key chunk (key, 16 pieces swizzled), the scores, or a value chunk
+    __shared__ alignas(16) elem sP[kRows * kPLd];
     __shared__ float sA[kRows], sL[kRows];
-    elem* sP = reinterpret_cast<elem*>(sS);
+    float* sS = reinterpret_cast<float*>(sKV);
     uint32_t* sV = reinterpret_cast<uint32_t*>(sKV);
 
     const int q0 = blockIdx.x * kRows;
@@ -336,7 +338,8 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
         sQ[row * kQChunks + (c ^ (row & 7))] = __builtin_bit_cast(uint4, h);
     }
 
-    // wave (rw, kw): rows 16 rw.., keys (then dims of a chunk) 32 kw..; the softmax keeps fa_dot2's (sr, sk) lanes
+    // wave (rw, kw): rows 16 rw.., keys 32 kw.. (scores) or dims 64 kw.. of a chunk (values); the softmax keeps
+    // fa_dot2's (sr, sk) lanes
     const int lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int rw = wave & 3, kw = wave >> 2;
     const int rl = lane & 15, rh = lane >> 4;
@@ -345,32 +348,38 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
 #pragma unroll
     for (int i = 0; i < 4; ++i) m_run[i] = -INFINITY, l_run[i] = 0.f;
     const f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    f32x8 o[4][2];
+    f32x8 o[2][4];
 #pragma unroll
-    for (int at = 0; at < 4; ++at) o[at][0] = o[at][1] = zero;
+    for (int at = 0; at < 2; ++at)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[at][j] = zero;
     auto frag = [](const uint4& lo, const uint4& hi) {
         const tf::rocm::u32x4 a = __builtin_bit_cast(tf::rocm::u32x4, lo), b = __builtin_bit_cast(tf::rocm::u32x4, hi);
         return __builtin_bit_cast(bf16x16, __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7));
     };
 
-    // a tile's chunks in order: the key chunks (idx < nc), then the value chunks; each fetched a chunk ahead into R
-    const int nc = chunks / kKChunks;
-    const int vp = tid % 32, vg = tid / 32;  // a value chunk's thread: key pair, 8 dims
-    uint4 R[2];
+    // a tile's chunks in order: keys (idx < nc), then values; each fetched a chunk ahead into R
+    const int nc = (d + kCDims - 1) / kCDims;
+    const int vp = tid % 32, vg = tid / 32;  // a value chunk's thread: key pair, 16 dims
+    uint4 R[4];
     auto fetch = [&](int kk0, int idx) {
         const long long tile = page_row(table[kk0 / kPageTokens], count, kv, 0, d);
         if (idx < nc) {
 #pragma unroll
-            for (int t = 0; t < 2; ++t) {
-                const int e = tid + t * kThreads, key = e / kKChunks, c = e % kKChunks;
-                R[t] = kk0 + key < span ? *reinterpret_cast<const uint4*>(k + tile + static_cast<long long>(key) * d + 8 * (idx * kKChunks + c))
-                                        : uint4{0, 0, 0, 0};
+            for (int t = 0; t < 4; ++t) {
+                const int e = tid + t * kThreads, key = e / kC, c = idx * kC + e % kC;
+                R[t] = kk0 + key < span && c < chunks ? *reinterpret_cast<const uint4*>(k + tile + static_cast<long long>(key) * d + 8 * c)
+                                                      : uint4{0, 0, 0, 0};
             }
         } else {
-            const int c0 = (idx - nc) * kKChunks;
-            const hip_bfloat16* vt = v + tile + 8 * (c0 + vg);
-            R[0] = kk0 + 2 * vp < span ? *reinterpret_cast<const uint4*>(vt + static_cast<long long>(2 * vp) * d) : uint4{0, 0, 0, 0};
-            R[1] = kk0 + 2 * vp + 1 < span ? *reinterpret_cast<const uint4*>(vt + static_cast<long long>(2 * vp + 1) * d) : uint4{0, 0, 0, 0};
+            const int dim = (idx - nc) * kCDims + 16 * vg;
+            const hip_bfloat16* vt = v + tile + dim;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int key = 2 * vp + (t >> 1);
+                R[t] = kk0 + key < span && dim < d ? *reinterpret_cast<const uint4*>(vt + static_cast<long long>(key) * d + 8 * (t & 1))
+                                                   : uint4{0, 0, 0, 0};
+            }
         }
     };
     auto fetch_after = [&](int kk0, int idx) {
@@ -381,36 +390,37 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
 
     for (int k0 = 0; k0 < max_vis; k0 += kKeys) {
         f32x8 s[2] = {zero, zero};
-#pragma unroll 1
-        for (int c0 = 0; c0 < chunks; c0 += kKChunks) {
+        for (int ci = 0; ci < nc; ++ci) {
             __syncthreads();
 #pragma unroll
-            for (int t = 0; t < 2; ++t) {
-                const int e = tid + t * kThreads, key = e / kKChunks, c = e % kKChunks;
-                sKV[key * kKChunks + (c ^ (key & 7))] = R[t];
+            for (int t = 0; t < 4; ++t) {
+                const int e = tid + t * kThreads, key = e / kC, c = e % kC;
+                sKV[key * kC + (c ^ (key & 15))] = R[t];
             }
             __syncthreads();
-            fetch_after(k0, c0 / kKChunks);
+            fetch_after(k0, ci);
+            const int steps = (chunks - ci * kC) / 2 < kC / 2 ? (chunks - ci * kC) / 2 : kC / 2;
 #pragma unroll
-            for (int t = 0; t < kKChunks / 2; ++t) {
+            for (int t = 0; t < kC / 2; ++t) {
+                if (t >= steps) break;
                 const int row = 16 * rw + rl;
-                const int qc = c0 + 2 * t;
+                const int qc = ci * kC + 2 * t;
                 const bf16x16 af = frag(sQ[row * kQChunks + (qc ^ (row & 7))], sQ[row * kQChunks + ((qc + 1) ^ (row & 7))]);
 #pragma unroll
                 for (int j = 0; j < 2; ++j) {
                     const int key = 32 * kw + 16 * j + rl;
-                    const bf16x16 bf = frag(sKV[key * kKChunks + ((2 * t) ^ (key & 7))], sKV[key * kKChunks + ((2 * t + 1) ^ (key & 7))]);
+                    const bf16x16 bf = frag(sKV[key * kC + ((2 * t) ^ (key & 15))], sKV[key * kC + ((2 * t + 1) ^ (key & 15))]);
                     s[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af, bf, s[j]);
                 }
             }
         }
+        __syncthreads();
 #pragma unroll
         for (int j = 0; j < 2; ++j)
 #pragma unroll
             for (int i = 0; i < 8; ++i) sS[(16 * rw + 2 * i + rh) * kSLd + 32 * kw + 16 * j + rl] = s[j][i];
         __syncthreads();
         // fa_dot2's online softmax on the same scores: a row's 64 keys on its 16 lanes
-        float pk[4][4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int row = sr + 16 * i;
@@ -429,43 +439,41 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
             const float next_m = fmaxf(m_run[i], tile_max);
             const float alpha = next_m == -INFINITY ? 1.f : expf(m_run[i] - next_m);
             float sum = 0.f;
+            elem h[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                pk[i][j] = next_m == -INFINITY ? 0.f : expf(acc[j] - next_m);
-                sum += pk[i][j];
+                const float p = next_m == -INFINITY ? 0.f : expf(acc[j] - next_m);
+                sum += p;
+                h[j] = static_cast<elem>(p);
             }
 #pragma unroll
             for (int ln = 8; ln > 0; ln >>= 1) sum += xmask16(sum, ln);
             l_run[i] = alpha * l_run[i] + sum;
             m_run[i] = next_m;
+            *reinterpret_cast<uint2*>(&sP[row * kPLd + 4 * sk]) = __builtin_bit_cast(uint2, h);
             if (sk == 0) sA[row] = alpha;
-        }
-        __syncthreads();
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            elem h[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) h[j] = static_cast<elem>(pk[i][j]);
-            *reinterpret_cast<uint2*>(&sP[(sr + 16 * i) * kPLd + 4 * sk]) = __builtin_bit_cast(uint2, h);
         }
         float alpha_r[8];
 #pragma unroll
-        for (int at = 0; at < 4; ++at) {
-            if (at * kKChunks >= chunks) break;
-            // a value chunk: thread (key pair p, dims 8 g..) writes the (key 2 p, key 2 p + 1) word of each dim
-            const int p = vp, g = vg;
-            const uint4 va = R[0], vb = R[1];
+        for (int at = 0; at < 2; ++at) {
+            if (at >= nc) break;
+            // a value chunk: thread (key pair p, dims 16 g..) writes the (key 2 p, key 2 p + 1) word of each dim
             __syncthreads();
             if (at == 0) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) alpha_r[i] = sA[16 * rw + 2 * i + rh];
             }
-            const uint32_t wa[4] = {va.x, va.y, va.z, va.w};
-            const uint32_t wb[4] = {vb.x, vb.y, vb.z, vb.w};
 #pragma unroll
-            for (int m = 0; m < 4; ++m) {
-                sV[(8 * g + 2 * m) * kVLd + p] = (wa[m] & 0xffffu) | (wb[m] << 16);
-                sV[(8 * g + 2 * m + 1) * kVLd + p] = (wa[m] >> 16) | (wb[m] & 0xffff0000u);
+            for (int hlf = 0; hlf < 2; ++hlf) {
+                const uint4 va = R[hlf], vb = R[2 + hlf];
+                const uint32_t wa[4] = {va.x, va.y, va.z, va.w};
+                const uint32_t wb[4] = {vb.x, vb.y, vb.z, vb.w};
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    const int dim = 16 * vg + 8 * hlf + 2 * m;
+                    sV[dim * kVLd + vp] = (wa[m] & 0xffffu) | (wb[m] << 16);
+                    sV[(dim + 1) * kVLd + vp] = (wa[m] >> 16) | (wb[m] & 0xffff0000u);
+                }
             }
             __syncthreads();
             fetch_after(k0, nc + at);
@@ -476,8 +484,9 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
                 pf[t] = frag(src[0], src[1]);
             }
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int dim = 32 * kw + 16 * j + rl;
+            for (int j = 0; j < 4; ++j) {
+                if (at * kCDims + 64 * kw + 16 * j >= d) break;
+                const int dim = 64 * kw + 16 * j + rl;
                 f32x8 pv = zero;
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
@@ -502,10 +511,12 @@ __device__ void fa_wmma(const float* __restrict__ q, const hip_bfloat16* __restr
         if (row >= q_hi) continue;
         const float inv = sL[row] == 0.f ? 0.f : 1.f / sL[row];
 #pragma unroll
-        for (int at = 0; at < 4; ++at) {
-            if (at * kKChunks >= chunks) break;
+        for (int at = 0; at < 2; ++at) {
 #pragma unroll
-            for (int j = 0; j < 2; ++j) orows[static_cast<long long>(row) * d + 64 * at + 32 * kw + 16 * j + erl] = o[at][j][i] * inv;
+            for (int j = 0; j < 4; ++j) {
+                const int dim = at * kCDims + 64 * kw + 16 * j;
+                if (dim < d) orows[static_cast<long long>(row) * d + dim + erl] = o[at][j][i] * inv;
+            }
         }
     }
 #else

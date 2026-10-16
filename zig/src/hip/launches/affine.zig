@@ -476,7 +476,7 @@ pub const Kernels = struct {
     pub fn sumsGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
         var args: hl.Args = .{};
         try args.add(a);
-        try go(r, k.prompt_sums, .{ .x = cdiv(a.m * @divExact(a.k, 64), 256) }, .{ .x = 256 }, s, &args);
+        try go(r, k.prompt_sums, .{ .x = cdiv(a.m, 8) }, .{ .x = 256 }, s, &args);
     }
 
     /// The 128 x 128 tile of a kind over every item of a plan (or the plain product).
