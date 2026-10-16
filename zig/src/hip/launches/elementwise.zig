@@ -28,9 +28,10 @@ pub fn tf_embed_rows(l: *const Launcher, words: C, scale: C, bias: C, scale_kind
     try l.flat(l.op.embed_rows, @as(i64, n) * k, s, &a);
 }
 
-pub fn tf_embed_dense(l: *const Launcher, table: CF, ids: CI, n: c_int, k: c_int, out: P, out_kind: c_int, s: S) Error!void {
+pub fn tf_embed_dense(l: *const Launcher, table: C, table_kind: c_int, ids: CI, n: c_int, k: c_int, out: P, out_kind: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(table));
+    try a.add(table_kind);
     try a.add(ad(ids));
     try a.add(n);
     try a.add(k);
@@ -81,11 +82,12 @@ pub fn tf_copy_cols(l: *const Launcher, src: C, stride: c_longlong, offset: c_in
     try l.flat(l.op.copy_cols, @as(i64, rows) * cols, s, &a);
 }
 
-pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: CF, out: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
+pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int, out: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(kind);
     try a.add(ad(w));
+    try a.add(w_kind);
     try a.add(ad(out));
     try a.add(rows);
     try a.add(n);

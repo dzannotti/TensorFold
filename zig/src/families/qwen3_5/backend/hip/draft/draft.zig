@@ -158,14 +158,11 @@ pub const Draft = struct {
     }
 
     /// The draft head: the target's head rows of `spans` side by side (the stock vocabulary, else every row), in the row
-    /// kernel's tiled layout. Only an affine-4 group-64 head with bf16 tables can be tiled; any other is refused.
+    /// kernel's tiled layout. An affine-4 group-64 head with bf16 tables is tiled as it is, an EXL3 one dequantized and
+    /// quantized to affine-4 first; any other is refused.
     fn draftHead(d: *Draft) !void {
         const full = d.e.model().head;
-        const h = switch (full.handle) {
-            .mlx => |x| x,
-            .dense => return error.UnsupportedDraftHead,
-        };
-        if (h.bits != 4 or h.group != 64 or h.tables != .bf16 or full.partial or full.n % 32 != 0) return error.UnsupportedDraftHead;
+        if (full.partial or full.n % 32 != 0) return error.UnsupportedDraftHead;
         d.restricted = full.n == stock_vocab;
         const all = [_][2]u32{.{ 0, full.n }};
         const parts: []const [2]u32 = if (d.restricted) &spans else &all;
@@ -180,13 +177,25 @@ pub const Draft = struct {
         defer gpa.free(scales);
         const biases = try gpa.alloc(u16, n * groups);
         defer gpa.free(biases);
-        var row: usize = 0;
-        for (parts) |s| {
-            const rows = s[1] - s[0];
-            try download(&d.e.driver, h.words + s[0] * k / 2, std.mem.sliceAsBytes(words[row * k / 8 ..][0 .. rows * k / 8]));
-            try download(&d.e.driver, h.scale + s[0] * groups * 2, std.mem.sliceAsBytes(scales[row * groups ..][0 .. rows * groups]));
-            try download(&d.e.driver, h.bias + s[0] * groups * 2, std.mem.sliceAsBytes(biases[row * groups ..][0 .. rows * groups]));
-            row += rows;
+        switch (full.handle) {
+            .mlx => |h| {
+                if (h.bits != 4 or h.group != 64 or h.tables != .bf16) return error.UnsupportedDraftHead;
+                var row: usize = 0;
+                for (parts) |s| {
+                    const rows = s[1] - s[0];
+                    try download(&d.e.driver, h.words + s[0] * k / 2, std.mem.sliceAsBytes(words[row * k / 8 ..][0 .. rows * k / 8]));
+                    try download(&d.e.driver, h.scale + s[0] * groups * 2, std.mem.sliceAsBytes(scales[row * groups ..][0 .. rows * groups]));
+                    try download(&d.e.driver, h.bias + s[0] * groups * 2, std.mem.sliceAsBytes(biases[row * groups ..][0 .. rows * groups]));
+                    row += rows;
+                }
+            },
+            .exl3 => |h| {
+                const rows = try gpa.alloc(u16, n * k);
+                defer gpa.free(rows);
+                try d.exl3Rows(h, full.n, parts, rows);
+                weights.quantize(rows, n, k, words, scales, biases);
+            },
+            .dense => return error.UnsupportedDraftHead,
         }
         const tw = try gpa.alloc(u32, n * k / 8);
         defer gpa.free(tw);
@@ -204,6 +213,37 @@ pub const Draft = struct {
         try buf.upload(bias_at, std.mem.sliceAsBytes(tb));
         d.head = .{ .words = buf.base(), .scales = buf.base() + scale_at, .biases = buf.base() + bias_at, .n = n, .k = k };
         d.head_buf = buf;
+    }
+
+    /// The head's rows `parts` as bf16 (rows, K): the EXL3 product of identity rows, 32 inputs a pass, is W's rows.
+    fn exl3Rows(d: *Draft, h: hip.quant.exl3.Matrix, n_all: u32, parts: []const [2]u32, out: []u16) !void {
+        const k: u32 = d.e.model().head.k;
+        const chunk = 32;
+        const e = d.e;
+        var x = try hip.DeviceBuffer.alloc(&e.driver, chunk * k * 2);
+        defer x.free();
+        var y = try hip.DeviceBuffer.alloc(&e.driver, chunk * @as(usize, n_all) * 4);
+        defer y.free();
+        var work = try hip.DeviceBuffer.alloc(&e.driver, hip.launches.Launcher.exl3Scratch(chunk, k, n_all));
+        defer work.free();
+        const eye = try d.gpa.alloc(u16, chunk * k);
+        defer d.gpa.free(eye);
+        const got = try d.gpa.alloc(f32, chunk * @as(usize, n_all));
+        defer d.gpa.free(got);
+        var c: u32 = 0;
+        while (c < k) : (c += chunk) {
+            @memset(eye, 0);
+            for (0..chunk) |i| eye[i * k + c + i] = 0x3F80; // bf16 1.0
+            try x.upload(0, std.mem.sliceAsBytes(eye));
+            try e.lib.exl3Project(x.base(), 1, h, n_all, k, chunk, y.base(), 0, work.base(), e.stream.handle);
+            e.drain();
+            try download(&e.driver, y.base(), std.mem.sliceAsBytes(got));
+            var row: usize = 0;
+            for (parts) |s| for (s[0]..s[1]) |col| {
+                for (0..chunk) |i| out[row * k + c + i] = toBf16(got[i * n_all + col]);
+                row += 1;
+            };
+        }
     }
 
     /// The token of draft-head column `col`.
@@ -666,6 +706,11 @@ pub fn proj(o: Ops, x: Tensor, l: Linear, rows: usize) !Tensor {
 /// `bytes` of device memory at `src` on the host (a load-time copy).
 fn download(r: *const hip.Runtime, src: u64, bytes: []u8) !void {
     try hip.runtime.check(r.api.hipMemcpyDtoH(bytes.ptr, @ptrFromInt(src), bytes.len));
+}
+
+fn toBf16(x: f32) u16 {
+    const u: u32 = @bitCast(x);
+    return @intCast((u +% (0x7fff + ((u >> 16) & 1))) >> 16);
 }
 
 fn bf16(h: u16) f32 {

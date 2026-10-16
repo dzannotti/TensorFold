@@ -9,6 +9,7 @@ pub const mlx = @import("mlx.zig");
 /// One canonical key per module, whatever prefix a checkpoint or loader writes.
 pub const keys = @import("keys.zig");
 pub const dense = @import("dense.zig");
+pub const exl3 = @import("exl3.zig");
 pub const experts = @import("experts.zig");
 /// FP8 and NVFP4 values and fp64 references; host only (no Format: their kernels' layouts are each backend's).
 pub const fp8 = @import("fp8.zig");
@@ -34,11 +35,12 @@ pub fn Module(comptime f: Format) type {
     return switch (f) {
         .mlx => mlx,
         .dense => dense,
+        .exl3 => exl3,
     };
 }
 
 /// The order a tensor is offered to the formats: the first that recognizes it reads it.
-const read_order = [_]Format{ .dense, .mlx };
+const read_order = [_]Format{ .dense, .mlx, .exl3 };
 
 /// What a format module provides, checked at compile time.
 pub fn conforms(comptime M: type) void {
@@ -60,12 +62,13 @@ pub fn conforms(comptime M: type) void {
 pub const Config = union(Format) {
     mlx: mlx.Config,
     dense: dense.Config,
+    exl3: exl3.Config,
 
     /// The tensor's MLX width (the table's own, else the global one).
     pub fn width(c: Config, key: []const u8) error{UnsupportedQuantization}!mlx.Width {
         return switch (c) {
             .mlx => |q| q.width(key),
-            .dense => error.UnsupportedQuantization,
+            .dense, .exl3 => error.UnsupportedQuantization,
         };
     }
 };
@@ -82,6 +85,7 @@ pub fn detect(a: Allocator, src: Sources) (Allocator.Error || error{UnsupportedQ
 pub const Host = union(Format) {
     mlx: mlx.Host,
     dense: dense.Host,
+    exl3: exl3.Host,
 
     /// Output rows N.
     pub fn rows(h: Host) usize {
@@ -145,6 +149,7 @@ pub fn sliceStack(a: Allocator, h: Host, r: Rank, part: usize) slice.Error!Host 
 pub const Device = union(Format) {
     mlx: mlx.Device,
     dense: dense.Device,
+    exl3: exl3.Device,
 };
 
 pub fn upload(u: Uploader, h: Host) !Device {
@@ -157,6 +162,7 @@ pub fn upload(u: Uploader, h: Host) !Device {
 pub const Handle = union(Format) {
     mlx: mlx.Matrix,
     dense: dense.Matrix,
+    exl3: exl3.Matrix,
 };
 
 /// One product (N, K): the format's handle and its shape. A stack is one expert's shape at the stack's addresses.
@@ -191,6 +197,7 @@ pub fn view(d: Device, stacked: bool) error{UnsupportedTables}!Projection {
 test "every format module provides the interface" {
     comptime conforms(mlx);
     comptime conforms(dense);
+    comptime conforms(exl3);
 }
 
 test "a projection knows its format and decoder" {
@@ -204,6 +211,7 @@ test {
     _ = convert;
     _ = mlx;
     _ = dense;
+    _ = exl3;
     _ = experts;
     _ = fp8;
     _ = nvfp4;

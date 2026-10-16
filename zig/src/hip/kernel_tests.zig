@@ -31,4 +31,5 @@ test {
     _ = @import("kernel_tests/flashnext.zig");
     _ = @import("kernel_tests/flashnext_attn.zig");
     _ = @import("kernel_tests/draft.zig");
+    _ = @import("kernel_tests/exl3.zig");
 }

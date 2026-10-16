@@ -48,8 +48,12 @@ pub const Config = struct {
         const a = arena.allocator();
         const doc = try shared.declared(a, bytes);
         const tower = try shared.textTower(doc);
-        const table = try quant.detect(a, .{ .root = doc, .quantization = try shared.pickObject(doc, tower, "quantization") });
-        const width = try table.width("");
+        // MLX conversions declare `quantization`, ExLlamaV3 packs `quantization_config`
+        var declared = try shared.pickObject(doc, tower, "quantization");
+        if (declared.count() == 0) declared = try shared.pickObject(doc, tower, "quantization_config");
+        const table = try quant.detect(a, .{ .root = doc, .quantization = declared });
+        // an EXL3 tensor's width is its own: the geometry records a nominal one
+        const width: Width = if (table == .exl3) .{ .bits = 4, .group = 128 } else try table.width("");
         const spec = try shared.geometry(tower, width.bits, width.group);
         const gen = if (generation) |g| (try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{})) else null;
         if (gen) |g| if (g != .object) return error.InvalidConfig;

@@ -4,6 +4,7 @@ const t = @import("types.zig");
 const quant = @import("core").quant;
 const launches = @import("../launches.zig");
 const affine_launch = @import("../launches/affine.zig");
+const exl3_launch = @import("../launches/exl3.zig");
 const registry = @import("core").registry;
 const Ops = @import("ops.zig").Ops;
 const Error = t.Error;
@@ -33,10 +34,21 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
         .dense => |h| {
             if (f32_out or m == 0 or x.kind == .f32) return error.BadShape;
             const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * x.kind.size()), .kind = x.kind };
-            try denseRows(o, x, h.weight, out, m, proj.n, proj.k);
+            try denseRows(o, x, h, out, m, proj.n, proj.k);
             return out;
         },
+        .exl3 => |h| return exl3(o, x, proj, h, m, f32_out),
     }
+}
+
+/// matmul(x, proj) on an EXL3 matrix: x rotated in, the trellis product, rotated out; fp32 when `f32_out`, else x's kind.
+pub fn exl3(o: Ops, x: Tensor, proj: Projection, w: quant.exl3.Matrix, m: usize, f32_out: bool) Error!Tensor {
+    if (m == 0 or x.kind == .f32 or proj.partial) return error.BadShape;
+    const kind: t.Kind = if (f32_out) .f32 else x.kind;
+    const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * kind.size()), .kind = kind };
+    const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+    try exl3_launch.project(o.l, x.ptr, x.kind.table(), w, proj.n, proj.k, m, out.ptr, kind.table(), scratch, o.stream);
+    return out;
 }
 
 /// Up to four products of the same `m` rows in one launch; false, nothing launched, when no grouped tile takes them.
@@ -45,7 +57,7 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
     if (ps.len > ws.len) return false;
     for (ps, ws[0..ps.len]) |pr, *w| switch (pr.handle) {
         .mlx => |h| w.* = affineOf(pr, h),
-        .dense => return false,
+        .dense, .exl3 => return false,
     };
     return affineGroup(o, x, ws[0..ps.len], m, outs);
 }
@@ -54,7 +66,7 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
 pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
     switch (proj.handle) {
         .mlx => |h| return affineRoutedAct(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, limit),
-        .dense => return null,
+        .dense, .exl3 => return null,
     }
 }
 
@@ -62,7 +74,7 @@ pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: 
 pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize) Error!u64 {
     switch (proj.handle) {
         .mlx => |h| return affineRouted(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows),
-        .dense => return error.BadShape,
+        .dense, .exl3 => return error.BadShape,
     }
 }
 
@@ -70,7 +82,8 @@ pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usi
 pub fn embedRows(o: Ops, table: Projection, ids: u64, n: usize, out: Tensor) Error!void {
     switch (table.handle) {
         .mlx => |h| return embedAffine(o, affineOf(table, h), ids, n, out),
-        .dense => |h| try o.l.tf_embed_dense(f(h.weight), @ptrFromInt(ids), int(n), int(table.k), p(out.ptr), @backingInt(out.kind), o.stream),
+        .dense => |h| try o.l.tf_embed_dense(p(h.weight), @backingInt(actKind(h.kind)), @ptrFromInt(ids), int(n), int(table.k), p(out.ptr), @backingInt(out.kind), o.stream),
+        .exl3 => return error.BadShape,
     }
 }
 
@@ -220,7 +233,16 @@ pub fn embedAffine(o: Ops, table: Affine, ids: u64, n: usize, out: Tensor) Error
     try o.l.tf_embed_rows(p(table.words), p(table.scale), p(table.bias), @backingInt(table.tables), @ptrFromInt(ids), int(n), table.bits, table.group, int(table.k), p(out.ptr), @backingInt(out.kind), o.stream);
 }
 
-/// x (rows, k) of x's kind times fp32 weights (n, k), out (rows, n) in x's kind: an unquantized draft projection.
-pub fn denseRows(o: Ops, x: Tensor, w: u64, out: Tensor, rows: usize, n: usize, k: usize) Error!void {
-    try o.l.tf_dense_rows(p(x.ptr), @backingInt(x.kind), f(w), p(out.ptr), int(rows), int(n), int(k), o.stream);
+/// x (rows, k) of x's kind times float weights (n, k), out (rows, n) in x's kind: an unquantized projection.
+pub fn denseRows(o: Ops, x: Tensor, w: quant.dense.Matrix, out: Tensor, rows: usize, n: usize, k: usize) Error!void {
+    try o.l.tf_dense_rows(p(x.ptr), @backingInt(x.kind), p(w.weight), @backingInt(actKind(w.kind)), p(out.ptr), int(rows), int(n), int(k), o.stream);
+}
+
+/// A table type as the activation kernels number buffers.
+fn actKind(k: quant.Tables) t.Kind {
+    return switch (k) {
+        .f32 => .f32,
+        .bf16 => .bf16,
+        .f16 => .f16,
+    };
 }

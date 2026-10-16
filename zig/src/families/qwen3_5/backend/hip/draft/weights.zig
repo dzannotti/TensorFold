@@ -80,7 +80,7 @@ fn toBf16(x: f32) u16 {
 }
 
 /// MLX affine-4 group 64 of one (n, k) bf16 matrix into words (n, k / 8) and scale and bias (n, k / 64), low nibble first.
-fn quantize(w: []align(1) const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) void {
+pub fn quantize(w: []align(1) const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) void {
     const groups = k / 64;
     for (0..n) |r| for (0..groups) |g| {
         const row = w[r * k + g * 64 ..][0..64];

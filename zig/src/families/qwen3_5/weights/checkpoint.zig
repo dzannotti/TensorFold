@@ -49,7 +49,12 @@ pub const Checkpoint = struct {
     }
 
     pub fn finalNorm(c: *const Checkpoint, a: std.mem.Allocator) !Tensor {
-        return projection.float(a, &c.main, prefix ++ "norm.weight");
+        return projection.norm(a, &c.main, prefix ++ "norm.weight", c.hf());
+    }
+
+    /// Hugging Face names and conventions (an ExLlamaV3 pack): zero-centered RMSNorm weights, (channels, 1, kernel) convs.
+    pub fn hf(c: *const Checkpoint) bool {
+        return c.main.renamed != null;
     }
 
     /// The output head, or null when it is the embedding (`tie_word_embeddings`).
@@ -81,8 +86,8 @@ pub const Checkpoint = struct {
         var name: [128]u8 = undefined;
         const base = std.fmt.bufPrint(&name, prefix ++ "layers.{d}.", .{index}) catch unreachable;
         var scratch: [160]u8 = undefined;
-        const input_norm = try projection.float(a, t, projection.join(&scratch, &.{ base, "input_layernorm.weight" }));
-        const post_norm = try projection.float(a, t, projection.join(&scratch, &.{ base, "post_attention_layernorm.weight" }));
+        const input_norm = try projection.norm(a, t, projection.join(&scratch, &.{ base, "input_layernorm.weight" }), c.hf());
+        const post_norm = try projection.norm(a, t, projection.join(&scratch, &.{ base, "post_attention_layernorm.weight" }), c.hf());
         const mlp = try readMlp(a, t, projection.join(&scratch, &.{ base, "mlp." }), s);
         if (s.full(index)) {
             const attn = projection.join(&scratch, &.{ base, "self_attn." });
@@ -93,8 +98,8 @@ pub const Checkpoint = struct {
                 .k = try sub(a, t, attn, "k_proj"),
                 .v = try sub(a, t, attn, "v_proj"),
                 .o = try sub(a, t, attn, "o_proj"),
-                .q_norm = try subFloat(a, t, attn, "q_norm.weight"),
-                .k_norm = try subFloat(a, t, attn, "k_norm.weight"),
+                .q_norm = try subNorm(a, t, attn, "q_norm.weight", c.hf()),
+                .k_norm = try subNorm(a, t, attn, "k_norm.weight", c.hf()),
                 .mlp = mlp,
             } };
             return .{ .arena = arena, .body = body };
@@ -108,7 +113,7 @@ pub const Checkpoint = struct {
             .z = try sub(a, t, lin, "in_proj_z"),
             .a = try sub(a, t, lin, "in_proj_a"),
             .b = try sub(a, t, lin, "in_proj_b"),
-            .conv = try subConv(a, t, lin),
+            .conv = try subConv(a, t, lin, c.hf()),
             .a_log = try subFloat(a, t, lin, "A_log"),
             .dt_bias = try subFloat(a, t, lin, "dt_bias"),
             .gnorm = try subFloat(a, t, lin, "norm.weight"),
@@ -137,7 +142,7 @@ pub const Checkpoint = struct {
         }
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         errdefer arena.deinit();
-        var m = try readMtp(arena.allocator(), t, c.spec());
+        var m = try readMtp(arena.allocator(), t, c.spec(), c.hf());
         m.arena = arena;
         m.owned = opened;
         m.io = c.io;
@@ -155,9 +160,14 @@ fn subFloat(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []con
     return projection.float(a, t, projection.join(&buf, &.{ base, name }));
 }
 
-fn subConv(a: std.mem.Allocator, t: *const Table, base: []const u8) !Tensor {
+fn subNorm(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []const u8, centered: bool) !Tensor {
     var buf: [192]u8 = undefined;
-    return projection.conv(a, t, projection.join(&buf, &.{ base, "conv1d.weight" }));
+    return projection.norm(a, t, projection.join(&buf, &.{ base, name }), centered);
+}
+
+fn subConv(a: std.mem.Allocator, t: *const Table, base: []const u8, hf: bool) !Tensor {
+    var buf: [192]u8 = undefined;
+    return projection.conv(a, t, projection.join(&buf, &.{ base, "conv1d.weight" }), hf);
 }
 
 /// The routed MLP when the config has experts, else gate, up and down.
@@ -171,7 +181,7 @@ fn readMlp(a: std.mem.Allocator, t: *const Table, mlp: []const u8, s: config.Spe
 }
 
 /// The head's tensors under `mtp.`: the Qwen3 shape (`pre_fc_norm_embedding`) or the Flash Next one (`norm_e`).
-fn readMtp(a: std.mem.Allocator, t: *const Table, s: config.Spec) !host.Mtp {
+fn readMtp(a: std.mem.Allocator, t: *const Table, s: config.Spec, hf: bool) !host.Mtp {
     const head: ?host.Projection = if (t.has("mtp.head_proj.weight")) try projection.projection(a, t, "mtp.head_proj") else null;
     if (!t.has("mtp.pre_fc_norm_embedding.weight")) {
         return .{
@@ -224,12 +234,13 @@ fn readMtp(a: std.mem.Allocator, t: *const Table, s: config.Spec) !host.Mtp {
         } },
         .gated = true,
     };
-    try uncenter(a, &m);
+    try uncenter(a, &m, hf);
     return m;
 }
 
-/// Norms averaging under 0.5 are zero-centered (mlx-serve bakes only the trunk's `1 + w`): add the 1.
-fn uncenter(a: std.mem.Allocator, m: *host.Mtp) !void {
+/// Norms averaging under 0.5 are zero-centered (mlx-serve bakes only the trunk's `1 + w`), and every one of a Hugging
+/// Face checkpoint (`hf`): add the 1.
+fn uncenter(a: std.mem.Allocator, m: *host.Mtp, hf: bool) !void {
     const norms = [_]*Tensor{ &m.fc_e_norm, &m.fc_h_norm, &m.q_norm, &m.k_norm, &m.final_norm, &m.input_norm.?, &m.post_norm.? };
     var sum: f64 = 0;
     var n: usize = 0;
@@ -237,7 +248,7 @@ fn uncenter(a: std.mem.Allocator, m: *host.Mtp) !void {
         sum += w;
         n += 1;
     };
-    if (sum >= 0.5 * @as(f64, @floatFromInt(n))) return;
+    if (!hf and sum >= 0.5 * @as(f64, @floatFromInt(n))) return;
     for (norms) |t| {
         const out = try a.alloc(f32, t.numel());
         for (out, std.mem.bytesAsSlice(f32, t.bytes)) |*o, w| o.* = w + 1;

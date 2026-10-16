@@ -40,6 +40,7 @@ const draw = @import("launches/draw.zig");
 const tp = @import("launches/tp.zig");
 const flashnext = @import("launches/flashnext.zig");
 const draft = @import("launches/draft.zig");
+const exl3 = @import("launches/exl3.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -86,6 +87,8 @@ pub const Launcher = struct {
     fnx: flashnext.Fns,
     /// The DFlash2 drafter's kernels: tap rows, rings, dynamic conv and block attention.
     dft: draft.Fns,
+    /// EXL3 projections: input rotation, the row-invariant product and the split sums' finish.
+    exl3: exl3.Fns,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -271,6 +274,7 @@ pub const Launcher = struct {
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.dft = try draft.Fns.load(l.mods[@backingInt(kernels.Group.draft)]);
+        l.exl3 = try exl3.Fns.load(l.mods[@backingInt(kernels.Group.exl3)]);
         return l;
     }
 
@@ -350,6 +354,8 @@ pub const Launcher = struct {
     pub const dftAttn = draft.attn;
     pub const dftBf16Rows = draft.bf16Rows;
     pub const dftQ4Rows = draft.q4Rows;
+    pub const exl3Project = exl3.project;
+    pub const exl3Scratch = exl3.scratchBytes;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {
