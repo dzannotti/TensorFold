@@ -6,6 +6,8 @@ const ids_file = @import("ids_file.zig");
 const lanes_session = @import("lanes_session.zig");
 const rows_run = @import("rows_run.zig");
 const check_radix = @import("check_radix.zig");
+const hip = @import("hip");
+const qwen35 = @import("qwen3_5");
 
 const Ctx = check_ctx.Ctx;
 const Session = lanes_session.Session;
@@ -28,6 +30,7 @@ const cases = blk: {
 
 pub fn run(c: *Ctx) void {
     rows(c);
+    steps(c);
     lanesSet(c, "short", c.short);
     lanesSet(c, "long", c.long);
     resumed(c);
@@ -50,6 +53,43 @@ fn rows(c: *Ctx) void {
             c.report.fail(name, "layer {d} ({s}), stream {d} row {d}: first difference at column {d}", .{ d.layer, d.kind, d.stream, d.row, d.column });
         } else c.report.pass(name, "every layer's residuals and the final rows equal each stream one row at a time", .{});
     }
+}
+
+/// A prompt in one span, then again in two cut at a page edge mid-way (the second reads the first's keys, conv and
+/// recurrent state): the final rows must be the same bits.
+fn steps(c: *Ctx) void {
+    const name = "prompt in two spans == one";
+    if (c.tp()) return c.report.skip(name, "one rank");
+    const n = @min(c.ids.len, c.e.o.capacity - 8);
+    const cut = n / 2 / qwen35.prefix.step * qwen35.prefix.step;
+    if (cut == 0) return c.report.skip(name, "the ids are shorter than two pages");
+    const whole = finalRows(c, c.ids[0..n], &.{ 0, n }) catch |err| return c.report.broke(name, err);
+    const parts = finalRows(c, c.ids[0..n], &.{ 0, cut, n }) catch |err| return c.report.broke(name, err);
+    const w = c.e.model().spec.hidden * c.e.model().act.size();
+    if (std.mem.indexOfDiff(u8, whole, parts)) |at|
+        return c.report.fail(name, "row {d} column {d} differs ({d} rows, cut at {d})", .{ at / w, at % w / c.e.model().act.size(), n, cut });
+    c.report.pass(name, "{d} rows, cut at {d}: every final row the same bits", .{ n, cut });
+}
+
+/// The final-normed rows of `ids` through `forward.span` on fresh caches, one span per pair of `cuts`.
+fn finalRows(c: *Ctx, ids: []const u32, cuts: []const usize) ![]u8 {
+    const e = c.e;
+    const w = e.model().spec.hidden * e.model().act.size();
+    const out = try c.arena.alloc(u8, ids.len * w);
+    var caches = try e.newCaches(ids.len + 8);
+    defer {
+        e.drain();
+        caches.deinit(c.gpa);
+    }
+    var dev = try hip.DeviceBuffer.fromHost(&e.driver, std.mem.sliceAsBytes(ids));
+    defer dev.free();
+    for (cuts[0 .. cuts.len - 1], cuts[1..]) |a, b| {
+        e.prompts.reset();
+        const y = try qwen35.forward.span(e.ops(&e.prompts), e.model(), &caches, dev.base() + a * 4, b - a, a, null);
+        try e.stream.synchronize();
+        try hip.runtime.check(e.driver.api.hipMemcpyDtoH(out[a * w ..].ptr, @ptrFromInt(y.ptr), (b - a) * w));
+    }
+    return out;
 }
 
 /// Where two runs' replies first differ, as a line to print; null when they are equal.
