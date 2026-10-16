@@ -68,4 +68,4 @@ work python tools/strix/quality.py --model ~/models/Qwen3.8-27B-MLX-4bit   # nee
 - The DFlash v1 drafter (the 35B-A3B's) does not load. HIP reads DFlash2 only.
 - MiniCPM-4.7 (ciru_q8) is being ported, text only first.
 - C8 (eight streams) is not tuned yet.
-- A feature-by-feature parity audit against CUDA and Metal is in progress.
+- Feature parity against CUDA and Metal: [the matrix](strix-halo-parity.md).
