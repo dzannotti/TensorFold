@@ -43,6 +43,8 @@ pub const Tables = struct {
             if (w.dtype != .f8_e4m3 or w.rank != 2 or w.shape[1] != dims) return error.UnexpectedNgramTable;
             starts[i + 1] = starts[i] + w.shape[0];
             s.* = .{ .words = w.bytes, .scales = &.{}, .biases = &.{} };
+            // a row is 160 bytes anywhere in 49 GiB: no read-around (128 KiB a fault), each page read alone
+            advise(w.bytes, std.os.linux.MADV.RANDOM);
         }
         const ref = try config.pleRef(c);
         var total: usize = 0;
@@ -95,15 +97,12 @@ pub const Tables = struct {
         const wb = t.wordBytes();
         const tb = t.tableBytes();
         if (words.len < ids.len * wb or scales.len < ids.len * tb or biases.len < ids.len * tb) return error.StagingTooSmall;
+        // an FP8 table's rows are mostly on disk: every page asked for first, so the reads go out together
+        if (t.fp8 != null) for (ids) |id| if (t.locate(id)) |at| advise(t.shards[at.shard].words[at.row * t.dims ..][0..t.dims], std.os.linux.MADV.WILLNEED);
         for (ids, 0..) |id, i| {
-            const s = std.sort.upperBound(usize, t.starts, @as(usize, id), struct {
-                fn order(x: usize, y: usize) std.math.Order {
-                    return std.math.order(x, y);
-                }
-            }.order) - 1;
-            if (s >= t.shards.len) return error.NgramRowOutOfRange;
-            const row = id - t.starts[s];
-            const sh = t.shards[s];
+            const at = t.locate(id) orelse return error.NgramRowOutOfRange;
+            const row = at.row;
+            const sh = t.shards[at.shard];
             if (t.fp8) |lut| {
                 const codes = sh.words[row * t.dims ..][0..t.dims];
                 for (codes, 0..) |code, j| std.mem.writeInt(u16, words[i * wb + 2 * j ..][0..2], lut[code], .little);
@@ -114,4 +113,21 @@ pub const Tables = struct {
             @memcpy(biases[i * tb ..][0..tb], sh.biases[row * tb ..][0..tb]);
         }
     }
+
+    /// The shard holding global row `id` and the row within it, or null past the last.
+    fn locate(t: *const Tables, id: u32) ?struct { shard: usize, row: usize } {
+        const s = std.sort.upperBound(usize, t.starts, @as(usize, id), struct {
+            fn order(x: usize, y: usize) std.math.Order {
+                return std.math.order(x, y);
+            }
+        }.order) - 1;
+        if (s >= t.shards.len) return null;
+        return .{ .shard = s, .row = id - t.starts[s] };
+    }
 };
+
+/// madvise over the pages `bytes` spans (a hint: a refusal changes nothing but speed).
+fn advise(bytes: []const u8, advice: u32) void {
+    const from = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr), std.heap.page_size_min);
+    _ = std.os.linux.madvise(@ptrFromInt(from), @intFromPtr(bytes.ptr) + bytes.len - from, advice);
+}
