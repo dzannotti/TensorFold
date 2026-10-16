@@ -56,10 +56,15 @@ pub const Fns = struct {
     had: Function,
     /// By half bits, codebook (3inst, mcg, mul1) and tile.
     product: [17][3][tiles.len]?Function,
+    /// A prompt's product on the dequantizing core (mul1, whole bits): by half bits, 128 x 256 or 256 x 128 blocks.
+    prompt: [17][2]?Function,
 
     pub fn load(m: Module) Error!Fns {
         @setEvalBranchQuota(200_000);
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))), .prompt = @splat(@splat(null)) };
+        inline for (.{ 4, 6, 8, 10, 12, 14, 16 }) |h| inline for (.{ .{ 128, 256 }, .{ 256, 128 } }, 0..) |b, i| {
+            f.prompt[h][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm11exl3_promptILi{d}ELi2ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, b[0], b[1] }));
+        };
         inline for (0..17) |h| inline for (0..3) |cb| {
             if (comptime built(h, cb)) inline for (tiles, 0..) |t, i| {
                 f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, t.rows, t.cols }));
@@ -128,6 +133,52 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
     var a: Args = .{};
     try a.add(arg);
     try l.go(f, dim(cols, sp, blocks), dim(256, 1, 1), 0, s, &a);
+}
+
+/// `project` for a prompt's rows on the dequantizing tile (quant/exl3.hip exl3_prompt): every output one WMMA chain over
+/// k, so a row's bits depend on its own x and (K, N) alone, never on m or where the prompt is cut, but differ from
+/// `project`'s (decode and rounds). False, nothing launched, where no prompt tile takes the matrix (mul1 whole bits).
+pub fn prompt(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!bool {
+    if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 prompt");
+    if (w.codebook != .mul1 or w.halves % 2 != 0) return false;
+    // its buffer loads take 31-bit byte offsets into the rotated x and the trellis
+    const words: u64 = 4 * @as(u64, w.halves);
+    if (@as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) return false;
+    // 256 x 128 (half the decode a weight) but where k is near n (o_proj, out_proj: 128 x 256 measured 25% faster);
+    // the same bits either way
+    const tall = k < n or k >= 3 * n;
+    const f = l.exl3.prompt[w.halves][@intFromBool(tall)] orelse return false;
+    {
+        var a: Args = .{};
+        try a.add(x);
+        try a.add(x_kind);
+        try a.add(w.suh);
+        try a.add(scratch);
+        try a.add(@as(c_int, @intCast(k)));
+        try a.add(@as(c_int, 0));
+        try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
+    }
+    const arg: Arg = .{
+        .xh = scratch,
+        .trellis = w.trellis,
+        .stride_k = @as(i64, w.columns / 16) * @as(i64, @intCast(words)),
+        .stride_nb = 8 * @as(i64, @intCast(words)),
+        .svh = w.svh,
+        .bias = w.bias,
+        .out = out,
+        .partial = 0,
+        .m = @intCast(m),
+        .k = @intCast(k),
+        .n = @intCast(n),
+        .splits = 1,
+        .out_kind = out_kind,
+    };
+    const bm: usize = if (tall) 256 else 128;
+    const bn: usize = 32768 / bm;
+    var a: Args = .{};
+    try a.add(arg);
+    try l.go(f, dim(((n + bn - 1) / bn) * ((m + bm - 1) / bm), 1, 1), dim(256, 1, 1), 0, s, &a);
+    return true;
 }
 
 /// out [rows, k] = x [rows, k] rotated by 128-block Hadamards in x's kind (`kind`: 1 fp16, 2 bf16); `out` may be `x`.

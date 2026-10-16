@@ -19,6 +19,8 @@ const cases = [_]Case{
     .{ .name = "2-bit 3inst", .k = 512, .n = 512, .halves = 4, .codebook = .inst3 },
     .{ .name = "8-bit mcg", .k = 512, .n = 256, .halves = 16, .codebook = .mcg },
     .{ .name = "6-bit mul1, two column blocks a wave", .k = 256, .n = 81920, .halves = 12, .codebook = .mul1 },
+    .{ .name = "6-bit mul1", .k = 1024, .n = 1024, .halves = 12, .codebook = .mul1 },
+    .{ .name = "5-bit mul1", .k = 1024, .n = 640, .halves = 10, .codebook = .mul1 },
 };
 
 const most_rows = 128;
@@ -99,6 +101,116 @@ fn run(t: *base.Rig, rng: *base.Rng, c: Case) !void {
         try out.download(0, std.mem.sliceAsBytes(got[0 .. rows * c.n]));
         const same = std.mem.eql(u8, std.mem.sliceAsBytes(got[0 .. rows * c.n]), std.mem.sliceAsBytes(all[first * c.n ..][0 .. rows * c.n]));
         try base.expect(same, "{s}: {d} rows from row {d} differ from the same rows among 128", .{ c.name, rows, first });
+    }
+
+    // the prompt tile: 300 rows (past one 256-row block) against fp64, then each row count's rows against the same rows
+    // among the 300 (and the first 128 against the decode product's to its rounding)
+    const pm = 300;
+    const px = try gpa.alloc(u16, pm * c.k);
+    defer gpa.free(px);
+    for (px, 0..) |*v, i| v.* = if (i < x.len) x[i] else base.bf16Bits(rng.unit());
+    var dpx = try Buffer.fromHost(t, px);
+    defer dpx.free();
+    var pout = try Buffer.alloc(t, pm * c.n * 4);
+    defer pout.free();
+    var pscratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(pm, @intCast(c.k), @intCast(c.n)));
+    defer pscratch.free();
+    if (!try t.on.exl3Prompt(dpx.ptr, 1, m, @intCast(c.n), @intCast(c.k), pm, pout.ptr, 0, pscratch.ptr, t.stream.handle)) return;
+    try t.stream.synchronize();
+    const pall = try gpa.alloc(f32, pm * c.n);
+    defer gpa.free(pall);
+    const pgot = try gpa.alloc(f32, pm * c.n);
+    defer gpa.free(pgot);
+    try pout.download(0, std.mem.sliceAsBytes(pall));
+    var perr: f64 = 0;
+    var pmag: f64 = 0;
+    for ([_]usize{ 0, 1, 2, 3, 130, 257, 299 }) |r| for (0..c.n) |j| {
+        var want: f64 = 0;
+        for (0..c.k) |i| want += base.bf16Value(px[r * c.k + i]) * w[i * c.n + j];
+        perr = @max(perr, @abs(want - pall[r * c.n + j]));
+        pmag = @max(pmag, @abs(want));
+    };
+    try base.expect(perr <= 2e-3 * pmag, "{s} prompt: max error {e} of {e}", .{ c.name, perr, pmag });
+    var drift: f64 = 0;
+    for (0..most_rows * c.n) |i| drift = @max(drift, @abs(@as(f64, pall[i]) - all[i]));
+    try base.expect(drift <= 1e-4 * pmag, "{s} prompt: {e} from the decode product's sums", .{ c.name, drift });
+    for (together ++ [_]usize{ 200, 256, 257, 300 }) |rows| {
+        const first = (rows * 5) % (pm - rows + 1);
+        try base.expect(try t.on.exl3Prompt(dpx.ptr + first * c.k * 2, 1, m, @intCast(c.n), @intCast(c.k), rows, pout.ptr, 0, pscratch.ptr, t.stream.handle), "{s}: prompt refused", .{c.name});
+        try t.stream.synchronize();
+        try pout.download(0, std.mem.sliceAsBytes(pgot[0 .. rows * c.n]));
+        const same = std.mem.eql(u8, std.mem.sliceAsBytes(pgot[0 .. rows * c.n]), std.mem.sliceAsBytes(pall[first * c.n ..][0 .. rows * c.n]));
+        try base.expect(same, "{s} prompt: {d} rows from row {d} differ from the same rows among {d}", .{ c.name, rows, first, pm });
+    }
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+// The prompt tile against the decode product on the 27B's prompt shapes (TF_EXL3_BENCH=1; TF_EXL3_BENCH_M rows,
+// default a prefill span's 2048): microseconds and TFLOPS, bf16 out.
+test "EXL3 prompt timings on the 27B shapes (TF_EXL3_BENCH=1)" {
+    _ = std.c.getenv("TF_EXL3_BENCH") orelse return;
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    const rows: usize = if (std.c.getenv("TF_EXL3_BENCH_M")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+    const Shape = struct { name: []const u8, k: usize, n: usize, halves: u16 };
+    const shapes = [_]Shape{
+        .{ .name = "qkv 4b", .k = 5120, .n = 10240, .halves = 8 },
+        .{ .name = "z 4b", .k = 5120, .n = 6144, .halves = 8 },
+        .{ .name = "out 4b", .k = 6144, .n = 5120, .halves = 8 },
+        .{ .name = "gate 3b", .k = 5120, .n = 17408, .halves = 6 },
+        .{ .name = "gate 4b", .k = 5120, .n = 17408, .halves = 8 },
+        .{ .name = "down 3b", .k = 17408, .n = 5120, .halves = 6 },
+        .{ .name = "down 4b", .k = 17408, .n = 5120, .halves = 8 },
+        .{ .name = "q 4b", .k = 5120, .n = 12288, .halves = 8 },
+        .{ .name = "k/v 4b", .k = 5120, .n = 1024, .halves = 8 },
+        .{ .name = "o 5b", .k = 6144, .n = 5120, .halves = 10 },
+        .{ .name = "head 6b", .k = 5120, .n = 248320, .halves = 12 },
+    };
+    std.debug.print("\nshape        M   kernel      us     TFLOPS\n", .{});
+    var rng: base.Rng = .{ .state = 0x62656e63 };
+    for (shapes) |sh| {
+        const m_rows = if (sh.n > 100000) @min(rows, 256) else rows;
+        const words = (sh.k / 16) * (sh.n / 16) * @as(usize, sh.halves) * 8;
+        const trellis = try gpa.alloc(i16, words);
+        defer gpa.free(trellis);
+        for (trellis) |*v| v.* = @bitCast(@as(u16, @truncate(rng.next())));
+        const ones = try gpa.alloc(f16, @max(sh.k, sh.n));
+        defer gpa.free(ones);
+        for (ones) |*v| v.* = 0.01;
+        var dt = try Buffer.fromHost(t, trellis);
+        defer dt.free();
+        var ds = try Buffer.fromHost(t, ones);
+        defer ds.free();
+        var dx = try Buffer.alloc(t, m_rows * sh.k * 2);
+        defer dx.free();
+        try dx.fill8(0x3c, null);
+        var out = try Buffer.alloc(t, m_rows * sh.n * 2);
+        defer out.free();
+        var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(m_rows, @intCast(sh.k), @intCast(sh.n)));
+        defer scratch.free();
+        const mat: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = ds.ptr, .bias = 0, .halves = @intCast(sh.halves), .codebook = .mul1, .columns = @intCast(sh.n) };
+        for (0..2) |which| {
+            var times: [5]f64 = undefined;
+            for (0..times.len + 1) |r| {
+                const t0 = nowNs();
+                for (0..4) |_| {
+                    if (which == 0) {
+                        try t.on.exl3Project(dx.ptr, 1, mat, @intCast(sh.n), @intCast(sh.k), m_rows, out.ptr, 1, scratch.ptr, t.stream.handle);
+                    } else if (!try t.on.exl3Prompt(dx.ptr, 1, mat, @intCast(sh.n), @intCast(sh.k), m_rows, out.ptr, 1, scratch.ptr, t.stream.handle)) return error.NoPromptTile;
+                }
+                try t.stream.synchronize();
+                if (r > 0) times[r - 1] = @as(f64, @floatFromInt(nowNs() - t0)) / 4e3;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const us = times[2];
+            const tf = 2.0 * @as(f64, @floatFromInt(m_rows * sh.n * sh.k)) / us / 1e6;
+            std.debug.print("{s:<10} {d:>5}   {s:<8} {d:>9.1} {d:>8.2} ({d:.0}% of 57)\n", .{ sh.name, m_rows, if (which == 0) "decode" else "prompt", us, tf, tf / 57 * 100 });
+        }
     }
 }
 
