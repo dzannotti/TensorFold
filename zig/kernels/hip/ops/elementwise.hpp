@@ -69,20 +69,42 @@ extern "C" __global__ void tf_copy_cols(const void* src, long long stride, int o
 }
 
 // y[r, n] = x[r, :] . w[n, :] over float weights of `w_kind` (MTP fc, an EXL3 pack's small projections), a block of 256
-// a value: each thread's strided terms, then the waves' sums and the block's in a fixed order, so a row's bits depend on
-// K alone.
+// a column and kDenseRows rows: each thread's strided terms, then the waves' sums and the block's in a fixed
+// order, so a row's bits depend on K alone. A thread loads 8 strides' terms before adding them in order.
+constexpr int kDenseRows = 4;
 extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
-    __shared__ float part[8];
-    const int col = blockIdx.x, r = blockIdx.y;
-    float acc = 0.0f;
-    for (int i = threadIdx.x; i < k; i += 256) acc += load(x, kind, static_cast<long long>(r) * k + i) * load(w, w_kind, static_cast<long long>(col) * k + i);
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+    constexpr int R = kDenseRows, U = 8;
+    __shared__ float part[R][8];
+    const int col = blockIdx.x, r0 = blockIdx.y * R;
+    float acc[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) acc[j] = 0.0f;
+    for (int i0 = threadIdx.x; i0 < k; i0 += 256 * U) {
+        float wv[U], xv[R][U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + 256 * u;
+            wv[u] = i < k ? load(w, w_kind, static_cast<long long>(col) * k + i) : 0.0f;
+#pragma unroll
+            for (int j = 0; j < R; ++j) xv[j][u] = i < k && r0 + j < rows ? load(x, kind, static_cast<long long>(r0 + j) * k + i) : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+            if (i0 + 256 * u < k)
+#pragma unroll
+                for (int j = 0; j < R; ++j) acc[j] += xv[j][u] * wv[u];
+    }
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_xor(acc[j], off, 32);
+        if ((threadIdx.x & 31) == 0) part[j][threadIdx.x >> 5] = acc[j];
+    }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum = part[0];
-        for (int j = 1; j < 8; ++j) sum += part[j];
-        store(out, kind, static_cast<long long>(r) * n + col, sum);
+    if (threadIdx.x < R && r0 + static_cast<int>(threadIdx.x) < rows) {
+        const int j = threadIdx.x;
+        float sum = part[j][0];
+        for (int q = 1; q < 8; ++q) sum += part[j][q];
+        store(out, kind, static_cast<long long>(r0 + j) * n + col, sum);
     }
 }
 
