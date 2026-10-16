@@ -164,8 +164,9 @@ pub fn upload(u: types.Uploader, h: Host) !Device {
     };
 }
 
-/// What the kernels read: the tensors' addresses (bias 0 when absent), the width in half bits and the codebook.
-pub const Matrix = struct { trellis: u64, suh: u64, svh: u64, bias: u64, halves: u8, codebook: format.Codebook };
+/// What the kernels read: the tensors' addresses (bias 0 when absent), the width in half bits, the codebook, and the
+/// stored output width the tiles are laid out for (a product may take only the first columns of it).
+pub const Matrix = struct { trellis: u64, suh: u64, svh: u64, bias: u64, halves: u8, codebook: format.Codebook, columns: u32 };
 
 pub const View = struct { n: u32, k: u32, matrix: Matrix };
 
@@ -175,7 +176,7 @@ pub fn view(d: Device, stacked: bool) error{UnsupportedTables}!View {
     return .{
         .n = @intCast(d.trellis.dim(1) * 16),
         .k = @intCast(d.trellis.dim(0) * 16),
-        .matrix = .{ .trellis = d.trellis.ptr, .suh = d.suh.ptr, .svh = d.svh.ptr, .bias = if (d.bias) |b| b.ptr else 0, .halves = @intCast(d.width.halves), .codebook = d.codebook },
+        .matrix = .{ .trellis = d.trellis.ptr, .suh = d.suh.ptr, .svh = d.svh.ptr, .bias = if (d.bias) |b| b.ptr else 0, .halves = @intCast(d.width.halves), .codebook = d.codebook, .columns = @intCast(d.trellis.dim(1) * 16) },
     };
 }
 

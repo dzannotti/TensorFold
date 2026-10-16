@@ -86,7 +86,7 @@ pub fn scratchBytes(m: usize, k: u32, n: u32) usize {
 /// y [m, n] (`out_kind`: 0 fp32, 1 bf16, 2 fp16) = x [m, k] (`x_kind` 1 bf16, 2 fp16) times the EXL3 matrix;
 /// `scratch` holds `scratchBytes(m, k, n)`.
 pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
-    if (m == 0 or k % 128 != 0 or n % 128 != 0 or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
+    if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
     const cb: usize = @backingInt(w.codebook);
     const tile = tiles[tileOf(m, n)];
     const f = l.exl3.product[w.halves][cb][tileOf(m, n)] orelse return invalid("exl3 width");
@@ -95,7 +95,7 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
     const arg: Arg = .{
         .xh = scratch,
         .trellis = w.trellis,
-        .stride_k = @as(i64, n / 16) * words,
+        .stride_k = @as(i64, w.columns / 16) * words,
         .stride_nb = 8 * words,
         .svh = w.svh,
         .bias = w.bias,

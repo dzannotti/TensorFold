@@ -52,7 +52,7 @@ fn run(t: *base.Rig, rng: *base.Rng, c: Case) !void {
     defer out.free();
     var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(most_rows, @intCast(c.k), @intCast(c.n)));
     defer scratch.free();
-    const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = @intCast(c.halves), .codebook = c.codebook };
+    const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = @intCast(c.halves), .codebook = c.codebook, .columns = @intCast(c.n) };
 
     const all = try gpa.alloc(f32, most_rows * c.n);
     defer gpa.free(all);
@@ -76,6 +76,21 @@ fn run(t: *base.Rig, rng: *base.Rng, c: Case) !void {
     };
     // the input rotation rounds to fp16 (as ExLlamaV3's): about 2^-11 of each term
     try base.expect(err <= 2e-3 * mag, "{s}: max error {e} of {e}", .{ c.name, err, mag });
+
+    // the first columns of the stored matrix alone (a draft head's narrowed vocabulary)
+    if (c.n % 256 == 0) {
+        const half: u32 = @intCast(c.n / 2);
+        try t.on.exl3Project(dx.ptr, 1, m, half, @intCast(c.k), 4, out.ptr, 0, scratch.ptr, t.stream.handle);
+        try t.stream.synchronize();
+        try out.download(0, std.mem.sliceAsBytes(got[0 .. 4 * half]));
+        var narrow_err: f64 = 0;
+        for (0..4) |r| for (0..half) |j| {
+            var want: f64 = 0;
+            for (0..c.k) |i| want += base.bf16Value(x[r * c.k + i]) * w[i * c.n + j];
+            narrow_err = @max(narrow_err, @abs(want - got[r * half + j]));
+        };
+        try base.expect(narrow_err <= 2e-3 * mag, "{s}: first {d} columns, max error {e} of {e}", .{ c.name, half, narrow_err, mag });
+    }
 
     for (together) |rows| {
         const first = (rows * 5) % (most_rows - rows + 1);
