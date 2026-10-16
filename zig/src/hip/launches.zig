@@ -9,6 +9,7 @@ const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
 const caps = @import("caps.zig");
 const affine = @import("launches/affine.zig");
+const coded = @import("launches/coded.zig");
 
 const util = @import("launches/util.zig");
 
@@ -86,6 +87,8 @@ pub const Launcher = struct {
     wide: bool,
     /// The MLX affine products and the registry that picks their tiles.
     affine: affine.Kernels,
+    /// The coded decoders' products (block FP8, BF16); null without gfx11 matrix cores.
+    coded: ?coded.Kernels,
     /// Flash Next's kernels: its residual streams, n-gram rows, indexer and sparse attention.
     fnx: flashnext.Fns,
     /// The DFlash2 drafter's kernels: tap rows, rings, dynamic conv and block attention.
@@ -149,6 +152,7 @@ pub const Launcher = struct {
         moe_localize: Function,
         moe_foreign_items: Function,
         moe_zero_foreign: Function,
+        moe_put_slot: Function,
         token_prob: Function,
     };
 
@@ -221,6 +225,7 @@ pub const Launcher = struct {
             .moe_localize = try ops.function("tf_moe_localize"),
             .moe_foreign_items = try ops.function("tf_moe_foreign_items"),
             .moe_zero_foreign = try ops.function("tf_moe_zero_foreign"),
+            .moe_put_slot = try ops.function("tf_moe_put_slot"),
             .token_prob = try ops.function("tf_token_prob"),
         };
         const ns = "_ZN2tf4rocm";
@@ -286,6 +291,7 @@ pub const Launcher = struct {
         const dot2 = l.mods[@backingInt(kernels.Group.affine_dot2)];
         l.affine = try affine.Kernels.load(tiles, dot2, caps.Caps.of(kernels.arch) orelse return error.Invalid, choices.products);
         try l.affine.fillByteLut(r, dot2);
+        l.coded = try coded.Kernels.load(tiles, l.affine.matrix);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.dft = try draft.Fns.load(l.mods[@backingInt(kernels.Group.draft)]);
         l.exl3 = try exl3.Fns.load(l.mods[@backingInt(kernels.Group.exl3)]);
@@ -326,6 +332,7 @@ pub const Launcher = struct {
     pub const tf_moe_localize = tp.tf_moe_localize;
     pub const tf_moe_foreign_items = tp.tf_moe_foreign_items;
     pub const tf_moe_zero_foreign = tp.tf_moe_zero_foreign;
+    pub const tf_moe_put_slot = tp.tf_moe_put_slot;
     pub const tf_token_prob = tp.tf_token_prob;
     pub const pagedCausal = attention.pagedCausal;
     pub const tf_gdn_gate = recurrence.tf_gdn_gate;

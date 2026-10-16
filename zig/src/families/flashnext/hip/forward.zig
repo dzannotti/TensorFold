@@ -259,22 +259,11 @@ fn ple(
     const t = host.tables;
     const mark = o.arena.mark();
     defer o.arena.release(mark);
-    const emb = try take(o, m.act, rows * d.ple_dim);
     const first = row0 * ngram.heads;
-    try o.l.tf_embed_rows(
-        @ptrFromInt(in.words + first * t.wordBytes()),
-        @ptrFromInt(in.scales + first * t.tableBytes()),
-        @ptrFromInt(in.biases + first * t.tableBytes()),
-        @backingInt(Kind.bf16),
-        @ptrFromInt(in.local),
-        @intCast(rows * ngram.heads),
-        t.bits,
-        @intCast(t.group),
-        @intCast(t.dims),
-        @ptrFromInt(emb.ptr),
-        @backingInt(m.act),
-        o.stream,
-    );
+    // an FP8 table's rows come up as the bf16 embedding itself
+    const emb: Tensor = if (t.fp8 != null) .{ .ptr = in.words + first * t.wordBytes(), .kind = .bf16 } else try take(o, m.act, rows * d.ple_dim);
+    if (t.fp8 != null and m.act != .bf16) return error.UnsupportedNgramTable;
+    if (t.fp8 == null) try o.l.tf_embed_rows(@ptrFromInt(in.words + first * t.wordBytes()), @ptrFromInt(in.scales + first * t.tableBytes()), @ptrFromInt(in.biases + first * t.tableBytes()), @backingInt(Kind.bf16), @ptrFromInt(in.local), @intCast(rows * ngram.heads), t.bits, @intCast(t.group), @intCast(t.dims), @ptrFromInt(emb.ptr), @backingInt(m.act), o.stream);
     const kv = try o.project(emb, m.ple.kv, rows, false);
     const gated = try take(o, m.act, rows * d.wide());
     const tail = c.layout.tail_rows * d.wide() * m.act.size();

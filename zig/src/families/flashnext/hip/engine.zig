@@ -7,6 +7,7 @@ const config = @import("../config.zig");
 const model = @import("model.zig");
 const loader = @import("load.zig");
 const tables = @import("tables.zig");
+const int4ar = @import("int4ar.zig");
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
 const mixers = @import("mixers.zig");
@@ -116,7 +117,7 @@ pub const Engine = struct {
         _ = try steps.done(.{ 0, 0 }, .first);
         e.cfg = try config.Config.read(gpa, io, dir);
         errdefer e.cfg.deinit();
-        e.ck = try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
+        e.ck = if (e.cfg.gptq) try int4ar.open(gpa, io, dir) else try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
         errdefer e.ck.close();
         e.keep = .init(gpa);
         errdefer e.keep.deinit();
@@ -124,8 +125,7 @@ pub const Engine = struct {
         e.weights = try loader.load(gpa, &e.driver, &e.ck, &e.cfg, rank, e.act);
         errdefer e.weights.deinit();
         e.weights.model.tp = e.comm;
-        const spelling = try spellingOf(e.keep.allocator(), io, dir);
-        e.tables = try tables.Tables.init(e.keep.allocator(), &e.ck, &e.cfg, e.weights.model.ple.layer, spelling);
+        e.tables = if (e.cfg.gptq) try tables.Tables.initFp8(e.keep.allocator(), &e.ck, &e.cfg, e.weights.model.ple.layer) else try tables.Tables.init(e.keep.allocator(), &e.ck, &e.cfg, e.weights.model.ple.layer, try spellingOf(e.keep.allocator(), io, dir));
         const c = mixers.qkConstants(e.cfg.key_dim);
         var w: [2]hip.DeviceBuffer = undefined;
         for (&w, [_]f32{ c.q, c.k }) |*b, v| {

@@ -46,10 +46,16 @@ pub const Affine = struct {
     k: u32,
     bits: u8,
     group: u16,
+    /// How the words read: affine codes, or a coded decoder's (launches/coded.zig).
+    code: @import("core").quant.mlx.Code = .affine,
     /// A tensor-parallel slice along K: the product stays fp32, one rank's share of a sum.
     partial: bool = false,
 
     pub fn check(a: Affine) Error!void {
+        if (a.code != .affine) {
+            if (a.group != 128 or a.k % 32 != 0 or a.bits != @as(u8, if (a.code == .fp8) 8 else 16)) return error.BadShape;
+            return;
+        }
         const ok_bits = switch (a.bits) {
             2, 3, 4, 5, 6, 8 => true,
             else => false,

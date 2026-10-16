@@ -54,6 +54,8 @@ pub const Config = struct {
     eos: [16]u32 = @splat(0),
     eos_count: usize = 0,
     global_affine: affine.Spec,
+    /// GPTQ int4 (azampatti's INT4-AutoRound): routed experts and lm_head GPTQ, dense linears block FP8 (hip/int4ar.zig).
+    gptq: bool = false,
     /// A widths.Widths set by a tensor reader; widths.quantization reads it, so this file imports no core.
     widths: ?*const anyopaque = null,
 
@@ -199,7 +201,11 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const tag = root.get("model_type") orelse text.get("model_type") orelse return error.MissingFlashField;
     if (tag != .string or !std.mem.eql(u8, tag.string, "qwen4_exp")) return error.NotFlashNext;
     const quant = try quantBlock(root, text);
-    if (quant.get("quant_method")) |v| if (v != .null and (v != .string or (!std.mem.eql(u8, v.string, "mlx") and !std.mem.eql(u8, v.string, "affine")))) return error.UnsupportedAffineMode;
+    const gptq = if (quant.get("quant_method")) |v| v == .string and std.mem.eql(u8, v.string, "gptq") else false;
+    if (gptq) {
+        // symmetric 4-bit groups of 128 in input order: the layout hip/int4ar.zig repacks
+        if ((try boolean(quant, "sym", true)) == false or (try boolean(quant, "desc_act", false)) or (try optional(quant, "bits", 4)) != 4 or (try optional(quant, "group_size", 128)) != 128) return error.UnsupportedAffineMode;
+    } else if (quant.get("quant_method")) |v| if (v != .null and (v != .string or (!std.mem.eql(u8, v.string, "mlx") and !std.mem.eql(u8, v.string, "affine")))) return error.UnsupportedAffineMode;
     const rope = if (text.get("rope_parameters")) |v| if (v == .null) std.json.ObjectMap.empty else try object(v) else std.json.ObjectMap.empty;
     for ([_][]const u8{ "rope_type", "type" }) |key| if (rope.get(key)) |v| if (v != .string or !std.mem.eql(u8, v.string, "default")) return error.UnsupportedFlashRope;
     const hidden = try required(text, "hidden_size");
@@ -251,6 +257,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .mrope_interleaved = try boolean(rope, "mrope_interleaved", true),
         .mrope_section = .{ 11, 11, 10 },
         .global_affine = try spec(quant, null),
+        .gptq = gptq,
     };
     if (c.layers > max_layers or c.heads % c.kv_heads != 0 or c.value_heads % c.key_heads != 0 or c.topk > c.experts) return error.InvalidFlashShape;
     if (c.conv < 2 or c.hc_count == 0 or c.hc_lowrank == 0 or c.index_ratio == 0 or c.index_heads == 0 or c.index_kv_heads == 0 or c.index_heads % c.index_kv_heads != 0 or c.index_dim == 0 or c.index_budget == 0 or c.index_budget % c.index_ratio != 0) return error.InvalidFlashShape;

@@ -112,8 +112,8 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         float bi[CB];
 #pragma unroll
         for (int c = 0; c < CB; ++c) {
-            sc[c] = live ? terms.widen(sr[c]) : 0.f;
-            bi[c] = live ? terms.widen(br[c]) : 0.f;
+            sc[c] = live ? Dec::stream_scale(terms, sr[c], br[c]) : 0.f;
+            bi[c] = live ? Dec::stream_bias(terms, sr[c], br[c]) : 0.f;
         }
         // RGX of a pass's rows from acc row g RG: a plan's item often holds fewer rows than the tile, and a row's sums
         // do not depend on the rows beside it, so the rows past the item's last are not run

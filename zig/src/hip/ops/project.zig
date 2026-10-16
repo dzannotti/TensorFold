@@ -25,7 +25,7 @@ fn affineOf(proj: Projection, h: mlx.Matrix) Affine {
         .bf16 => .bf16,
         .f16 => .f16,
     };
-    return .{ .words = h.words, .scale = h.scale, .bias = h.bias, .tables = tables, .n = proj.n, .k = proj.k, .bits = h.bits, .group = h.group, .partial = proj.partial };
+    return .{ .words = h.words, .scale = h.scale, .bias = h.bias, .tables = tables, .n = proj.n, .k = proj.k, .bits = h.bits, .group = h.group, .code = h.code, .partial = proj.partial };
 }
 
 /// matmul(x, proj) for a projection of any format: fp32 when `f32_out`, else x's kind (the MLX rules of `affine`).
@@ -113,6 +113,7 @@ fn shapeOf(o: Ops, x: Tensor, w: Affine, m: usize) registry.Shape {
 pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tensor {
     try w.check();
     if (m == 0) return error.BadShape;
+    if (w.code != .affine) return coded(o, x, w, m, f32_out);
     const fp16 = x.kind == .f16;
     if (x.kind == .f32 or (fp16 and o.bf16) or (!fp16 and !o.bf16)) return error.BadShape;
     const n: usize = w.n;
@@ -156,6 +157,30 @@ pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tenso
     return .{ .ptr = narrow, .kind = x.kind };
 }
 
+/// matmul(x, w) on a coded decoder's weights (block FP8, BF16): fp32 when `f32_out`, else x's kind, rounded once.
+pub fn coded(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tensor {
+    const ck = if (o.l.coded) |*c| c else return error.BadShape;
+    if (x.kind != .bf16 or w.partial) return error.BadShape;
+    const kind: t.Kind = if (f32_out) .f32 else x.kind;
+    const out = try o.arena.take(m * w.n * kind.size());
+    var arg: affine_launch.Arg = .{
+        .x = x.ptr,
+        .words = w.words,
+        .scale = .{ .p = w.scale, .kind = 1 },
+        .bias = .{ .p = w.bias, .kind = 1 },
+        .out = 0,
+        .m = int(m),
+        .n = int(w.n),
+        .k = int(w.k),
+        .bits = w.bits,
+        .group = w.group,
+        .fp16 = 0,
+    };
+    if (f32_out) arg.out = out else arg.out16 = out;
+    try ck.run(o.l.r, w.code, arg, o.prefill, o.stream);
+    return .{ .ptr = out, .kind = kind };
+}
+
 /// Up to four products of the same rows in one stream-tile launch, rounded to x's kind; false if unsupported.
 pub fn affineGroup(o: Ops, x: Tensor, ws: []const Affine, m: usize, outs: []Tensor) Error!bool {
     const z = o.l;
@@ -163,7 +188,7 @@ pub fn affineGroup(o: Ops, x: Tensor, ws: []const Affine, m: usize, outs: []Tens
     var widest: u32 = 0;
     for (ws) |w| {
         try w.check();
-        if (w.k != ws[0].k or w.bits != ws[0].bits or w.group != ws[0].group or w.tables != ws[0].tables or w.partial) return false;
+        if (w.code != .affine or w.k != ws[0].k or w.bits != ws[0].bits or w.group != ws[0].group or w.tables != ws[0].tables or w.partial) return false;
         widest = @max(widest, w.n);
     }
     const kind = ws[0].tables.table();
@@ -197,7 +222,7 @@ pub fn affineGroup(o: Ops, x: Tensor, ws: []const Affine, m: usize, outs: []Tens
 /// Routed gate and up in one launch, silu(gate) * up as epilogue into x's kind; null when the tile cannot.
 pub fn affineRoutedAct(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
     const z = o.l;
-    if (o.prefill or !o.fused() or x.kind == .f32 or w.n % 2 != 0) return null;
+    if (o.prefill or !o.fused() or x.kind == .f32 or w.n % 2 != 0 or w.code != .affine) return null;
     try w.check();
     const kind = w.tables.table();
     var shape = shapeOf(o, x, w, rows);
@@ -226,6 +251,7 @@ pub fn affineRoutedAct(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, m
 /// matmul_routed: every item (expert, first, count) in one launch over stacked weights; out (pairs, N) fp32.
 pub fn affineRouted(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize) Error!u64 {
     try w.check();
+    if (w.code != .affine) return error.BadShape;
     const out = try o.arena.of(f32, pairs * w.n);
     if (o.prefill) {
         const z = o.l;
@@ -240,6 +266,7 @@ pub fn affineRouted(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, memb
 /// The MLX affine gather: `n` embedding rows of width `table.k` by device ids, dequantized into `out`.
 pub fn embedAffine(o: Ops, table: Affine, ids: u64, n: usize, out: Tensor) Error!void {
     try table.check();
+    if (table.code != .affine) return error.BadShape;
     try o.l.tf_embed_rows(p(table.words), p(table.scale), p(table.bias), @backingInt(table.tables), @ptrFromInt(ids), int(n), table.bits, table.group, int(table.k), p(out.ptr), @backingInt(out.kind), o.stream);
 }
 
