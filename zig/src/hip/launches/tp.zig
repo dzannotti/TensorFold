@@ -52,6 +52,19 @@ pub fn tf_moe_foreign_items(l: *const Launcher, items: I, count: c_int, skip: c_
     try l.go(l.op.moe_foreign_items, dim(blocks(count, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
 }
 
+/// y[(r slots + slot) d + c] = src[r d + c] over `rows` rows of `d` fp32.
+pub fn tf_moe_put_slot(l: *const Launcher, y: F, src: CF, rows: c_longlong, slots: c_int, slot: c_int, d: c_int, s: S) Error!void {
+    if (rows == 0) return;
+    var a: Args = .{};
+    try a.add(ad(y));
+    try a.add(ad(src));
+    try a.add(rows);
+    try a.add(slots);
+    try a.add(slot);
+    try a.add(d);
+    try l.go(l.op.moe_put_slot, dim(blocks(rows * d, 256), 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
 /// Zeroes the rows of `y` (pairs, d) fp32 whose pick is `skip`.
 pub fn tf_moe_zero_foreign(l: *const Launcher, y: F, picks: CI, skip: c_int, pairs: c_longlong, d: c_int, s: S) Error!void {
     if (pairs == 0) return;

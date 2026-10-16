@@ -16,14 +16,47 @@ pub const Tables = struct {
     bits: u8,
     group: usize,
     hasher: ngram.Hasher,
+    /// An FP8 table (INT4-AutoRound's): each code's bf16 value, e4m3 times the table's scale rounded once; a row is
+    /// gathered as its bf16 values (the device reads them as the embedding), with no group tables.
+    fp8: ?*const [256]u16 = null,
 
-    /// Bytes of a row's packed words, and of its scales (as of its biases).
+    /// Bytes of a row's packed words (an FP8 table's bf16 row), and of its scales (as of its biases).
     pub fn wordBytes(t: Tables) usize {
-        return t.dims * t.bits / 8;
+        return if (t.fp8 != null) t.dims * 2 else t.dims * t.bits / 8;
     }
 
     pub fn tableBytes(t: Tables) usize {
-        return t.dims / t.group * 2;
+        return if (t.fp8 != null) 0 else t.dims / t.group * 2;
+    }
+
+    /// The FP8 tables of the PLE layer `layer` (shards `shard_{i}`, one bf16 weight_scale), from the mapped checkpoint.
+    pub fn initFp8(a: std.mem.Allocator, ck: *core.checkpoint.Checkpoint, c: *const config.Config, layer: usize) !Tables {
+        const heads = try c.ngramHeadCount();
+        const dims = c.ple_dim / heads;
+        const shards = try a.alloc(Shard, c.ngram_shards);
+        const starts = try a.alloc(usize, c.ngram_shards + 1);
+        starts[0] = 0;
+        var lb: [128]u8 = undefined;
+        const stem = try std.fmt.allocPrint(a, "{s}.ple.ple_embedding.ngram_embedding", .{try tensors.layer(&lb, layer)});
+        for (shards, 0..) |*s, i| {
+            const w = try ck.get(try std.fmt.allocPrint(a, "{s}.shard_{d}.weight", .{ stem, i }));
+            if (w.dtype != .f8_e4m3 or w.rank != 2 or w.shape[1] != dims) return error.UnexpectedNgramTable;
+            starts[i + 1] = starts[i] + w.shape[0];
+            s.* = .{ .words = w.bytes, .scales = &.{}, .biases = &.{} };
+        }
+        const ref = try config.pleRef(c);
+        var total: usize = 0;
+        for (ref.sizes) |x| total += @intCast(x);
+        if (starts[c.ngram_shards] != try std.math.divCeil(usize, total, c.ngram_divisor) * c.ngram_divisor) return error.UnexpectedNgramTable;
+        const sc = try ck.get(try std.fmt.allocPrint(a, "{s}.weight_scale", .{stem}));
+        if (sc.numel() != 1 or !core.quant.convert.isFloat(sc.dtype) or sc.dtype == .f64) return error.UnexpectedNgramTable;
+        const scale = core.quant.convert.load(sc.dtype, sc.bytes, 0);
+        const lut = try a.create([256]u16);
+        for (lut, 0..) |*v, code| {
+            const x: f32 = @floatCast(core.quant.fp8.e4m3(@intCast(code)));
+            v.* = if (std.math.isNan(x)) 0x7fc0 else core.quant.convert.bf16(x * scale);
+        }
+        return .{ .shards = shards, .starts = starts, .dims = dims, .bits = 8, .group = dims, .hasher = try ngram.Hasher.init(c), .fp8 = lut };
     }
 
     /// The tables of the PLE layer `layer` from the mapped checkpoint; the shards' rows as the reference splits them.
@@ -71,6 +104,11 @@ pub const Tables = struct {
             if (s >= t.shards.len) return error.NgramRowOutOfRange;
             const row = id - t.starts[s];
             const sh = t.shards[s];
+            if (t.fp8) |lut| {
+                const codes = sh.words[row * t.dims ..][0..t.dims];
+                for (codes, 0..) |code, j| std.mem.writeInt(u16, words[i * wb + 2 * j ..][0..2], lut[code], .little);
+                continue;
+            }
             @memcpy(words[i * wb ..][0..wb], sh.words[row * wb ..][0..wb]);
             @memcpy(scales[i * tb ..][0..tb], sh.scales[row * tb ..][0..tb]);
             @memcpy(biases[i * tb ..][0..tb], sh.biases[row * tb ..][0..tb]);

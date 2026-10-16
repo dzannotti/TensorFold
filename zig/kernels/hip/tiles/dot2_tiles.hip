@@ -380,3 +380,5 @@ TF_TILES(8)
 
 }  // namespace rocm
 }  // namespace tf
+
+#include "quant/coded_tiles.hpp"

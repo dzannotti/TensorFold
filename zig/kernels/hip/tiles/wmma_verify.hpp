@@ -65,12 +65,22 @@ __device__ __forceinline__ void verify_for(F&& f) {
 // Where row r's sum of x sits in a slab's sums: a lane reads its eight rows (2 e + half) as two 16-byte words.
 __device__ inline int verify_sum_at(int r) { return (r & ~15) + (r & 1) * 8 + ((r & 15) >> 1); }
 
+// A chunk's codes 16 T .. 16 T + 15 as a B fragment: the affine widths above, a coded decoder's own (quant/coded.hpp).
+template <class Dec, int T>
+__device__ inline bf16x16 verify_frag_of(const uint32_t (&w)[Dec::kBits]) {
+    if constexpr (requires { Dec::kCoded; }) {
+        return Dec::template frag<T, bf16x16>(w);
+    } else {
+        return verify_frag<Dec::kBits, T>(w);
+    }
+}
+
 // Columns 16 W bx.. of the product (or of side s of a group) for rows 16 MT blockIdx.y..; x and sums of x in LDS.
-template <int BITS, int MT, int G, int WV>
-__global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSides sides) {
+template <class Dec, int MT, int G, int WV>
+__device__ __forceinline__ void verify_tile(Affine& a, const StreamSides& sides) {
 #if TF_DEVICE_WMMA_GFX11
     using S = VerifyShape<MT, WV>;
-    using Dec = MlxDecoder<BITS>;
+    constexpr int BITS = Dec::kBits;
     using T = WmmaBF16;
     constexpr int MP = S::rows, W = S::waves, KS = S::ks, LD = S::ld, CPS = KS / 32;
     constexpr int SPT = 8 / CPS;                 // slabs a trip of 8 chunks (256 K)
@@ -120,6 +130,11 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
         const int tt = t < ntrips ? t : ntrips - 1;
 #pragma unroll
         for (int j = 0; j < 4; ++j) Dec::template load<true>(wp + static_cast<long long>(tt * 8 + 4 * half + j) * BITS, w[j]);
+        if constexpr (!Dec::kTerms) {
+#pragma unroll
+            for (int v = 0; v < GPT; ++v) g[v] = 0;
+            return;
+        }
         // lane half 0 loads the trip's scales, half 1 its biases; each takes the other's from its partner lane
         constexpr int NW = GPT / 2 > 0 ? GPT / 2 : 1;
         uint32_t own[NW];
@@ -210,8 +225,8 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
             const uint32_t other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
             w[b] = half == J / 4 ? own : other;
         }
-        const bf16x16 b0 = verify_frag<BITS, 0>(w);
-        const bf16x16 b1 = verify_frag<BITS, 1>(w);
+        const bf16x16 b0 = verify_frag_of<Dec, 0>(w);
+        const bf16x16 b1 = verify_frag_of<Dec, 1>(w);
         if ((c & cpgm) == 0) {
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) d[mt] = zero;
@@ -225,8 +240,8 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
         }
         if ((c & cpgm) == cpgm) {
             const uint32_t g = tr[RB][J / CPG];
-            const float scale = terms.widen(static_cast<unsigned short>(g & 0xffffu));
-            const float bias = terms.widen(static_cast<unsigned short>(g >> 16));
+            const float scale = Dec::term_scale(terms, g);
+            const float bias = Dec::term_bias(terms, g);
             const int seg = KS >= G ? (i * 32) / G : 0;
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
@@ -297,15 +312,26 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
 #endif
 }
 
+template <int BITS, int MT, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSides sides) {
+    verify_tile<MlxDecoder<BITS>, MT, G, WV>(a, sides);
+}
+
+// The verify tile over a coded decoder's weights (quant/coded.hpp).
+template <class Dec, int MT, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) coded_wmma_verify(Affine a, StreamSides sides) {
+    verify_tile<Dec, MT, G, WV>(a, sides);
+}
+
 // The verify tile's sums with K spread over a block's waves, for at most 16 rows and few columns (the A3B's 2048-wide
 // products leave affine_wmma_verify one wave a 16 columns: a few waves a CU, each a chain of every trip of K).
 // A group's WMMA chain starts from zero, so any wave may run it: wave w runs trips w, w + WV, ... and parks each group's
 // 16 x 16 sums, its x sums and its scale and bias in LDS; then each wave folds its elements over the groups in K order.
 // Every sum is affine_wmma_verify's (same chains, same fold), so the outputs carry the same bits.
-template <int BITS, int G, int WV>
-__global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, StreamSides sides) {
+template <class Dec, int G, int WV>
+__device__ __forceinline__ void verify_split_tile(Affine& a, const StreamSides& sides) {
 #if TF_DEVICE_WMMA_GFX11
-    using Dec = MlxDecoder<BITS>;
+    constexpr int BITS = Dec::kBits;
     using T = WmmaBF16;
     constexpr int CPG = G / 32;   // chunks a group
     constexpr int GPT = 8 / CPG;  // groups a trip of 8 chunks (256 K)
@@ -357,7 +383,10 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, St
             uint32_t g[GPT];
 #pragma unroll
             for (int j = 0; j < 4; ++j) Dec::template load<true>(wp + static_cast<long long>(t * 8 + 4 * half + j) * BITS, ring[j]);
-            {
+            if constexpr (!Dec::kTerms) {
+#pragma unroll
+                for (int v = 0; v < GPT; ++v) g[v] = 0;
+            } else {
                 constexpr int NW = GPT / 2 > 0 ? GPT / 2 : 1;
                 uint32_t own[NW];
                 using V = std::conditional_t<GPT == 8, u32x4, std::conditional_t<GPT == 4, uint2, uint32_t>>;
@@ -399,8 +428,8 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, St
                         const uint32_t other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
                         w[b] = half == J / 4 ? own : other;
                     }
-                    const bf16x16 b0 = verify_frag<BITS, 0>(w);
-                    const bf16x16 b1 = verify_frag<BITS, 1>(w);
+                    const bf16x16 b0 = verify_frag_of<Dec, 0>(w);
+                    const bf16x16 b1 = verify_frag_of<Dec, 1>(w);
                     constexpr int C = decltype(cc)::value;
                     const u32x4 x0 = xv[Q][4 * C], x1 = xv[Q][4 * C + 1], x2 = xv[Q][4 * C + 2], x3 = xv[Q][4 * C + 3];
                     d = T::mma(__builtin_bit_cast(bf16x16, __builtin_shufflevector(x0, x1, 0, 1, 2, 3, 4, 5, 6, 7)), b0, d);
@@ -427,8 +456,8 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, St
 #pragma unroll
                 for (int q = 0; q < GPT; ++q) {
                     const uint32_t gq = tl[tt][q][c];
-                    v = Dec::fold_scale(v, dl[tt][q][row >> 1][(row & 1) * 16 + c], terms.widen(static_cast<unsigned short>(gq & 0xffffu)));
-                    v = Dec::fold_bias(v, sxl[tt][q][row], terms.widen(static_cast<unsigned short>(gq >> 16)));
+                    v = Dec::fold_scale(v, dl[tt][q][row >> 1][(row & 1) * 16 + c], Dec::term_scale(terms, gq));
+                    v = Dec::fold_bias(v, sxl[tt][q][row], Dec::term_bias(terms, gq));
                 }
             }
             acc[i] = v;
@@ -453,6 +482,16 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, St
     (void)sides;
     __builtin_trap();
 #endif
+}
+
+template <int BITS, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, StreamSides sides) {
+    verify_split_tile<MlxDecoder<BITS>, G, WV>(a, sides);
+}
+
+template <class Dec, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) coded_wmma_verify_split(Affine a, StreamSides sides) {
+    verify_split_tile<Dec, G, WV>(a, sides);
 }
 
 // Few columns over a long K at few rows (Flash Next's hyper-connection down, 324 x 10240, in a round of at most 4
@@ -532,8 +571,8 @@ __global__ void __launch_bounds__(640) affine_wmma_deal(Affine a, StreamSides si
         const u32x4(&v)[4] = xr[i % A];
         const bf16x16 lo = __builtin_bit_cast(bf16x16, __builtin_shufflevector(v[0], v[1], 0, 1, 2, 3, 4, 5, 6, 7));
         const bf16x16 hi = __builtin_bit_cast(bf16x16, __builtin_shufflevector(v[2], v[3], 0, 1, 2, 3, 4, 5, 6, 7));
-        f32x8 d = T::mma(lo, verify_frag<BITS, 0>(w[i % P]), zero);
-        d = T::mma(hi, verify_frag<BITS, 1>(w[i % P]), d);
+        f32x8 d = T::mma(lo, verify_frag_of<Dec, 0>(w[i % P]), zero);
+        d = T::mma(hi, verify_frag_of<Dec, 1>(w[i % P]), d);
         tr[i] = tp[i % P];
         if (i + P < L) cload(i + P, w[i % P], tp[i % P]);
 #pragma unroll

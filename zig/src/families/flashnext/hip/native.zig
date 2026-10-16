@@ -56,8 +56,12 @@ pub const Verdict = struct {
 /// Admits `c` with the index text `index_json` on rank `rank` of `world` at `window` positions in `room` bytes.
 pub fn admit(a: std.mem.Allocator, gpa: std.mem.Allocator, c: *const config.Config, index_json: []const u8, world: u32, rank: u32, window: u64, room: u64, problem: *[]const u8) Refused!Verdict {
     const spec = c.global_affine;
-    if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
-    _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
+    // INT4-AutoRound (GPTQ 4-bit groups of 128): its own names, checked as the loader reads them (hip/int4ar.zig);
+    // the plan prices every matrix at 4 bits (its float and FP8 ones are wider: the engine measures what is left)
+    if (!c.gptq) {
+        if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
+        _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
+    }
     const w = plan.weights(c, spec, world) catch |err| return refuse(a, problem, "--tp {d} does not split Flash Next's heads, experts and vocabulary evenly ({s})", .{ world, @errorName(err) });
     const token = plan.tokenBytes(c, world, 2) catch return refuse(a, problem, "Flash Next's layer types are unreadable", .{});
     const stream = plan.streamBytes(c, world) catch return refuse(a, problem, "Flash Next's DeltaNet heads do not split over --tp {d}", .{world});

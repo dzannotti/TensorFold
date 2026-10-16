@@ -182,26 +182,32 @@ pub fn experts(a: Allocator, t: anytype, prefix: []const u8) !Experts {
 
 /// `_routed`: router rows [E + 1, D] in bf16 (the shared expert's gate row last), widened once, and the experts.
 pub fn routed(a: Allocator, t: anytype, prefix: []const u8, spec: Shape) !Routed {
+    var r = try router(a, t, prefix, spec);
+    r.experts = try experts(a, t, prefix);
+    if (r.experts.count != r.router.shape[0]) return refuse(prefix, "router and experts disagree on E + 1");
+    return r;
+}
+
+/// The router rows alone (`experts` left undefined for the caller's own stack).
+pub fn router(a: Allocator, t: anytype, prefix: []const u8, spec: Shape) !Routed {
     var b: [2][256]u8 = undefined;
     const gate = try routerRows(a, t, join(&b[0], &.{ prefix, "gate" }));
     const shared_gate = try routerRows(a, t, join(&b[1], &.{ prefix, "shared_expert_gate" }));
     const rows = gate.rows + shared_gate.rows;
     if (gate.cols != shared_gate.cols or rows != spec.experts + 1 or gate.cols != spec.hidden) return refuse(prefix, "router rows do not fit E + 1 by hidden");
-    const router = try a.alloc(u8, rows * gate.cols * 2);
+    const bf = try a.alloc(u8, rows * gate.cols * 2);
     const rows32 = try a.alloc(u8, rows * gate.cols * 4);
     var at: usize = 0;
     for ([_][]f32{ gate.data, shared_gate.data }) |part_rows| for (part_rows) |v| {
         const half = convert.bf16(v);
-        std.mem.writeInt(u16, router[2 * at ..][0..2], half, .little);
+        std.mem.writeInt(u16, bf[2 * at ..][0..2], half, .little);
         std.mem.writeInt(u32, rows32[4 * at ..][0..4], @as(u32, half) << 16, .little);
         at += 1;
     };
-    const ex = try experts(a, t, prefix);
-    if (ex.count != rows) return refuse(prefix, "router and experts disagree on E + 1");
     return .{
-        .router = .{ .dtype = .bf16, .rank = 2, .shape = .{ rows, gate.cols, 1, 1, 1 }, .bytes = router },
+        .router = .{ .dtype = .bf16, .rank = 2, .shape = .{ rows, gate.cols, 1, 1, 1 }, .bytes = bf },
         .rows32 = .{ .dtype = .f32, .rank = 2, .shape = .{ rows, gate.cols, 1, 1, 1 }, .bytes = rows32 },
-        .experts = ex,
+        .experts = undefined,
         .top_k = spec.top_k,
     };
 }
