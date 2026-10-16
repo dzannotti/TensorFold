@@ -256,11 +256,12 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         start[w] = ((exl3_end<K2>(exl3_first(c, h, w)) - 16 + RING) % RING) >> 5;
         off[w] = ((exl3_end<K2>(exl3_first(c, h, w)) - 16 + RING) % RING) & 31;
     }
-    f32x8e acc[NT][MT];
+    // even and odd k steps chain into separate sums (independent WMMAs interleave), added once at the end
+    f32x8e acc[NT][MT], odd[NT][MT];
 #pragma unroll
     for (int n = 0; n < NT; ++n)
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) acc[n][mt] = f32x8e{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int mt = 0; mt < MT; ++mt) acc[n][mt] = odd[n][mt] = f32x8e{0, 0, 0, 0, 0, 0, 0, 0};
 
     if constexpr (MT <= 2) {
         constexpr int D = 4;  // tiles in flight a wave
@@ -282,10 +283,11 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
             const int r = m0 + mt * 16 + c;
             xo[mt] = static_cast<uint32_t>(r < a.m ? r : a.m - 1) * static_cast<uint32_t>(a.k) * 2u;
         }
+        // the tiles' words D - 1 k steps ahead (DRAM), x one ahead (L2)
         uint32_t ring[D][NT][2][LW];
-        u32x8e xa[D][MT];
+        u32x8e xa[2][MT];
         // every load is unconditional on a clamped tile, so the wait counters never drain the ring
-        auto fetch = [&](int i, uint32_t (&r)[NT][2][LW], u32x8e (&x)[MT]) {
+        auto fetch = [&](int i, uint32_t (&r)[NT][2][LW]) {
             const int t = i < tiles ? i : tiles - 1;
 #pragma unroll
             for (int n = 0; n < NT; ++n)
@@ -293,6 +295,9 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
                 for (int w = 0; w < 2; ++w)
 #pragma unroll
                     for (int j = 0; j < LW; ++j) r[n][w][j] = __builtin_amdgcn_raw_buffer_load_b32(tb, idx[n][w][j], t * tstep, 0);
+        };
+        auto xfetch = [&](int i, u32x8e (&x)[MT]) {
+            const int t = i < tiles ? i : tiles - 1;
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 const u32x4e lo = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt], t * 32, 0);
@@ -301,17 +306,22 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
             }
         };
 #pragma unroll
-        for (int i = 0; i < D - 1; ++i) fetch(i, ring[i], xa[i]);
+        for (int i = 0; i < D - 1; ++i) fetch(i, ring[i]);
+        xfetch(0, xa[0]);
         // the launch takes `tiles` a multiple of D
         for (int i0 = 0; i0 < tiles; i0 += D) {
 #pragma unroll
             for (int rb = 0; rb < D; ++rb) {
-                fetch(i0 + rb + D - 1, ring[(rb + D - 1) % D], xa[(rb + D - 1) % D]);
+                fetch(i0 + rb + D - 1, ring[(rb + D - 1) % D]);
+                xfetch(i0 + rb + 1, xa[(rb + 1) & 1]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
 #pragma unroll
-                    for (int mt = 0; mt < MT; ++mt) acc[n][mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb][mt]), b, acc[n][mt]);
+                    for (int mt = 0; mt < MT; ++mt) {
+                        f32x8e& sum = rb & 1 ? odd[n][mt] : acc[n][mt];
+                        sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb & 1][mt]), b, sum);
+                    }
                 }
             }
         }
@@ -392,7 +402,8 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const u32x8e x = *reinterpret_cast<const u32x8e*>(l + xat + mt * 16 * XP + i * 32);
-                    acc[0][mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, acc[0][mt]);
+                    f32x8e& sum = i & 1 ? odd[0][mt] : acc[0][mt];
+                    sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, sum);
                 }
             }
             store((sl + 1) & 1);
@@ -401,6 +412,10 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         }
     }
 
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) acc[n][mt] += odd[n][mt];
     if (a.splits > 1) {
 #pragma unroll
         for (int n = 0; n < NT; ++n)
