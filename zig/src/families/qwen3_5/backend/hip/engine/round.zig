@@ -47,6 +47,8 @@ pub const State = struct {
     last: ?Last = null,
     /// The layout of the plan in flight, for the copy a round starts with.
     layout: plan.Layout = undefined,
+    /// Recorded before each keep's launches (ordering only).
+    before_keep: hip.Event,
 
     pub fn init(e: *Engine) !State {
         const m = e.model();
@@ -63,10 +65,13 @@ pub const State = struct {
         const staging = try e.gpa.alloc(i32, rows + 1);
         errdefer e.gpa.free(staging);
         @memset(staging, -1);
-        return .{ .buffer = buffer, .scratch = scratch, .snaps = snaps, .wins = wins, .staging = staging, .keeps = try hip.HostBuffer.alloc(&e.driver, keep_ring * 4 * (rows + 1)) };
+        var keeps = try hip.HostBuffer.alloc(&e.driver, keep_ring * 4 * (rows + 1));
+        errdefer keeps.free();
+        return .{ .buffer = buffer, .scratch = scratch, .snaps = snaps, .wins = wins, .staging = staging, .keeps = keeps, .before_keep = try hip.Event.init(&e.driver, false) };
     }
 
     pub fn deinit(s: *State, e: *Engine) void {
+        s.before_keep.deinit();
         s.keeps.free();
         e.gpa.free(s.staging);
         e.gpa.free(s.wins);
@@ -258,6 +263,8 @@ pub fn flush(e: *Engine) !void {
     st.ring = (st.ring + 1) % keep_ring;
     @memcpy(words, st.staging[0..slots]);
     @memset(st.staging[0..slots], -1);
+    try st.before_keep.record(e.stream);
     try st.buffer.dev.uploadAsync(last.keep_at, st.keeps.view(from, from + 4 * slots), e.stream);
     try win.keep(e.ops(&e.rounds), e.model(), last.plan, st.buffer.dev.base() + last.keep_at, last.hidden);
+    e.keep_last = true;
 }

@@ -73,6 +73,10 @@ pub const Draft = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     e: *Engine,
+    /// The drafter's own stream: its absorbs and holds run beside the target's keep (they wait for its forward alone).
+    stream: hip.Stream,
+    /// Orders the drafter after the target work it reads (ordering only).
+    ev: hip.Event,
     c: Config,
     w: weights.Weights,
     /// The target's head over the draft vocabulary, its rows copied and tiled.
@@ -118,7 +122,10 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, .{ .hidden = m.spec.hidden, .vocab = m.head.n, .layers = m.spec.n_layers });
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .head = undefined, .head_buf = null, .restricted = false, .cap = @max(cap, 1), .table_rows = 0, .arena = undefined, .stage = undefined, .dev = undefined, .ks = undefined, .ks_chunks = undefined, .att = undefined, .graphs = graph_cache.Cache(Key, u64).init(gpa), .use_graphs = e.headGraphs() };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .stream = try hip.Stream.init(&e.driver), .ev = undefined, .c = c, .w = undefined, .head = undefined, .head_buf = null, .restricted = false, .cap = @max(cap, 1), .table_rows = 0, .arena = undefined, .stage = undefined, .dev = undefined, .ks = undefined, .ks_chunks = undefined, .att = undefined, .graphs = graph_cache.Cache(Key, u64).init(gpa), .use_graphs = e.headGraphs() };
+        errdefer d.stream.deinit();
+        d.ev = try hip.Event.init(&e.driver, false);
+        errdefer d.ev.deinit();
         errdefer d.graphs.deinit();
         d.table_rows = @max(c.window, d.cap * 17);
         d.w = try weights.load(gpa, io, &e.driver, dir, c, bits);
@@ -154,6 +161,7 @@ pub const Draft = struct {
 
     pub fn deinit(d: *Draft) void {
         d.e.drain();
+        d.stream.synchronize() catch {};
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -168,6 +176,8 @@ pub const Draft = struct {
         d.arena.deinit();
         if (d.head_buf) |*b| b.free();
         d.w.deinit(d.gpa);
+        d.ev.deinit();
+        d.stream.deinit();
         d.gpa.destroy(d);
     }
 
@@ -309,7 +319,7 @@ pub const Draft = struct {
     }
 
     fn ops(d: *Draft, prefill: bool) Ops {
-        return .{ .l = &d.e.lib, .bf16 = true, .stream = d.e.stream.handle, .arena = &d.arena, .prefill = prefill };
+        return .{ .l = &d.e.lib, .bf16 = true, .stream = d.stream.handle, .arena = &d.arena, .prefill = prefill };
     }
 
     /// The arena the widest absorb and hold take, counted on the counting stream.
@@ -345,9 +355,16 @@ pub const Draft = struct {
         while (d.pool.items.len < n) d.pool.appendAssumeCapacity(try d.create());
     }
 
+    /// The drafter's stream waits for the target's forward it reads: not for a keep the target queued after it.
+    fn follow(d: *Draft) !void {
+        if (d.e.keepTail()) |before| return d.stream.wait(before);
+        try d.ev.record(d.e.stream);
+        try d.stream.wait(d.ev);
+    }
+
     /// Waits for what the staging areas' queued copies read, once.
     fn settle(d: *Draft) !void {
-        try d.e.stream.synchronize();
+        try d.stream.synchronize();
         d.absorb_busy = false;
         d.hold_busy = false;
         d.synced = true;
@@ -400,8 +417,9 @@ pub const Draft = struct {
             ctx.slot = null;
         }
         if (n == 0) return;
+        try d.follow();
         const at = d.layout().rows;
-        try hip.raw.upload(d.dev, at, d.stage.bytes[at..][0 .. n * @sizeOf(dft.Row)], d.e.stream.handle);
+        try hip.raw.upload(d.dev, at, d.stage.bytes[at..][0 .. n * @sizeOf(dft.Row)], d.stream.handle);
         d.absorb_busy = true;
         var first: usize = 0;
         while (first < n) : (first += absorb_rows) {
@@ -415,13 +433,13 @@ pub const Draft = struct {
 
     fn tick(d: *Draft, o: Ops, label: []const u8) !void {
         const p = d.prof orelse return;
-        if (o.stream != d.e.stream.handle or p.n == p.ev.len) return;
+        if (o.stream != d.stream.handle or p.n == p.ev.len) return;
         if (p.n == p.made) {
             p.ev[p.n] = try hip.Event.init(&d.e.driver, true);
             p.made += 1;
         }
         p.label[p.n] = label;
-        try p.ev[p.n].record(d.e.stream);
+        try p.ev[p.n].record(d.stream);
         p.n += 1;
     }
 
@@ -439,9 +457,9 @@ pub const Draft = struct {
             var picks: [8]u32 = @splat(0);
             var least: f64 = std.math.inf(f64);
             for (0..10) |_| {
-                try a.record(d.e.stream);
+                try a.record(d.stream);
                 try d.absorbAll(&.{.{ .stream = &s, .features = .{ .buffer = taps, .rows = 1, .row_bytes = @intCast(d.c.n_taps * d.c.hidden * 2), .space = .device, .dtype = .bf16 }, .start = ctx.end - 8, .follow = &.{}, .rows = &picks }});
-                try b.record(d.e.stream);
+                try b.record(d.stream);
                 try d.settle();
                 least = @min(least, try hip.Event.elapsedMs(a, b));
             }
@@ -580,7 +598,7 @@ pub const Draft = struct {
     fn launchHold(d: *Draft, streams: usize) !u64 {
         d.arena.reset();
         const o = d.ops(false);
-        const stream = d.e.stream;
+        const stream = d.stream;
         d.graphs.rounds += 1;
         const entry = if (d.use_graphs) try d.graphs.find(.{ .streams = @intCast(streams) }) else null;
         if (entry) |e| switch (e.state) {
@@ -637,19 +655,20 @@ pub const Draft = struct {
             }
         }
         // the descriptors and ids up in one copy, the batch, its results down: no wait until `held`
-        try hip.raw.upload(d.dev, 0, d.stage.bytes[0..at.rows], d.e.stream.handle);
+        try d.follow();
+        try hip.raw.upload(d.dev, 0, d.stage.bytes[0..at.rows], d.stream.handle);
         d.hold_busy = true;
         const hp = try d.launchHold(items.len);
         const rows = items.len * B;
-        try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * c.topk * 4], d.e.stream.handle);
-        try hip.raw.download(d.dev, at.top_vals, d.stage.bytes[at.top_vals..][0 .. rows * c.topk * 2], d.e.stream.handle);
+        try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * c.topk * 4], d.stream.handle);
+        try hip.raw.download(d.dev, at.top_vals, d.stage.bytes[at.top_vals..][0 .. rows * c.topk * 2], d.stream.handle);
         try hipDownload(d, hp, d.stage.bytes[at.hp..][0 .. rows * c.rank * 2]);
         d.synced = false;
         d.held_rows = rows;
     }
 
     fn hipDownload(d: *Draft, src: u64, out: []u8) !void {
-        try hip.runtime.check(d.e.driver.api.hipMemcpyDtoHAsync(out.ptr, @ptrFromInt(src), out.len, d.e.stream.handle));
+        try hip.runtime.check(d.e.driver.api.hipMemcpyDtoHAsync(out.ptr, @ptrFromInt(src), out.len, d.stream.handle));
     }
 
     /// Row `r` of the last hold's `rank`-th candidate after `pred`: its draft-head logit + pred . projected . successor,
@@ -731,9 +750,9 @@ pub const Draft = struct {
         var gpu: f64 = std.math.inf(f64);
         for (0..10) |_| {
             const t0 = std.Io.Clock.awake.now(d.io);
-            try start.record(d.e.stream);
+            try start.record(d.stream);
             try d.holdAll(holds[0..ctxs.len]);
-            try stop.record(d.e.stream);
+            try stop.record(d.stream);
             try d.heldAll(ptrs[0..ctxs.len], outs[0..ctxs.len]);
             wall = @min(wall, @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(d.io)).toNanoseconds())) / 1e6);
             gpu = @min(gpu, try hip.Event.elapsedMs(start, stop));
@@ -832,6 +851,8 @@ pub const Draft = struct {
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
+        // the target frees the stream's taps next: nothing of the drafter's may still read them
+        d.stream.synchronize() catch {};
         if (d.streams.fetchRemove(s)) |kv| d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
     }
 };
