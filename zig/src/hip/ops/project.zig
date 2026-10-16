@@ -33,9 +33,12 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
     switch (proj.handle) {
         .mlx => |h| return affine(o, x, affineOf(proj, h), m, f32_out),
         .dense => |h| {
-            if (f32_out or m == 0 or x.kind == .f32) return error.BadShape;
-            const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * x.kind.size()), .kind = x.kind };
-            try denseRows(o, x, h, out, m, proj.n, proj.k);
+            if (m == 0) return error.BadShape;
+            // the rows store in x's kind: fp32 out reads x widened (exact), the same fp32 sums
+            const wide: Tensor = if (f32_out and x.kind != .f32) .{ .ptr = try o.arena.take(m * proj.k * 4), .kind = .f32 } else x;
+            if (wide.ptr != x.ptr) try @import("elementwise.zig").cast(o, x, wide, m * proj.k);
+            const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * wide.kind.size()), .kind = wide.kind };
+            try denseRows(o, wide, h, out, m, proj.n, proj.k);
             return out;
         },
         .exl3 => |h| return exl3(o, x, proj, h, m, f32_out),
