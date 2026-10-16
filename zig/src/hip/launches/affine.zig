@@ -489,10 +489,10 @@ pub const Kernels = struct {
         return !k.prompt_fold and k.promptTakes(a) and a.scale.kind == 1 and fits;
     }
 
-    /// The dequantizing prompt tile: 256 x 128 blocks where n and k are far apart (gate/up, down, k/v: timed faster),
-    /// else 128 x 256. Either shape adds each output's k in the same order, so the choice never moves a bit.
+    /// The dequantizing prompt tile: 256 x 128 blocks where k is long against n (down, k/v: x read half as often per
+    /// weight), else 128 x 256. Either shape adds each output's k in the same order, so the choice never moves a bit.
     pub fn dqGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
-        return k.dqShape(r, a, s, a.k >= 3 * a.n or a.n >= 3 * a.k);
+        return k.dqShape(r, a, s, a.k >= 3 * a.n);
     }
 
     /// The dequantizing prompt tile at 256 x 128 (`tall`) or 128 x 256 blocks.

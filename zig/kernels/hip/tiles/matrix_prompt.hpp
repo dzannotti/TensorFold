@@ -1,6 +1,7 @@
 #pragma once
 
-// gfx11 WMMA prompt GEMM, MLX 4-bit group 64: wmma_gemm_tile's bits from a pipelined tile and precomputed x group sums.
+// gfx11 WMMA prompt GEMMs, MLX 4-bit group 64: prompt_tile keeps wmma_gemm_tile's bits (an exact per-group fold over
+// precomputed x group sums); prompt_dq_tile dequantizes the weights to bf16 and runs one WMMA chain over all of k.
 
 #include <type_traits>
 #include <utility>
@@ -41,17 +42,20 @@ __device__ inline void prompt_sync() {
 // sx is kept so a lane's eight rows 2 i + h of a 16-row tile are eight neighbours.
 __device__ inline int prompt_sx_at(int r) { return (r & ~15) | ((r & 1) << 3) | ((r & 15) >> 1); }
 
-// Tile t of the launch: groups of 4 M tiles, M fastest, so the blocks in flight share their weights and x in L2.
-__device__ inline void prompt_place(const Affine& a, int t, int& m0, int& n0) {
+// Tile t of a BM x BN launch: bands of 4 M tiles, M fastest, so the blocks in flight share their weights and x in L2.
+template <int BM, int BN>
+__device__ inline void prompt_place_at(const Affine& a, int t, int& m0, int& n0) {
     constexpr int G = 4;
-    const int nt = (a.n + 127) >> 7;
-    const int mt = (a.m + 127) >> 7;
+    const int nt = (a.n + BN - 1) / BN;
+    const int mt = (a.m + BM - 1) / BM;
     const int band = t / (G * nt);
     const int rows = mt - band * G < G ? mt - band * G : G;
     const int in = t - band * G * nt;
-    n0 = (in / rows) * 128;
-    m0 = (band * G + in % rows) * 128;
+    n0 = (in / rows) * BN;
+    m0 = (band * G + in % rows) * BM;
 }
+
+__device__ inline void prompt_place(const Affine& a, int t, int& m0, int& n0) { prompt_place_at<128, 128>(a, t, m0, n0); }
 
 template <class Epi>
 __device__ __forceinline__ void prompt_tile(const Affine& a) {
@@ -319,19 +323,6 @@ struct MlxDq4 {
         }
     }
 };
-
-// Tile t of a BM x BN launch: bands of 4 M tiles, M fastest, so the blocks in flight share their weights and x in L2.
-template <int BM, int BN>
-__device__ inline void prompt_place_at(const Affine& a, int t, int& m0, int& n0) {
-    constexpr int G = 4;
-    const int nt = (a.n + BN - 1) / BN;
-    const int mt = (a.m + BM - 1) / BM;
-    const int band = t / (G * nt);
-    const int rows = mt - band * G < G ? mt - band * G : G;
-    const int in = t - band * G * nt;
-    n0 = (in / rows) * BN;
-    m0 = (band * G + in % rows) * BM;
-}
 
 // A staged row is 32 k (64 bytes, four 16-byte chunks) with no pad: chunk c of row r sits at c ^ ((r >> 1) & 3), so
 // each 8 rows of a fragment read (a pass of 128 bytes) hit 8 different bank groups.
