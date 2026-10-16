@@ -239,6 +239,7 @@ pub const LaneHost = struct {
         h.gpa.free(job.marks);
         const s = &job.stream;
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+        if (job.started and std.c.getenv("TF_LANES_DEBUG") != null) debugStream(s);
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             if (s.grammar) |g| g.deinit(h.gpa);
@@ -568,6 +569,19 @@ pub const LaneHost = struct {
 /// The prompt length a request's kept states count as: its own, or for a warm pass the request whose reply it prefills.
 fn born(r: *const Request) u32 {
     return if (r.born > 0) r.born else @intCast(r.prompt.len);
+}
+
+/// TF_LANES_DEBUG: a finished stream's rounds, drafts kept, the lane planner's picks and its tree lanes taken, on stderr.
+fn debugStream(s: *const lanes.Stream) void {
+    std.debug.print("lanes: rounds {d} drafted {d} accepted {d} tok/round {d:.2} picks", .{ s.rounds, s.drafted, s.accepted, @as(f64, @floatFromInt(s.emitted().len)) / @as(f64, @floatFromInt(@max(s.rounds, 1))) });
+    for (s.picks, 0..) |k, i| if (k > 0) std.debug.print(" {d}:{d}", .{ if (i < lanes.plan_lanes.sizes.len) lanes.plan_lanes.sizes[i] else 0, k });
+    std.debug.print(" taken/seen", .{});
+    for (s.landed, 0..) |by_rank, d| {
+        if (by_rank[0][0] == 0) continue;
+        std.debug.print(" d{d}", .{d});
+        for (by_rank) |x| std.debug.print(" {d}/{d}", .{ x[1], x[0] });
+    }
+    std.debug.print(" over {d:.1} tree_over {d:.1}\n", .{ s.round_over orelse -1, s.tree_over orelse -1 });
 }
 
 test {
