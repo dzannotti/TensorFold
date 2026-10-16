@@ -92,8 +92,9 @@ pub fn denseWave(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: u
     try a.add(@as(c_int, @intCast(rows)));
     try a.add(@as(c_int, @intCast(n)));
     try a.add(@as(c_int, @intCast(k)));
-    // every variant adds a row's products in the same order: the rows a pass never move a bit
-    const which: usize = if (rows == 1) 0 else if (rows <= 4) 1 else 2;
+    // every variant adds a row's products in the same order: the rows a pass never move a bit. Past 4 rows the tile is
+    // ALU-bound (16 rows: wave4 702 us, wave16 1050 us on 9216 x 2048; 1 and 4 rows ~240 GB/s): many rows want WMMA
+    const which: usize = if (rows == 1) 0 else 1;
     const per: usize = ([_]usize{ 1, 4, 16 })[which];
     try l.go(l.op.dense_wave[which], dim(@divFloor(n + 7, 8), @divFloor(rows + per - 1, per), 1), dim(256, 1, 1), 0, s, &a);
 }
