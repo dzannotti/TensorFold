@@ -61,7 +61,8 @@ pub const Config = struct {
             .dense => if (declared.count() == 0) .{ .bits = 16, .group = 0 } else .{ .bits = 8, .group = 128 },
             .mlx => try table.width(""),
         };
-        const spec = try shared.geometry(tower, width.bits, width.group);
+        var spec = try shared.geometry(tower, width.bits, width.group);
+        if (doc.get("model_type")) |k| spec.flash_decode = k == .string and std.mem.eql(u8, k.string, "minicpmv4_7");
         const gen = if (generation) |g| (try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{})) else null;
         if (gen) |g| if (g != .object) return error.InvalidConfig;
         const ids = try a.create([shared.checks.max_eos]u32);

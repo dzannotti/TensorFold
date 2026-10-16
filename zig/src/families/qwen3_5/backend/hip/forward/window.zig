@@ -134,7 +134,7 @@ fn attentionRows(o: Ops, m: *const view.Model, f: view.Full, r: Round, index: us
     try o.qkRope(keys, s.kv_heads * hd, hd, f.k_norm, eps, total, s.kv_heads, hd, s.rotary_dim, theta, r.plan.args.pos, k32, null, 0);
     try pops.kvWrite(o, k32, values, r.plan, index, s.kv_heads, hd);
     const att = try o.arena.of(f32, q_rows * hd);
-    try pops.causal(o, q32, m.act, att, r.plan, index, s.heads, s.kv_heads, hd, r.span, fwd.scaleOf(hd));
+    try pops.causal(o, q32, m.act, att, r.plan, index, s.heads, s.kv_heads, hd, r.span, fwd.scaleOf(hd), s.flash_decode);
     const gated = try fwd.take(o, m.act, q_rows * hd);
     try o.attnGate(att, qg, gated, total, s.heads, hd, true);
     return o.project(gated, f.o, total, f.o.partial);
