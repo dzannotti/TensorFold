@@ -544,36 +544,31 @@ pub const Draft = struct {
             try d.tick(o, "dyn_conv");
             const qkv = try proj(o, xin, l.qkv, M);
             try d.tick(o, "qkv");
-            try o.l.dftNormRope(qkv.ptr, qkv_w, l.q_norm, q, desc, B, M, c.heads, c.eps, c.theta, o.stream);
-            try o.l.dftNormRope(qkv.ptr + c.qWidth() * 2, qkv_w, l.k_norm, kb, desc, B, M, c.kv_heads, c.eps, c.theta, o.stream);
+            try o.l.dftNormRopeQk(qkv.ptr, qkv_w, c.qWidth(), l.q_norm, l.k_norm, q, kb, desc, B, M, c.heads, c.kv_heads, c.eps, c.theta, o.stream);
             try d.tick(o, "norm_rope");
             try o.l.dftAttn(.{ .q = q, .kb = kb, .vb = qkv.ptr + (c.qWidth() + c.kvWidth()) * 2, .vstride = qkv_w, .desc = desc, .layer = li, .streams = streams, .block = B, .heads = c.heads, .kv_heads = c.kv_heads, .ring_rows = c.ringRows(), .window = c.window, .splits = splits, .part = part, .out = att, .ostride = d.attWidth() }, o.stream);
             try d.tick(o, "attn");
-            const ao = try proj(o, .{ .ptr = att, .kind = .bf16 }, l.o, M);
-            try d.tick(o, "o");
-            try o.l.dftDynConv(ao.ptr, dyn.ptr, l.attn_base, h.ptr, h2.ptr, M, H, c.group, 1, B, o.stream);
-            try d.tick(o, "dyn_conv");
+            try projConv(o, .{ .ptr = att, .kind = .bf16 }, l.o, M, .{ .dyn = dyn.ptr, .base = l.attn_base, .res = h.ptr, .group = c.group, .block = B }, h2.ptr);
+            try d.tick(o, "o+conv");
             try o.rms(h2, l.post_norm, x, M, H, c.eps);
             try d.tick(o, "rms");
             const mdyn = try proj(o, x, l.mlp_conv, M);
             try d.tick(o, "mlp_conv");
             try o.l.dftDynConv(x.ptr, mdyn.ptr, l.mlp_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
             try d.tick(o, "dyn_conv");
-            const gu = try pairProj(o, xin, l.gate, l.up, M);
+            const act = try mlpAct(o, xin, l.gate, l.up, M);
             try d.tick(o, "gate+up");
-            try o.siluMul(gu[0], gu[1], gu[0], M * c.intermediate);
-            try d.tick(o, "silu");
-            const down = try proj(o, gu[0], l.down, M);
-            try d.tick(o, "down");
-            try o.l.dftDynConv(down.ptr, mdyn.ptr, l.mlp_base, h2.ptr, h.ptr, M, H, c.group, 1, B, o.stream);
-            try d.tick(o, "dyn_conv");
+            try projConv(o, act, l.down, M, .{ .dyn = mdyn.ptr, .base = l.mlp_base, .res = h2.ptr, .group = c.group, .block = B }, h.ptr);
+            try d.tick(o, "down+conv");
         }
         o.arena.release(mark);
         // the mask rows' best tokens by the draft head, and every row's selector projection (the pending rows' unused)
         try o.rms(h, d.w.final_norm, x, M, H, c.eps);
         try d.tick(o, "rms");
-        const logits = try proj(o, x, .{ .q4 = d.head }, M);
-        try d.tick(o, "head");
+        // the head and the selector's projection of the same rows in one launch
+        const head_sel = try pairProj(o, x, .{ .q4 = d.head }, d.w.selector, M);
+        const logits = head_sel[0];
+        try d.tick(o, "head+sel");
         if (d.head.n % topk_chunks == 0 and topk_chunks * c.topk <= 1024) {
             // each row as topk_chunks rows, their top-k merged: the same set as the whole row's
             const chunk = d.head.n / topk_chunks;
@@ -583,9 +578,7 @@ pub const Draft = struct {
             try o.l.dftTopkMerge(ci, cv, M, topk_chunks, c.topk, chunk, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals, o.stream);
         } else try o.topkRows(logits, M, d.head.n, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals);
         try d.tick(o, "topk");
-        const hp = try proj(o, x, d.w.selector, M);
-        try d.tick(o, "selector");
-        return hp.ptr;
+        return head_sel[1].ptr;
     }
 
     const Recording = struct { d: *Draft, o: Ops, streams: usize };
@@ -861,6 +854,11 @@ pub const Draft = struct {
 pub fn proj(o: Ops, x: Tensor, l: Linear, rows: usize) !Tensor {
     switch (l) {
         .q4 => |p| {
+            if (tileFor(rows, p.n, p.realK())) |v| {
+                const out = try o.arena.take(rows * p.n * 2);
+                try o.l.dftMlx(v, x.ptr, rows, p.realK(), p.k, matOf(p, out), matOf(p, 0), .{}, o.stream);
+                return .{ .ptr = out, .kind = .bf16 };
+            }
             if (weights.mlx_layout) return o.affine(x, affineOf(p), rows, false);
             const out = try o.arena.take(rows * p.n * 2);
             try o.l.dftQ4Rows(x.ptr, p.words, p.scales, p.biases, out, rows, p.n, p.k, o.stream);
@@ -878,9 +876,53 @@ fn affineOf(p: weights.Q4) hip.ops.Affine {
     return .{ .words = p.words, .scale = p.scales, .bias = p.biases, .tables = .bf16, .n = @intCast(p.n), .k = @intCast(p.k), .bits = 4, .group = 64 };
 }
 
+/// The drafter's own MLX tile for a product of `rows` rows (its bits are the verify tile's), or null for the verify tile.
+/// TF_DFT_TILE: verify, w4, w8 or w4x2 for every product (experiments).
+fn tileFor(rows: usize, n: usize, k: usize) ?dft.Mlx {
+    if (!weights.mlx_layout or rows > 16 or k % 256 != 0) return null;
+    if (std.c.getenv("TF_DFT_TILE")) |e| {
+        const v = std.mem.span(e);
+        return if (std.mem.eql(u8, v, "verify")) null else std.meta.stringToEnum(dft.Mlx, v);
+    }
+    // the selector's 256 columns are too few to split
+    return if (n <= 256) null else .w4;
+}
+
+/// dynConv(x l, cv) on branch 1 into `out`: the product's own launch on the drafter's tile, else the product then the conv.
+fn projConv(o: Ops, x: Tensor, l: Linear, rows: usize, cv: dft.Conv, out: u64) !void {
+    if (l == .q4 and std.c.getenv("TF_DFT_NOCONV") == null) if (tileFor(rows, l.q4.n, l.q4.realK())) |v| {
+        const with: ?dft.Mlx = switch (v) {
+            .w2 => .w2conv,
+            .w4 => .w4conv,
+            .w8 => .w8conv,
+            else => null,
+        };
+        if (with) |w| return o.l.dftMlx(w, x.ptr, rows, l.q4.realK(), l.q4.k, matOf(l.q4, out), matOf(l.q4, 0), cv, o.stream);
+    };
+    const y = try proj(o, x, l, rows);
+    try o.l.dftDynConv(y.ptr, cv.dyn, cv.base, cv.res, out, rows, l.rows(), cv.group, 1, cv.block, o.stream);
+}
+
+fn matOf(p: weights.Q4, out: u64) dft.Mat {
+    return .{ .words = p.words, .scale = p.scales, .bias = p.biases, .out = out, .n = @intCast(p.n), .ld = @intCast(p.k) };
+}
+
+/// silu(x gate) * (x up), rounded as tf_silu_mul rounds: one launch on the drafter's tile, else the products and the act.
+fn mlpAct(o: Ops, x: Tensor, gate: Linear, up: Linear, rows: usize) !Tensor {
+    const gu = try pairProj(o, x, gate, up, rows);
+    try o.siluMul(gu[0], gu[1], gu[0], rows * gate.rows());
+    return gu[0];
+}
+
 /// Two products of the same rows: one group launch on the MLX layout (each column's sum as alone), else two.
 fn pairProj(o: Ops, x: Tensor, a: Linear, b: Linear, rows: usize) ![2]Tensor {
-    if (weights.mlx_layout and a == .q4 and b == .q4) {
+    if (a == .q4 and b == .q4 and a.q4.realK() == b.q4.realK() and a.q4.k == b.q4.k and tileFor(rows, a.q4.n, a.q4.realK()) != null) {
+        // one launch, a's tiles then b's: the launch's fill and drain once (gate|up 16 rows: 471 us against 2 x 253)
+        const out = [2]u64{ try o.arena.take(rows * a.q4.n * 2), try o.arena.take(rows * b.q4.n * 2) };
+        try o.l.dftMlx(.pair, x.ptr, rows, a.q4.realK(), a.q4.k, matOf(a.q4, out[0]), matOf(b.q4, out[1]), .{}, o.stream);
+        return .{ .{ .ptr = out[0], .kind = .bf16 }, .{ .ptr = out[1], .kind = .bf16 } };
+    }
+    if (weights.mlx_layout and a == .q4 and b == .q4 and tileFor(rows, a.q4.n, a.q4.realK()) == null) {
         var out: [2]Tensor = undefined;
         if (try o.affineGroup(x, &.{ affineOf(a.q4), affineOf(b.q4) }, rows, &out)) return out;
     }

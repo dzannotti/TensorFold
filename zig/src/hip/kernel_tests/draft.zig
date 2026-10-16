@@ -118,7 +118,7 @@ test "ring put: every layer's keys normed and rotated into slot pos % R, values 
         const ring = got[w.s][l * 2 * R * kvw ..];
         for (0..hd) |d| try rig.expect(near(ring[slot * kvw + h * hd + d], want[d], w.pos), "key row {d} layer {d} head {d} dim {d}: {d} vs {d}", .{ r, l, h, d, bfv(ring[slot * kvw + h * hd + d]), want[d] });
         const vt = ring[R * kvw + h * hd * R ..];
-        for (0..hd) |d| try std.testing.expectEqual(kv[r * stride + l * 2 * kvw + kvw + h * hd + d], vt[d * R + slot]);
+        for (0..hd) |d| try std.testing.expectEqual(kv[r * stride + l * 2 * kvw + kvw + h * hd + d], vt[(slot / 16) * hd * 16 + d * 16 + slot % 16]);
     };
 }
 
@@ -300,7 +300,7 @@ test "block attention: each row's window over a wrapped ring, the context's star
             for (0..hd) |e| {
                 var acc: f64 = 0;
                 for (0..n) |i| {
-                    const v = if (vt[i]) |slot| ring[R * kvw + (kh * hd + e) * R + slot] else vals[i][e];
+                    const v = if (vt[i]) |slot| ring[R * kvw + kh * hd * R + (slot / 16) * hd * 16 + e * 16 + slot % 16] else vals[i][e];
                     acc += scores[i] * bfv(v);
                 }
                 const want: f32 = @floatCast(acc / sum);
@@ -448,5 +448,195 @@ test "top-k merge: chunks' own top k merged give the whole row's, ties to the lo
         };
         std.mem.sort(u32, &order, Desc{ .row = row }, Desc.less);
         for (0..k) |j| try std.testing.expectEqual(@as(i32, @intCast(order[j])), got[r * k + j]);
+    }
+}
+
+test "mlx products: the drafter's tiles write the verify tile's bytes, and gate|up with silu tf_silu_mul's" {
+    const affine = @import("../launches/affine.zig");
+    const Buf = @import("../memory.zig").DeviceBuffer;
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x5eed };
+    const Case = struct { n: usize, k: usize };
+    for ([_]Case{ .{ .n = 96, .k = 512 }, .{ .n = 80, .k = 768 }, .{ .n = 48, .k = 2560 }, .{ .n = 32, .k = 4352 }, .{ .n = 32, .k = 17408 } }) |cs| {
+        const n = cs.n;
+        const k = cs.k;
+        const groups = k / 64;
+        var dw: [2]Buf = undefined;
+        var ds: [2]Buf = undefined;
+        var db: [2]Buf = undefined;
+        for (0..2) |i| {
+            const words = try gpa.alloc(u32, n * k / 8);
+            defer gpa.free(words);
+            for (words) |*w| w.* = @truncate(rng.next());
+            const scales = try randoms(&rng, n * groups, 0.05);
+            defer gpa.free(scales);
+            const biases = try randoms(&rng, n * groups, 0.4);
+            defer gpa.free(biases);
+            dw[i] = try t.upload(words);
+            ds[i] = try t.upload(scales);
+            db[i] = try t.upload(biases);
+        }
+        defer for (0..2) |i| {
+            dw[i].free();
+            ds[i].free();
+            db[i].free();
+        };
+        for ([_]usize{ 1, 5, 16 }) |rows| {
+            const x = try randoms(&rng, rows * k, 2);
+            defer gpa.free(x);
+            var dx = try t.upload(x);
+            defer dx.free();
+            var want: [2]Buf = undefined;
+            for (0..2) |i| {
+                want[i] = try t.alloc(rows * n * 2);
+                const arg: affine.Arg = .{ .x = at(dx), .words = at(dw[i]), .scale = .{ .p = at(ds[i]), .kind = 1 }, .bias = .{ .p = at(db[i]), .kind = 1 }, .out = 0, .out16 = at(want[i]), .m = @intCast(rows), .n = @intCast(n), .k = @intCast(k), .bits = 4, .group = 64, .fp16 = 0 };
+                try t.on.affine.verifyGo(&t.r, arg, .{}, @intCast(n), t.stream.handle);
+            }
+            defer for (&want) |*w| w.free();
+            var act = try t.alloc(rows * n * 2);
+            defer act.free();
+            try t.on.tf_silu_mul(@ptrFromInt(at(want[0])), @ptrFromInt(at(want[1])), @ptrFromInt(at(act)), 2, @intCast(rows * n), t.stream.handle);
+            try t.stream.synchronize();
+            var out = try t.alloc(rows * n * 2);
+            defer out.free();
+            var out2 = try t.alloc(rows * n * 2);
+            defer out2.free();
+            const mats = [2]dft.Mat{
+                .{ .words = at(dw[0]), .scale = at(ds[0]), .bias = at(db[0]), .out = at(out), .n = @intCast(n) },
+                .{ .words = at(dw[1]), .scale = at(ds[1]), .bias = at(db[1]), .out = at(out2), .n = @intCast(n) },
+            };
+            const w1 = try rig.download(u16, want[1]);
+            defer gpa.free(w1);
+            const w0 = try rig.download(u16, want[0]);
+            defer gpa.free(w0);
+            const wa = try rig.download(u16, act);
+            defer gpa.free(wa);
+            // the conv variants: dynConv's branch 1 with a residual over the product
+            const group = 16;
+            const block: usize = if (rows == 16) 16 else 4;
+            const dyn = try randoms(&rng, rows * 4 * (n / group), 1);
+            defer gpa.free(dyn);
+            const cbase = try randoms(&rng, 4 * n, 1);
+            defer gpa.free(cbase);
+            const res = try randoms(&rng, rows * n, 4);
+            defer gpa.free(res);
+            var ddyn = try t.upload(dyn);
+            defer ddyn.free();
+            var dbase = try t.upload(cbase);
+            defer dbase.free();
+            var dres = try t.upload(res);
+            defer dres.free();
+            var conv = try t.alloc(rows * n * 2);
+            defer conv.free();
+            try t.on.dftDynConv(at(want[0]), at(ddyn), at(dbase), at(dres), at(conv), rows, n, group, 1, block, t.stream.handle);
+            try t.stream.synchronize();
+            const wc = try rig.download(u16, conv);
+            defer gpa.free(wc);
+            const cv: dft.Conv = .{ .dyn = at(ddyn), .base = at(dbase), .res = at(dres), .group = group, .block = block };
+            for ([_]dft.Mlx{ .w4conv, .w8conv, .w2conv }) |v| {
+                try out.fill8(0xff);
+                try t.on.dftMlx(v, at(dx), rows, k, 0, mats[0], mats[1], cv, t.stream.handle);
+                try t.stream.synchronize();
+                const got = try rig.download(u16, out);
+                defer gpa.free(got);
+                for (got, wc, 0..) |g, r, i| try rig.expect(g == r, "{s} n {d} k {d} rows {d}: element {d} {x} vs {x}", .{ @tagName(v), n, k, rows, i, g, r });
+            }
+            for ([_]dft.Mlx{ .w4, .w8, .w4x2, .act, .w2, .pair }) |v| {
+                try out.fill8(0xff);
+                try t.on.dftMlx(v, at(dx), rows, k, 0, mats[0], mats[1], .{}, t.stream.handle);
+                try t.stream.synchronize();
+                const got = try rig.download(u16, out);
+                defer gpa.free(got);
+                const ref = if (v == .act) wa else w0;
+                for (got, ref, 0..) |g, r, i| try rig.expect(g == r, "{s} n {d} k {d} rows {d}: element {d} {x} vs {x}", .{ @tagName(v), n, k, rows, i, g, r });
+                if (v == .pair) {
+                    const got2 = try rig.download(u16, out2);
+                    defer gpa.free(got2);
+                    for (got2, w1, 0..) |g, r, i| try rig.expect(g == r, "pair b n {d} k {d} rows {d}: element {d} {x} vs {x}", .{ n, k, rows, i, g, r });
+                }
+            }
+        }
+    }
+}
+
+test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1)" {
+    if (std.c.getenv("TF_DFT_BENCH") == null) return;
+    const affine = @import("../launches/affine.zig");
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    // ld: a row's k as stored (zero codes past k, never read)
+    const Shape = struct { name: []const u8, n: usize, k: usize, ld: usize = 0 };
+    const all = [_]Shape{
+        .{ .name = "conv", .n = 1280, .k = 5120 },
+        .{ .name = "conv/5376", .n = 1280, .k = 5120, .ld = 5376 },
+        .{ .name = "qkv", .n = 6144, .k = 5120 },
+        .{ .name = "qkv/5376", .n = 6144, .k = 5120, .ld = 5376 },
+        .{ .name = "o/4096", .n = 5120, .k = 4096 },
+        .{ .name = "o/4352", .n = 5120, .k = 4096, .ld = 4352 },
+        .{ .name = "o+256", .n = 5120, .k = 4352 },
+        .{ .name = "down", .n = 5120, .k = 17408 },
+        .{ .name = "down/17664", .n = 5120, .k = 17408, .ld = 17664 },
+        .{ .name = "gate", .n = 17408, .k = 5120 },
+        .{ .name = "gate/5376", .n = 17408, .k = 5120, .ld = 5376 },
+        .{ .name = "head", .n = 98592, .k = 5120 },
+        .{ .name = "head/5376", .n = 98592, .k = 5120, .ld = 5376 },
+        .{ .name = "selector", .n = 256, .k = 5120 },
+    };
+    const want: ?[]const u8 = if (std.c.getenv("TF_DFT_BENCH_SHAPE")) |e| std.mem.span(e) else null;
+    const m = 16;
+    const spread = 256 << 20;
+    std.debug.print("\nshape        variant     us     GB/s\n", .{});
+    for (all) |sh| {
+        if (want) |w| if (std.mem.indexOf(u8, w, sh.name) == null) continue;
+        const ld = if (sh.ld == 0) sh.k else sh.ld;
+        const wbytes = sh.n * ld / 2;
+        const tbytes = sh.n * ld / 64 * 2;
+        const real = sh.n * sh.k / 2 + 2 * (sh.n * sh.k / 64 * 2);
+        const copies = @max(2, spread / (wbytes + 2 * tbytes));
+        var words = try t.alloc(copies * wbytes);
+        defer words.free();
+        var tables = try t.alloc(copies * 2 * tbytes);
+        defer tables.free();
+        var x = try t.alloc(m * sh.k * 2);
+        defer x.free();
+        var out = try t.alloc(m * sh.n * 2);
+        defer out.free();
+        try words.fill8(0x95);
+        try tables.fill8(0x3c);
+        try x.fill8(0x3f);
+        // verify (the engine's), then each drafter variant; .act runs gate and up (twice the bytes, counted as two)
+        for ([_]?dft.Mlx{ null, .w4, .act, .pair }) |v| {
+            if (v == null and ld != sh.k) continue;
+            var times: [7]f64 = undefined;
+            const launches = @max(copies, 8);
+            for (0..times.len + 1) |r| {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &ts);
+                const t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+                var i: usize = 0;
+                while (i < launches) : (i += if (v == .act or v == .pair) 2 else 1) {
+                    const c = i % copies;
+                    const c2 = (i + 1) % copies;
+                    const w = at(words) + c * wbytes;
+                    const sc = at(tables) + c * 2 * tbytes;
+                    if (v) |vv| {
+                        const a: dft.Mat = .{ .words = w, .scale = sc, .bias = sc + tbytes, .out = at(out), .n = @intCast(sh.n), .ld = @intCast(ld) };
+                        const b: dft.Mat = .{ .words = at(words) + c2 * wbytes, .scale = at(tables) + c2 * 2 * tbytes, .bias = at(tables) + c2 * 2 * tbytes + tbytes, .out = at(out), .n = @intCast(sh.n), .ld = @intCast(ld) };
+                        try t.on.dftMlx(vv, at(x), m, sh.k, 0, a, b, .{}, t.stream.handle);
+                    } else {
+                        const arg: affine.Arg = .{ .x = at(x), .words = w, .scale = .{ .p = sc, .kind = 1 }, .bias = .{ .p = sc + tbytes, .kind = 1 }, .out = 0, .out16 = at(out), .m = m, .n = @intCast(sh.n), .k = @intCast(sh.k), .bits = 4, .group = 64, .fp16 = 0 };
+                        try t.on.affine.verifyGo(&t.r, arg, .{}, @intCast(sh.n), t.stream.handle);
+                    }
+                }
+                try t.stream.synchronize();
+                _ = std.c.clock_gettime(.MONOTONIC, &ts);
+                const t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+                if (r > 0) times[r - 1] = @as(f64, @floatFromInt(t1 - t0)) / 1e3 / @as(f64, @floatFromInt(launches));
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const us = times[times.len / 2];
+            std.debug.print("{s:<12} {s:<8} {d:>8.1} {d:>8.1}\n", .{ sh.name, if (v) |vv| @tagName(vv) else "verify", us, @as(f64, @floatFromInt(real)) / us / 1e3 });
+        }
     }
 }

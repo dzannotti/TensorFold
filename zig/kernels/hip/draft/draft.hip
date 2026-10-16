@@ -77,7 +77,7 @@ extern "C" __global__ void tf_dft_gather(const DftRow* rows, int width, uint4* o
 }
 
 // Absorbed rows' keys and values into every layer's ring: KV row (stride `stride`) holds layer l's k at 2 l kvw, v after.
-// A layer's ring: keys (R, kv_heads, HD) then values transposed (kv_heads, HD, R). Grid (rows, layers * kv_heads), 32 threads.
+// A layer's ring: keys (R, kv_heads, HD) then values transposed by 16-slot tiles (kv_heads, R / 16, HD, 16). Grid (rows, layers * kv_heads), 32 threads.
 extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put(const uint16_t* KV, long long stride, const DftRow* rows, const float* knorm,
                                                                  int kv_heads, int R, float eps, float theta) {
     const int r = blockIdx.x;
@@ -95,7 +95,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put(const uint16_t*
     const uint16_t* v = k + kvw;
     uint16_t* vt = ring + static_cast<size_t>(R) * kvw + static_cast<size_t>(h) * HD * R;
 #pragma unroll
-    for (int i = 0; i < 4; i++) vt[static_cast<size_t>(4 * t + i) * R + slot] = v[4 * t + i];
+    for (int i = 0; i < 4; i++) vt[(slot / 16) * HD * 16 + static_cast<size_t>(4 * t + i) * 16 + slot % 16] = v[4 * t + i];
 }
 
 // Block rows' q or k heads normed and rotated at desc[row / block].pos0 + row % block; OUT packed (rows, heads, HD).
@@ -108,6 +108,23 @@ extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope(const uint16_t
     float out[4];
     norm_rope4(X + row * stride + head * HD, W, eps, theta, pos, out);
     uint16_t* o = OUT + (static_cast<size_t>(row) * heads + head) * HD + 4 * threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 4; i++) o[i] = tobf(out[i]);
+}
+
+// tf_dft_norm_rope on the q heads (rows x heads blocks) then the k heads at X + koff (rows x kv_heads), in one launch.
+extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope_qk(const uint16_t* X, long long stride, long long koff, const float* WQ,
+                                                                     const float* WK, uint16_t* QO, uint16_t* KO, const DftDesc* desc,
+                                                                     int block, int rows, int heads, int kv_heads, float eps, float theta) {
+    const bool q = static_cast<int>(blockIdx.x) < rows * heads;
+    const int b = q ? blockIdx.x : blockIdx.x - rows * heads;
+    const int hs = q ? heads : kv_heads;
+    const int head = b % hs;
+    const int row = b / hs;
+    const long long pos = desc[row / block].pos0 + row % block;
+    float out[4];
+    norm_rope4((q ? X : X + koff) + row * stride + head * HD, q ? WQ : WK, eps, theta, pos, out);
+    uint16_t* o = (q ? QO : KO) + (static_cast<size_t>(row) * hs + head) * HD + 4 * threadIdx.x;
 #pragma unroll
     for (int i = 0; i < 4; i++) o[i] = tobf(out[i]);
 }
@@ -244,12 +261,41 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
             o[i] = mma(vfrag(i), pf, c);
         }
     };
+    // a tile's keys (16, HD) and values transposed (HD, 16) staged in LDS by the whole block, the next one loading while
+    // this one runs (the waves read the same tile); rows padded off the banks
+    constexpr int KLD = HD + 8, VLD = kTile + 8;
+    __shared__ __attribute__((aligned(16))) uint16_t ks[2][kTile * KLD];
+    __shared__ __attribute__((aligned(16))) uint16_t vs[2][HD * VLD];
+    uint4 kr[2], vr[2];
+    auto tload = [&](int t) {
+        const size_t slot0 = static_cast<size_t>((base + static_cast<long long>(t) * kTile) % R);
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int p = threadIdx.x + 128 * j;  // 256 pieces of 16 bytes each
+            kr[j] = *reinterpret_cast<const uint4*>(RK + (slot0 + p / 16) * kvw + kvh * HD + (p % 16) * 8);
+            vr[j] = *reinterpret_cast<const uint4*>(RVT + slot0 * HD + p * 8);
+        }
+    };
+    auto tstore = [&](int b) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int p = threadIdx.x + 128 * j;
+            *reinterpret_cast<uint4*>(&ks[b][(p / 16) * KLD + (p % 16) * 8]) = kr[j];
+            *reinterpret_cast<uint4*>(&vs[b][(p / 2) * VLD + (p % 2) * 8]) = vr[j];
+        }
+    };
+    if (t0 < t1) {
+        tload(t0);
+        tstore(0);
+    }
+    __syncthreads();
     for (int t = t0; t < t1; t++) {
+        const int b = (t - t0) & 1;
+        if (t + 1 < t1) tload(t + 1);
         const long long p0 = base + static_cast<long long>(t) * kTile;
-        const size_t slot0 = static_cast<size_t>(p0 % R);
         // S^T = K Q^T: A the keys (this lane's key `col`), B the queries
         f32x8 s = {0, 0, 0, 0, 0, 0, 0, 0};
-        const uint16_t* kp = RK + (slot0 + col) * kvw + kvh * HD;
+        const uint16_t* kp = &ks[b][col * KLD];
 #pragma unroll
         for (int u = 0; u < HD / 16; u++) s = mma(load16(kp + 16 * u), qf[u], s);
 #pragma unroll
@@ -257,7 +303,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
             const long long kpos = p0 + 2 * i + half;
             s[i] = (qlive && kpos >= first && kpos < d.pos0) ? s[i] * scale : -INFINITY;
         }
-        step(s, [&](int i) { return load16(RVT + static_cast<size_t>(16 * i + col) * R + slot0); });
+        step(s, [&](int i) { return load16(&vs[b][(16 * i + col) * VLD]); });
+        if (t + 1 < t1) tstore(b ^ 1);
+        __syncthreads();
     }
     if (split == splits - 1) {
         // the block's own rows, every one visible to every block row (zeros past the block)
@@ -511,3 +559,280 @@ extern "C" __global__ void tf_dft_topk_merge(const int* CI, const uint16_t* CV, 
         values[r * stride + rank] = CV[static_cast<size_t>(r) * n + i];
     }
 }
+
+// ---- the drafter's MLX affine-4 group-64 products at up to 16 rows (tiles/wmma_verify.hpp's split tile, same bits) ----
+
+// One matrix of a product: MLX words (n, k / 8), bf16 scales and biases (n, k / 64), its bf16 output (rows, n).
+struct DftMat {
+    const uint32_t* words;
+    const uint16_t* scale;
+    const uint16_t* bias;
+    uint16_t* out;
+    int n;
+    int ld;  // a row's k as stored (zero codes past k), 0: k
+};
+
+// X (m <= 16 rows, k a multiple of 256) bf16 against `a`, CT 16-column tiles a block; with ACT, a block's tile 0 the gate
+// `a`'s and tile 1 the up `b`'s same columns, written as silu(gate) * up (tf_silu_mul's roundings) into a.out.
+struct DftMlx {
+    const uint16_t* x;
+    int m;
+    int k;
+    DftMat a;
+    DftMat b;
+    // with CONV, a.out = tf_dft_dyn_conv(product, dyn, base, res) on branch 1: the product's rows, `block` a stream
+    const uint16_t* dyn;
+    const uint16_t* base;
+    const uint16_t* res;
+    int group;
+    int block;
+    int ldx;  // x's row stride, 0: k
+};
+
+namespace {
+
+using tf::rocm::u32x4;
+using tf::rocm::u32x8;
+
+// Codes 16 T .. 16 T + 15 of a 32-code chunk (4 words, low nibble first) as a WMMA B fragment: verify_frag<4, T>.
+template <int T>
+__device__ __forceinline__ bf16x16 dft_frag(const uint32_t (&w)[4]) {
+    u32x8 f;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint32_t n0 = w[2 * T + h] & 0x0f0f0f0fu;
+        const uint32_t n1 = (w[2 * T + h] >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t lo = __float_as_uint(static_cast<float>((n0 >> (8 * j)) & 0xffu));
+            const uint32_t hi = __float_as_uint(static_cast<float>((n1 >> (8 * j)) & 0xffu));
+            f[4 * h + j] = __builtin_amdgcn_perm(hi, lo, 0x07060302u);
+        }
+    }
+    return __builtin_bit_cast(bf16x16, f);
+}
+
+}  // namespace
+
+// The split tile's sums: per 16 x 16 tile and group, a WMMA chain from zero over the group's 64 k, then the fold
+// acc = fma(dot, scale, acc); acc = fma(sum_x, bias, acc) in k order (sum_x: the row's x over the group, lo then hi of
+// each pair). Wave w makes trips (256 k) w, w + WV, ... of every tile of the block, parks the sums in LDS, then all fold;
+// with PH the tiles take turns in one tile's LDS.
+template <int WV, int CT, bool ACT, bool CONV, bool PH = false, bool PAIR = false>
+__device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
+#if TF_DEVICE_WMMA_GFX11
+    constexpr int GPT = 4;                  // groups a trip
+    constexpr int EPL = 256 / (32 * WV);    // elements of a tile a lane folds
+    constexpr int LT = PH ? 1 : CT;         // tiles parked at once
+    __shared__ float dl[WV][LT][GPT][8][32];
+    __shared__ float sxl[WV][GPT][16];
+    __shared__ uint32_t tl[WV][CT][GPT][16];
+    __shared__ uint16_t ob[CONV ? CT : 1][16][16];
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int half = lane >> 4;
+    const int live = p.m < 16 ? p.m : 16;
+    const int K = p.k;
+    const int nch = K >> 5;
+    const int ntrips = nch >> 3;
+    // PAIR: the first blocks a's tiles, the rest b's (two products of the same x in one launch)
+    const int blocks_a = (p.a.n + 16 * CT - 1) / (16 * CT);
+    const bool second = PAIR && static_cast<int>(blockIdx.x) >= blocks_a;
+    const int bx = second ? blockIdx.x - blocks_a : blockIdx.x;
+    const DftMat& om = second ? p.b : p.a;
+    const uint32_t* wp[CT];
+    const uint32_t* sp[CT];
+#pragma unroll
+    for (int c = 0; c < CT; ++c) {
+        const DftMat& mt = ACT && c == 1 ? p.b : om;
+        const int col = ACT ? bx * 16 + (lane & 15) : (bx * CT + c) * 16 + (lane & 15);
+        const int col_s = col < mt.n ? col : mt.n - 1;
+        const int ld = mt.ld ? mt.ld : K;
+        wp[c] = mt.words + static_cast<long long>(col_s) * (ld / 8);
+        // lane half 0 reads the scales, half 1 the biases
+        sp[c] = reinterpret_cast<const uint32_t*>((half ? mt.bias : mt.scale) + static_cast<long long>(col_s) * (ld / 64));
+    }
+    const int xrow = (lane & 15) < live ? (lane & 15) : live - 1;
+    const uint32_t* xg = reinterpret_cast<const uint32_t*>(p.x + static_cast<long long>(xrow) * (p.ldx ? p.ldx : K));
+
+    float acc[CT][EPL];
+#pragma unroll
+    for (int c = 0; c < CT; ++c)
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) acc[c][i] = 0.f;
+
+    for (int ss = 0; ss < ntrips; ss += WV) {
+        const int t = ss + wave;
+        f32x8 dsv[CT][GPT];
+        if (t < ntrips) {
+            uint32_t ring[CT][4][4];
+            uint32_t g[CT][GPT];
+#pragma unroll
+            for (int c = 0; c < CT; ++c) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const u32x4 v = *reinterpret_cast<const u32x4*>(wp[c] + static_cast<long long>(t * 8 + 4 * half + j) * 4);
+                    ring[c][j][0] = v.x;
+                    ring[c][j][1] = v.y;
+                    ring[c][j][2] = v.z;
+                    ring[c][j][3] = v.w;
+                }
+                const uint2 own = *reinterpret_cast<const uint2*>(sp[c] + t * 2);
+                const uint32_t ow[2] = {own.x, own.y};
+#pragma unroll
+                for (int v = 0; v < 2; ++v) {
+                    const uint32_t other = __builtin_amdgcn_permlanex16(ow[v], ow[v], 0x76543210u, 0xfedcba98u, false, false);
+                    const uint32_t sw = half ? other : ow[v];
+                    const uint32_t bw = half ? ow[v] : other;
+                    g[c][2 * v] = (sw & 0xffffu) | (bw << 16);
+                    g[c][2 * v + 1] = (sw >> 16) | (bw & 0xffff0000u);
+                }
+            }
+            u32x4 xv[GPT][8];
+#pragma unroll
+            for (int q = 0; q < GPT; ++q)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) xv[q][v] = *reinterpret_cast<const u32x4*>(xg + (t * 256 + q * 64) / 2 + 4 * v);
+#pragma unroll
+            for (int q = 0; q < GPT; ++q) {
+                float run = 0.f;
+#pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const uint32_t q4[4] = {xv[q][v].x, xv[q][v].y, xv[q][v].z, xv[q][v].w};
+#pragma unroll
+                    for (int h = 0; h < 4; ++h) {
+                        run += __uint_as_float(q4[h] << 16);
+                        run += __uint_as_float(q4[h] & 0xffff0000u);
+                    }
+                }
+                const bf16x16 xa0 = __builtin_bit_cast(bf16x16, __builtin_shufflevector(xv[q][0], xv[q][1], 0, 1, 2, 3, 4, 5, 6, 7));
+                const bf16x16 xa1 = __builtin_bit_cast(bf16x16, __builtin_shufflevector(xv[q][2], xv[q][3], 0, 1, 2, 3, 4, 5, 6, 7));
+                const bf16x16 xa2 = __builtin_bit_cast(bf16x16, __builtin_shufflevector(xv[q][4], xv[q][5], 0, 1, 2, 3, 4, 5, 6, 7));
+                const bf16x16 xa3 = __builtin_bit_cast(bf16x16, __builtin_shufflevector(xv[q][6], xv[q][7], 0, 1, 2, 3, 4, 5, 6, 7));
+#pragma unroll
+                for (int c = 0; c < CT; ++c) {
+                    f32x8 d = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+                    for (int cc = 0; cc < 2; ++cc) {
+                        const int J = q * 2 + cc;
+                        uint32_t w[4];
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const uint32_t own = ring[c][J % 4][b];
+                            const uint32_t other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
+                            w[b] = half == J / 4 ? own : other;
+                        }
+                        d = mma(cc ? xa2 : xa0, dft_frag<0>(w), d);
+                        d = mma(cc ? xa3 : xa1, dft_frag<1>(w), d);
+                    }
+                    dsv[c][q] = d;
+                    if (lane < 16) tl[wave][c][q][lane] = g[c][q];
+                }
+                if (lane < 16) sxl[wave][q][lane] = run;
+            }
+        }
+        const int trips = ntrips - ss < WV ? ntrips - ss : WV;
+#pragma unroll
+        for (int ph = 0; ph < CT / LT; ++ph) {
+            if (t < ntrips) {
+#pragma unroll
+                for (int l = 0; l < LT; ++l)
+#pragma unroll
+                    for (int q = 0; q < GPT; ++q)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) dl[wave][l][q][e][lane] = dsv[ph * LT + l][q][e];
+            }
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < EPL; ++i) {
+                const int e = i * 32 * WV + wave * 32 + lane;
+                const int row = e >> 4, cl = e & 15;
+                if (row >= live) continue;
+#pragma unroll
+                for (int l = 0; l < LT; ++l) {
+                    const int c = ph * LT + l;
+                    float v = acc[c][i];
+                    for (int tt = 0; tt < trips; ++tt) {
+#pragma unroll
+                        for (int q = 0; q < GPT; ++q) {
+                            const uint32_t gq = tl[tt][c][q][cl];
+                            v = fmaf(dl[tt][l][q][row >> 1][(row & 1) * 16 + cl], bf(static_cast<uint16_t>(gq & 0xffffu)), v);
+                            v = fmaf(sxl[tt][q][row], bf(static_cast<uint16_t>(gq >> 16)), v);
+                        }
+                    }
+                    acc[c][i] = v;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+        const int e = i * 32 * WV + wave * 32 + lane;
+        const int row = e >> 4, cl = e & 15;
+        if (row >= p.m) continue;
+        if constexpr (ACT) {
+            const int c = bx * 16 + cl;
+            if (c >= p.a.n) continue;
+            // tf_silu_mul over the rounded gate and up: s = bf16(silu(gate)), out = bf16(s * up)
+            const float gv = bf(tobf(acc[0][i]));
+            const float uv = bf(tobf(acc[1][i]));
+            const float s = rbf(gv / (1.0f + expf(-gv)));
+            p.a.out[static_cast<long long>(row) * p.a.n + c] = tobf(s * uv);
+        } else if constexpr (CONV) {
+#pragma unroll
+            for (int c = 0; c < CT; ++c) ob[c][row][cl] = tobf(acc[c][i]);
+        } else {
+#pragma unroll
+            for (int c = 0; c < CT; ++c) {
+                const int col = (bx * CT + c) * 16 + cl;
+                if (col < om.n) om.out[static_cast<long long>(row) * om.n + col] = tobf(acc[c][i]);
+            }
+        }
+    }
+    if constexpr (CONV) {
+        // tf_dft_dyn_conv's branch 1 with its residual over the rounded product, row t - 1 from the tile
+        __syncthreads();
+        const int D = p.a.n;
+        const int groups = D / p.group;
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) {
+            const int e = i * 32 * WV + wave * 32 + lane;
+            const int t = e >> 4, cl = e & 15;
+            if (t >= p.m) continue;
+            const int lags = t % p.block == 0 ? 1 : 2;
+#pragma unroll
+            for (int c = 0; c < CT; ++c) {
+                const int col = (bx * CT + c) * 16 + cl;
+                if (col >= D) continue;
+                const int g = col / p.group;
+                float total = 0.f;
+                for (int l = 0; l < lags; l++) {
+                    const float xv = bf(ob[c][t - l][cl]);
+                    total = rbf(total + rbf(bf(p.base[(2 + l) * D + col]) * xv));
+                    total = rbf(total + rbf(bf(p.dyn[static_cast<size_t>(t) * (4 * groups) + (2 + l) * groups + g]) * xv));
+                }
+                total = rbf(total + bf(p.res[static_cast<size_t>(t) * D + col]));
+                p.a.out[static_cast<size_t>(t) * D + col] = tobf(total);
+            }
+        }
+    }
+#else
+    (void)p;
+    __builtin_trap();
+#endif
+}
+
+#define TF_DFT_MLX(WV, CT, ACT, CONV, NAME) \
+    extern "C" __global__ void __launch_bounds__(32 * WV) NAME(DftMlx p) { dft_mlx_tile<WV, CT, ACT, CONV>(p); }
+TF_DFT_MLX(4, 1, false, false, tf_dft_mlx_w4c1)
+TF_DFT_MLX(8, 1, false, false, tf_dft_mlx_w8c1)
+TF_DFT_MLX(4, 2, false, false, tf_dft_mlx_w4c2)
+extern "C" __global__ void __launch_bounds__(128) tf_dft_mlx_w4act(DftMlx p) { dft_mlx_tile<4, 2, true, false, true>(p); }
+TF_DFT_MLX(4, 1, false, true, tf_dft_mlx_w4conv)
+TF_DFT_MLX(8, 1, false, true, tf_dft_mlx_w8conv)
+TF_DFT_MLX(2, 1, false, false, tf_dft_mlx_w2c1)
+TF_DFT_MLX(2, 1, false, true, tf_dft_mlx_w2conv)
+extern "C" __global__ void __launch_bounds__(128) tf_dft_mlx_w4pair(DftMlx p) { dft_mlx_tile<4, 1, false, false, false, true>(p); }
+#undef TF_DFT_MLX

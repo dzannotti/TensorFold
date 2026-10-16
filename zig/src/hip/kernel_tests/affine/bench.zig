@@ -28,6 +28,11 @@ const shapes = [_]Shape{
     .{ .name = "dft o 2x", .n = 10240, .k = 4096 },
     .{ .name = "dft gate", .n = 17408, .k = 5120 },
     .{ .name = "dft head", .n = 98592, .k = 5120 },
+    .{ .name = "dft gu", .n = 34816, .k = 5120 },
+    .{ .name = "dft qkv+256", .n = 6144, .k = 5376 },
+    .{ .name = "dft gate+256", .n = 17408, .k = 5376 },
+    .{ .name = "dft down+256", .n = 5120, .k = 17664 },
+    .{ .name = "dft conv+256", .n = 1280, .k = 5376 },
 };
 /// Flash Next 3-bit (MLX group 32): its dense decode products.
 const fn3 = [_]Shape{
@@ -62,12 +67,14 @@ test "affine decode timings on the 27B shapes (TF_AFFINE_BENCH=1)" {
     const b = try base.Rig.open(1 << 20);
     defer b.close();
     const k = &b.on.affine;
+    const dft_only = if (std.c.getenv("TF_AFFINE_BENCH_SET")) |v| std.mem.eql(u8, std.mem.span(v), "dft") else false;
     const flash = if (std.c.getenv("TF_AFFINE_BENCH_SET")) |v| std.mem.eql(u8, std.mem.span(v), "fn3") else false;
     const bits: c_int = if (flash) 3 else 4;
     const group: c_int = if (flash) 32 else 64;
     const s = b.stream.handle;
     std.debug.print("\nshape        M   entry                          us      GB/s   TFLOPS\n", .{});
     for (if (flash) &fn3 else &shapes) |sh| {
+        if (dft_only and !std.mem.startsWith(u8, sh.name, "dft")) continue;
         const words_row = sh.k * @as(usize, @intCast(bits)) / 32;
         const groups = sh.k / @as(usize, @intCast(group));
         const wbytes = sh.n * words_row * 4;
@@ -84,7 +91,7 @@ test "affine decode timings on the 27B shapes (TF_AFFINE_BENCH=1)" {
         try words.buf.fill32(0x7b3d1e95);
         try tables.buf.fill32(0x3c003c00);
         try x.buf.fill32(0x3f803f80);
-        for (if (quick) &[_]c_int{ 1, 16, 128 } else &rows) |m| {
+        for (if (dft_only) &[_]c_int{16} else if (quick) &[_]c_int{ 1, 16, 128 } else &rows) |m| {
             var arg: affine.Arg = .{ .x = x.ptr, .words = words.ptr, .scale = .{ .p = tables.ptr, .kind = 1 }, .bias = .{ .p = tables.ptr + tbytes, .kind = 1 }, .out = 0, .out16 = out.ptr, .m = m, .n = @intCast(sh.n), .k = @intCast(sh.k), .bits = bits, .group = group, .fp16 = 0 };
             var shape = affine.Kernels.shapeOf(arg, 1);
             shape.round = true;
