@@ -237,8 +237,8 @@ __device__ inline void prompt_sums(const Affine& a) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int groups = a.k >> 6;
     if (i >= a.m * groups) return;
-    const int r = i % a.m;
-    const int g = i / a.m;
+    const int r = i / groups;  // a wave reads a row's groups in a run
+    const int g = i % groups;
     const u32x4* src = reinterpret_cast<const u32x4*>(static_cast<const uint16_t*>(a.x) + static_cast<long long>(r) * a.k + 64 * g);
     float run = 0.f;
 #pragma unroll
@@ -251,7 +251,7 @@ __device__ inline void prompt_sums(const Affine& a) {
             run += __uint_as_float(w[j] & 0xffff0000u);
         }
     }
-    const_cast<float*>(a.sums)[i] = run;
+    const_cast<float*>(a.sums)[static_cast<long long>(g) * a.m + r] = run;
 }
 
 }  // namespace rocm

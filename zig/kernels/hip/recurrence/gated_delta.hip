@@ -7,10 +7,15 @@
 namespace tf {
 namespace rocm {
 
+// Lane 0's sum of the xor butterfly (16, 8, 4, 2, 1) on permlanex16 and DPP row_xmask: no LDS round trips, same adds.
 __device__ float lane0_sum(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) x += __shfl_xor(x, mask, 32);
-    return __shfl(x, 0, 32);
+    const int u = __float_as_int(x);
+    x += __int_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210, 0xfedcba98, false, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x168, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x164, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x162, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x161, 0xf, 0xf, false));
+    return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x), 0));
 }
 
 template <int DK>
