@@ -7,8 +7,11 @@ GLM-5.3-Flash.
 ## Where it stands
 
 - The native engine has the format and a reference decoder in core (`zig/src/core/exl3_format.zig`, @akol1, #496),
-  and Metal has a standalone EXL3 projection (`zig/src/core/exl3_projection.zig`, @akol1, #681). No model serves an
-  EXL3 checkpoint in this release.
+  and Metal has a standalone EXL3 projection (`zig/src/core/exl3_projection.zig`, @akol1, #681).
+- The HIP engine serves qwen3_5 EXL3 packs (the 27B dense) on gfx11: `core/quant/exl3.zig` reads them through the
+  format interface, `zig/kernels/hip/quant/exl3.hip` rotates x and runs a WMMA product whose rows have the same bits at
+  any row count (rounds and prompt chunks alike). Hugging Face names, zero-centered norms and the (C, 1, K) conv of
+  ExLlamaV3 packs load as they are; a DFlash2 drafter's head is quantized to affine-4 from the EXL3 head.
 - CUDA projections and routed experts on this format are in review (#740, #741, #806). A model needs them and a loader
   for its EXL3 tensors before it can serve a checkpoint; the 27B on CUDA is the first planned.
 - The Python engine served EXL3 on CUDA from 0.3.6 to 0.6.6 through the module @vcruz305 wrote (#42): every codebook,
@@ -183,5 +186,5 @@ reproduces the numpy oracle on every codebook and width and on real checkpoint b
 (the oracle vectors ship beside the test). Its real checkpoint bytes are one 128x128 block from
 `UnstableLlama/Qwen3.5-2B-exl3-8.00bpw` (mcg codebook, 8.00 bpw), in `zig/tests/fixtures/exl3_oracle.bin`.
 
-No model is registered for EXL3 yet: the Metal projection (#681) and the CUDA operators in review are the GPU parts
-so far.
+On Metal and CUDA no model is registered for EXL3 yet: the Metal projection (#681) and the CUDA operators in review
+are the GPU parts so far.
