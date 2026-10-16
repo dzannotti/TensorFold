@@ -16,7 +16,7 @@ typedef float f32x8e __attribute__((ext_vector_type(8)));
 typedef unsigned u32x8e __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4e __attribute__((ext_vector_type(4)));
 
-// One product: xh [m, k] rotated fp16, the trellis tiles (tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb +
+// One product: xh rotated fp16 ([k / 16, m, 16] for a round's row tiles, MT <= 2; [m, k] for a prompt's), the trellis tiles (tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb +
 // (nt % 8) * 4 K2 dwords), out [m, n] of `out_kind` (0 fp32, 1 bf16, 2 fp16), or fp32 partial sums [splits, m, n].
 struct Exl3 {
     const __half* xh;
@@ -54,45 +54,64 @@ __host__ __device__ constexpr int exl3_window_words() {
     return (most + 31) / 32;
 }
 
-// s0 * C and s1 * C mod 2^32 for two 16-bit states packed in `p` (s0 low): the high halves from one packed 16-bit
-// multiply, the low ones from two 16-bit multiply-adds; v_mul_lo_u32 is quarter rate (asm: the compiler refolds it).
-template <uint32_t C>
-__device__ __forceinline__ void exl3_mul2(uint32_t p, uint32_t& x0, uint32_t& x1) {
-    uint32_t hi;
-    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(hi) : "v"(p), "s"((C >> 16) * 0x10001u));
-    const uint32_t c0 = hi << 16, c1 = hi & 0xffff0000u;
-    asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x0) : "v"(p), "s"(C & 0xffffu), "v"(c0));
-    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x1) : "v"(p), "s"(C & 0xffffu), "v"(c1));
+// s * C + D mod 2^32 for the 16-bit state s in the low (HI false) or high half of `src`, the rest of it ignored: the
+// high product half from one packed 16-bit multiply(-add) whose low lane gives D's low half, the rest from one 16-bit
+// multiply-add; v_mul_lo_u32 is quarter rate (asm: the compiler refolds it).
+template <uint32_t C, uint32_t D, bool HI>
+__device__ __forceinline__ uint32_t exl3_hash(uint32_t src) {
+    uint32_t r, x;
+    if constexpr (D == 0) {
+        if constexpr (HI) asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u));
+        else asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u));
+    } else {
+        if constexpr (HI) asm("v_pk_mad_u16 %0, %1, %2, %3" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u), "s"(D));
+        else asm("v_pk_mad_u16 %0, %1, %2, %3 op_sel_hi:[0,1,1]" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u), "s"(D));
+    }
+    if constexpr (HI) asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x) : "v"(src), "s"(C & 0xffffu), "v"(r));
+    else asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x) : "v"(src), "s"(C & 0xffffu), "v"(r));
+    return x;
 }
 
-// Two codebook values from two 16-bit states packed in `p` (the first low), as a half2 (one rounding each).
-template <int CB>
-__device__ __forceinline__ uint32_t exl3_decode2(uint32_t p) {
+// Two codebook values from two 16-bit states (each in the HI0 / HI1 half of its register), as a half2, first low (one
+// rounding each).
+template <int CB, bool HI0, bool HI1>
+__device__ __forceinline__ uint32_t exl3_decode2(uint32_t a, uint32_t b) {
     if constexpr (CB == 2) {
-        uint32_t x0, x1;
-        exl3_mul2<0x83DCD12Du>(p, x0, x1);
-        // fp16 bits of 1024 + the byte sum (below 1024, so the integer lands in the mantissa exactly)
-        const uint32_t h0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
-        const uint32_t h1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
-        const h16x2 h = __builtin_bit_cast(h16x2, __builtin_amdgcn_perm(h1, h0, 0x05040100u));
+        const uint32_t x0 = exl3_hash<0x83DCD12Du, 0, HI0>(a), x1 = exl3_hash<0x83DCD12Du, 0, HI1>(b);
+        // fp16 bits of 1024 + each byte sum (below 1024, so the integer lands in the mantissa exactly), packed
+        const uint32_t s = __builtin_amdgcn_sad_hi_u8(x1, 0u, __builtin_amdgcn_sad_u8(x0, 0u, 0x64006400u));
+        const h16x2 h = __builtin_bit_cast(h16x2, s);
         const h16x2 scale = {__builtin_bit_cast(_Float16, static_cast<unsigned short>(0x1EEE)), __builtin_bit_cast(_Float16, static_cast<unsigned short>(0x1EEE))};
         const h16x2 bias = {__builtin_bit_cast(_Float16, static_cast<unsigned short>(0xC931)), __builtin_bit_cast(_Float16, static_cast<unsigned short>(0xC931))};
         return __builtin_bit_cast(uint32_t, __builtin_elementwise_fma(h, scale, bias));
     } else {
-        uint32_t x0, x1;
-        if constexpr (CB == 1) {
-            exl3_mul2<0xCBAC1FEDu>(p, x0, x1);
-        } else {
-            exl3_mul2<89226354u>(p, x0, x1);
-            x0 += 64248484u;
-            x1 += 64248484u;
-        }
+        constexpr uint32_t C = CB == 1 ? 0xCBAC1FEDu : 89226354u;
+        constexpr uint32_t D = CB == 1 ? 0u : 64248484u;
+        uint32_t x0 = exl3_hash<C, D, HI0>(a), x1 = exl3_hash<C, D, HI1>(b);
         x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
         x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
         const h16x2 lo = __builtin_bit_cast(h16x2, __builtin_amdgcn_perm(x1, x0, 0x05040100u));
         const h16x2 hi = __builtin_bit_cast(h16x2, __builtin_amdgcn_perm(x1, x0, 0x07060302u));
         return __builtin_bit_cast(uint32_t, lo + hi);
     }
+}
+
+// The register holding the state SH bits up in hi:lo (exl3_window_pair takes the high half at 48 and 16): halves and
+// whole words need no shift, the rest one.
+template <int SH>
+__device__ __forceinline__ uint32_t exl3_state(uint32_t hi, uint32_t lo) {
+    if constexpr (SH == 48 || SH == 32) return hi;
+    else if constexpr (SH > 32) return hi >> (SH - 32);
+    else if constexpr (SH == 16 || SH == 0) return lo;
+    else return __builtin_amdgcn_alignbit(hi, lo, SH);
+}
+
+// Values 2 j, 2 j + 1 of a window's four, from its 64 stream bits hi:lo (the first state's last bit at bit 48).
+template <int K2, int CB, int J>
+__device__ __forceinline__ uint32_t exl3_window_pair(uint32_t hi, uint32_t lo) {
+    constexpr int S0 = 48 - (exl3_end<K2>(2 * J) - exl3_end<K2>(0));
+    constexpr int S1 = 48 - (exl3_end<K2>(2 * J + 1) - exl3_end<K2>(0));
+    return exl3_decode2<CB, S0 == 48 || S0 == 16, S1 == 48 || S1 == 16>(exl3_state<S0>(hi, lo), exl3_state<S1>(hi, lo));
 }
 
 // Unscaled Walsh-Hadamard transform of 128 fp32 values, values 4 l .. 4 l + 3 in lane l, in a fixed butterfly order.
@@ -150,10 +169,12 @@ __device__ __forceinline__ void exl3_store(const Exl3& a, float (&v)[4], int lan
 }
 
 // x [m, k] (kind 1 bf16, 2 fp16) times suh, rotated by 128-blocks, scaled, rounded to fp16: one wave a block of a row.
-extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x, int kind, const __half* suh, __half* xh, int k) {
+// xh is [m, k], or with `steps` (the call's m) [k / 16, m, 16]: a round's k step of every row in one run.
+extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x, int kind, const __half* suh, __half* xh, int k, int steps) {
     const int lane = threadIdx.x;
     const int col = blockIdx.x * 128 + 4 * lane;
     const long long at = static_cast<long long>(blockIdx.y) * k + col;
+    const long long to = steps > 0 ? (static_cast<long long>(col >> 4) * steps + blockIdx.y) * 16 + (col & 15) : at;
     const uint2 raw = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(x) + at);
     const uint2 su = *reinterpret_cast<const uint2*>(suh + col);
     float v[4];
@@ -176,7 +197,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x
     exl3_fwht(v, lane);
     const h16x2 lo = {static_cast<_Float16>(v[0] * kExl3Had), static_cast<_Float16>(v[1] * kExl3Had)};
     const h16x2 hi = {static_cast<_Float16>(v[2] * kExl3Had), static_cast<_Float16>(v[3] * kExl3Had)};
-    *reinterpret_cast<uint2*>(xh + at) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
+    *reinterpret_cast<uint2*>(xh + to) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
 }
 
 // Arrivals of a product's split blocks at each (column block, row block): the last one finishes the sums and resets
@@ -206,13 +227,8 @@ __device__ __forceinline__ h16x16 exl3_fragment(const uint32_t (&r)[2][LW], cons
         } else {
             lo = r[w][1] << off[w];
         }
-        const uint64_t st = (static_cast<uint64_t>(hi) << 32) | lo;
-        // state b in the low 16 bits of v[b] (one funnel shift each), packed in pairs
-        uint32_t v[4];
-#pragma unroll
-        for (int b = 0; b < 4; ++b) v[b] = static_cast<uint32_t>(st >> (48 - (exl3_end<K2>(b) - exl3_end<K2>(0))));
-        own[w][0] = exl3_decode2<CB>(__builtin_amdgcn_perm(v[1], v[0], 0x05040100u));
-        own[w][1] = exl3_decode2<CB>(__builtin_amdgcn_perm(v[3], v[2], 0x05040100u));
+        own[w][0] = exl3_window_pair<K2, CB, 0>(hi, lo);
+        own[w][1] = exl3_window_pair<K2, CB, 1>(hi, lo);
     }
     // dword d holds rows 2 d, 2 d + 1: half 0 decoded dwords 0, 1, 4, 5 and half 1 dwords 2, 3, 6, 7
     u32x8e f;
@@ -268,7 +284,9 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         // buffers over the block's tiles and x: a load takes a lane's byte offset and the tile's uniform one
         const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(blockIdx.x) * NT * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
         const int tstep = static_cast<int>(a.stride_k * 4);
-        const __amdgpu_buffer_rsrc_t xb = exl3_buffer(a.xh + kt0 * 16);
+        // x by k steps ([k / 16, m, 16], tf_exl3_rotate_in): a step's rows are one run
+        const __amdgpu_buffer_rsrc_t xb = exl3_buffer(a.xh + static_cast<long long>(kt0) * 16 * a.m);
+        const int xstep = 32 * a.m;
         uint32_t idx[NT][2][LW];
 #pragma unroll
         for (int n = 0; n < NT; ++n)
@@ -281,7 +299,7 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             const int r = m0 + mt * 16 + c;
-            xo[mt] = static_cast<uint32_t>(r < a.m ? r : a.m - 1) * static_cast<uint32_t>(a.k) * 2u;
+            xo[mt] = static_cast<uint32_t>(r < a.m ? r : a.m - 1) * 32u;
         }
         // the tiles' words D - 1 k steps ahead (DRAM), x one ahead (L2)
         uint32_t ring[D][NT][2][LW];
@@ -300,8 +318,8 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
             const int t = i < tiles ? i : tiles - 1;
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
-                const u32x4e lo = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt], t * 32, 0);
-                const u32x4e hi = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt] + 16, t * 32, 0);
+                const u32x4e lo = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt], t * xstep, 0);
+                const u32x4e hi = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt] + 16, t * xstep, 0);
                 x[mt] = __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
             }
         };
