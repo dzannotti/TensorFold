@@ -21,7 +21,8 @@ const mlx_formats: []const []const u8 = &.{ "mlx-q2", "mlx-q3", "mlx-q4", "mlx-q
 pub fn Native(comptime type_name: []const u8) type {
     return struct {
         pub const model_type = type_name;
-        pub const formats = mlx_formats;
+        // the dense 27B also loads EXL3 trellis checkpoints
+        pub const formats: []const []const u8 = if (std.mem.eql(u8, type_name, "qwen3_5")) &.{ "mlx-q2", "mlx-q3", "mlx-q4", "mlx-q5", "mlx-q6", "mlx-q8", "exl3" } else mlx_formats;
         /// Positions a stream holds when neither --context nor the checkpoint's config names a window.
         pub const default_context: i64 = 32768;
         /// The engine cuts prompts itself.
