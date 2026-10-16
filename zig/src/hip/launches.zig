@@ -377,6 +377,7 @@ pub const Launcher = struct {
     pub const dftRingPut = draft.ringPut;
     pub const dftNormRope = draft.normRope;
     pub const dftNormRopeQk = draft.normRopeQk;
+    pub const dftRms = draft.rms;
     pub const dftDynConv = draft.dynConv;
     pub const dftAttn = draft.attn;
     pub const dftBf16Rows = draft.bf16Rows;

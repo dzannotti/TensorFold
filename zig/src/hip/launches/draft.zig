@@ -15,14 +15,15 @@ pub const Fns = struct {
     ring_put: Function,
     norm_rope: Function,
     norm_rope_qk: Function,
+    rms: Function,
     dyn_conv: Function,
     attn: Function,
     attn_merge: Function,
     bf16_rows: Function,
     q4_rows: Function,
     topk_merge: Function,
-    /// The MLX products (draft.hip dft_mlx_tile): 4 or 8 waves a tile; 4 waves two tiles; 4 waves gate|up with silu.
-    mlx: [Mlx.len]Function,
+    /// The MLX products (draft.hip dft_mlx_tile) by kind.
+    mlx: [3]Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -30,13 +31,14 @@ pub const Fns = struct {
             .ring_put = try m.function("tf_dft_ring_put"),
             .norm_rope = try m.function("tf_dft_norm_rope"),
             .norm_rope_qk = try m.function("tf_dft_norm_rope_qk"),
+            .rms = try m.function("tf_dft_rms"),
             .dyn_conv = try m.function("tf_dft_dyn_conv"),
             .attn = try m.function("tf_dft_attn"),
             .attn_merge = try m.function("tf_dft_attn_merge"),
             .bf16_rows = try m.function("tf_dft_bf16_rows"),
             .q4_rows = try m.function("tf_dft_q4_rows"),
             .topk_merge = try m.function("tf_dft_topk_merge"),
-            .mlx = .{ try m.function("tf_dft_mlx_w4c1"), try m.function("tf_dft_mlx_w8c1"), try m.function("tf_dft_mlx_w4c2"), try m.function("tf_dft_mlx_w4act"), try m.function("tf_dft_mlx_w4conv"), try m.function("tf_dft_mlx_w8conv"), try m.function("tf_dft_mlx_w2c1"), try m.function("tf_dft_mlx_w2conv"), try m.function("tf_dft_mlx_w4pair") },
+            .mlx = .{ try m.function("tf_dft_mlx"), try m.function("tf_dft_mlx_pair"), try m.function("tf_dft_mlx_conv") },
         };
     }
 };
@@ -91,6 +93,18 @@ pub fn normRope(l: *const Launcher, x: u64, stride: usize, weight: u64, out: u64
     try a.add(eps);
     try a.add(theta);
     try l.go(l.dft.norm_rope, dim(rows * heads, 1, 1), dim(32, 1, 1), 0, s, &a);
+}
+
+/// tf_rms's bits on `rows` bf16 rows of `width` (at most 8192) with an fp32 weight, four blocks a row.
+pub fn rms(l: *const Launcher, x: u64, weight: u64, y: u64, rows: usize, width: usize, eps: f32, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(weight);
+    try a.add(y);
+    try a.add(@as(c_int, @intCast(width)));
+    try a.add(eps);
+    if (width > 8192) return invalid("dft rms");
+    try l.go(l.dft.rms, dim(rows, 4, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// normRope of the q heads (weight wq, into qo) and of the k heads `koff` elements on (wk, into ko), in one launch.
@@ -240,42 +254,19 @@ pub fn topkMerge(l: *const Launcher, ci: u64, cv: u64, rows: usize, chunks: usiz
 /// draft.hip's DftMat: one MLX affine-4 group-64 matrix with bf16 tables and its bf16 output.
 pub const Mat = extern struct { words: u64, scale: u64, bias: u64, out: u64, n: c_int, ld: c_int = 0 };
 
-/// The MLX product tiles, by index into `Fns.mlx`.
-pub const Mlx = enum(u4) {
-    w4,
-    w8,
-    w4x2,
-    act,
-    /// w4 and w8 with dynConv's branch 1 and residual on the rounded product (`Conv`)
-    w4conv,
-    w8conv,
-    w2,
-    w2conv,
-    /// w4 over a's tiles then b's (two products of the same x)
-    pair,
-    pub const len = 9;
-};
+/// What a launch makes: one product, two of the same x (`a`'s tiles then `b`'s), or one ending in `Conv`.
+pub const Kind = enum { plain, pair, conv };
 
-/// The dynamic convolution a `.w4conv` or `.w8conv` product ends with: dynConv(product, dyn, base, res) on branch 1.
+/// dynConv(product, dyn, base, res) on branch 1, a `.conv` product's end.
 pub const Conv = struct { dyn: u64 = 0, base: u64 = 0, res: u64 = 0, group: usize = 1, block: usize = 1 };
 
-/// out (m <= 16 rows, a.n) = x (m, k) times `a`, rounded to bf16, the verify split tile's bits; with `.act`, a.out =
-/// silu(x a) * (x b) as tf_silu_mul rounds them; with a conv variant, `cv` after. k a multiple of 256.
-pub fn mlx(l: *const Launcher, v: Mlx, x: u64, m: usize, k: usize, ldx: usize, a: Mat, b: Mat, cv: Conv, s: S) Error!void {
-    if (m == 0 or m > 16 or k % 256 != 0 or a.n <= 0 or (v == .act and b.n != a.n)) return invalid("dft mlx");
-    if ((v == .w4conv or v == .w8conv or v == .w2conv) and (cv.res == 0 or @as(usize, @intCast(a.n)) % cv.group != 0)) return invalid("dft mlx conv");
+/// a.out (m <= 16 rows, a.n) = x (m, k; rows `ldx` apart, 0: k) times `a`, rounded to bf16: the verify split tile's
+/// bits. `.pair` also writes b.out = x b; `.conv` writes dynConv's branch 1 of the product (`cv`). k a multiple of 256.
+pub fn mlx(l: *const Launcher, kind: Kind, x: u64, m: usize, k: usize, ldx: usize, a: Mat, b: Mat, cv: Conv, s: S) Error!void {
+    if (m == 0 or m > 16 or k % 256 != 0 or a.n <= 0 or (kind == .pair and b.n <= 0)) return invalid("dft mlx");
+    if (kind == .conv and (cv.res == 0 or @as(usize, @intCast(a.n)) % cv.group != 0)) return invalid("dft mlx conv");
     var p: Args = .{};
-    try p.add(extern struct { x: u64, m: c_int, k: c_int, a: Mat, b: Mat, dyn: u64, base: u64, res: u64, group: c_int, block: c_int, ldx: c_int }{ .ldx = @intCast(ldx), .x = x, .m = @intCast(m), .k = @intCast(k), .a = a, .b = b, .dyn = cv.dyn, .base = cv.base, .res = cv.res, .group = @intCast(cv.group), .block = @intCast(cv.block) });
-    const n: usize = @intCast(a.n);
-    const blocks = switch (v) {
-        .w4x2 => (n + 31) / 32,
-        .pair => (n + 15) / 16 + (@as(usize, @intCast(b.n)) + 15) / 16,
-        else => (n + 15) / 16,
-    };
-    const waves: usize = switch (v) {
-        .w8, .w8conv => 8,
-        .w2, .w2conv => 2,
-        else => 4,
-    };
-    try l.go(l.dft.mlx[@intFromEnum(v)], dim(blocks, 1, 1), dim(32 * waves, 1, 1), 0, s, &p);
+    try p.add(extern struct { x: u64, m: c_int, k: c_int, a: Mat, b: Mat, dyn: u64, base: u64, res: u64, group: c_int, block: c_int, ldx: c_int }{ .x = x, .m = @intCast(m), .k = @intCast(k), .a = a, .b = b, .dyn = cv.dyn, .base = cv.base, .res = cv.res, .group = @intCast(cv.group), .block = @intCast(cv.block), .ldx = @intCast(ldx) });
+    const tiles = (@as(usize, @intCast(a.n)) + 15) / 16 + if (kind == .pair) (@as(usize, @intCast(b.n)) + 15) / 16 else 0;
+    try l.go(l.dft.mlx[@intFromEnum(kind)], dim(tiles, 1, 1), dim(128, 1, 1), 0, s, &p);
 }
