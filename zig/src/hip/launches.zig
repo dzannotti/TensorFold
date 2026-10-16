@@ -71,6 +71,7 @@ pub const Launcher = struct {
     fa_prefill: Triple,
     fa_wide: [2]Function, // the 64-row prefill tile, fp16 and bf16 caches
     fa_paged: [2]Function, // the same tile over a stream's pages
+    fa_paged_wmma: Function, // its bf16 tile on gfx11's matrix cores, the same bits
     softmax_stats: Function,
     sum_partials: Function,
     op: Ops,
@@ -180,6 +181,7 @@ pub const Launcher = struct {
         };
         l.fa_wide = .{ try pre.function("tf_fa_wide_f16"), try pre.function("tf_fa_wide_bf16") };
         l.fa_paged = .{ try pre.function("tf_fa_paged_f16"), try pre.function("tf_fa_paged_bf16") };
+        l.fa_paged_wmma = try pre.function("tf_fa_paged_wmma");
         l.op = .{
             .embed_rows = try ops.function("tf_embed_rows"),
             .embed_dense = try ops.function("tf_embed_dense"),
