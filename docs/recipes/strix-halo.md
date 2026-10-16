@@ -27,6 +27,7 @@ else building or running. The Spark column is MiaAI-Lab's published TensorFold n
 | Qwen3.8-27B | EXL3 3.5 bpw, DFlash2 (block 16) | 57.6 | 128.8 | 380 | 58.3 / 136.9 / 1,793 |
 | Qwen3.8-27B | MLX 4-bit, DFlash2 (block 16) | 43.6 | 112.7 | 562 | same |
 | Qwen3.6-35B-A3B | MLX 4-bit, MTP 3 | 112.0 | 147.6 | 2,394 | ~110 / ~130 / 7,353 |
+| Qwen3.8 Flash Next | INT4-AutoRound, MTP (warm) | 54.2 | 69.1 | 458 | 64.4 / 57.5 / 2,606 |
 | Qwen3.8 Flash Next | MLX 3-bit, MTP (warm) | 49.4 | 64.2 | ~400 | 64.4 / 57.5 / 2,606 (INT4-AR) |
 
 Every row passes the exactness check: one stream alone, four streams at once and `draft:false` all give the same
@@ -64,7 +65,7 @@ work python tools/strix/quality.py --model ~/models/Qwen3.8-27B-MLX-4bit   # nee
 
 ## Not done yet
 
-- Flash Next INT4-AutoRound and NVFP4 checkpoints are being ported. The 3-bit MLX checkpoint is a stopgap.
+- Flash Next NVFP4 is being ported. Flash Next prefill is far behind (the sparse-attention prompt kernel is half its time).
 - The DFlash v1 drafter (the 35B-A3B's) does not load. HIP reads DFlash2 only.
 - MiniCPM-4.7 (ciru_q8) is being ported, text only first.
 - C8 (eight streams) is not tuned yet.
