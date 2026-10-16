@@ -47,7 +47,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
     for (commands) |c| if (std.mem.eql(u8, args[1], c.name)) {
         c.run(init.gpa, init.io, args[2..]) catch |e| {
-            if (@errorReturnTrace()) |t| std.debug.dumpErrorReturnTrace(t.*); // DEBUG
             std.debug.print("FAIL {t}\n", .{e});
             return 1;
         };

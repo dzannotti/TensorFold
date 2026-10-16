@@ -137,7 +137,7 @@ test "z-lab's DFlash2 config parses; a zero divisor is refused; a wider block th
         defer gpa.free(bad);
         try std.testing.expectError(error.BadDraftConfig, Config.parse(gpa, bad, target));
     }
-    const wide = try std.mem.replaceOwned(u8, gpa, text, "\"block_size\":8", "\"block_size\":16");
+    const wide = try std.mem.replaceOwned(u8, gpa, text, "\"block_size\":8", "\"block_size\":32");
     defer gpa.free(wide);
     try std.testing.expectError(error.UnsupportedDraftConfig, Config.parse(gpa, wide, target));
     try std.testing.expectError(error.BadDraftConfig, Config.parse(gpa, text, .{ .hidden = 5120, .vocab = 248320, .layers = 61 }));
