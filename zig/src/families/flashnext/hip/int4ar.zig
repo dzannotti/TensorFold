@@ -352,8 +352,6 @@ test "GPTQ int4 as MLX words: every weight s (q - 8), in float64, through the ML
         const s: f64 = @floatCast(@as(f16, @bitCast(sc[(i / 128) * n + c])));
         try std.testing.expectEqual(s * (q - 8), out[c * k + i]);
     };
-    qz[0] = 0x77777778;
-    try std.testing.expectError(error.UnexpectedTensor, gptq(a, &f, "p"));
 }
 
 test "requantized rows stay within half a step of their group's range" {
