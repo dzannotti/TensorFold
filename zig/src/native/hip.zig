@@ -61,6 +61,10 @@ fn checkGroup(a: Allocator, o: api.Open, problem: *[]const u8) Refused!void {
     if (o.mtp_drafts) |n| if (n > 3) return refuse(a, problem, "--mtp-drafts {d}: the HIP engine drafts at most 3", .{n});
     if (o.mtp_confidence) |c| if (c < 0 or c > 1) return refuse(a, problem, "--mtp-confidence must be from 0 to 1", .{});
     if (o.prompt_cache_gib) |g| if (g < 0) return refuse(a, problem, "--prompt-cache-gib must be 0 or more", .{});
+    // flags no HIP family serves are refused, not ignored (as the CUDA server refuses them)
+    if (o.learn != null) return refuse(a, problem, "--learn keeps prompt states on disk, which no HIP family does yet: serve without --learn, --learn-dir or --learn-gib", .{});
+    if (o.slide) return refuse(a, problem, "--slide (Sliding Weights) has no HIP learner yet: serve without --slide", .{});
+    if (o.segments != null) return refuse(a, problem, "--segments splits a CUDA model's layers: serve without it on HIP", .{});
 }
 
 /// What every family needs before it loads: the card, the policy, the group, and the window and lanes asked for.
@@ -254,6 +258,12 @@ test "the group flags: one rank source, a supported world, a master past one ran
     var outside = two;
     outside.rank = 2;
     try std.testing.expectError(error.Refused, checkGroup(a, outside, &problem));
+    var learn = base;
+    learn.learn = "/x";
+    try std.testing.expectError(error.Refused, checkGroup(a, learn, &problem));
+    var slide = base;
+    slide.slide = true;
+    try std.testing.expectError(error.Refused, checkGroup(a, slide, &problem));
 }
 
 test "matrix=on runs only where the matrix-core tiles exist; auto runs everywhere" {

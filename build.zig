@@ -166,6 +166,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
     hip_build.steps(b, target, optimize, build_options, test_step);
+    // -Dxgrammar=DIR: native-hip also installs libtfgrammar into its lib/, where the server looks (structured output)
+    if (xgrammar) |dir| if (b.top_level_steps.get("native-hip")) |s| if (grammar_build.library(b, target, dir)) |lib|
+        s.step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "native-hip/lib" } } }).step);
     exlr8_build.hostTests(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{
