@@ -42,9 +42,9 @@ pub fn planKvWrite(l: *const Launcher, keys: u64, values: u64, kind: c_int, p: P
 /// Keys a split of the flash walk (plan.hip's kFlashKeys).
 pub const flash_keys = 256;
 
-/// Whether the flash walk takes the shape: d a multiple of 8 up to 256, at most 16 query heads a KV head.
+/// Whether the flash walk takes the shape: d a multiple of 64 up to 256, at most 16 query heads a KV head.
 pub fn flashTakes(heads: usize, kv_heads: usize, d: usize) bool {
-    return d % 8 == 0 and d <= 256 and kv_heads > 0 and heads % kv_heads == 0 and heads / kv_heads <= 16;
+    return d % 64 == 0 and d <= 256 and kv_heads > 0 and heads % kv_heads == 0 and heads / kv_heads <= 16;
 }
 
 /// planCausal's result by 256-key splits (flash decoding): `part` (rows, heads, splits, d) and `ml` (rows, heads,

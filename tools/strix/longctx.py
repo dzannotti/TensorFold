@@ -53,9 +53,11 @@ def main():
         stamps, usage = stream(a.base_url, a.model, messages, a.max_tokens, a.temperature)
         prompt = usage.get("prompt_tokens", a.tokens)
         n = len(stamps)
-        tg = (n - 1) / (stamps[-1] - stamps[0]) if n > 1 else 0.0
+        # a streamed chunk can carry several tokens (a drafted round lands them together): count tokens, not chunks
+        toks = usage.get("completion_tokens", n)
+        tg = (toks - 1) / (stamps[-1] - stamps[0]) if n > 1 else 0.0
         print(f"{state:9} prompt {prompt:>6} tok  TTFT {stamps[0]:7.2f} s  PP {prompt / stamps[0]:8.1f} tok/s  "
-              f"TG {tg:6.2f} tok/s  ({n} chunks, wall {stamps[-1]:.2f} s)")
+              f"TG {tg:6.2f} tok/s  ({toks} tokens in {n} chunks, wall {stamps[-1]:.2f} s)")
 
 
 if __name__ == "__main__":

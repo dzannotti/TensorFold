@@ -236,22 +236,30 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
     for (int j = 0; j < kFlashQueries; ++j) s[j] = 0.f;
     if (live) {
         const uint4* kp = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(reinterpret_cast<const void*>(desc[plan_first(layer)])) + base);
-        for (int c = 0; c < d / 8; ++c) {
-            float k8[8];
-            flash_widen8<KIND>(kp[c], k8);
+        // 64 dims of the key in flight at once (d a multiple of 64), added in dimension order
+        for (int c0 = 0; c0 < d / 8; c0 += 8) {
+            uint4 kk[8];
 #pragma unroll
-            for (int j = 0; j < kFlashQueries; ++j) {
-                if (j < nq) {
-                    const float4 a = *reinterpret_cast<const float4*>(qs + j * d + 8 * c);
-                    const float4 b = *reinterpret_cast<const float4*>(qs + j * d + 8 * c + 4);
-                    s[j] += a.x * k8[0];
-                    s[j] += a.y * k8[1];
-                    s[j] += a.z * k8[2];
-                    s[j] += a.w * k8[3];
-                    s[j] += b.x * k8[4];
-                    s[j] += b.y * k8[5];
-                    s[j] += b.z * k8[6];
-                    s[j] += b.w * k8[7];
+            for (int u = 0; u < 8; ++u) kk[u] = kp[c0 + u];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int c = c0 + u;
+                float k8[8];
+                flash_widen8<KIND>(kk[u], k8);
+#pragma unroll
+                for (int j = 0; j < kFlashQueries; ++j) {
+                    if (j < nq) {
+                        const float4 a = *reinterpret_cast<const float4*>(qs + j * d + 8 * c);
+                        const float4 b = *reinterpret_cast<const float4*>(qs + j * d + 8 * c + 4);
+                        s[j] += a.x * k8[0];
+                        s[j] += a.y * k8[1];
+                        s[j] += a.z * k8[2];
+                        s[j] += a.w * k8[3];
+                        s[j] += b.x * k8[4];
+                        s[j] += b.y * k8[5];
+                        s[j] += b.z * k8[6];
+                        s[j] += b.w * k8[7];
+                    }
                 }
             }
         }
