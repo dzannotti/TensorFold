@@ -21,6 +21,8 @@ pub const Experts = struct {
 /// The router's rows in fp32 (E + 1, D), the shared expert's gate last, and the experts.
 pub const Routed = struct {
     rows32: u64,
+    /// The same rows in bf16 (0: none), which decode's router reads.
+    rows16: u64 = 0,
     experts: Experts,
     top_k: usize,
     /// The router's rows, E + 1: the model's expert count, whatever share of the experts this rank holds.
@@ -63,7 +65,8 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     _ = prefill; // the affine experts' arithmetic does not depend on it (the plan's tile comes from tile_for)
     const ex = r.experts;
     const slots = r.top_k + 1;
-    const size = if (r.exact) rows else bucket(rows);
+    // a lane round's rows are its graph's bucket already: its plan takes them as they are (fewer empty items)
+    const size = if (r.exact or o.window) rows else bucket(rows);
     const pairs = rows * slots;
     const cap = capacity(size * slots, r.rows);
     const logits = try o.arena.of(f32, rows * r.rows);
@@ -71,7 +74,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     const wts = try o.arena.of(f32, size * slots);
     const items = try o.arena.of(i32, cap * 3);
     const members = try o.arena.of(i32, size * slots);
-    try o.moeRouter(x, r.rows32, logits, rows, ex.dims, r.rows);
+    try o.moeRouter(x, r.rows32, r.rows16, logits, rows, ex.dims, r.rows);
     const count: usize = cap;
     var tile: usize = undefined;
     if (r.remap != 0) {
@@ -103,14 +106,15 @@ pub const Parts = struct { y: u64, wts: u64, slots: usize };
 
 pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Parts {
     const slots = r.top_k + 1;
-    const size = if (r.exact) rows else bucket(rows);
+    // a lane round's rows are its graph's bucket already: its plan takes them as they are (fewer empty items)
+    const size = if (r.exact or o.window) rows else bucket(rows);
     const cap = capacity(size * slots, r.rows);
     const logits = try o.arena.of(f32, rows * r.rows);
     const pick = try o.arena.of(i32, size * slots);
     const wts = try o.arena.of(f32, size * slots);
     const items = try o.arena.of(i32, cap * 3);
     const members = try o.arena.of(i32, size * slots);
-    try o.moeRouter(x, r.rows32, logits, rows, r.experts.dims, r.rows);
+    try o.moeRouter(x, r.rows32, r.rows16, logits, rows, r.experts.dims, r.rows);
     const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap);
     return .{ .y = p.y, .wts = wts, .slots = slots };
 }

@@ -76,6 +76,41 @@ __device__ void router_decode(const void* x, const float* rows, float* logits, i
     }
 }
 
+// router_decode's logits from the router's bf16 rows (rows32 is them widened, so each product is the same): a wave a
+// (row, expert), half the weight bytes and r times the waves; each logit is router_decode's chain and butterfly.
+template <int KIND>
+__device__ void router_rows16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    const int lane = threadIdx.x & 31;
+    const int expert = blockIdx.x * kRouterWaves + (threadIdx.x >> 5);
+    const int k = blockIdx.y;
+    if (expert >= e || k >= r) return;
+    const uint16_t* xr = static_cast<const uint16_t*>(x) + static_cast<long long>(k) * d;
+    const uint16_t* w = rows + static_cast<long long>(expert) * d;
+    float acc = 0.f;
+    for (int base = 0; base < d; base += kRouterSteps * 128) {
+        uint2 wv[kRouterSteps], xv[kRouterSteps];
+#pragma unroll
+        for (int s = 0; s < kRouterSteps; ++s) {
+            const int at = base + (lane + 32 * s) * 4;
+            wv[s] = at < d ? *reinterpret_cast<const uint2*>(w + at) : make_uint2(0, 0);
+            xv[s] = at < d ? *reinterpret_cast<const uint2*>(xr + at) : make_uint2(0, 0);
+        }
+#pragma unroll
+        for (int s = 0; s < kRouterSteps; ++s) {
+            const int at = base + (lane + 32 * s) * 4;
+            if (at >= d) continue;
+            const float4 xf = widen4<KIND>(xv[s]);
+            const float4 wf = widen4<2>(wv[s]);
+            acc = fmaf(xf.x, wf.x, acc);
+            acc = fmaf(xf.y, wf.y, acc);
+            acc = fmaf(xf.z, wf.z, acc);
+            acc = fmaf(xf.w, wf.w, acc);
+        }
+    }
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) acc += __shfl_xor(acc, mask, 32);
+    if (lane == 0) logits[static_cast<long long>(k) * e + expert] = acc;
+}
 
 __device__ __forceinline__ float load_kind(const void* p, int kind, long long i) {
     return kind == 1 ? __half2float(static_cast<const __half*>(p)[i]) : bf16_up(static_cast<const uint16_t*>(p)[i]);
@@ -444,6 +479,16 @@ extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
 extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
     tf_router_decode_bf16(const void* x, const float* rows, float* logits, int r, int d, int e) {
     router_decode<2>(x, rows, logits, r, d, e);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_rows16_f16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    router_rows16<1>(x, rows, logits, r, d, e);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * kRouterWaves)
+    tf_router_rows16_bf16(const void* x, const uint16_t* rows, float* logits, int r, int d, int e) {
+    router_rows16<2>(x, rows, logits, r, d, e);
 }
 
 extern "C" __global__ void __launch_bounds__(kTailThreads)
