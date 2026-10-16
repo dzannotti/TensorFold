@@ -31,6 +31,8 @@ pub const Fns = struct {
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_staged: [2]Function, // the same bits, tiles staged with every load in flight: a round's few rows
     sparse_merge: Function,
+    attn_prompt: [5]Function, // a prompt's dense rows on the matrix cores (gfx11 only), by q and p planes: attn_splits
+    attn_listed: [5]Function, // a prompt's listed rows on the matrix cores, the same planes
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -47,6 +49,8 @@ pub const Fns = struct {
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
             .sparse_staged = .{ try m.function("tf_fn_sparse_parts6_staged"), try m.function("tf_fn_sparse_parts12_staged") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
+            .attn_prompt = .{ try m.function("tf_fn_attn_prompt11"), try m.function("tf_fn_attn_prompt22"), try m.function("tf_fn_attn_prompt33"), try m.function("tf_fn_attn_prompt31"), try m.function("tf_fn_attn_prompt13") },
+            .attn_listed = .{ try m.function("tf_fn_attn_listed11"), try m.function("tf_fn_attn_listed22"), try m.function("tf_fn_attn_listed33"), try m.function("tf_fn_attn_listed31"), try m.function("tf_fn_attn_listed13") },
         };
     }
 };
@@ -433,4 +437,25 @@ pub fn sparseAttention(
     var b: Args = .{};
     inline for (.{ ad(parts_o), ad(parts_ms), ad(out), heads, dims, parts }) |x| try b.add(x);
     try l.go(l.fnx.sparse_merge, dim(heads, rows, 1), dim(256, 1, 1), 0, s, &b);
+}
+
+/// The prompt attention's (q, p) BF16 plane counts, by index: 3 and 3 are the fp32 kernel's precision.
+pub const attn_splits = [_][2]u8{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 3, 1 }, .{ 1, 3 } };
+
+/// A prompt's dense rows (row r attends its first count[r] keys) on the matrix cores: 256 dims, bf16 caches, query
+/// heads a kv head a multiple of 4; out (rows, heads, 256) fp32. `split` indexes attn_splits.
+pub fn attnPrompt(l: *const Launcher, split: usize, q: CF, k: C, v: C, count: CI, out: F, rows: c_int, heads: c_int, kv_heads: c_int, cap: i64, scale: f32, s: S) Error!void {
+    if (@rem(heads, kv_heads) != 0 or @rem(@divExact(heads, kv_heads), 4) != 0) return util.invalid("attnPrompt");
+    var a: Args = .{};
+    inline for (.{ ad(q), ad(k), ad(v), ad(count), ad(out), rows, heads, kv_heads, cap, scale }) |x| try a.add(x);
+    try l.go(l.fnx.attn_prompt[split], dim(cdiv(rows, 16), @divExact(heads, 4), 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// A prompt's rows over their listed keys (or their first count[r] keys where sparse[r] is 0) on the matrix cores, a
+/// row's query heads of a kv head a block: 256 dims, bf16 caches, at most 16 query heads a kv head.
+pub fn attnListed(l: *const Launcher, split: usize, q: CF, k: C, v: C, ids: CI, id_stride: i64, count: CI, sparse: CI, out: F, rows: c_int, heads: c_int, kv_heads: c_int, cap: i64, scale: f32, s: S) Error!void {
+    if (@rem(heads, kv_heads) != 0 or @divExact(heads, kv_heads) > 16) return util.invalid("attnListed");
+    var a: Args = .{};
+    inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(out), heads, kv_heads, cap, scale }) |x| try a.add(x);
+    try l.go(l.fnx.attn_listed[split], dim(rows, kv_heads, 1), dim(256, 1, 1), 0, s, &a);
 }

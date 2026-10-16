@@ -8,6 +8,7 @@ const at = rig.at;
 const ptr = fx.ptr;
 const rnd = fx.rnd;
 const value = fx.value;
+const attn_splits = @import("../launches/flashnext.zig").attn_splits;
 
 test "pooled block keys: the mean of a block's raw keys, normed and rotated at its first position" {
     const t = try Rig.open(1 << 20);
@@ -414,4 +415,212 @@ fn sparseCase(t: *Rig, comptime heads: usize, comptime kv_heads: usize) !void {
             );
         }
     };
+}
+
+test "prompt attention on the matrix cores: dense rows at three planes as near fp64's softmax as the fp32 kernel, a row's bits alike wherever the prompt is cut" {
+    const t = try Rig.open(1 << 22);
+    defer t.close();
+    if (!t.bf16 or !t.on.affine.matrix) return;
+    var rng: rig.Rng = .{ .state = 0xB0B };
+    const heads = 24;
+    const kv_heads = 2;
+    const dims = 256;
+    const cap = 400;
+    const rows = 40;
+    const pos = 290; // row r attends keys 0 .. pos + r
+    const cut = 17;
+    const scale: f32 = 0.0625;
+    const hk = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hk);
+    const hv = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hv);
+    const hq = try gpa.alloc(f32, rows * heads * dims);
+    defer gpa.free(hq);
+    for (hq) |*x| x.* = rng.unit() * 4.0;
+    var count: [rows]i32 = undefined;
+    for (&count, 0..) |*c, r| c.* = @intCast(pos + r + 1);
+    var dk = try t.upload(hk);
+    defer dk.free();
+    var dv = try t.upload(hv);
+    defer dv.free();
+    var dq = try t.upload(hq);
+    defer dq.free();
+    var dc = try t.upload(&count);
+    defer dc.free();
+    const st = t.stream.handle;
+    const row_bytes = heads * dims * 4;
+    // the fp32 kernel on the same rows, and fp64 over the exact inputs
+    const parts = 16;
+    const flags: [rows]i32 = @splat(0);
+    var df = try t.upload(&flags);
+    defer df.free();
+    var po = try t.alloc(rows * heads * parts * dims * 4);
+    defer po.free();
+    var pm = try t.alloc(rows * heads * parts * 2 * 4);
+    defer pm.free();
+    var old = try t.alloc(rows * heads * dims * 4);
+    defer old.free();
+    try t.on.fn_sparse_attention(ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), 2, ptr(?[*]const i32, dc), 0, ptr(?[*]const i32, dc), ptr(?[*]const i32, df), ptr(?[*]f32, po), ptr(?[*]f32, pm), ptr(?[*]f32, old), rows, heads, kv_heads, dims, cap, scale, parts, st);
+    try t.stream.synchronize();
+    const was = try rig.download(f32, old);
+    defer gpa.free(was);
+    const want = try gpa.alloc(f64, rows * heads * dims);
+    defer gpa.free(want);
+    var w: [cap]f64 = undefined;
+    for (0..rows) |r| for (0..heads) |h| {
+        const kvh = h / (heads / kv_heads);
+        const n: usize = @intCast(count[r]);
+        var top: f64 = -std.math.inf(f64);
+        for (0..n) |j| {
+            var s: f64 = 0;
+            for (0..dims) |d| s += @as(f64, hq[(r * heads + h) * dims + d]) * t.value(hk[(kvh * cap + j) * dims + d]);
+            w[j] = s * scale;
+            top = @max(top, w[j]);
+        }
+        var total: f64 = 0;
+        for (w[0..n]) |*x| {
+            x.* = @exp(x.* - top);
+            total += x.*;
+        }
+        for (0..dims) |d| {
+            var acc: f64 = 0;
+            for (0..n) |j| acc += w[j] * t.value(hv[(kvh * cap + j) * dims + d]);
+            want[(r * heads + h) * dims + d] = acc / total;
+        }
+    };
+    const old_max, const old_rms = errors(was, want);
+    if (std.c.getenv("TF_ALL_SPLITS") != null) std.debug.print("vs fp64: the fp32 kernel max {e:.3} rms {e:.3}\n", .{ old_max, old_rms });
+    var out = try t.alloc(rows * heads * dims * 4);
+    defer out.free();
+    var part = try t.alloc(rows * heads * dims * 4);
+    defer part.free();
+    for (attn_splits, 0..) |planes, split| {
+        try t.on.fn_attn_prompt(split, ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), ptr(?[*]const i32, dc), ptr(?[*]f32, out), rows, heads, kv_heads, cap, scale, st);
+        // the same prompt cut after row `cut`: each piece on its own
+        try t.on.fn_attn_prompt(split, ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), ptr(?[*]const i32, dc), ptr(?[*]f32, part), cut, heads, kv_heads, cap, scale, st);
+        try t.on.fn_attn_prompt(split, @ptrFromInt(at(dq) + cut * row_bytes), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), @ptrFromInt(at(dc) + cut * 4), @ptrFromInt(at(part) + cut * row_bytes), rows - cut, heads, kv_heads, cap, scale, st);
+        try t.stream.synchronize();
+        const got = try rig.download(f32, out);
+        defer gpa.free(got);
+        const cutg = try rig.download(f32, part);
+        defer gpa.free(cutg);
+        try std.testing.expectEqualSlices(f32, got, cutg);
+        const e_max, const e_rms = errors(got, want);
+        if (std.c.getenv("TF_ALL_SPLITS") != null) std.debug.print("vs fp64: q in {d} planes, p in {d}: max {e:.3} rms {e:.3}\n", .{ planes[0], planes[1], e_max, e_rms });
+        // three planes each: the fp32 kernel's error (bf16 q or p alone is ~1e-3; what is left, within 4x of its, is the
+        // WMMA chains' fp32 sums in another order)
+        if (planes[0] == 3 and planes[1] == 3 and std.c.getenv("TF_ALL_SPLITS") == null)
+            try rig.expect(e_max <= 4 * old_max and e_rms <= 4 * old_rms, "three planes' error {e} against the fp32 kernel's {e}", .{ e_max, old_max });
+    }
+}
+
+/// The largest and the root-mean-square error of `got` against `want`.
+fn errors(got: []const f32, want: []const f64) struct { f64, f64 } {
+    var most: f64 = 0;
+    var sq: f64 = 0;
+    for (got, want) |g, x| {
+        const e = @abs(g - x);
+        most = @max(most, e);
+        sq += e * e;
+    }
+    return .{ most, @sqrt(sq / @as(f64, @floatFromInt(got.len))) };
+}
+
+test "listed prompt attention on the matrix cores: at three planes as near fp64's softmax as the fp32 kernel, a row's bits alike at any row count" {
+    const t = try Rig.open(1 << 22);
+    defer t.close();
+    if (!t.bf16 or !t.on.affine.matrix) return;
+    var rng: rig.Rng = .{ .state = 0x1157 };
+    const heads = 24;
+    const kv_heads = 2;
+    const dims = 256;
+    const cap = 700;
+    const parts = 16;
+    const rows = 3;
+    const stride = 300;
+    const scale: f32 = 0.0625;
+    const hk = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hk);
+    const hv = try fx.acts(t, &rng, kv_heads * cap * dims, 1.0);
+    defer gpa.free(hv);
+    const hq = try gpa.alloc(f32, rows * heads * dims);
+    defer gpa.free(hq);
+    for (hq) |*x| x.* = rng.unit() * 4.0;
+    var ids: [rows * stride]i32 = @splat(0);
+    const count = [rows]i32{ 260, 650, 7 };
+    const sparse = [rows]i32{ 1, 0, 1 };
+    for (0..rows) |r| for (0..stride) |j| {
+        ids[r * stride + j] = @intCast((j * 37 + r * 11) % cap);
+    };
+    var dk = try t.upload(hk);
+    defer dk.free();
+    var dv = try t.upload(hv);
+    defer dv.free();
+    var dq = try t.upload(hq);
+    defer dq.free();
+    var di = try t.upload(&ids);
+    defer di.free();
+    var dc = try t.upload(&count);
+    defer dc.free();
+    var ds = try t.upload(&sparse);
+    defer ds.free();
+    var po = try t.alloc(rows * heads * parts * dims * 4);
+    defer po.free();
+    var pm = try t.alloc(rows * heads * parts * 2 * 4);
+    defer pm.free();
+    var old = try t.alloc(rows * heads * dims * 4);
+    defer old.free();
+    var out = try t.alloc(rows * heads * dims * 4);
+    defer out.free();
+    var one = try t.alloc(heads * dims * 4);
+    defer one.free();
+    const st = t.stream.handle;
+    try t.on.fn_sparse_attention(ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), 2, ptr(?[*]const i32, di), stride, ptr(?[*]const i32, dc), ptr(?[*]const i32, ds), ptr(?[*]f32, po), ptr(?[*]f32, pm), ptr(?[*]f32, old), rows, heads, kv_heads, dims, cap, scale, parts, st);
+    try t.stream.synchronize();
+    const was = try rig.download(f32, old);
+    defer gpa.free(was);
+    const want = try gpa.alloc(f64, rows * heads * dims);
+    defer gpa.free(want);
+    var w: [cap]f64 = undefined;
+    for (0..rows) |r| for (0..heads) |h| {
+        const kvh = h / (heads / kv_heads);
+        const n: usize = @intCast(count[r]);
+        var top: f64 = -std.math.inf(f64);
+        for (0..n) |j| {
+            const key: usize = if (sparse[r] != 0) @intCast(ids[r * stride + j]) else j;
+            var s: f64 = 0;
+            for (0..dims) |d| s += @as(f64, hq[(r * heads + h) * dims + d]) * t.value(hk[(kvh * cap + key) * dims + d]);
+            w[j] = s * scale;
+            top = @max(top, w[j]);
+        }
+        var total: f64 = 0;
+        for (w[0..n]) |*x| {
+            x.* = @exp(x.* - top);
+            total += x.*;
+        }
+        for (0..dims) |d| {
+            var acc: f64 = 0;
+            for (0..n) |j| {
+                const key: usize = if (sparse[r] != 0) @intCast(ids[r * stride + j]) else j;
+                acc += w[j] * t.value(hv[(kvh * cap + key) * dims + d]);
+            }
+            want[(r * heads + h) * dims + d] = acc / total;
+        }
+    };
+    const old_max, const old_rms = errors(was, want);
+    if (std.c.getenv("TF_ALL_SPLITS") != null) std.debug.print("listed vs fp64: the fp32 kernel max {e:.3} rms {e:.3}\n", .{ old_max, old_rms });
+    for (attn_splits, 0..) |planes, split| {
+        try t.on.fn_attn_listed(split, ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), ptr(?[*]const i32, di), stride, ptr(?[*]const i32, dc), ptr(?[*]const i32, ds), ptr(?[*]f32, out), rows, heads, kv_heads, cap, scale, st);
+        try t.on.fn_attn_listed(split, ptr(?[*]const f32, dq), ptr(?*const anyopaque, dk), ptr(?*const anyopaque, dv), ptr(?[*]const i32, di), stride, ptr(?[*]const i32, dc), ptr(?[*]const i32, ds), ptr(?[*]f32, one), 1, heads, kv_heads, cap, scale, st);
+        try t.stream.synchronize();
+        const got = try rig.download(f32, out);
+        defer gpa.free(got);
+        const solo = try rig.download(f32, one);
+        defer gpa.free(solo);
+        try std.testing.expectEqualSlices(f32, got[0 .. heads * dims], solo);
+        const e_max, const e_rms = errors(got, want);
+        if (std.c.getenv("TF_ALL_SPLITS") != null) std.debug.print("listed vs fp64: q in {d} planes, p in {d}: max {e:.3} rms {e:.3}\n", .{ planes[0], planes[1], e_max, e_rms });
+        if (planes[0] == 3 and planes[1] == 3 and std.c.getenv("TF_ALL_SPLITS") == null)
+            try rig.expect(e_max <= 4 * old_max and e_rms <= 4 * old_rms, "three planes' error {e} against the fp32 kernel's {e}", .{ e_max, old_max });
+    }
 }

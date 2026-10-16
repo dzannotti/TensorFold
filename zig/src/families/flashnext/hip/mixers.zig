@@ -313,6 +313,13 @@ pub fn sparse(
     return o.project(gated, s.o, rows, s.o.partial);
 }
 
+/// The prompt attention's BF16 planes (launches/flashnext.zig attn_splits): three each, the fp32 kernel's precision,
+/// unless TF_FN_ATTN_SPLIT names another index (measurements only).
+fn attnSplit() usize {
+    const v = std.c.getenv("TF_FN_ATTN_SPLIT") orelse return 2;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2;
+}
+
 /// One stream's `rows` rows from `pos` in slices; `graphed`: every row scored and selected over `staged.bound` blocks.
 fn attend(
     o: Ops,
@@ -334,6 +341,26 @@ fn attend(
     const kind = @backingInt(m.act);
     const key_stride = d.index_top * d.index_ratio + d.index_ratio;
     var r0: usize = 0;
+    // a prompt's rows on the matrix cores: its dense rows (no more complete blocks than the indexer keeps) in one launch,
+    // the rest over their listed keys a slice at a time
+    const matrix = !graphed and staged != null and o.l.affine.matrix and hd == 256 and m.act == .bf16 and (d.heads / d.kv_heads) % 4 == 0;
+    if (matrix) {
+        while (r0 < rows and (pos + r0 + 1) / d.index_ratio <= d.index_top) r0 += 1;
+        if (r0 > 0) try o.l.fn_attn_prompt(
+            attnSplit(),
+            @ptrFromInt(q32),
+            @ptrFromInt(kv.k),
+            @ptrFromInt(kv.v),
+            @ptrFromInt(staged.?.ends),
+            @ptrFromInt(att),
+            @intCast(r0),
+            @intCast(d.heads),
+            @intCast(d.kv_heads),
+            @intCast(cap),
+            @floatCast(1.0 / std.math.sqrt(@as(f64, @floatFromInt(hd)))),
+            o.stream,
+        );
+    }
     while (r0 < rows) : (r0 += slice_rows) {
         const n = @min(slice_rows, rows - r0);
         const mark = o.arena.mark();
@@ -392,9 +419,29 @@ fn attend(
             sparse_flags = flags;
             count = counts;
         }
+        const scale: f32 = @floatCast(1.0 / std.math.sqrt(@as(f64, @floatFromInt(hd))));
+        if (matrix) {
+            try o.l.fn_attn_listed(
+                attnSplit(),
+                @ptrFromInt(q32 + r0 * d.heads * hd * 4),
+                @ptrFromInt(kv.k),
+                @ptrFromInt(kv.v),
+                if (ids) |i| @ptrFromInt(i) else null,
+                @intCast(key_stride),
+                @ptrFromInt(count),
+                if (sparse_flags) |f| @ptrFromInt(f) else null,
+                @ptrFromInt(att + r0 * d.heads * hd * 4),
+                @intCast(n),
+                @intCast(d.heads),
+                @intCast(d.kv_heads),
+                @intCast(cap),
+                scale,
+                o.stream,
+            );
+            continue;
+        }
         const po = try o.arena.of(f32, n * d.heads * parts * hd);
         const pm = try o.arena.of(f32, n * d.heads * parts * 2);
-        const scale: f32 = @floatCast(1.0 / std.math.sqrt(@as(f64, @floatFromInt(hd))));
         try o.l.fn_sparse_attention(
             @ptrFromInt(q32 + r0 * d.heads * hd * 4),
             @ptrFromInt(kv.k),
