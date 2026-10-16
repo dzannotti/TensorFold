@@ -46,6 +46,13 @@ __global__ void __launch_bounds__(256) affine_wmma_prompt(Affine a) {
     prompt_tile<ActOut<WmmaBF16>>(a);
 }
 
+// The dequantizing prompt tile, BM x 32768 / BM a block (same bits at either shape).
+template <int BITS, int BM>
+__global__ void __launch_bounds__(256) affine_wmma_prompt_dq(Affine a) {
+    static_assert(BITS == 4, "the prompt tile decodes 4-bit words");
+    prompt_dq_tile<ActOut<WmmaBF16>, MlxDq4, BM, 32768 / BM>(a);
+}
+
 template <int BITS>
 __global__ void __launch_bounds__(256) affine_prompt_sums(Affine a) {
     prompt_sums(a);

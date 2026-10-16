@@ -144,6 +144,11 @@ pub const Kernels = struct {
     /// tiles/matrix_prompt.hpp: the pipelined 4-bit group-64 tile and the x group sums it reads; gfx11 only.
     prompt: Function,
     prompt_sums: Function,
+    /// The dequantizing prompt tile (weights to bf16 in LDS, one WMMA chain over K) at 128 x 256 and 256 x 128 a
+    /// block: every prefill row count takes it.
+    prompt_dq: [2]Function,
+    /// TF_PROMPT_FOLD set: the exact-fold prompt tile (the 128-row block's bits) instead of the dequantizing one.
+    prompt_fold: bool,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -177,7 +182,12 @@ pub const Kernels = struct {
         if (k.matrix) {
             k.prompt = try tiles_obj.function(r ++ "18affine_wmma_promptILi4EEEvNS0_6AffineE");
             k.prompt_sums = try tiles_obj.function(r ++ "18affine_prompt_sumsILi4EEEvNS0_6AffineE");
+            k.prompt_dq = .{
+                try tiles_obj.function(r ++ "21affine_wmma_prompt_dqILi4ELi128EEEvNS0_6AffineE"),
+                try tiles_obj.function(r ++ "21affine_wmma_prompt_dqILi4ELi256EEEvNS0_6AffineE"),
+            };
         }
+        k.prompt_fold = std.c.getenv("TF_PROMPT_FOLD") != null;
         return k;
     }
 
@@ -470,6 +480,27 @@ pub const Kernels = struct {
     pub fn promptTakes(k: *const Kernels, a: Arg) bool {
         return k.matrix and a.bits == 4 and a.group == 64 and @mod(a.k, 64) == 0 and a.route.items == 0 and a.fp16 == 0 and
             a.scale.kind != 0 and a.scale.kind == a.bias.kind and a.x % 16 == 0 and a.words % 16 == 0;
+    }
+
+    /// Whether a prefill product takes the dequantizing prompt tile at any row count: the prompt tile's shapes, BF16 tables.
+    pub fn dqTakes(k: *const Kernels, a: Arg) bool {
+        // its buffer loads take 31-bit byte offsets into x and the words
+        const fits = @as(u64, @intCast(a.m)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31 and @as(u64, @intCast(a.n)) * @as(u64, @intCast(a.k)) / 2 < 1 << 31;
+        return !k.prompt_fold and k.promptTakes(a) and a.scale.kind == 1 and fits;
+    }
+
+    /// The dequantizing prompt tile: 256 x 128 blocks where k is long against n (down, k/v: x read half as often per
+    /// weight), else 128 x 256. Either shape adds each output's k in the same order, so the choice never moves a bit.
+    pub fn dqGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
+        return k.dqShape(r, a, s, a.k >= 3 * a.n);
+    }
+
+    /// The dequantizing prompt tile at 256 x 128 (`tall`) or 128 x 256 blocks.
+    pub fn dqShape(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream, tall: bool) Error!void {
+        var args: hl.Args = .{};
+        try args.add(a);
+        const bm: c_int = if (tall) 256 else 128;
+        try go(r, k.prompt_dq[@intFromBool(tall)], .{ .x = cdiv(a.n, @divExact(32768, bm)) * cdiv(a.m, bm) }, .{ .x = 256 }, s, &args);
     }
 
     /// x's group sums into `a.sums` for the prompt tile: each row's 64 values a group added in order from zero.
