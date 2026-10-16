@@ -29,6 +29,7 @@ pub const Fns = struct {
     idx_scores: Function,
     idx_select: Function,
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
+    sparse_staged: [2]Function, // the same bits, tiles staged with every load in flight: a round's few rows
     sparse_merge: Function,
 
     pub fn load(m: Module) Error!Fns {
@@ -44,6 +45,7 @@ pub const Fns = struct {
             .idx_scores = try m.function("tf_fn_idx_scores"),
             .idx_select = try m.function("tf_fn_idx_select"),
             .sparse_parts = .{ try m.function("tf_fn_sparse_parts6"), try m.function("tf_fn_sparse_parts12") },
+            .sparse_staged = .{ try m.function("tf_fn_sparse_parts6_staged"), try m.function("tf_fn_sparse_parts12_staged") },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
         };
     }
@@ -150,7 +152,8 @@ pub fn sparseAttention(l: *const Launcher, q: CF, k: C, v: C, cache_kind: c_int,
     var a: Args = .{};
     inline for (.{ ad(q), ad(k), ad(v), cache_kind, ad(ids), id_stride, ad(count), ad(sparse), ad(parts_o), ad(parts_ms), heads, kv_heads, dims, cap, scale, parts }) |x| try a.add(x);
     const wide: usize = if (@divExact(heads, kv_heads) <= 6) 0 else 1;
-    try l.go(l.fnx.sparse_parts[wide], dim(kv_heads, rows, parts), dim(256, 1, 1), 0, s, &a);
+    const f = if (rows <= 16) l.fnx.sparse_staged[wide] else l.fnx.sparse_parts[wide];
+    try l.go(f, dim(kv_heads, rows, parts), dim(256, 1, 1), 0, s, &a);
     var b: Args = .{};
     inline for (.{ ad(parts_o), ad(parts_ms), ad(out), heads, dims, parts }) |x| try b.add(x);
     try l.go(l.fnx.sparse_merge, dim(heads, rows, 1), dim(256, 1, 1), 0, s, &b);

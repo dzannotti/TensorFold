@@ -51,12 +51,22 @@ extern "C" __global__ void tf_moe_zero_foreign(float* y, const int* picks, int s
 extern "C" __global__ void tf_token_prob(const uint16_t* logits, int kind, int n, const int* id, float* out) {
     const uint16_t* row = logits + static_cast<long long>(blockIdx.x) * n;
     __shared__ float shared[kProbThreads];
+    // eight loads a thread in flight; each thread's sums keep its values' order
+    constexpr int U = 8;
     float top = -INFINITY;
     bool nan = false;
-    for (int i = threadIdx.x; i < n; i += kProbThreads) {
-        float v = widen(row[i], kind);
-        nan |= v != v;
-        top = fmaxf(top, v);
+    for (int i0 = threadIdx.x; i0 < n; i0 += kProbThreads * U) {
+        float v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + u * kProbThreads;
+            v[u] = widen(row[i < n ? i : n - 1], kind);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            nan |= v[u] != v[u];
+            top = fmaxf(top, v[u]);
+        }
     }
     shared[threadIdx.x] = nan ? NAN : top;
     __syncthreads();
@@ -70,7 +80,18 @@ extern "C" __global__ void tf_token_prob(const uint16_t* logits, int kind, int n
     const float peak = shared[0];
     __syncthreads();
     float total = 0.f;
-    for (int i = threadIdx.x; i < n; i += kProbThreads) total += expf(widen(row[i], kind) - peak);
+    for (int i0 = threadIdx.x; i0 < n; i0 += kProbThreads * U) {
+        float v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int i = i0 + u * kProbThreads;
+            v[u] = widen(row[i < n ? i : n - 1], kind);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (i0 + u * kProbThreads < n) total += expf(v[u] - peak);
+        }
+    }
     shared[threadIdx.x] = total;
     __syncthreads();
     for (int stride = kProbThreads / 2; stride > 0; stride >>= 1) {

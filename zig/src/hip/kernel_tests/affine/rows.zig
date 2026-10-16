@@ -26,6 +26,9 @@ const cases = [_]Case{
     .{ .name = "5-bit", .n = 4096, .k = 2048, .bits = 5 },
     .{ .name = "6-bit group 32", .n = 4096, .k = 2048, .bits = 6, .group = 32 },
     .{ .name = "8-bit group 128", .n = 4096, .k = 2048, .bits = 8, .group = 128 },
+    // Flash Next 3-bit group 32: the hyper-connection down (the deal tile) and out
+    .{ .name = "fn3 hc down", .n = 324, .k = 10240, .bits = 3, .group = 32 },
+    .{ .name = "fn3 out", .n = 2560, .k = 6144, .bits = 3, .group = 32 },
 };
 
 /// Row counts launched together: every count of a lane round up to 16, then wider rounds.

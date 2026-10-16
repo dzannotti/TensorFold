@@ -1,4 +1,5 @@
-//! Decode product timings on Qwen3.8-27B's shapes by rows (TF_AFFINE_BENCH=1; TF_AFFINE_BENCH_ENTRY names an entry).
+//! Decode product timings on Qwen3.8-27B's shapes by rows (TF_AFFINE_BENCH=1; TF_AFFINE_BENCH_ENTRY names an entry;
+//! TF_AFFINE_BENCH_SET=fn3 takes Flash Next's 3-bit group-32 shapes).
 
 const std = @import("std");
 const base = @import("../rig.zig");
@@ -28,9 +29,17 @@ const shapes = [_]Shape{
     .{ .name = "dft gate", .n = 17408, .k = 5120 },
     .{ .name = "dft head", .n = 98592, .k = 5120 },
 };
+/// Flash Next 3-bit (MLX group 32): its dense decode products.
+const fn3 = [_]Shape{
+    .{ .name = "hc down", .n = 324, .k = 10240 },
+    .{ .name = "hc mix", .n = 320, .k = 10240 },
+    .{ .name = "qkv|z|a|b", .n = 16480, .k = 2560 },
+    .{ .name = "q|k|v|idx", .n = 13952, .k = 2560 },
+    .{ .name = "out/o", .n = 2560, .k = 6144 },
+    .{ .name = "fc", .n = 2560, .k = 2560 },
+    .{ .name = "lm_head", .n = 248320, .k = 2560 },
+};
 const rows = [_]c_int{ 1, 2, 4, 8, 12, 16, 32, 64, 128 };
-const bits = 4;
-const group = 64;
 /// Weight copies a timed run cycles through: at least this many bytes, past the 32 MB MALL.
 const spread = 256 << 20;
 const reps = 7;
@@ -53,11 +62,14 @@ test "affine decode timings on the 27B shapes (TF_AFFINE_BENCH=1)" {
     const b = try base.Rig.open(1 << 20);
     defer b.close();
     const k = &b.on.affine;
+    const flash = if (std.c.getenv("TF_AFFINE_BENCH_SET")) |v| std.mem.eql(u8, std.mem.span(v), "fn3") else false;
+    const bits: c_int = if (flash) 3 else 4;
+    const group: c_int = if (flash) 32 else 64;
     const s = b.stream.handle;
     std.debug.print("\nshape        M   entry                          us      GB/s   TFLOPS\n", .{});
-    for (shapes) |sh| {
-        const words_row = sh.k * bits / 32;
-        const groups = sh.k / group;
+    for (if (flash) &fn3 else &shapes) |sh| {
+        const words_row = sh.k * @as(usize, @intCast(bits)) / 32;
+        const groups = sh.k / @as(usize, @intCast(group));
         const wbytes = sh.n * words_row * 4;
         const tbytes = sh.n * groups * 2;
         const copies = @max(1, spread / (wbytes + 2 * tbytes));

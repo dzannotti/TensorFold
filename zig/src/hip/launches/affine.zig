@@ -98,6 +98,9 @@ const stream_code_words = 32; // kStreamCodeWords
 const verify_tiles = [_]c_int{ 1, 2 }; // VerifyShape's MT: 16-row tiles a block (past 32 rows, more 32-row blocks beat 4 and 8)
 const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
 const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for at most 6144 columns of at most 8192 K, else 4 (the bits are the same)
+pub const deal_bits = [_]c_int{ 2, 3, 4 }; // the deal tile's widths (tiles/wmma_verify.hpp affine_wmma_deal), group 32
+const deal_groups = 16; // groups a deal wave makes (its L)
+const deal_rows = 4; // the most rows it takes; more go to the verify tile (the same bits)
 const split_groups = [_]c_int{ 64, 128 }; // the split verify tile's group sizes
 const split_waves = [_]c_int{ 4, 8 }; // its waves a block (a 16-column tile each)
 
@@ -140,6 +143,8 @@ pub const Kernels = struct {
     stream_on: bool,
     /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2); gfx11 only.
     verify: [bit_widths.len][verify_groups.len][verify_waves.len][verify_tiles.len]Function,
+    /// The verify tile's sums with K dealt across a block's waves, for few columns over a long K; gfx11 only.
+    deal: [deal_bits.len][2]Function,
     /// The verify tile with K spread over a block's waves (same bits), for few columns at up to 16 rows.
     split: [bit_widths.len][split_groups.len][split_waves.len]Function,
     block: [bit_widths.len]Function,
@@ -184,6 +189,9 @@ pub const Kernels = struct {
         k.tiled = try dot2_obj.function(r ++ "17affine_dot2_tiledENS0_6AffineE");
         k.reference = try dot2_obj.function(r ++ "18affine_dot2_kernelENS0_6AffineE");
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
+        if (k.matrix) inline for (deal_bits, 0..) |bits, b| inline for (.{ 1, 2 }, 0..) |e, i| {
+            k.deal[b][i] = try tiles_obj.function(std.fmt.comptimePrint(r ++ "16affine_wmma_dealILi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, e }));
+        };
         if (k.matrix) {
             k.prompt = try tiles_obj.function(r ++ "18affine_wmma_promptILi4EEEvNS0_6AffineE");
             k.prompt_sums = try tiles_obj.function(r ++ "18affine_prompt_sumsILi4EEEvNS0_6AffineE");
@@ -410,6 +418,53 @@ pub const Kernels = struct {
         };
         if (split) return go(r, k.split[b][gi - 1][wi], .{ .x = blocks, .y = cdiv(a.m, 16) }, .{ .x = @intCast(32 * split_waves[wi]) }, s, &args);
         try go(r, k.verify[b][gi][wi][t], .{ .x = blocks, .y = cdiv(a.m, 16 * verify_tiles[t]) }, .{ .x = @intCast(cols * 2) }, s, &args);
+    }
+
+    /// The waves a deal block takes for `k` (8 to 32), or null when its groups pass 32 waves' rounds.
+    pub fn dealWaves(bits: c_int, k: c_int, group: c_int) ?c_int {
+        if (std.mem.indexOfScalar(c_int, &deal_bits, bits) == null or group != 32) return null;
+        const w = cdiv(@divTrunc(k, group), deal_groups);
+        return if (w <= 20) @intCast(w) else null;
+    }
+
+    /// The deal tile on `total_n` columns (a group's sides counted off side by side): 16 columns a block.
+    pub fn dealGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
+        if (a.m > deal_rows) return k.verifyGo(r, a, sides_in, total_n, s);
+        const b = std.mem.indexOfScalar(c_int, &deal_bits, a.bits) orelse return refuse("bits");
+        const waves = dealWaves(a.bits, a.k, a.group) orelse return refuse("deal shape");
+        var sides = sides_in;
+        var blocks: c_uint = cdiv(total_n, 16);
+        if (sides.count > 0) {
+            blocks = 0;
+            for (0..@intCast(sides.count)) |i| {
+                sides.first[i] = @intCast(blocks);
+                blocks += cdiv(sides.n[i], 16);
+            }
+            sides.first[@intCast(sides.count)] = @intCast(blocks);
+        }
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(sides);
+        try go(r, k.deal[b][if (a.m <= 2) 0 else 1], .{ .x = blocks }, .{ .x = @intCast(32 * waves) }, s, &args);
+    }
+
+    /// The deal tile over a group: the sides' addresses and widths in one launch.
+    pub fn dealGroupGo(k: *const Kernels, r: *const runtime.Runtime, arg: Arg, group: []const Side, out_half: bool, s: abi.Stream) Error!void {
+        var a = arg;
+        var sides: StreamSides = .{ .count = @intCast(group.len), .out_half = @intFromBool(out_half) };
+        var total: c_int = 0;
+        for (group, 0..) |side, i| {
+            sides.words[i] = side.words;
+            sides.scale[i] = side.scale;
+            sides.bias[i] = side.bias;
+            sides.out[i] = side.out;
+            sides.n[i] = side.n;
+            total += side.n;
+        }
+        a.words = group[0].words;
+        a.scale.p = group[0].scale;
+        a.bias.p = group[0].bias;
+        try k.dealGo(r, a, sides, total, s);
     }
 
     /// The verify tile over a group: the sides' addresses and widths in one launch.

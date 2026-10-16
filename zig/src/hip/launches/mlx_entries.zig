@@ -173,6 +173,15 @@ fn fitsVerify(s: Shape) bool {
     return streamShape(s) and !s.fp16 and groupOk(s) and s.words_aligned and s.terms_aligned and s.k % 256 == 0 and s.items == 0;
 }
 
+/// The deal tile: the verify tile's shapes at 2 to 4 bits whose K fits a block's rounds, on few columns (a skinny n
+/// leaves the verify tile a wave a 16 columns, too few to keep the memory busy).
+fn fitsDeal(s: Shape) bool {
+    return fitsVerify(s) and s.n <= deal_cols and Kernels.dealWaves(s.bits, @intCast(s.k), @intCast(s.group)) != null;
+}
+
+/// The most columns the deal tile takes (the widest side of a group).
+const deal_cols: u32 = 1024;
+
 fn fitsGroup(s: Shape) bool {
     return streamShape(s);
 }
@@ -215,6 +224,14 @@ fn launchPair(k: *const Kernels, c: Call) Error!void {
 
 fn launchVerify(k: *const Kernels, c: Call) Error!void {
     try k.verifyGo(c.r, c.arg, .{}, c.arg.n, c.s);
+}
+
+fn launchDeal(k: *const Kernels, c: Call) Error!void {
+    try k.dealGo(c.r, c.arg, .{}, c.arg.n, c.s);
+}
+
+fn launchDealGroup(k: *const Kernels, c: Call) Error!void {
+    try k.dealGroupGo(c.r, c.arg, c.sides, c.out_half, c.s);
 }
 
 fn launchVerifyGroup(k: *const Kernels, c: Call) Error!void {
@@ -296,6 +313,7 @@ fn entry(comptime op: Op, comptime path: registry.Path, comptime name: []const u
 
 const project_decode = [_]Entry{
     entry(.project, .decode, "split", .{ .family = .split, .fits = &fitsSplit, .launch = &launchSplit, .caps = &rdna2 }),
+    entry(.project, .decode, "deal", .{ .family = .gemm, .fits = &fitsDeal, .launch = &launchDeal, .caps = &matrixCores, .policy = &verifyOn, .rounds = .always, .round_any = true }),
     entry(.project, .decode, "verify", .{ .family = .gemm, .fits = &fitsVerify, .launch = &launchVerify, .caps = &matrixCores, .policy = &verifyOn, .rounds = .always, .round_any = true }),
     entry(.project, .decode, "stream", .{ .family = .stream, .fits = &fitsStream, .launch = &launchStream, .policy = &streamOn, .rounds = .always, .round_any = true }),
     entry(.project, .decode, "row", .{ .family = .row, .fits = &fitsRow, .launch = &launchRow, .rounds = .fp16 }),
@@ -318,6 +336,7 @@ const routed_decode = [_]Entry{
 };
 
 const other_decode = [_]Entry{
+    entry(.group, .decode, "deal", .{ .family = .gemm, .fits = &fitsDeal, .launch = &launchDealGroup, .caps = &matrixCores, .policy = &verifyOn, .round_any = true }),
     entry(.group, .decode, "verify", .{ .family = .gemm, .fits = &fitsVerify, .launch = &launchVerifyGroup, .caps = &matrixCores, .policy = &verifyOn, .round_any = true }),
     entry(.group, .decode, "stream", .{ .family = .stream, .fits = &fitsGroup, .launch = &launchGroup, .policy = &streamOn, .round_any = true }),
     entry(.routed_act, .decode, "stream", .{ .family = .stream, .fits = &fitsPair, .launch = &launchPair, .policy = &streamOn }),

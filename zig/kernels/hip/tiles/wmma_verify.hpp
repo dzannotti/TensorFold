@@ -455,7 +455,165 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, St
 #endif
 }
 
+// Few columns over a long K at few rows (Flash Next's hyper-connection down, 324 x 10240, in a round of at most 4
+// rows): the verify tile's sums with K cut across a block's waves. Wave w makes groups [16 w, 16 w + 16) of the block's
+// 16 columns, each group's WMMA chain from zero as the verify tile makes it, and keeps each group's dots of the rows
+// below 2 E (E of a lane's 8 sums); lanes 0-15 put the groups' sums of x in LDS. Then the folds run in K order: wave w
+// folds its groups onto wave w - 1's running sums, handed over in LDS. Every product and sum is the verify tile's, in
+// its order: the same bits. Codes and terms run eight groups ahead, x three. W = blockDim / 32 is 1 to 20.
+template <int BITS, int E>
+__global__ void __launch_bounds__(640) affine_wmma_deal(Affine a, StreamSides sides) {
+#if TF_DEVICE_WMMA_GFX11
+    using Dec = MlxDecoder<BITS>;
+    using T = WmmaBF16;
+    constexpr int L = 16;  // groups a wave
+    constexpr int A = 3;   // groups of x in flight
+    constexpr int P = 8;   // groups of codes in flight
+    constexpr int ROWS = 2 * E;
+    __shared__ float sxs[20 * L][ROWS];  // a group's sums of x, a row each
+    __shared__ float hand[32][E];        // the running sums a wave hands the next, a lane's E
+
+    int bx = blockIdx.x;
+    if (sides.count > 0) {
+        int s = 0;
+        while (s + 1 < sides.count && bx >= sides.first[s + 1]) ++s;
+        bx -= sides.first[s];
+        Dec::bind(a, sides, s);
+        a.n = sides.n[s];
+        if (sides.out_half) {
+            a.out16 = static_cast<__half*>(sides.out[s]);
+        } else {
+            a.out = static_cast<float*>(sides.out[s]);
+        }
+    }
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int W = blockDim.x >> 5;
+    const int live = a.m < ROWS ? a.m : ROWS;
+    const int K = a.k;
+    const int groups = K >> 5;
+    const int col = bx * 16 + (lane & 15);
+    const int col_s = col < a.n ? col : a.n - 1;
+    const uint32_t* wp = Dec::words(a) + static_cast<long long>(col_s) * groups * BITS;
+    const long long tb = static_cast<long long>(col_s) * groups;
+    const typename Dec::StreamTerms terms(a);
+    // the A fragment's row: rows past the call read its last row, whose sums are never stored
+    const int xrow = (lane & 15) < live ? (lane & 15) : live - 1;
+    const __bf16* xp0 = static_cast<const __bf16*>(a.x) + static_cast<long long>(xrow) * K;
+    const int g0 = wave * L;
+
+    // codes and terms P groups ahead, unconditional on clamped groups so no load waits on another
+    uint32_t w[P][BITS];
+    uint32_t tp[P];
+    uint32_t tr[L];
+    auto cload = [&](int i, uint32_t (&c)[BITS], uint32_t& t) {
+        const int g = g0 + i < groups ? g0 + i : groups - 1;
+        Dec::template load<true>(wp + static_cast<long long>(g) * BITS, c);
+        t = static_cast<uint32_t>(terms.scale_raw(tb + g)) | static_cast<uint32_t>(terms.bias_raw(tb + g)) << 16;
+    };
+#pragma unroll
+    for (int i = 0; i < P; ++i) cload(i, w[i], tp[i]);
+    u32x4 xr[A][4];
+    auto xload = [&](int i, u32x4 (&v)[4]) {
+        const int g = g0 + i < groups ? g0 + i : groups - 1;
+        const u32x4* src = reinterpret_cast<const u32x4*>(xp0 + static_cast<long long>(g) * 32);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = src[q];
+    };
+#pragma unroll
+    for (int i = 0; i < A - 1; ++i) xload(i, xr[i]);
+
+    float dl[L][E];
+    const f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int i = 0; i < L; ++i) {
+        xload(i + A - 1 < L ? i + A - 1 : L - 1, xr[(i + A - 1) % A]);
+        const u32x4(&v)[4] = xr[i % A];
+        const bf16x16 lo = __builtin_bit_cast(bf16x16, __builtin_shufflevector(v[0], v[1], 0, 1, 2, 3, 4, 5, 6, 7));
+        const bf16x16 hi = __builtin_bit_cast(bf16x16, __builtin_shufflevector(v[2], v[3], 0, 1, 2, 3, 4, 5, 6, 7));
+        f32x8 d = T::mma(lo, verify_frag<BITS, 0>(w[i % P]), zero);
+        d = T::mma(hi, verify_frag<BITS, 1>(w[i % P]), d);
+        tr[i] = tp[i % P];
+        if (i + P < L) cload(i + P, w[i % P], tp[i % P]);
+#pragma unroll
+        for (int e = 0; e < E; ++e) dl[i][e] = d[e];
+        if (lane < ROWS && g0 + i < groups) {
+            // the verify tile's sum of x over a group: from zero, in K order
+            float run = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint32_t u[4] = {v[q].x, v[q].y, v[q].z, v[q].w};
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    run += __uint_as_float(u[h] << 16);
+                    run += __uint_as_float(u[h] & 0xffff0000u);
+                }
+            }
+            sxs[g0 + i][lane] = run;
+        }
+    }
+    __syncthreads();
+
+    // the folds in K order, a wave at a time: a lane's sums of x first, so a fold waits only on the handover
+    const int half = lane >> 4;
+    float sv[L][E];
+#pragma unroll
+    for (int i = 0; i < L; ++i)
+#pragma unroll
+        for (int e = 0; e < E; ++e) sv[i][e] = sxs[g0 + i < groups ? g0 + i : groups - 1][2 * e + half];
+    for (int s = 0; s < W; ++s) {
+        if (wave == s) {
+            float acc[E];
+#pragma unroll
+            for (int e = 0; e < E; ++e) acc[e] = s > 0 ? hand[lane][e] : 0.f;
+#pragma unroll
+            for (int i = 0; i < L; ++i) {
+                if (g0 + i < groups) {
+                    const float scale = terms.widen(static_cast<unsigned short>(tr[i] & 0xffffu));
+                    const float bias = terms.widen(static_cast<unsigned short>(tr[i] >> 16));
+#pragma unroll
+                    for (int e = 0; e < E; ++e) {
+                        acc[e] = Dec::fold_scale(acc[e], dl[i][e], scale);
+                        acc[e] = Dec::fold_bias(acc[e], sv[i][e], bias);
+                    }
+                }
+            }
+            if (s + 1 < W) {
+#pragma unroll
+                for (int e = 0; e < E; ++e) hand[lane][e] = acc[e];
+            } else {
+#pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    const int row = 2 * e + half;
+                    if (row >= a.m || col >= a.n) continue;
+                    const long long at = static_cast<long long>(row) * a.n + col;
+                    if (a.out16 != nullptr) {
+                        static_cast<__bf16*>(static_cast<void*>(a.out16))[at] = narrow<T>(acc[e]);
+                    } else {
+                        a.out[at] = acc[e];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#else
+    (void)a;
+    (void)sides;
+    __builtin_trap();
+#endif
+}
+
 #if TF_MATRIX
+// group 32 at 2, 3 or 4 bits; E = 1 (two rows) or 2 (four)
+#define TF_DEAL(BITS)                                                        \
+    template __global__ void affine_wmma_deal<BITS, 1>(Affine, StreamSides); \
+    template __global__ void affine_wmma_deal<BITS, 2>(Affine, StreamSides);
+TF_DEAL(2)
+TF_DEAL(3)
+TF_DEAL(4)
+#undef TF_DEAL
 #define TF_VERIFY_W(BITS, G, WV)                                                   \
     template __global__ void affine_wmma_verify<BITS, 1, G, WV>(Affine, StreamSides); \
     template __global__ void affine_wmma_verify<BITS, 2, G, WV>(Affine, StreamSides);
