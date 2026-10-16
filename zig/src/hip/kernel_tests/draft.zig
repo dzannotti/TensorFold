@@ -398,3 +398,55 @@ test "q4 rows: a tiled affine-4 group-64 matrix's products over every row count 
         };
     }
 }
+
+test "top-k merge: chunks' own top k merged give the whole row's, ties to the lower id, best first" {
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x7c };
+    const rows = 3;
+    const chunks = 8;
+    const chunk = 64;
+    const k = 16;
+    const n = chunks * chunk;
+    // few distinct values: many ties, inside and across chunks
+    const logits = try gpa.alloc(u16, rows * n);
+    defer gpa.free(logits);
+    for (logits) |*x| x.* = tobf(@round(rng.unit() * 6));
+    const ks = [_]i32{ 0, k, k };
+    var kc: [rows * chunks]i32 = undefined;
+    for (&kc, 0..) |*x, i| x.* = ks[i / chunks];
+    var dl = try t.upload(logits);
+    defer dl.free();
+    var dks = try t.upload(@as([]const i32, &ks));
+    defer dks.free();
+    var dkc = try t.upload(@as([]const i32, &kc));
+    defer dkc.free();
+    var ci = try t.alloc(rows * chunks * k * 4);
+    defer ci.free();
+    var cv = try t.alloc(rows * chunks * k * 2);
+    defer cv.free();
+    var ids = try t.alloc(rows * k * 4);
+    defer ids.free();
+    var vals = try t.alloc(rows * k * 2);
+    defer vals.free();
+    try t.on.tf_topk_rows(@ptrFromInt(at(dl)), rows * chunks, chunk, @ptrFromInt(at(dkc)), k, @ptrFromInt(at(ci)), @ptrFromInt(at(cv)), t.stream.handle);
+    try t.on.dftTopkMerge(at(ci), at(cv), rows, chunks, k, chunk, at(dks), k, at(ids), at(vals), t.stream.handle);
+    try t.stream.synchronize();
+    const got = try rig.download(i32, ids);
+    defer gpa.free(got);
+    for (1..rows) |r| {
+        const row = logits[r * n ..][0..n];
+        var order: [n]u32 = undefined;
+        for (&order, 0..) |*o, i| o.* = @intCast(i);
+        const Desc = struct {
+            row: []const u16,
+            fn less(c: @This(), a: u32, b: u32) bool {
+                const va = bfv(c.row[a]);
+                const vb = bfv(c.row[b]);
+                return va > vb or (va == vb and a < b);
+            }
+        };
+        std.mem.sort(u32, &order, Desc{ .row = row }, Desc.less);
+        for (0..k) |j| try std.testing.expectEqual(@as(i32, @intCast(order[j])), got[r * k + j]);
+    }
+}

@@ -186,6 +186,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (loaded.facts.head_trees) { // a drafter's trees: the planner picks a lone stream's lanes, as deep as it drafts
         h.cfg.head_lanes = loaded.rows - 1;
         h.cfg.head_depth = @max(1, loaded.facts.drafts);
+        // priced by the table and the stream's chain and tree overs alone: a pick's own correction keeps the graph
+        // captures of its first rounds and then starves (27B code C1: 15-draft chains 116 tok/s, with corrections 112)
+        h.cfg.own_prices = false;
     }
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, loaded.backend, h.clock.clock());

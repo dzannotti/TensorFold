@@ -4,8 +4,8 @@ const Allocator = std.mem.Allocator;
 const shape = @import("shape.zig");
 const Table = @import("table.zig").Table;
 
-/// Lane counts the planner weighs for a head tree (each at most the cap).
-pub const sizes = [_]u32{ 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 };
+/// Lane counts the planner weighs for a head tree (each at most the cap): 15 fills a 16-row window.
+pub const sizes = [_]u32{ 1, 2, 3, 4, 6, 8, 12, 15, 16, 24, 32 };
 
 /// The pick that keeps the head's chain and grafts copies onto it.
 pub const chain_grafts = sizes.len;
@@ -81,6 +81,21 @@ fn chainExpected(o: shape.Odds, depth: usize) f64 {
     return total;
 }
 
+/// The head's chain of `n` drafts as a shape.
+fn chainOf(gpa: Allocator, o: shape.Odds, n: usize) !shape.Shape {
+    const parents = try gpa.alloc(i32, n);
+    errdefer gpa.free(parents);
+    const ranks = try gpa.alloc(u8, n);
+    errdefer gpa.free(ranks);
+    const depths = try gpa.alloc(u8, n);
+    for (parents, ranks, depths, 0..) |*p, *r, *d, j| {
+        p.* = @as(i32, @intCast(j)) - 1;
+        r.* = 0;
+        d.* = @intCast(j);
+    }
+    return .{ .parents = parents, .ranks = ranks, .depths = depths, .expected = chainExpected(o, n) };
+}
+
 /// A pick's table price (the window, its head levels, the stream's time beyond them), for measuring its own correction.
 pub fn tablePrice(c: Costs, p: Pick) ?f64 {
     if (p.tree) |t| return if (t.isChain()) c.round(1 + t.parents.len, levels(t)) else c.treeRound(1 + t.parents.len, levels(t));
@@ -91,21 +106,26 @@ pub fn tablePrice(c: Costs, p: Pick) ?f64 {
 pub fn pick(gpa: Allocator, o: shape.Odds, c: Costs, cap: u32, depth_cap: usize, grafts: ?Grafts, wider: bool) !Pick {
     var best: Pick = .{ .choice = 0 };
     var best_rate: f64 = -1;
+    var best_is_chain = false;
     errdefer if (best.tree) |t| t.deinit(gpa);
     for (sizes, 0..) |n, i| {
         if (n > cap) break;
-        const t = try shape.best(gpa, o, n, depth_cap);
-        const priced = if (t.isChain()) c.round(1 + t.parents.len, levels(t)) else c.treeRound(1 + t.parents.len, levels(t));
-        const cost = (priced orelse {
-            t.deinit(gpa);
-            continue;
-        }) + c.own(i);
-        const rate = (1 + t.expected) / cost;
-        if (rate > best_rate) {
-            if (best.tree) |old| old.deinit(gpa);
-            best = .{ .choice = i, .tree = t, .expected = 1 + t.expected };
-            best_rate = rate;
-        } else t.deinit(gpa);
+        // the best tree of n lanes, and the chain of n when that tree is not one: a tree round costs its own over
+        for (0..2) |as_chain| {
+            const t = if (as_chain == 0) try shape.best(gpa, o, n, depth_cap) else if (n <= depth_cap and !best_is_chain) try chainOf(gpa, o, n) else break;
+            if (as_chain == 0) best_is_chain = t.isChain();
+            const priced = if (t.isChain()) c.round(1 + t.parents.len, levels(t)) else c.treeRound(1 + t.parents.len, levels(t));
+            const cost = (priced orelse {
+                t.deinit(gpa);
+                continue;
+            }) + c.own(i);
+            const rate = (1 + t.expected) / cost;
+            if (rate > best_rate) {
+                if (best.tree) |old| old.deinit(gpa);
+                best = .{ .choice = i, .tree = t, .expected = 1 + t.expected };
+                best_rate = rate;
+            } else t.deinit(gpa);
+        }
     }
     if (grafts) |g| if (g.rows > 0) {
         for (1..@min(4, @as(usize, cap)) + 1) |d| {
@@ -170,4 +190,17 @@ test "grafts that keep landing win the round when they add more rows than the he
     defer if (p.tree) |t| t.deinit(gpa);
     try std.testing.expectEqual(chain_grafts, p.choice);
     try std.testing.expect(p.grafts == 20 and p.depth >= 1);
+}
+
+test "a tree's rounds that cost more than a chain's of the same rows leave the chain of that size" {
+    const gpa = std.testing.allocator;
+    var flat: Table = .{};
+    defer flat.deinit(gpa);
+    for (1..34) |r| try flat.put(gpa, @intCast(r), 10.0);
+    // second choices worth a lane: the best 15 lanes are a tree, but its rounds run 5 ms over a chain's
+    const o = shape.Odds.init(.{ 0.8, 0.3, 0.03, 0.01 }, 10);
+    const p = try pick(gpa, o, .{ .window = &flat, .head_ms = 0, .over_ms = 0, .tree_over_ms = 5 }, 15, 16, null, false);
+    defer if (p.tree) |t| t.deinit(gpa);
+    try std.testing.expect(p.tree.?.isChain());
+    try std.testing.expectEqual(@as(usize, 15), p.tree.?.parents.len);
 }

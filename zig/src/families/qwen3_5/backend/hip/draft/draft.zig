@@ -27,6 +27,9 @@ const splits = 16;
 const spans = [_][2]u32{ .{ 0, 98304 }, .{ 248032, 248320 } };
 const stock_vocab = 248320;
 
+/// The draft head's rows a hold's top-k splits into, each chunk's own top-k then merged (16 rows alone fill 16 CUs).
+const topk_chunks = 8;
+
 /// Acceptance by depth until a stream has its own (#836's, measured on the reference's chat text).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4 };
 
@@ -58,6 +61,14 @@ const Layout = struct { desc: usize, ids: usize, rows: usize, top_ids: usize, to
 /// The hold's launches by streams held at once.
 const Key = struct { streams: u32 };
 
+/// Events between an eager hold's launches, by label.
+const Prof = struct {
+    ev: [256]hip.Event = undefined,
+    label: [256][]const u8 = undefined,
+    n: usize = 0,
+    made: usize = 0,
+};
+
 pub const Draft = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -74,8 +85,11 @@ pub const Draft = struct {
     arena: hip.Arena,
     stage: hip.HostBuffer,
     dev: hip.DeviceBuffer,
-    /// top-k counts a hold row: 0 for each block's pending row.
+    /// top-k counts a hold row: 0 for each block's pending row; then the same a row's chunk (topk_chunks a row).
     ks: hip.DeviceBuffer,
+    ks_chunks: hip.DeviceBuffer,
+    /// The attention rows the o product reads, as wide as its stored K: zeros past qWidth, written once.
+    att: hip.DeviceBuffer,
     /// The staging areas a queued copy may still read: written again only after a sync.
     absorb_busy: bool = false,
     hold_busy: bool = false,
@@ -93,6 +107,8 @@ pub const Draft = struct {
     /// The hold's GPU time at load (events) and the hold with `held` of a 16-lane tree (wall), for the logs.
     gpu_ms: f64 = 0,
     tree_ms: f64 = 0,
+    /// TF_DRAFT_PROFILE: an event after each of an eager hold's launches, for the per-launch breakdown in the logs.
+    prof: ?*Prof = null,
 
     /// The drafter in `dir` over the target engine `e`, `bits` 4 (affine-4) or 0 (bf16), for up to `cap` streams a hold.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, bits: u8, cap: usize) !*Draft {
@@ -102,7 +118,7 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, .{ .hidden = m.spec.hidden, .vocab = m.head.n, .layers = m.spec.n_layers });
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .head = undefined, .head_buf = null, .restricted = false, .cap = @max(cap, 1), .table_rows = 0, .arena = undefined, .stage = undefined, .dev = undefined, .ks = undefined, .graphs = graph_cache.Cache(Key, u64).init(gpa), .use_graphs = e.headGraphs() };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .head = undefined, .head_buf = null, .restricted = false, .cap = @max(cap, 1), .table_rows = 0, .arena = undefined, .stage = undefined, .dev = undefined, .ks = undefined, .ks_chunks = undefined, .att = undefined, .graphs = graph_cache.Cache(Key, u64).init(gpa), .use_graphs = e.headGraphs() };
         errdefer d.graphs.deinit();
         d.table_rows = @max(c.window, d.cap * 17);
         d.w = try weights.load(gpa, io, &e.driver, dir, c, bits);
@@ -115,12 +131,21 @@ pub const Draft = struct {
         d.dev = try hip.DeviceBuffer.alloc(&e.driver, at.total);
         errdefer d.dev.free();
         try d.dev.fill8(0);
+        d.att = try hip.DeviceBuffer.alloc(&e.driver, d.cap * c.block * d.attWidth() * 2);
+        errdefer d.att.free();
+        try d.att.fill8(0);
         d.ks = try hip.DeviceBuffer.alloc(&e.driver, d.cap * c.block * 4);
         errdefer d.ks.free();
         const ks = try gpa.alloc(i32, d.cap * c.block);
         defer gpa.free(ks);
         for (ks, 0..) |*k, r| k.* = if (r % c.block == 0) 0 else @intCast(c.topk);
         try d.ks.upload(0, std.mem.sliceAsBytes(ks));
+        d.ks_chunks = try hip.DeviceBuffer.alloc(&e.driver, d.cap * c.block * topk_chunks * 4);
+        errdefer d.ks_chunks.free();
+        const kc = try gpa.alloc(i32, d.cap * c.block * topk_chunks);
+        defer gpa.free(kc);
+        for (kc, 0..) |*k, i| k.* = ks[i / topk_chunks];
+        try d.ks_chunks.upload(0, std.mem.sliceAsBytes(kc));
         d.arena = try hip.Arena.init(&e.driver, try d.scratch());
         errdefer d.arena.deinit();
         try d.time();
@@ -136,6 +161,8 @@ pub const Draft = struct {
         d.pool.deinit(d.gpa);
         d.graphs.deinit();
         d.ks.free();
+        d.ks_chunks.free();
+        d.att.free();
         d.dev.free();
         d.stage.free();
         d.arena.deinit();
@@ -261,6 +288,14 @@ pub const Draft = struct {
         return col;
     }
 
+    /// The attention rows' width: the o product's stored K.
+    fn attWidth(d: *const Draft) usize {
+        return switch (d.w.layers[0].o) {
+            .q4 => |p| p.k,
+            .bf16 => |b| b.k,
+        };
+    }
+
     fn layout(d: *const Draft) Layout {
         const rows = d.cap * d.c.block;
         const a = std.mem.alignForward;
@@ -378,6 +413,87 @@ pub const Draft = struct {
 
     // hold: [pending, mask x (block - 1)] a stream -> the layers over the rings -> the draft head's top-k and the selector
 
+    fn tick(d: *Draft, o: Ops, label: []const u8) !void {
+        const p = d.prof orelse return;
+        if (o.stream != d.e.stream.handle or p.n == p.ev.len) return;
+        if (p.n == p.made) {
+            p.ev[p.n] = try hip.Event.init(&d.e.driver, true);
+            p.made += 1;
+        }
+        p.label[p.n] = label;
+        try p.ev[p.n].record(d.e.stream);
+        p.n += 1;
+    }
+
+    /// The eager hold's GPU ms between launches, summed by label over the layers (best of 10), on stderr.
+    fn profile(d: *Draft, ctx: *Ctx, taps: u64) !void {
+        {
+            // an absorb of 8 kept rows (a round's), rewriting the context's last 8
+            var a = try hip.Event.init(&d.e.driver, true);
+            defer a.deinit();
+            var b = try hip.Event.init(&d.e.driver, true);
+            defer b.deinit();
+            var s: Stream = undefined;
+            try d.streams.put(d.gpa, &s, ctx);
+            defer _ = d.streams.remove(&s);
+            var picks: [8]u32 = @splat(0);
+            var least: f64 = std.math.inf(f64);
+            for (0..10) |_| {
+                try a.record(d.e.stream);
+                try d.absorbAll(&.{.{ .stream = &s, .features = .{ .buffer = taps, .rows = 1, .row_bytes = @intCast(d.c.n_taps * d.c.hidden * 2), .space = .device, .dtype = .bf16 }, .start = ctx.end - 8, .follow = &.{}, .rows = &picks }});
+                try b.record(d.e.stream);
+                try d.settle();
+                least = @min(least, try hip.Event.elapsedMs(a, b));
+            }
+            std.debug.print("drafter profile: an absorb of 8 rows {d:.3} ms\n", .{least});
+        }
+        var p: Prof = .{};
+        d.prof = &p;
+        const graphs = d.use_graphs;
+        d.use_graphs = false;
+        defer {
+            d.prof = null;
+            d.use_graphs = graphs;
+            for (p.ev[0..p.made]) |*e| e.deinit();
+        }
+        var s: Stream = undefined;
+        try d.streams.put(d.gpa, &s, ctx);
+        defer _ = d.streams.remove(&s);
+        var out: [max_lanes]u32 = undefined;
+        const Sum = struct { label: []const u8, ms: f64, n: usize };
+        var best: [64]Sum = undefined;
+        var nb: usize = 0;
+        var total_best: f64 = std.math.inf(f64);
+        for (0..10) |_| {
+            try d.holdAll(&.{.{ .stream = &s, .pending = 1, .position = ctx.end + 1, .depth = @intCast(d.c.block - 1) }});
+            try d.heldAll(&.{&s}, &.{out[0 .. d.c.block - 1]});
+            var sums: [64]Sum = undefined;
+            var ns: usize = 0;
+            var total: f64 = 0;
+            for (1..p.n) |i| {
+                const ms: f64 = try hip.Event.elapsedMs(p.ev[i - 1], p.ev[i]);
+                total += ms;
+                const at = for (sums[0..ns], 0..) |x, j| {
+                    if (std.mem.eql(u8, x.label, p.label[i])) break j;
+                } else blk: {
+                    sums[ns] = .{ .label = p.label[i], .ms = 0, .n = 0 };
+                    ns += 1;
+                    break :blk ns - 1;
+                };
+                sums[at].ms += ms;
+                sums[at].n += 1;
+            }
+            p.n = 0;
+            if (total < total_best) {
+                total_best = total;
+                best = sums;
+                nb = ns;
+            }
+        }
+        std.debug.print("drafter profile (eager, events between launches): {d:.3} ms\n", .{total_best});
+        for (best[0..nb]) |x| std.debug.print("  {s:<12} {d:>3} launches {d:.3} ms\n", .{ x.label, x.n, x.ms });
+    }
+
     /// Every launch of a hold of `streams` streams; the selector's projected rows' address.
     fn holdPass(d: *Draft, o: Ops, streams: usize) !u64 {
         const c = d.c;
@@ -388,41 +504,69 @@ pub const Draft = struct {
         const desc = base + at.desc;
         const H = c.hidden;
         const h: Tensor = .{ .ptr = try o.arena.take(M * H * 2), .kind = .bf16 };
+        try d.tick(o, "start");
         try o.embedRows(d.e.model().embed, base + at.ids, M, h);
+        try d.tick(o, "embed");
         const x: Tensor = .{ .ptr = try o.arena.take(M * H * 2), .kind = .bf16 };
         const xin: Tensor = .{ .ptr = try o.arena.take(M * H * 2), .kind = .bf16 };
         const h2: Tensor = .{ .ptr = try o.arena.take(M * H * 2), .kind = .bf16 };
         const q = try o.arena.take(M * c.qWidth() * 2);
         const kb = try o.arena.take(M * c.kvWidth() * 2);
-        const att = try o.arena.take(M * c.qWidth() * 2);
+        const att = d.att.base();
         const part = try o.arena.take(dft.partBytes(streams, c.kv_heads, splits));
         const qkv_w = c.qWidth() + 2 * c.kvWidth();
         const mark = o.arena.mark();
         for (d.w.layers, 0..) |l, li| {
             o.arena.release(mark);
             try o.rms(h, l.input_norm, x, M, H, c.eps);
+            try d.tick(o, "rms");
             const dyn = try proj(o, x, l.attn_conv, M);
+            try d.tick(o, "attn_conv");
             try o.l.dftDynConv(x.ptr, dyn.ptr, l.attn_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
+            try d.tick(o, "dyn_conv");
             const qkv = try proj(o, xin, l.qkv, M);
+            try d.tick(o, "qkv");
             try o.l.dftNormRope(qkv.ptr, qkv_w, l.q_norm, q, desc, B, M, c.heads, c.eps, c.theta, o.stream);
             try o.l.dftNormRope(qkv.ptr + c.qWidth() * 2, qkv_w, l.k_norm, kb, desc, B, M, c.kv_heads, c.eps, c.theta, o.stream);
-            try o.l.dftAttn(.{ .q = q, .kb = kb, .vb = qkv.ptr + (c.qWidth() + c.kvWidth()) * 2, .vstride = qkv_w, .desc = desc, .layer = li, .streams = streams, .block = B, .heads = c.heads, .kv_heads = c.kv_heads, .ring_rows = c.ringRows(), .window = c.window, .splits = splits, .part = part, .out = att }, o.stream);
+            try d.tick(o, "norm_rope");
+            try o.l.dftAttn(.{ .q = q, .kb = kb, .vb = qkv.ptr + (c.qWidth() + c.kvWidth()) * 2, .vstride = qkv_w, .desc = desc, .layer = li, .streams = streams, .block = B, .heads = c.heads, .kv_heads = c.kv_heads, .ring_rows = c.ringRows(), .window = c.window, .splits = splits, .part = part, .out = att, .ostride = d.attWidth() }, o.stream);
+            try d.tick(o, "attn");
             const ao = try proj(o, .{ .ptr = att, .kind = .bf16 }, l.o, M);
+            try d.tick(o, "o");
             try o.l.dftDynConv(ao.ptr, dyn.ptr, l.attn_base, h.ptr, h2.ptr, M, H, c.group, 1, B, o.stream);
+            try d.tick(o, "dyn_conv");
             try o.rms(h2, l.post_norm, x, M, H, c.eps);
+            try d.tick(o, "rms");
             const mdyn = try proj(o, x, l.mlp_conv, M);
+            try d.tick(o, "mlp_conv");
             try o.l.dftDynConv(x.ptr, mdyn.ptr, l.mlp_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
-            const gu = [2]Tensor{ try proj(o, xin, l.gate, M), try proj(o, xin, l.up, M) };
+            try d.tick(o, "dyn_conv");
+            const gu = try pairProj(o, xin, l.gate, l.up, M);
+            try d.tick(o, "gate+up");
             try o.siluMul(gu[0], gu[1], gu[0], M * c.intermediate);
+            try d.tick(o, "silu");
             const down = try proj(o, gu[0], l.down, M);
+            try d.tick(o, "down");
             try o.l.dftDynConv(down.ptr, mdyn.ptr, l.mlp_base, h2.ptr, h.ptr, M, H, c.group, 1, B, o.stream);
+            try d.tick(o, "dyn_conv");
         }
         o.arena.release(mark);
         // the mask rows' best tokens by the draft head, and every row's selector projection (the pending rows' unused)
         try o.rms(h, d.w.final_norm, x, M, H, c.eps);
+        try d.tick(o, "rms");
         const logits = try proj(o, x, .{ .q4 = d.head }, M);
-        try o.topkRows(logits, M, d.head.n, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals);
+        try d.tick(o, "head");
+        if (d.head.n % topk_chunks == 0 and topk_chunks * c.topk <= 1024) {
+            // each row as topk_chunks rows, their top-k merged: the same set as the whole row's
+            const chunk = d.head.n / topk_chunks;
+            const ci = try o.arena.take(M * topk_chunks * c.topk * 4);
+            const cv = try o.arena.take(M * topk_chunks * c.topk * 2);
+            try o.topkRows(logits, M * topk_chunks, chunk, d.ks_chunks.base(), c.topk, ci, cv);
+            try o.l.dftTopkMerge(ci, cv, M, topk_chunks, c.topk, chunk, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals, o.stream);
+        } else try o.topkRows(logits, M, d.head.n, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals);
+        try d.tick(o, "topk");
         const hp = try proj(o, x, d.w.selector, M);
+        try d.tick(o, "selector");
         return hp.ptr;
     }
 
@@ -626,6 +770,7 @@ pub const Draft = struct {
         var depths = [_]u8{ 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 4, 5, 6, 3, 2 };
         const tree: Shape = .{ .parents = &parents, .ranks = &ranks, .depths = &depths, .expected = 0 };
         const t = try d.timeHold(&.{ctx}, &tree);
+        if (std.c.getenv("TF_DRAFT_PROFILE") != null) try d.profile(ctx, taps.base());
         d.step_ms = chain.wall / @as(f64, @floatFromInt(c.block - 1));
         d.gpu_ms = chain.gpu;
         d.tree_ms = t.wall;
@@ -660,7 +805,7 @@ pub const Draft = struct {
 
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = prior[0..@min(prior.len, d.c.block - 1)], .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .trees = true };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .fixed_hold = true, .prior = prior[0..@min(prior.len, d.c.block - 1)], .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .trees = true };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -695,7 +840,7 @@ pub const Draft = struct {
 pub fn proj(o: Ops, x: Tensor, l: Linear, rows: usize) !Tensor {
     switch (l) {
         .q4 => |p| {
-            if (weights.mlx_layout) return o.affine(x, .{ .words = p.words, .scale = p.scales, .bias = p.biases, .tables = .bf16, .n = @intCast(p.n), .k = @intCast(p.k), .bits = 4, .group = 64 }, rows, false);
+            if (weights.mlx_layout) return o.affine(x, affineOf(p), rows, false);
             const out = try o.arena.take(rows * p.n * 2);
             try o.l.dftQ4Rows(x.ptr, p.words, p.scales, p.biases, out, rows, p.n, p.k, o.stream);
             return .{ .ptr = out, .kind = .bf16 };
@@ -706,6 +851,19 @@ pub fn proj(o: Ops, x: Tensor, l: Linear, rows: usize) !Tensor {
             return .{ .ptr = out, .kind = .bf16 };
         },
     }
+}
+
+fn affineOf(p: weights.Q4) hip.ops.Affine {
+    return .{ .words = p.words, .scale = p.scales, .bias = p.biases, .tables = .bf16, .n = @intCast(p.n), .k = @intCast(p.k), .bits = 4, .group = 64 };
+}
+
+/// Two products of the same rows: one group launch on the MLX layout (each column's sum as alone), else two.
+fn pairProj(o: Ops, x: Tensor, a: Linear, b: Linear, rows: usize) ![2]Tensor {
+    if (weights.mlx_layout and a == .q4 and b == .q4) {
+        var out: [2]Tensor = undefined;
+        if (try o.affineGroup(x, &.{ affineOf(a.q4), affineOf(b.q4) }, rows, &out)) return out;
+    }
+    return .{ try proj(o, x, a, rows), try proj(o, x, b, rows) };
 }
 
 /// `bytes` of device memory at `src` on the host (a load-time copy).
