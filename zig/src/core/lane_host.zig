@@ -325,6 +325,7 @@ pub const LaneHost = struct {
             .think_end = if (r.think_end) |t| t else -1,
             .logprobs = r.logprobs,
             .prompt_logprobs = r.prompt_logprobs,
+            .penalties = r.penalties,
             .loop_guard = r.loop_guard,
             .chunks = r.chunks,
             .history_len = r.history_len,

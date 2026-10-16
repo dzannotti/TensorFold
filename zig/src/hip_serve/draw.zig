@@ -16,11 +16,26 @@ pub const Request = struct {
     mask: []const u32 = &.{},
     /// The row's logits copied here (the prompt's last row, kept for a masked first draw).
     keep: ?[]u16 = null,
+    /// The drawn token's logprob row (after the mask, as CUDA's) with this many best tokens.
+    logprob: ?Logprob = null,
+    /// Penalties and logit_bias on the row before its draw (the logprob row stays the raw one, as vLLM's).
+    penalty: ?Penalty = null,
 };
+
+pub const Logprob = struct { k: u8, out: *lanes.LogprobRow };
+
+/// A row's penalties and the tokens they count: the prompt, the stream's reply, then the window's rows before.
+pub const Penalty = struct { p: lanes.Penalties, prompt: []const u32, reply: []const u32, more: []const u32 = &.{} };
+
+/// The stream's penalties for a row whose window rows before it (after the pending token) are `more`; null: none.
+pub fn penaltyFor(s: *const lanes.Stream, more: []const u32) ?Penalty {
+    const p = s.penalties orelse return null;
+    return .{ .p = p, .prompt = s.prompt(), .reply = s.context.items[s.prompt_len..], .more = more };
+}
 
 /// Whether a row is drawn on the host from the whole row.
 fn whole(r: Request) bool {
-    return r.mask.len > 0 or r.keep != null;
+    return r.mask.len > 0 or r.keep != null or r.logprob != null or r.penalty != null;
 }
 
 fn greedy(s: ?lanes.Sampling) bool {
@@ -142,6 +157,16 @@ pub const Drawer = struct {
         }
     }
 
+    /// prompt_logprobs: each logits row's logprob row for its next prompt token in `picks`, ranked, appended to `out`.
+    pub fn promptRows(w: *Drawer, stream: hip.Stream, logits: hip.ops.Tensor, picks: []const u32, k: u8, out: *std.ArrayList(lanes.LogprobRow)) !void {
+        const bytes = w.vocab * 2;
+        for (picks, 0..) |pick, i| {
+            try hip.runtime.check(w.d.api.hipMemcpyDtoHAsync(w.row.bytes.ptr, @ptrFromInt(logits.ptr + i * bytes), bytes, stream.handle));
+            try stream.synchronize();
+            try out.append(w.gpa, sample.logprobRow(w.row.slice(u16)[0..w.vocab], w.dtype, pick, k, true));
+        }
+    }
+
     /// Row `i` downloaded whole: kept if asked, masked if asked, then drawn as an unmasked whole row is.
     fn drawWhole(w: *Drawer, stream: hip.Stream, logits: hip.ops.Tensor, i: usize, r: Request) !u32 {
         const bytes = w.vocab * 2;
@@ -152,9 +177,17 @@ pub const Drawer = struct {
         return w.drawHost(row, r);
     }
 
-    /// A host row's token per `r`: its mask applied in place, then greedy or the keyed draw.
+    /// A host row's token per `r`: its mask applied in place, its penalties, then greedy or the keyed draw, then its logprob row.
     pub fn drawHost(w: *const Drawer, row: []u16, r: Request) !u32 {
         if (r.mask.len > 0) sample.mask(row, w.dtype, r.mask);
-        return sample.draw(w.gpa, row, w.dtype, r.sampling, r.position);
+        const token = if (r.penalty) |pen| blk: {
+            const vals = try w.gpa.alloc(f32, row.len);
+            defer w.gpa.free(vals);
+            for (vals, 0..) |*v, i| v.* = sample.widen(row, w.dtype, i);
+            try pen.p.apply(w.gpa, vals, pen.prompt, pen.reply, pen.more);
+            break :blk try sample.drawFloats(w.gpa, vals, r.sampling, r.position);
+        } else try sample.draw(w.gpa, row, w.dtype, r.sampling, r.position);
+        if (r.logprob) |lp| lp.out.* = sample.logprobRow(row, w.dtype, token, lp.k, false);
+        return token;
     }
 };

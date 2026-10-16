@@ -51,9 +51,15 @@ pub const Config = struct {
         // MLX conversions declare `quantization`, ExLlamaV3 packs `quantization_config`
         var declared = try shared.pickObject(doc, tower, "quantization");
         if (declared.count() == 0) declared = try shared.pickObject(doc, tower, "quantization_config");
-        const table = try quant.detect(a, .{ .root = doc, .quantization = declared });
-        // an EXL3 tensor's width is its own: the geometry records a nominal one
-        const width: Width = if (table == .exl3) .{ .bits = 4, .group = 128 } else try table.width("");
+        // a checkpoint that declares no quantization is the float release (bf16): every projection dense
+        const table: quant.Config = quant.detect(a, .{ .root = doc, .quantization = declared }) catch |e|
+            if (declared.count() == 0) .{ .dense = {} } else return e;
+        // an EXL3 tensor's width is its own: the geometry records a nominal one (a float one: 16 bits, no groups)
+        const width: Width = switch (table) {
+            .exl3 => .{ .bits = 4, .group = 128 },
+            .dense => .{ .bits = 16, .group = 0 },
+            .mlx => try table.width(""),
+        };
         const spec = try shared.geometry(tower, width.bits, width.group);
         const gen = if (generation) |g| (try std.json.parseFromSliceLeaky(std.json.Value, a, g, .{})) else null;
         if (gen) |g| if (g != .object) return error.InvalidConfig;
@@ -93,6 +99,16 @@ test "per-tensor widths override the global one, and a bad entry fails only when
     try std.testing.expectEqual(Width{ .bits = 8, .group = 32 }, try c.quant.width("language_model.model.layers.0.mlp.gate"));
     try std.testing.expectEqual(Width{ .bits = 4, .group = 64 }, try c.quant.width("language_model.model.layers.1.mlp.gate"));
     try std.testing.expectError(error.UnsupportedQuantization, c.quant.width("vision_tower.x"));
+}
+
+test "a config with no quantization is the float release: every projection dense" {
+    const a = std.testing.allocator;
+    const float = try std.mem.replaceOwned(u8, a, sample, "\"quantization\"", "\"not_quantized\"");
+    defer a.free(float);
+    var c = try Config.parse(a, float, null);
+    defer c.deinit();
+    try std.testing.expect(c.quant == .dense);
+    try std.testing.expectEqual(@as(u8, 16), c.spec.bits);
 }
 
 test "the Python loader's refusals of a quantization" {

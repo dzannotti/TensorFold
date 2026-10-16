@@ -20,6 +20,7 @@ const mtp = @import("mtp.zig");
 const admission = hip.admission;
 const prefix = @import("prefix.zig");
 const plan = @import("../forward/plan.zig");
+const lanes = @import("lanes");
 
 pub const Options = struct {
     /// Most positions a stream's caches hold (its prompt, its reply and a window's rows).
@@ -102,6 +103,14 @@ pub const Engine = struct {
     n_taps: usize = 0,
     /// The stream's last work is a keep (no op since): a drafter then waits for the forward before it alone.
     keep_last: bool = false,
+    /// prompt_logprobs: the stream's rows the prompt pass appends to, with this many best tokens (null: none asked).
+    prompt_lp: ?PromptRows = null,
+    /// Their logits' scratch, `lp_batch` rows a projection, made at first use.
+    lp_arena: ?hip.Arena = null,
+
+    pub const PromptRows = struct { k: u8, out: *std.ArrayList(lanes.LogprobRow) };
+    /// Prompt rows a projection takes for prompt_logprobs.
+    const lp_batch = 32;
 
     /// The model on the device, its scratch not yet sized; a rank that fails here leaves the refusal to its caller.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options) !*Engine {
@@ -114,6 +123,8 @@ pub const Engine = struct {
         e.sized = false;
         e.n_taps = 0;
         e.keep_last = false;
+        e.prompt_lp = null;
+        e.lp_arena = null;
         e.stopped = false;
         // rounds and the draft head's batches replay graphs unless the policy says `graphs=off`, at any world size
         e.o.graphs = o.graphs and o.policy.graphsOn();
@@ -258,6 +269,7 @@ pub const Engine = struct {
             e.rounds.deinit();
             e.pool.deinit();
         }
+        if (e.lp_arena) |*a| a.deinit();
         e.bridge.deinit();
         e.weights.deinit();
         e.stream.deinit();
@@ -406,7 +418,8 @@ pub const Engine = struct {
         try e.ids_dev.uploadAsync(0, e.ids.view(0, 4 * ids.len), e.stream);
         var p: Poll = undefined;
         var t: Tapper = undefined;
-        _ = try fwd.span(e.ops(&e.prompts), e.model(), caches, e.ids_dev.base(), end - pos0, pos0, e.tapped(caches, pos0, e.poll(cancel, end - pos0, &p), &t));
+        const hidden = try fwd.span(e.ops(&e.prompts), e.model(), caches, e.ids_dev.base(), end - pos0, pos0, e.tapped(caches, pos0, e.poll(cancel, end - pos0, &p), &t));
+        try e.promptRows(hidden, prompt, pos0, end - pos0);
         try e.stream.synchronize();
     }
 
@@ -424,11 +437,35 @@ pub const Engine = struct {
         var p: Poll = undefined;
         var t: Tapper = undefined;
         const hidden = try fwd.span(o, m, caches, e.ids_dev.base(), len, pos0, e.tapped(caches, pos0, e.poll(cancel, len, &p), &t));
+        try e.promptRows(hidden, prompt, pos0, len);
         const row = fwd.at(hidden, (len - 1) * m.spec.hidden);
         if (last) |b| try hip.raw.copy(b, 0, row.ptr, m.spec.hidden * m.act.size(), e.stream.handle);
         var token: [1]u32 = undefined;
         try e.project(o, row, 1, &.{req}, &token);
         return token[0];
+    }
+
+    /// prompt_logprobs: the row of each of the pass's `len` final rows from `pos0` whose next prompt token is known.
+    fn promptRows(e: *Engine, hidden: hip.ops.Tensor, prompt: []const u32, pos0: usize, len: usize) !void {
+        const p = e.prompt_lp orelse return;
+        const m = e.model();
+        if (m.tp != null) return error.PromptLogprobsUnsupported; // the other ranks would not join the projections
+        if (e.lp_arena == null) {
+            var counted = hip.Arena.counting();
+            var c = e.ops(&counted);
+            c.stream = hip.counting;
+            _ = try c.project(hidden, m.head, lp_batch, false);
+            e.lp_arena = try hip.Arena.init(&e.driver, counted.peak);
+        }
+        const arena = &e.lp_arena.?;
+        const n = @min(len, prompt.len - 1 - pos0);
+        var i: usize = 0;
+        while (i < n) : (i += lp_batch) {
+            const b = @min(lp_batch, n - i);
+            arena.reset();
+            const y = try e.ops(arena).project(fwd.at(hidden, i * m.spec.hidden), m.head, b, false);
+            try e.drawer.promptRows(e.stream, y, prompt[pos0 + i + 1 ..][0..b], p.k, p.out);
+        }
     }
 
     /// Every window in one forward: `out` the token of every row; the round's snapshots live until its keeps flush.

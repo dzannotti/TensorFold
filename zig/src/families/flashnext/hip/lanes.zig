@@ -42,8 +42,13 @@ pub const Lane = struct {
     /// The last verify's tokens until its keep.
     pending: ?struct { tokens: [cache.max_window]u32, rows: usize } = null,
     first_row: ?[]u16 = null,
+    /// The first token's logprob row, for a stream with `logprobs`.
+    first_lp: lanes.LogprobRow = .{ .token = 0, .logprob = 0 },
     id: u32 = 0,
 };
+
+/// Prompt rows a projection takes for prompt_logprobs.
+const lp_batch = 32;
 
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
@@ -104,6 +109,8 @@ pub const Fx = struct {
     store: ?pc.Store = null,
     next_slot: u32 = 0,
     times: Times = .{},
+    /// prompt_logprobs' logits scratch, made at first use.
+    lp_arena: ?hip.Arena = null,
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, streams: usize) !*Fx {
         const f = try gpa.create(Fx);
@@ -136,6 +143,7 @@ pub const Fx = struct {
         f.lanes.deinit(f.gpa);
         f.msg.deinit(f.gpa);
         f.ones.free();
+        if (f.lp_arena) |*a| a.deinit();
         f.gpa.free(f.draft_ids);
         f.gpa.destroy(f);
     }
@@ -239,6 +247,8 @@ pub const Fx = struct {
             .keep = keepFn,
             .draft = draftFn,
             .tree = heldFn,
+            .first_row = firstRowFn,
+            .prompt_rows = true,
             .release = releaseFn,
         } };
     }
@@ -344,10 +354,12 @@ pub const Fx = struct {
         gop.value_ptr.* = lane;
         if (f.link != null) try f.send(&.{ @backingInt(worker.Op.begin), lane.id, slot });
         const fill = &lane.fill.?;
-        if (f.store) |*st| {
+        if (f.store) |*st| fill.kept0 = st.counts.kept;
+        // prompt_logprobs read every prompt row: the pass starts at 0
+        if (f.store != null and s.prompt_logprobs == null) {
+            const st = &f.store.?;
             var arena: std.heap.ArenaAllocator = .init(f.gpa);
             defer arena.deinit();
-            fill.kept0 = st.counts.kept;
             const plan = st.begin(
                 arena.allocator(),
                 prompt,
@@ -389,6 +401,10 @@ pub const Fx = struct {
         }
         const out = try e.prompt(&lane.caches, prompt[at..to]);
         const rows = to - at;
+        if (s.prompt_logprobs) |k| {
+            if (at == 0) s.prompt_rows.clearRetainingCapacity();
+            try f.promptRows(out.mixed, prompt, at, rows, k, &s.prompt_rows);
+        }
         const row_bytes = m.dims.wide() * m.act.size();
         if (lane.head) |*hc| {
             // the head's keys for every prompt row with a next token (the last waits for the first draw)
@@ -424,6 +440,8 @@ pub const Fx = struct {
                 .sampling = sampling(s),
                 .position = prompt.len,
                 .keep = if (s.grammar != null) lane.first_row else null,
+                .logprob = if (s.logprobs) |k| .{ .k = k, .out = &lane.first_lp } else null,
+                .penalty = draw.penaltyFor(s, &.{}),
             }},
             &token,
             false,
@@ -431,6 +449,35 @@ pub const Fx = struct {
         _ = f.take(token[0]);
         lane.fill = null;
         return true;
+    }
+
+    /// prompt_logprobs: the row of each of a chunk's `len` final rows from `pos0` whose next prompt token is known.
+    fn promptRows(f: *Fx, mixed: hip.ops.Tensor, prompt: []const u32, pos0: usize, len: usize, k: u8, out: *std.ArrayList(lanes.LogprobRow)) !void {
+        const e = f.e;
+        const m = &e.weights.model;
+        if (m.tp != null) return error.PromptLogprobsUnsupported; // the other ranks would not join the projections
+        if (f.lp_arena == null) {
+            var counted = hip.Arena.counting();
+            var c = e.ops(&counted);
+            c.stream = hip.counting;
+            _ = try c.project(mixed, m.head, lp_batch, false);
+            f.lp_arena = try hip.Arena.init(&e.driver, counted.peak);
+        }
+        const arena = &f.lp_arena.?;
+        const n = @min(len, prompt.len - 1 - pos0);
+        var i: usize = 0;
+        while (i < n) : (i += lp_batch) {
+            const b = @min(lp_batch, n - i);
+            arena.reset();
+            const y = try e.ops(arena).project(forward.at(mixed, i * m.dims.hidden), m.head, b, false);
+            try e.drawer.promptRows(e.stream, y, prompt[pos0 + i + 1 ..][0..b], k, out);
+        }
+    }
+
+    fn firstRowFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!lanes.LogprobRow {
+        const lane = of(ptr).lanes.get(s) orelse return error.UnknownStream;
+        if (s.logprobs == null) return error.NoFirstRow;
+        return lane.first_lp;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -446,7 +493,7 @@ pub const Fx = struct {
         const kept = lane.first_row orelse return error.StructuresUnsupported;
         const row = try f.gpa.dupe(u16, kept);
         defer f.gpa.free(row);
-        return f.take(try f.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits }));
+        return f.take(try f.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits, .penalty = draw.penaltyFor(s, &.{}) }));
     }
 
     fn heldTokensFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
@@ -517,13 +564,15 @@ pub const Fx = struct {
         var reqs: [forward.max_segs * cache.max_window]draw.Request = undefined;
         var drawn: [forward.max_segs * cache.max_window]u32 = undefined;
         off = 0;
-        for (windows) |w| {
+        for (windows, out, 0..) |w, v, i| {
             const n = w.rows();
             const words = if (w.masks.len > 0) w.masks.len / n else 0;
             for (w.positions, 0..) |p, r| reqs[off + r] = .{
                 .sampling = sampling(w.stream),
                 .position = p,
                 .mask = w.masks[r * words ..][0..words],
+                .logprob = if (w.stream.logprobs) |k| .{ .k = k, .out = &v.rows[r] } else null,
+                .penalty = draw.penaltyFor(w.stream, tokens[i][1 .. r + 1]),
             };
             off += n;
         }

@@ -53,6 +53,8 @@ pub const Lane = struct {
     written: usize = 0,
     /// A structured reply's prompt row, kept for its masked first draw (null for the others).
     first_row: ?[]u16 = null,
+    /// The first token's logprob row, for a stream with `logprobs`.
+    first_lp: lanes.LogprobRow = .{ .token = 0, .logprob = 0 },
 };
 
 /// The engine this thread's HIP calls go to.
@@ -179,6 +181,8 @@ pub const Hip = struct {
             .tree = heldFn,
             .prepare_features = prepareFeaturesFn,
             .features = featuresFn,
+            .first_row = firstRowFn,
+            .prompt_rows = true,
             .release = releaseFn,
         } };
     }
@@ -328,7 +332,8 @@ pub const Hip = struct {
         var owner: hip_prefix.Owner = .{ .caches = &lane.caches, .id = lane.id };
         h.matched.clearRetainingCapacity();
         h.prefix.restored = worker.no_snapshot;
-        const plan = try h.prefix.begin(prompt, s.history_len, s.shared_prefixes, &owner, &h.matched);
+        // prompt_logprobs read every prompt row: the pass starts at 0
+        const plan: radix.Plan = if (s.prompt_logprobs != null) .{} else try h.prefix.begin(prompt, s.history_len, s.shared_prefixes, &owner, &h.matched);
         defer h.gpa.free(plan.marks);
         errdefer for (h.matched.items) |id| h.e.pool.release(id);
         const at: usize = plan.from;
@@ -365,6 +370,9 @@ pub const Hip = struct {
         const lane = if (h.lanes.get(s)) |l| (if (l.fill != null) l else try h.begin(s)) else try h.begin(s);
         const prompt = s.prompt();
         const f = &lane.fill.?;
+        if (f.at == 0) s.prompt_rows.clearRetainingCapacity();
+        h.e.prompt_lp = if (s.prompt_logprobs) |k| .{ .k = k, .out = &s.prompt_rows } else null;
+        defer h.e.prompt_lp = null;
         const limit: usize = if (f.next < f.count) f.stops[f.next] else prompt.len;
         // a prompt cut anywhere on 64 rows gives the same bits; streams decoding between chunks wait less on short ones
         const to = prefix.chunkEnd(f.at, limit, if (h.decoding()) h.e.o.policy.fill_rows else prefix.chunk);
@@ -373,7 +381,7 @@ pub const Hip = struct {
             // a structured reply keeps the prompt's last row: its first token is drawn again under the grammar
             if (s.grammar != null and lane.first_row == null) lane.first_row = try h.gpa.alloc(u16, h.e.drawer.vocab);
             const keep = if (s.grammar != null) lane.first_row else null;
-            _ = h.take(try h.e.prefill(&lane.caches, prompt, f.at, lane.hidden, .{ .sampling = sampling(s), .position = prompt.len, .keep = keep }, null));
+            _ = h.take(try h.e.prefill(&lane.caches, prompt, f.at, lane.hidden, .{ .sampling = sampling(s), .position = prompt.len, .keep = keep, .logprob = if (s.logprobs) |k| .{ .k = k, .out = &lane.first_lp } else null, .penalty = draw.penaltyFor(s, &.{}) }, null));
             lane.fill = null;
             lane.written = prompt.len;
             return true;
@@ -398,6 +406,12 @@ pub const Hip = struct {
         return h.next - 1;
     }
 
+    fn firstRowFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!lanes.LogprobRow {
+        const lane = of(ptr).lanes.get(s) orelse return error.UnknownStream;
+        if (s.logprobs == null) return error.NoFirstRow;
+        return lane.first_lp;
+    }
+
     /// The first token among the grammar's allowed ones, from the prompt row the pass kept.
     fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, bits: []const u32) anyerror!u64 {
         const h = of(ptr);
@@ -406,7 +420,7 @@ pub const Hip = struct {
         const kept = lane.first_row orelse return error.StructuresUnsupported;
         const row = try h.gpa.dupe(u16, kept);
         defer h.gpa.free(row);
-        return h.take(try h.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits }));
+        return h.take(try h.e.drawer.drawHost(row, .{ .sampling = sampling(s), .position = position, .mask = bits, .penalty = draw.penaltyFor(s, &.{}) }));
     }
 
     /// The drafts the head holds for the stream, as host tokens (a grammar walks them).
@@ -447,6 +461,7 @@ pub const Hip = struct {
         var rows: [64]Engine.Rows = undefined;
         var tokens: [64][16]u32 = undefined;
         var trees: [64]bool = undefined;
+        var ancs: [64][max_window]u32 = undefined;
         if (windows.len > rows.len) return error.WindowTooWide;
         for (windows, 0..) |w, i| {
             const lane = h.lanes.get(w.stream) orelse return error.UnknownStream;
@@ -456,10 +471,10 @@ pub const Hip = struct {
             trees[i] = if (w.parents) |ps| !window_plan.isChain(ps) else false;
             // the other ranks are told tokens alone
             if (trees[i] and h.link != null) return error.TreesNotBuilt;
-            var anc: [max_window]u32 = undefined;
+            const anc = &ancs[i];
             if (trees[i]) {
                 if (w.parents.?.len != n) return error.BadParents;
-                try window_plan.ancestors(w.parents.?, &anc);
+                try window_plan.ancestors(w.parents.?, anc);
             }
             for (w.positions, 0..) |p, r| if (p != lane.len + 1 + if (trees[i]) @popCount(anc[r]) - 1 else r) {
                 std.log.err("row {d} keyed at {d}, the stream holds {d} slots", .{ r, p, lane.len });
@@ -472,13 +487,23 @@ pub const Hip = struct {
         }
         var reqs: [256]draw.Request = undefined;
         var drawn: [256]u32 = undefined;
+        // penalties: a tree row's path tokens before it, after the pending one
+        var paths: [256][max_window]u32 = undefined;
         var total: usize = 0;
-        for (windows) |w| {
+        for (windows, out, 0..) |w, o, i| {
             if (total + w.positions.len > reqs.len) return error.WindowTooWide;
             // structured output: each row's allowed bits, rows x words
             const words = if (w.masks.len > 0) w.masks.len / w.positions.len else 0;
             for (w.positions, 0..) |p, r| {
-                reqs[total] = .{ .sampling = sampling(w.stream), .position = p, .mask = w.masks[r * words ..][0..words] };
+                const more: []const u32 = if (w.stream.penalties == null) &.{} else if (!trees[i]) tokens[i][1 .. r + 1] else blk: {
+                    var n: usize = 0;
+                    for (1..r + 1) |a| if (ancs[i][r] >> @intCast(a) & 1 == 1) {
+                        paths[total][n] = tokens[i][a];
+                        n += 1;
+                    };
+                    break :blk paths[total][0..n];
+                };
+                reqs[total] = .{ .sampling = sampling(w.stream), .position = p, .mask = w.masks[r * words ..][0..words], .logprob = if (w.stream.logprobs) |k| .{ .k = k, .out = &o.rows[r] } else null, .penalty = draw.penaltyFor(w.stream, more) };
                 total += 1;
             }
         }

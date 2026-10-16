@@ -18,17 +18,7 @@ pub fn widen(row: []const u16, dtype: Dtype, i: usize) f32 {
 
 /// torch.argmax over the widened row: the first index of the largest value (a NaN wins, as torch's).
 pub fn argmax(row: []const u16, dtype: Dtype) u32 {
-    var best: usize = 0;
-    var top = widen(row, dtype, 0);
-    for (1..row.len) |i| {
-        const v = widen(row, dtype, i);
-        if (std.math.isNan(top)) break;
-        if (std.math.isNan(v) or v > top) {
-            best = i;
-            top = v;
-        }
-    }
-    return @intCast(best);
+    return argmaxBy(Wide{ .row = row, .dtype = dtype });
 }
 
 /// Structured output: every token whose bit is clear in `bits` (32 a word, token i in word i / 32) becomes -inf.
@@ -52,19 +42,64 @@ fn larger(_: void, a: Candidate, b: Candidate) bool {
 
 /// draw(): greedy (no sampling or temperature <= 0) is the argmax; else `choose` at `position` over the candidates.
 pub fn draw(gpa: Allocator, row: []const u16, dtype: Dtype, sampling: ?lanes.Sampling, position: u64) !u32 {
-    const s = sampling orelse return argmax(row, dtype);
-    if (s.temperature <= 0.0) return argmax(row, dtype);
-    const width = row.len;
+    return drawBy(gpa, Wide{ .row = row, .dtype = dtype }, sampling, position);
+}
+
+/// `draw` over a row already widened (and penalized) on the host.
+pub fn drawFloats(gpa: Allocator, row: []const f32, sampling: ?lanes.Sampling, position: u64) !u32 {
+    return drawBy(gpa, Floats{ .row = row }, sampling, position);
+}
+
+const Wide = struct {
+    row: []const u16,
+    dtype: Dtype,
+    fn len(w: Wide) usize {
+        return w.row.len;
+    }
+    fn at(w: Wide, i: usize) f32 {
+        return widen(w.row, w.dtype, i);
+    }
+};
+
+const Floats = struct {
+    row: []const f32,
+    fn len(w: Floats) usize {
+        return w.row.len;
+    }
+    fn at(w: Floats, i: usize) f32 {
+        return w.row[i];
+    }
+};
+
+/// argmax over any row source (torch's: the first largest, a NaN wins).
+fn argmaxBy(src: anytype) u32 {
+    var best: usize = 0;
+    var top = src.at(0);
+    for (1..src.len()) |i| {
+        const v = src.at(i);
+        if (std.math.isNan(top)) break;
+        if (std.math.isNan(v) or v > top) {
+            best = i;
+            top = v;
+        }
+    }
+    return @intCast(best);
+}
+
+fn drawBy(gpa: Allocator, src: anytype, sampling: ?lanes.Sampling, position: u64) !u32 {
+    const s = sampling orelse return argmaxBy(src);
+    if (s.temperature <= 0.0) return argmaxBy(src);
+    const width = src.len();
     const count = if (s.top_k != 0) @min(width, @as(usize, s.top_k) + MARGIN) else width;
     const best = try gpa.alloc(Candidate, count);
     defer gpa.free(best);
     var filled: usize = 0;
     // the whole row when top_k is 0 (choose orders it), else the top `count` by value then id in one pass
     if (count == width) {
-        for (best, 0..) |*c, i| c.* = .{ .value = widen(row, dtype, i), .id = @intCast(i) };
+        for (best, 0..) |*c, i| c.* = .{ .value = src.at(i), .id = @intCast(i) };
         filled = width;
     } else for (0..width) |i| {
-        const c: Candidate = .{ .value = widen(row, dtype, i), .id = @intCast(i) };
+        const c: Candidate = .{ .value = src.at(i), .id = @intCast(i) };
         if (filled == count and !larger({}, c, best[count - 1])) continue;
         var at = if (filled < count) filled else count - 1;
         if (filled < count) filled += 1;
@@ -89,6 +124,54 @@ pub fn probability(row: []const u16, dtype: Dtype, id: u32) f64 {
     var total: f64 = 0;
     for (0..row.len) |i| total += @exp(@as(f64, widen(row, dtype, i)) - top);
     return @exp(@as(f64, widen(row, dtype, id)) - top) / total;
+}
+
+/// The logprob row of `pick` in the widened row (the target's raw distribution): its log-softmax, the `k` best
+/// (logit descending, ties by the lower id), and with `rank` vLLM's rank (tokens at or above the pick, itself included).
+pub fn logprobRow(row: []const u16, dtype: Dtype, pick: u32, k: u8, rank: bool) lanes.LogprobRow {
+    var top: f64 = -std.math.inf(f64);
+    for (0..row.len) |i| top = @max(top, widen(row, dtype, i));
+    var total: f64 = 0;
+    for (0..row.len) |i| total += @exp(@as(f64, widen(row, dtype, i)) - top);
+    const lse = top + @log(total);
+    const n = @min(k, lanes.logprob.max_top);
+    var r: lanes.LogprobRow = .{ .token = pick, .logprob = @floatCast(@as(f64, widen(row, dtype, pick)) - lse), .count = n };
+    var vals: [lanes.logprob.max_top]f32 = undefined;
+    var filled: usize = 0;
+    if (n > 0) for (0..row.len) |i| {
+        const v = widen(row, dtype, i);
+        if (filled == n and !(v > vals[n - 1])) continue; // a later equal value loses to the lower id
+        var at = if (filled < n) filled else n - 1;
+        if (filled < n) filled += 1;
+        while (at > 0 and v > vals[at - 1]) : (at -= 1) {
+            vals[at] = vals[at - 1];
+            r.ids[at] = r.ids[at - 1];
+        }
+        vals[at] = v;
+        r.ids[at] = @intCast(i);
+    };
+    for (0..n) |i| r.logprobs[i] = @floatCast(@as(f64, vals[i]) - lse);
+    if (rank) {
+        const pv = widen(row, dtype, pick);
+        for (0..row.len) |i| r.rank += @intFromBool(widen(row, dtype, i) >= pv);
+    }
+    return r;
+}
+
+test "a logprob row is the log-softmax of the raw row, its best tokens by value then id" {
+    // bf16 2.0, 1.0, 2.0, 0.0
+    const row = [_]u16{ 0x4000, 0x3f80, 0x4000, 0x0000 };
+    const r = logprobRow(&row, .bf16, 1, 3, true);
+    const lse = @log(2 * @exp(2.0) + @exp(1.0) + 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(1.0 - lse)), r.logprob, 1e-6);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 1 }, r.ids[0..3]);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(2.0 - lse)), r.logprobs[0], 1e-6);
+    try std.testing.expectEqual(r.logprob, r.logprobs[2]);
+    try std.testing.expectEqual(@as(u32, 3), r.rank);
+    var p: f64 = 0;
+    for (r.logprobs[0..3]) |lp| p += @exp(@as(f64, lp));
+    try std.testing.expect(p <= 1.0);
+    try std.testing.expectEqual(@as(u8, 0), logprobRow(&row, .bf16, 3, 0, false).count);
 }
 
 test "argmax keeps the first of equal values; bf16 and fp16 widen exactly" {

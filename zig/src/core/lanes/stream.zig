@@ -9,6 +9,8 @@ const Reader = @import("recall.zig").Reader;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
 const Row = @import("logprob.zig").Row;
+const Penalties = @import("penalty.zig").Penalties;
+
 
 pub const Reason = enum {
     none,
@@ -127,6 +129,7 @@ pub const Spec = struct {
     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
     prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
+    penalties: ?Penalties = null, // presence, frequency, repetition and logit_bias on every row the target draws
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
@@ -155,6 +158,7 @@ pub const Stream = struct {
     shared_prefixes: []const u32,
     logprobs: ?u8 = null,
     grammar: ?*grammar.Constraint = null, // follows each committed token; its masks keep the draws inside it
+    penalties: ?Penalties = null,
     problem: []const u8 = "", // why a stream finished with `error` (static text)
     rows: std.ArrayList(Row) = .empty, // with `logprobs`: one a token of emitted(), in order
     prompt_logprobs: ?u8 = null,
@@ -229,6 +233,7 @@ pub const Stream = struct {
             .logprobs = spec.logprobs,
             .prompt_logprobs = spec.prompt_logprobs,
             .grammar = spec.grammar,
+            .penalties = if (spec.penalties) |p| (if (p.active()) p else null) else null,
             .decode_spans = spec.decode_spans,
             .images = spec.images,
             .key = spec.key,
