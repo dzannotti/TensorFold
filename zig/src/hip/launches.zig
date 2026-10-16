@@ -63,6 +63,8 @@ pub const Launcher = struct {
     gdn_gate: Triple,
     gated_delta_tile: [2]Function, // dk 128, 16
     gated_delta_wave: [2]Function,
+    /// The prompt scan with 8 value rows a wave, 4 waves a block (dk 128).
+    gated_delta_rows: Function,
     score_keys: Triple, // by cache kind
     apply_values: Triple,
     causal: Triple,
@@ -239,6 +241,7 @@ pub const Launcher = struct {
             try gd.function(ns ++ "16gated_delta_tileILi128ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "16gated_delta_tileILi16ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
         };
+        l.gated_delta_rows = try gd.function("tf_gdn_rows_128_8_4");
         l.gated_delta_wave = .{
             try gd.function(ns ++ "18gated_delta_kernelILi128EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "18gated_delta_kernelILi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),

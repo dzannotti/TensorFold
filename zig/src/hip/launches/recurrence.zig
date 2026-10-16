@@ -46,8 +46,10 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
     try a.add(dv);
     try a.add(ad(states));
     const wide: usize = if (dk == 128) 0 else 1;
-    // Eight rows share one k/q tile; a short dv stays on the one-row wave, which is the same scan.
-    if (@rem(dv, 8) == 0) {
+    // dk 128: 8 value rows a wave, 32 a block share one k/q tile; else 8 rows; a short dv stays on the one-row wave.
+    if (dk == 128 and @rem(dv, 32) == 0) {
+        try l.go(l.gated_delta_rows, dim(@divExact(dv, 32), value_heads, batch), dim(32, 4, 1), 0, s, &a);
+    } else if (@rem(dv, 8) == 0) {
         try l.go(l.gated_delta_tile[wide], dim(@divExact(dv, 8), value_heads, batch), dim(32, 8, 1), 0, s, &a);
     } else {
         try l.go(l.gated_delta_wave[wide], dim(dv, value_heads, batch), dim(32, 1, 1), 0, s, &a);
