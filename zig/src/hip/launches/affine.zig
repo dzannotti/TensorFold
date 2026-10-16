@@ -98,6 +98,8 @@ const stream_code_words = 32; // kStreamCodeWords
 const verify_tiles = [_]c_int{ 1, 2 }; // VerifyShape's MT: 16-row tiles a block (past 32 rows, more 32-row blocks beat 4 and 8)
 const verify_groups = [_]c_int{ 32, 64, 128 }; // the tile's group sizes
 const verify_waves = [_]c_int{ 2, 4 }; // waves a block: 2 for at most 6144 columns of at most 8192 K, else 4 (the bits are the same)
+const split_groups = [_]c_int{ 64, 128 }; // the split verify tile's group sizes
+const split_waves = [_]c_int{ 4, 8 }; // its waves a block (a 16-column tile each)
 
 /// The K-parallel tiles of a short prompt: cb columns a lane set, r rows a pass over up to rb row blocks.
 pub const KpTile = struct { cb: c_int, r: c_int, waves: c_int, rb: c_int, loop: bool = true };
@@ -138,6 +140,8 @@ pub const Kernels = struct {
     stream_on: bool,
     /// The WMMA verify tile (tiles/wmma_verify.hpp) by width and 16-row tiles a block (1, 2); gfx11 only.
     verify: [bit_widths.len][verify_groups.len][verify_waves.len][verify_tiles.len]Function,
+    /// The verify tile with K spread over a block's waves (same bits), for few columns at up to 16 rows.
+    split: [bit_widths.len][split_groups.len][split_waves.len]Function,
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
@@ -188,6 +192,9 @@ pub const Kernels = struct {
             if (k.matrix) k.wmma_gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm16affine_wmma_gemmILi{d}EEEvNS0_6AffineE", .{bits}));
             if (k.matrix) inline for (verify_groups, 0..) |g, gi| inline for (verify_waves, 0..) |wv, wi| inline for (verify_tiles, 0..) |mt, i| {
                 k.verify[b][gi][wi][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm18affine_wmma_verifyILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, mt, g, wv }));
+            };
+            if (k.matrix) inline for (split_groups, 0..) |g, gi| inline for (split_waves, 0..) |wv, wi| {
+                k.split[b][gi][wi] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm24affine_wmma_verify_splitILi{d}ELi{d}ELi{d}EEEvNS0_6AffineENS0_11StreamSidesE", .{ bits, g, wv }));
             };
             k.gemm[b] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm17affine_gemm_blockINS0_{s}ELi{d}E{s}EEvNS0_6AffineE", .{ dot, bits, shape }));
             inline for (kp_tiles, 0..) |t, i| {
@@ -365,8 +372,12 @@ pub const Kernels = struct {
     pub fn verifyGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, sides_in: StreamSides, total_n: c_int, s: abi.Stream) Error!void {
         const b = bitIndex(a.bits) orelse return refuse("bits");
         const t: usize = if (a.m <= 16) 0 else 1;
-        const wi: usize = if (total_n <= 6144 and a.k <= 8192) 0 else 1;
-        const cols: c_int = 16 * verify_waves[wi];
+        // up to 16 rows on 64 or 128 groups: K spread over a block's waves, a 16-column tile a block (same bits);
+        // 8 waves while the columns are few, 4 past 32768 of them (the 248320-row head: 4 is 10% faster); past 8 rows
+        // a deep K keeps one wave a column tile (27B down, 16 rows: 276 us against 304, the folds outweigh the waves)
+        const split = t == 0 and (a.group == 64 or a.group == 128) and (a.m <= 8 or a.k <= 8192);
+        const wi: usize = if (split) @intFromBool(total_n <= 32768) else if (total_n <= 6144 and a.k <= 8192) 0 else 1;
+        const cols: c_int = if (split) 16 else 16 * verify_waves[wi];
         var sides = sides_in;
         var blocks: c_uint = cdiv(total_n, cols);
         if (sides.count > 0) {
@@ -386,6 +397,7 @@ pub const Kernels = struct {
             128 => 2,
             else => return refuse("group"),
         };
+        if (split) return go(r, k.split[b][gi - 1][wi], .{ .x = blocks, .y = cdiv(a.m, 16) }, .{ .x = @intCast(32 * split_waves[wi]) }, s, &args);
         try go(r, k.verify[b][gi][wi][t], .{ .x = blocks, .y = cdiv(a.m, 16 * verify_tiles[t]) }, .{ .x = @intCast(cols * 2) }, s, &args);
     }
 

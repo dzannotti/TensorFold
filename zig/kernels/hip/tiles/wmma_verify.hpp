@@ -297,12 +297,173 @@ __global__ void __launch_bounds__(32 * WV) affine_wmma_verify(Affine a, StreamSi
 #endif
 }
 
+// The verify tile's sums with K spread over a block's waves, for at most 16 rows and few columns (the A3B's 2048-wide
+// products leave affine_wmma_verify one wave a 16 columns: a few waves a CU, each a chain of every trip of K).
+// A group's WMMA chain starts from zero, so any wave may run it: wave w runs trips w, w + WV, ... and parks each group's
+// 16 x 16 sums, its x sums and its scale and bias in LDS; then each wave folds its elements over the groups in K order.
+// Every sum is affine_wmma_verify's (same chains, same fold), so the outputs carry the same bits.
+template <int BITS, int G, int WV>
+__global__ void __launch_bounds__(32 * WV) affine_wmma_verify_split(Affine a, StreamSides sides) {
+#if TF_DEVICE_WMMA_GFX11
+    using Dec = MlxDecoder<BITS>;
+    using T = WmmaBF16;
+    constexpr int CPG = G / 32;   // chunks a group
+    constexpr int GPT = 8 / CPG;  // groups a trip of 8 chunks (256 K)
+    constexpr int EPL = 256 / (32 * WV);  // elements of the 16 x 16 tile a lane folds
+    static_assert(GPT >= 1 && EPL >= 1, "64 or 128 groups, 4 or 8 waves");
+    __shared__ float dl[WV][GPT][8][32];
+    __shared__ float sxl[WV][GPT][16];
+    __shared__ uint32_t tl[WV][GPT][16];
+
+    int bx = blockIdx.x;
+    if (sides.count > 0) {
+        int s = 0;
+        while (s + 1 < sides.count && bx >= sides.first[s + 1]) ++s;
+        bx -= sides.first[s];
+        Dec::bind(a, sides, s);
+        a.n = sides.n[s];
+        if (sides.out_half) {
+            a.out16 = static_cast<__half*>(sides.out[s]);
+        } else {
+            a.out = static_cast<float*>(sides.out[s]);
+        }
+    }
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int half = lane >> 4;
+    const int m0 = blockIdx.y * 16;
+    const int live = a.m - m0 < 16 ? a.m - m0 : 16;
+    const int K = a.k;
+    const int nch = K >> 5;
+    const int ntrips = nch >> 3;
+    const int col = bx * 16 + (lane & 15);
+    const int col_s = col < a.n ? col : a.n - 1;
+    const uint32_t* wp = Dec::words(a) + static_cast<long long>(col_s) * nch * BITS;
+    const long long tb = static_cast<long long>(col_s) * (K / G);
+    const typename Dec::StreamTerms terms(a);
+    // rows past the call read its last row: their sums are never folded
+    const int xrow = m0 + ((lane & 15) < live ? (lane & 15) : live - 1);
+    const uint32_t* xg = reinterpret_cast<const uint32_t*>(static_cast<const __bf16*>(a.x) + static_cast<long long>(xrow) * K);
+
+    float acc[EPL];
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) acc[i] = 0.f;
+
+    for (int ss = 0; ss < ntrips; ss += WV) {
+        const int t = ss + wave;
+        if (t < ntrips) {
+            // the trip's codes (lane half h: chunks 4 h .. 4 h + 3 of its column) and group terms, as the tile fetches
+            uint32_t ring[4][BITS];
+            uint32_t g[GPT];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) Dec::template load<true>(wp + static_cast<long long>(t * 8 + 4 * half + j) * BITS, ring[j]);
+            {
+                constexpr int NW = GPT / 2 > 0 ? GPT / 2 : 1;
+                uint32_t own[NW];
+                using V = std::conditional_t<GPT == 8, u32x4, std::conditional_t<GPT == 4, uint2, uint32_t>>;
+                *reinterpret_cast<V*>(own) = *reinterpret_cast<const V*>((half ? terms.bias : terms.scale) + tb + t * GPT);
+#pragma unroll
+                for (int v = 0; v < NW; ++v) {
+                    const uint32_t other = __builtin_amdgcn_permlanex16(own[v], own[v], 0x76543210u, 0xfedcba98u, false, false);
+                    const uint32_t sw = half ? other : own[v];
+                    const uint32_t bw = half ? own[v] : other;
+                    g[2 * v] = (sw & 0xffffu) | (bw << 16);
+                    if (2 * v + 1 < GPT) g[2 * v + 1] = (sw >> 16) | (bw & 0xffff0000u);
+                }
+            }
+            u32x4 xv[GPT][CPG * 4];
+#pragma unroll
+            for (int q = 0; q < GPT; ++q)
+#pragma unroll
+                for (int v = 0; v < CPG * 4; ++v) xv[q][v] = *reinterpret_cast<const u32x4*>(xg + (t * 256 + q * G) / 2 + 4 * v);
+            verify_for<GPT>([&](auto qc) {
+                constexpr int Q = decltype(qc)::value;
+                // the row's x sum over the group: lo then hi of each pair in K order, from zero (the tile's sums)
+                float run = 0.f;
+#pragma unroll
+                for (int v = 0; v < CPG * 4; ++v) {
+                    const uint32_t q4[4] = {xv[Q][v].x, xv[Q][v].y, xv[Q][v].z, xv[Q][v].w};
+#pragma unroll
+                    for (int h = 0; h < 4; ++h) {
+                        run += __uint_as_float(q4[h] << 16);
+                        run += __uint_as_float(q4[h] & 0xffff0000u);
+                    }
+                }
+                f32x8 d = {0, 0, 0, 0, 0, 0, 0, 0};
+                verify_for<CPG>([&](auto cc) {
+                    constexpr int J = Q * CPG + decltype(cc)::value;
+                    uint32_t w[BITS];
+#pragma unroll
+                    for (int b = 0; b < BITS; ++b) {
+                        const uint32_t own = ring[J % 4][b];
+                        const uint32_t other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
+                        w[b] = half == J / 4 ? own : other;
+                    }
+                    const bf16x16 b0 = verify_frag<BITS, 0>(w);
+                    const bf16x16 b1 = verify_frag<BITS, 1>(w);
+                    constexpr int C = decltype(cc)::value;
+                    const u32x4 x0 = xv[Q][4 * C], x1 = xv[Q][4 * C + 1], x2 = xv[Q][4 * C + 2], x3 = xv[Q][4 * C + 3];
+                    d = T::mma(__builtin_bit_cast(bf16x16, __builtin_shufflevector(x0, x1, 0, 1, 2, 3, 4, 5, 6, 7)), b0, d);
+                    d = T::mma(__builtin_bit_cast(bf16x16, __builtin_shufflevector(x2, x3, 0, 1, 2, 3, 4, 5, 6, 7)), b1, d);
+                });
+#pragma unroll
+                for (int e = 0; e < 8; ++e) dl[wave][Q][e][lane] = d[e];
+                if (lane < 16) {
+                    sxl[wave][Q][lane] = run;
+                    tl[wave][Q][lane] = g[Q];
+                }
+            });
+        }
+        __syncthreads();
+        // element i of this lane: row (e >> 4), column (e & 15) of the tile; its sums sit at [row / 2][(row & 1) 16 + col]
+        const int trips = ntrips - ss < WV ? ntrips - ss : WV;
+#pragma unroll
+        for (int i = 0; i < EPL; ++i) {
+            const int e = i * 32 * WV + wave * 32 + lane;
+            const int row = e >> 4, c = e & 15;
+            if (row >= live) continue;
+            float v = acc[i];
+            for (int tt = 0; tt < trips; ++tt) {
+#pragma unroll
+                for (int q = 0; q < GPT; ++q) {
+                    const uint32_t gq = tl[tt][q][c];
+                    v = Dec::fold_scale(v, dl[tt][q][row >> 1][(row & 1) * 16 + c], terms.widen(static_cast<unsigned short>(gq & 0xffffu)));
+                    v = Dec::fold_bias(v, sxl[tt][q][row], terms.widen(static_cast<unsigned short>(gq >> 16)));
+                }
+            }
+            acc[i] = v;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+        const int e = i * 32 * WV + wave * 32 + lane;
+        const int row = m0 + (e >> 4), c = bx * 16 + (e & 15);
+        if (row >= a.m || c >= a.n) continue;
+        const long long at = static_cast<long long>(row) * a.n + c;
+        if (a.out16 != nullptr) {
+            static_cast<__bf16*>(static_cast<void*>(a.out16))[at] = narrow<T>(acc[i]);
+        } else {
+            a.out[at] = acc[i];
+        }
+    }
+#else
+    (void)a;
+    (void)sides;
+    __builtin_trap();
+#endif
+}
+
 #if TF_MATRIX
-#define TF_VERIFY_W(BITS, G, WV)                                                     \
+#define TF_VERIFY_W(BITS, G, WV)                                                   \
     template __global__ void affine_wmma_verify<BITS, 1, G, WV>(Affine, StreamSides); \
     template __global__ void affine_wmma_verify<BITS, 2, G, WV>(Affine, StreamSides);
 #define TF_VERIFY_G(BITS, G) TF_VERIFY_W(BITS, G, 2) TF_VERIFY_W(BITS, G, 4)
-#define TF_VERIFY(BITS) TF_VERIFY_G(BITS, 32) TF_VERIFY_G(BITS, 64) TF_VERIFY_G(BITS, 128)
+#define TF_SPLIT_G(BITS, G)                                                                 \
+    template __global__ void affine_wmma_verify_split<BITS, G, 4>(Affine, StreamSides); \
+    template __global__ void affine_wmma_verify_split<BITS, G, 8>(Affine, StreamSides);
+#define TF_VERIFY(BITS) TF_VERIFY_G(BITS, 32) TF_VERIFY_G(BITS, 64) TF_VERIFY_G(BITS, 128) TF_SPLIT_G(BITS, 64) TF_SPLIT_G(BITS, 128)
 TF_VERIFY(2)
 TF_VERIFY(3)
 TF_VERIFY(4)
@@ -312,6 +473,7 @@ TF_VERIFY(8)
 #undef TF_VERIFY
 #undef TF_VERIFY_G
 #undef TF_VERIFY_W
+#undef TF_SPLIT_G
 #endif
 
 }  // namespace rocm
