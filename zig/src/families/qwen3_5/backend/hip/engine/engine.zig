@@ -96,6 +96,8 @@ pub const Engine = struct {
     /// A drafter's tapped layers (`setTaps`): forwards over caches with a tap ring write those layers' residual rows.
     taps: [8]u32 = undefined,
     n_taps: usize = 0,
+    /// The stream's last work is a keep (no op since): a drafter then waits for the forward before it alone.
+    keep_last: bool = false,
 
     /// The model on the device, its scratch not yet sized: `size` takes the capacity the memory plan fits.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options) !*Engine {
@@ -105,6 +107,7 @@ pub const Engine = struct {
         e.o = o;
         e.sized = false;
         e.n_taps = 0;
+        e.keep_last = false;
         // rounds and the draft head's batches replay graphs unless the policy says `graphs=off`, at any world size
         e.o.graphs = o.graphs and o.policy.graphsOn();
         e.graphs = round_graphs.Graphs.init(gpa);
@@ -274,6 +277,7 @@ pub const Engine = struct {
     }
 
     pub fn ops(e: *Engine, arena: *hip.Arena) hip.ops.Ops {
+        e.keep_last = false;
         return .{ .l = &e.lib, .bf16 = e.act == .bf16, .stream = e.stream.handle, .arena = arena };
     }
 
@@ -442,6 +446,11 @@ pub const Engine = struct {
     /// Marks a slot of the last verify to keep its first `rows` rows at the next `flush` (a tree: the path to row `rows` - 1).
     pub fn keep(e: *Engine, slot: usize, rows: usize) void {
         lane_round.mark(e, slot, rows);
+    }
+
+    /// The event before the stream's last work when that is a keep: what another stream reading the forward waits for.
+    pub fn keepTail(e: *const Engine) ?hip.Event {
+        return if (e.keep_last) e.round.before_keep else null;
     }
 
     /// Keeps every marked slot in one launch.
