@@ -18,6 +18,7 @@ const cases = [_]Case{
     .{ .name = "3.5-bit mul1", .k = 1024, .n = 384, .halves = 7, .codebook = .mul1 },
     .{ .name = "2-bit 3inst", .k = 512, .n = 512, .halves = 4, .codebook = .inst3 },
     .{ .name = "8-bit mcg", .k = 512, .n = 256, .halves = 16, .codebook = .mcg },
+    .{ .name = "6-bit mul1, two column blocks a wave", .k = 256, .n = 81920, .halves = 12, .codebook = .mul1 },
 };
 
 const most_rows = 128;

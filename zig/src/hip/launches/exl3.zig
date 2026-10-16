@@ -32,8 +32,18 @@ pub const Arg = extern struct {
 /// quant/exl3.hip's kExl3Counters: (column block, row block) pairs a split launch may take.
 const arrivals = 65536;
 
-/// The row tiles of a launch (16 rows each): 1 and 2 for a round, 8 for a prompt's chunk; the sums are the same.
-const row_tiles = [_]u32{ 1, 2, 8 };
+/// A launch's tile: 16-row tiles (1 and 2 for a round, 8 for a prompt's chunk) by the 128-column blocks a wave walks
+/// (2 on the widest products, sharing x); every row's and column's sums are the same.
+const Tile = struct { rows: u32, cols: u32 };
+const tiles = [_]Tile{ .{ .rows = 1, .cols = 1 }, .{ .rows = 2, .cols = 1 }, .{ .rows = 8, .cols = 1 }, .{ .rows = 1, .cols = 2 }, .{ .rows = 2, .cols = 2 } };
+
+/// The tile of an `m`-row product with `n` columns.
+fn tileOf(m: usize, n: u32) usize {
+    const wide = n % 256 == 0 and n / 256 >= 320;
+    if (m <= 16) return if (wide) 3 else 0;
+    if (m <= 32) return if (wide) 4 else 1;
+    return 2;
+}
 
 /// Widths the kernels are built for, in half bits: whole bits 2 to 8 on every codebook, 1.5 to 3.5 on mul1.
 fn built(halves: usize, codebook: usize) bool {
@@ -42,27 +52,28 @@ fn built(halves: usize, codebook: usize) bool {
 
 pub const Fns = struct {
     rotate: Function,
-    /// By half bits, codebook (3inst, mcg, mul1) and row tiles.
-    product: [17][3][row_tiles.len]?Function,
+    /// By half bits, codebook (3inst, mcg, mul1) and tile.
+    product: [17][3][tiles.len]?Function,
 
     pub fn load(m: Module) Error!Fns {
+        @setEvalBranchQuota(200_000);
         var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .product = @splat(@splat(@splat(null))) };
         inline for (0..17) |h| inline for (0..3) |cb| {
-            if (comptime built(h, cb)) inline for (row_tiles, 0..) |mt, i| {
-                f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, mt }));
+            if (comptime built(h, cb)) inline for (tiles, 0..) |t, i| {
+                f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, t.rows, t.cols }));
             };
         };
         return f;
     }
 };
 
-/// The K splits of a (K, N) product: enough 128-column blocks to fill the GPU, from the shape alone (bits never
+/// The K splits of a (K, N) product: enough column blocks for the GPU's 80 SIMDs, from the shape alone (bits never
 /// depend on the call's rows); a column block's last split block adds the splits' sums in order. Each split's tiles
 /// stay a multiple of the kernel's 4 k steps.
 pub fn splits(k: u32, n: u32) u32 {
-    const blocks = n / 128;
+    const blocks = n / 128 / tiles[tileOf(1, n)].cols;
     var s: u32 = 1;
-    while (blocks * s < 320 and s < 8 and ((k / 16) / (2 * s)) % 4 == 0) s *= 2;
+    while (blocks * s < 80 and s < 8 and ((k / 16) / (2 * s)) % 4 == 0) s *= 2;
     return s;
 }
 
@@ -77,8 +88,8 @@ pub fn scratchBytes(m: usize, k: u32, n: u32) usize {
 pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     if (m == 0 or k % 128 != 0 or n % 128 != 0 or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
     const cb: usize = @backingInt(w.codebook);
-    const tile: usize = if (m <= 16) 0 else if (m <= 32) 1 else 2;
-    const f = l.exl3.product[w.halves][cb][tile] orelse return invalid("exl3 width");
+    const tile = tiles[tileOf(m, n)];
+    const f = l.exl3.product[w.halves][cb][tileOf(m, n)] orelse return invalid("exl3 width");
     const sp = splits(k, n);
     const words: i64 = 4 * @as(i64, w.halves);
     const arg: Arg = .{
@@ -105,13 +116,14 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
         try a.add(@as(c_int, @intCast(k)));
         try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
-    const rows = 16 * row_tiles[tile];
+    const rows = 16 * tile.rows;
     const blocks = (m + rows - 1) / rows;
+    const cols = n / 128 / tile.cols;
     // the split blocks' arrival counts (quant/exl3.hip) cover every block of a launch
-    if (sp > 1 and blocks * (n / 128) > arrivals) return invalid("exl3 arrivals");
+    if (sp > 1 and blocks * cols > arrivals) return invalid("exl3 arrivals");
     var a: Args = .{};
     try a.add(arg);
-    try l.go(f, dim(n / 128, sp, blocks), dim(256, 1, 1), 0, s, &a);
+    try l.go(f, dim(cols, sp, blocks), dim(256, 1, 1), 0, s, &a);
 }
 
 test "splits keep whole tile runs and depend on the shape alone" {

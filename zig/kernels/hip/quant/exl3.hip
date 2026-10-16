@@ -226,13 +226,14 @@ __device__ __forceinline__ h16x16 exl3_fragment(const uint32_t (&r)[2][LW], cons
     return __builtin_bit_cast(h16x16, f);
 }
 
-// Columns 128 blockIdx.x.. over split blockIdx.y of K for rows 16 MT blockIdx.z..: wave w owns tile column 8 bx + w, a
+// Columns 128 NT blockIdx.x.. over split blockIdx.y of K for rows 16 MT blockIdx.z..: wave w owns tile columns
+// 8 (NT bx + n) + w (n < NT, one x fragment feeding the NT tiles' WMMAs) and of each a
 // lane column c = lane % 16 of it, and rows 8 h .. of its WMMA B fragment (h = lane / 16) from two windows of the tile's
 // stream; the halves swap theirs. Every row's sum is the same WMMA chain over its K range in K order.
 // A round's row tiles (MT 1, 2) keep a ring of each lane's window words and x fragments in registers; a prompt's (MT 8)
 // stages a slab of k steps (the block's 8 tiles each and its rows' x) through LDS, one slab ahead, a staged tile
 // repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain.
-template <int K2, int CB, int MT>
+template <int K2, int CB, int MT, int NT>
 __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TD = 4 * K2;      // dwords a tile
@@ -255,21 +256,25 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         start[w] = ((exl3_end<K2>(exl3_first(c, h, w)) - 16 + RING) % RING) >> 5;
         off[w] = ((exl3_end<K2>(exl3_first(c, h, w)) - 16 + RING) % RING) & 31;
     }
-    f32x8e acc[MT];
+    f32x8e acc[NT][MT];
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) acc[mt] = f32x8e{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) acc[n][mt] = f32x8e{0, 0, 0, 0, 0, 0, 0, 0};
 
     if constexpr (MT <= 2) {
         constexpr int D = 4;  // tiles in flight a wave
         // buffers over the block's tiles and x: a load takes a lane's byte offset and the tile's uniform one
-        const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(blockIdx.x) * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
+        const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(blockIdx.x) * NT * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
         const int tstep = static_cast<int>(a.stride_k * 4);
         const __amdgpu_buffer_rsrc_t xb = exl3_buffer(a.xh + kt0 * 16);
-        uint32_t idx[2][LW];
+        uint32_t idx[NT][2][LW];
 #pragma unroll
-        for (int w = 0; w < 2; ++w)
+        for (int n = 0; n < NT; ++n)
 #pragma unroll
-            for (int i = 0; i < LW; ++i) idx[w][i] = 4u * ((start[w] + i) % TD);
+            for (int w = 0; w < 2; ++w)
+#pragma unroll
+                for (int i = 0; i < LW; ++i) idx[n][w][i] = 4u * ((start[w] + i) % TD + n * a.stride_nb);
         // rows past the call read its last row: their outputs are never stored
         uint32_t xo[MT];
 #pragma unroll
@@ -277,15 +282,17 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
             const int r = m0 + mt * 16 + c;
             xo[mt] = static_cast<uint32_t>(r < a.m ? r : a.m - 1) * static_cast<uint32_t>(a.k) * 2u;
         }
-        uint32_t ring[D][2][LW];
+        uint32_t ring[D][NT][2][LW];
         u32x8e xa[D][MT];
         // every load is unconditional on a clamped tile, so the wait counters never drain the ring
-        auto fetch = [&](int i, uint32_t (&r)[2][LW], u32x8e (&x)[MT]) {
+        auto fetch = [&](int i, uint32_t (&r)[NT][2][LW], u32x8e (&x)[MT]) {
             const int t = i < tiles ? i : tiles - 1;
 #pragma unroll
-            for (int w = 0; w < 2; ++w)
+            for (int n = 0; n < NT; ++n)
 #pragma unroll
-                for (int j = 0; j < LW; ++j) r[w][j] = __builtin_amdgcn_raw_buffer_load_b32(tb, idx[w][j], t * tstep, 0);
+                for (int w = 0; w < 2; ++w)
+#pragma unroll
+                    for (int j = 0; j < LW; ++j) r[n][w][j] = __builtin_amdgcn_raw_buffer_load_b32(tb, idx[n][w][j], t * tstep, 0);
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
                 const u32x4e lo = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt], t * 32, 0);
@@ -300,12 +307,16 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #pragma unroll
             for (int rb = 0; rb < D; ++rb) {
                 fetch(i0 + rb + D - 1, ring[(rb + D - 1) % D], xa[(rb + D - 1) % D]);
-                const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb], off, c);
 #pragma unroll
-                for (int mt = 0; mt < MT; ++mt) acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb][mt]), b, acc[mt]);
+                for (int n = 0; n < NT; ++n) {
+                    const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) acc[n][mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb][mt]), b, acc[n][mt]);
+                }
             }
         }
     } else {
+        static_assert(NT == 1, "a prompt's row tiles take one column tile a wave");
         constexpr int KS = kExl3Slab;
         constexpr int TP = TD + 4;                          // dwords a staged tile
         constexpr int XP = KS * 32 + 16;                    // bytes a staged x row
@@ -381,7 +392,7 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const u32x8e x = *reinterpret_cast<const u32x8e*>(l + xat + mt * 16 * XP + i * 32);
-                    acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, acc[mt]);
+                    acc[0][mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, acc[0][mt]);
                 }
             }
             store((sl + 1) & 1);
@@ -390,15 +401,16 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         }
     }
 
-    const int col0 = blockIdx.x * 128;
     if (a.splits > 1) {
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt)
+        for (int n = 0; n < NT; ++n)
 #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int row = m0 + mt * 16 + 2 * e + h;
-                if (row < a.m) a.partial[(static_cast<long long>(blockIdx.y) * a.m + row) * a.n + col0 + wave * 16 + c] = acc[mt][e];
-            }
+            for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int row = m0 + mt * 16 + 2 * e + h;
+                    if (row < a.m) a.partial[(static_cast<long long>(blockIdx.y) * a.m + row) * a.n + (blockIdx.x * NT + n) * 128 + wave * 16 + c] = acc[n][mt][e];
+                }
         // the last split block to arrive adds every split's sums in split order (the same bits whichever arrives last)
         __shared__ int last;
         __threadfence();
@@ -408,36 +420,43 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         __syncthreads();
         if (!last) return;
         __threadfence();
-        for (int r = wave; r < R; r += 8) {
-            const int row = m0 + r;
-            if (row >= a.m) break;
-            const long long at = static_cast<long long>(row) * a.n + col0 + 4 * lane;
-            // volatile loads bypass the non-coherent vector caches, where another CU's sums may be stale
-            float v[4] = {0, 0, 0, 0};
-            for (int q = 0; q < a.splits; ++q) {
-                const u32x4e u = *reinterpret_cast<const volatile u32x4e*>(a.partial + static_cast<long long>(q) * a.m * a.n + at);
+        for (int n = 0; n < NT; ++n) {
+            const int col0 = (blockIdx.x * NT + n) * 128;
+            for (int r = wave; r < R; r += 8) {
+                const int row = m0 + r;
+                if (row >= a.m) break;
+                const long long at = static_cast<long long>(row) * a.n + col0 + 4 * lane;
+                // volatile loads bypass the non-coherent vector caches, where another CU's sums may be stale
+                float v[4] = {0, 0, 0, 0};
+                for (int q = 0; q < a.splits; ++q) {
+                    const u32x4e u = *reinterpret_cast<const volatile u32x4e*>(a.partial + static_cast<long long>(q) * a.m * a.n + at);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) v[j] += __uint_as_float(u[j]);
+                    for (int j = 0; j < 4; ++j) v[j] += __uint_as_float(u[j]);
+                }
+                exl3_store(a, v, lane, row, col0);
             }
-            exl3_store(a, v, lane, row, col0);
         }
         if (tid == 0) *arrived = 0;
         return;
     }
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-        __syncthreads();
+    for (int n = 0; n < NT; ++n) {
+        const int col0 = (blockIdx.x * NT + n) * 128;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) red[2 * e + h][wave * 16 + c] = acc[mt][e];
-        __syncthreads();
+        for (int mt = 0; mt < MT; ++mt) {
+            __syncthreads();
 #pragma unroll
-        for (int q = 0; q < 2; ++q) {
-            const int r = wave + 8 * q;
-            const int row = m0 + mt * 16 + r;
-            if (row >= a.m) continue;
-            const float4 u = *reinterpret_cast<const float4*>(&red[r][4 * lane]);
-            float v[4] = {u.x, u.y, u.z, u.w};
-            exl3_store(a, v, lane, row, col0);
+            for (int e = 0; e < 8; ++e) red[2 * e + h][wave * 16 + c] = acc[n][mt][e];
+            __syncthreads();
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int r = wave + 8 * q;
+                const int row = m0 + mt * 16 + r;
+                if (row >= a.m) continue;
+                const float4 u = *reinterpret_cast<const float4*>(&red[r][4 * lane]);
+                float v[4] = {u.x, u.y, u.z, u.w};
+                exl3_store(a, v, lane, row, col0);
+            }
         }
     }
 #else
@@ -448,9 +467,11 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 
 #if TF_MATRIX
 #define TF_EXL3_MT(K2, CB)                                                    \
-    template __global__ void exl3_product<K2, CB, 1>(Exl3);                   \
-    template __global__ void exl3_product<K2, CB, 2>(Exl3);                   \
-    template __global__ void exl3_product<K2, CB, 8>(Exl3);
+    template __global__ void exl3_product<K2, CB, 1, 1>(Exl3);                \
+    template __global__ void exl3_product<K2, CB, 1, 2>(Exl3);                \
+    template __global__ void exl3_product<K2, CB, 2, 1>(Exl3);                \
+    template __global__ void exl3_product<K2, CB, 2, 2>(Exl3);                \
+    template __global__ void exl3_product<K2, CB, 8, 1>(Exl3);
 #define TF_EXL3_CB(K2) TF_EXL3_MT(K2, 0) TF_EXL3_MT(K2, 1) TF_EXL3_MT(K2, 2)
 TF_EXL3_CB(4)
 TF_EXL3_CB(6)
