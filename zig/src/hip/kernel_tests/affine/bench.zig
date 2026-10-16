@@ -17,6 +17,16 @@ const shapes = [_]Shape{
     .{ .name = "k|v", .n = 1024, .k = 5120 },
     .{ .name = "o", .n = 5120, .k = 6144 },
     .{ .name = "lm_head", .n = 248320, .k = 5120 },
+    // the DFlash2 drafter's
+    .{ .name = "dft conv", .n = 1280, .k = 5120 },
+    .{ .name = "dft qkv", .n = 6144, .k = 5120 },
+    .{ .name = "dft o", .n = 5120, .k = 4096 },
+    .{ .name = "dft o+256", .n = 5120, .k = 4352 },
+    .{ .name = "dft o+512", .n = 5120, .k = 4608 },
+    .{ .name = "dft down", .n = 5120, .k = 17408 },
+    .{ .name = "dft o 2x", .n = 10240, .k = 4096 },
+    .{ .name = "dft gate", .n = 17408, .k = 5120 },
+    .{ .name = "dft head", .n = 98592, .k = 5120 },
 };
 const rows = [_]c_int{ 1, 2, 4, 8, 12, 16, 32, 64, 128 };
 const bits = 4;
