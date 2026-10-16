@@ -27,7 +27,12 @@ pub const Host = struct {
         const dst = try o.arena.take(bytes.len);
         @memcpy(h.staging.bytes[from..][0..bytes.len], bytes);
         h.used = from + bytes.len;
-        if (o.stream != hip.counting and bytes.len > 0) try hip.runtime.check(h.d.api.hipMemcpyHtoDAsync(@ptrFromInt(dst), h.staging.bytes[from..].ptr, bytes.len, o.stream));
+        if (o.stream != hip.counting and bytes.len > 0) try hip.runtime.check(h.d.api.hipMemcpyHtoDAsync(
+            @ptrFromInt(dst),
+            h.staging.bytes[from..].ptr,
+            bytes.len,
+            o.stream,
+        ));
         return dst;
     }
 };
@@ -57,10 +62,28 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
     const z = try o.project(x, hc.down, rows, true);
     const act = try take(o, m.act, rows * d.low);
     const kind = @backingInt(m.act);
-    try o.l.fn_hc_gates(@ptrFromInt(z.ptr), @ptrFromInt(act.ptr), if (inject) |i| @ptrFromInt(i.ptr) else null, kind, @intCast(rows), @intCast(d.low), @intCast(d.streams), o.stream);
+    try o.l.fn_hc_gates(
+        @ptrFromInt(z.ptr),
+        @ptrFromInt(act.ptr),
+        if (inject) |i| @ptrFromInt(i.ptr) else null,
+        kind,
+        @intCast(rows),
+        @intCast(d.low),
+        @intCast(d.streams),
+        o.stream,
+    );
     const g = try o.project(act, hc.up, rows, true);
     const mixed = try take(o, m.act, rows * d.hidden);
-    try o.l.fn_hc_mix(@ptrFromInt(g.ptr), @ptrFromInt(x.ptr), @ptrFromInt(mixed.ptr), kind, @intCast(rows), @intCast(d.streams), @intCast(d.hidden), o.stream);
+    try o.l.fn_hc_mix(
+        @ptrFromInt(g.ptr),
+        @ptrFromInt(x.ptr),
+        @ptrFromInt(mixed.ptr),
+        kind,
+        @intCast(rows),
+        @intCast(d.streams),
+        @intCast(d.hidden),
+        o.stream,
+    );
     return mixed;
 }
 
@@ -76,9 +99,31 @@ pub fn hcBranch(o: Ops, m: *const model.Model, h: Tensor, branch: Tensor, inject
 }
 
 /// h += round(branch * inject) per stream when a branch is given, then x = the streams normed with `scale`.
-pub fn hcNorm(o: Ops, m: *const model.Model, h: Tensor, branch: ?Tensor, inject: ?Tensor, x: Tensor, scale: u64, rows: usize) !void {
+pub fn hcNorm(
+    o: Ops,
+    m: *const model.Model,
+    h: Tensor,
+    branch: ?Tensor,
+    inject: ?Tensor,
+    x: Tensor,
+    scale: u64,
+    rows: usize,
+) !void {
     const d = m.dims;
-    try o.l.fn_hc_norm(@ptrFromInt(h.ptr), if (branch) |b| @ptrFromInt(b.ptr) else null, if (inject) |i| @ptrFromInt(i.ptr) else null, if (branch != null) @ptrFromInt(h.ptr) else null, @ptrFromInt(x.ptr), @ptrFromInt(scale), @backingInt(m.act), @intCast(rows), @intCast(d.streams), @intCast(d.hidden), d.eps, o.stream);
+    try o.l.fn_hc_norm(
+        @ptrFromInt(h.ptr),
+        if (branch) |b| @ptrFromInt(b.ptr) else null,
+        if (inject) |i| @ptrFromInt(i.ptr) else null,
+        if (branch != null) @ptrFromInt(h.ptr) else null,
+        @ptrFromInt(x.ptr),
+        @ptrFromInt(scale),
+        @backingInt(m.act),
+        @intCast(rows),
+        @intCast(d.streams),
+        @intCast(d.hidden),
+        d.eps,
+        o.stream,
+    );
 }
 
 /// A forward's host inputs, laid out in one span of the staging (byte offsets into it) and sent up in one copy.
@@ -98,7 +143,17 @@ pub const Staged = struct {
 };
 
 /// The staged inputs on the device: token ids (one a stream), positions, ends, complete blocks, n-gram rows.
-pub const Inputs = struct { ids: u64, pos: u64, ends: u64, complete: u64, local: u64, words: u64, scales: u64, biases: u64, bound: usize };
+pub const Inputs = struct {
+    ids: u64,
+    pos: u64,
+    ends: u64,
+    complete: u64,
+    local: u64,
+    words: u64,
+    scales: u64,
+    biases: u64,
+    bound: usize,
+};
 
 /// Every host input of a forward of `segs` written into the staging, n-gram rows hashed and gathered: no launch.
 pub fn stage(m: *const model.Model, host: *Host, segs: []const Seg, window: bool) !Staged {
@@ -110,7 +165,16 @@ pub fn stage(m: *const model.Model, host: *Host, segs: []const Seg, window: bool
     const n16 = rows * ngram.heads;
     var s: Staged = .{ .from = std.mem.alignForward(usize, host.used, 16) };
     var used: usize = 0;
-    inline for (.{ .{ "ids", rows * d.streams * 4 }, .{ "pos", rows * 4 }, .{ "ends", rows * 4 }, .{ "complete", rows * 4 }, .{ "local", n16 * 4 }, .{ "words", n16 * t.wordBytes() }, .{ "scales", n16 * t.tableBytes() }, .{ "biases", n16 * t.tableBytes() } }) |f| {
+    inline for (.{
+        .{ "ids", rows * d.streams * 4 },
+        .{ "pos", rows * 4 },
+        .{ "ends", rows * 4 },
+        .{ "complete", rows * 4 },
+        .{ "local", n16 * 4 },
+        .{ "words", n16 * t.wordBytes() },
+        .{ "scales", n16 * t.tableBytes() },
+        .{ "biases", n16 * t.tableBytes() },
+    }) |f| {
         @field(s, f[0]) = used;
         used = std.mem.alignForward(usize, used + f[1], 16);
     }
@@ -142,7 +206,12 @@ pub fn stage(m: *const model.Model, host: *Host, segs: []const Seg, window: bool
         row += n;
     }
     const flat: []const u32 = @as([*]const u32, @ptrCast(hashed.ptr))[0..n16];
-    try t.gather(flat, span[s.words..][0 .. n16 * t.wordBytes()], span[s.scales..][0 .. n16 * t.tableBytes()], span[s.biases..][0 .. n16 * t.tableBytes()]);
+    try t.gather(
+        flat,
+        span[s.words..][0 .. n16 * t.wordBytes()],
+        span[s.scales..][0 .. n16 * t.tableBytes()],
+        span[s.biases..][0 .. n16 * t.tableBytes()],
+    );
     // a window's scores walk every block its caches hold: the launch is the same at any position
     if (window) for (segs) |g| {
         s.bound = @max(s.bound, g.c.layout.cap / d.index_ratio);
@@ -154,12 +223,37 @@ pub fn stage(m: *const model.Model, host: *Host, segs: []const Seg, window: bool
 /// The staged span up to fresh arena memory in one copy, queued on the stream (inside a graph when one records).
 pub fn send(o: Ops, host: *Host, s: Staged) !Inputs {
     const dst = try o.arena.take(s.len);
-    if (o.stream != hip.counting) try hip.runtime.check(host.d.api.hipMemcpyHtoDAsync(@ptrFromInt(dst), host.staging.bytes[s.from..].ptr, s.len, o.stream));
-    return .{ .ids = dst + s.ids, .pos = dst + s.pos, .ends = dst + s.ends, .complete = dst + s.complete, .local = dst + s.local, .words = dst + s.words, .scales = dst + s.scales, .biases = dst + s.biases, .bound = s.bound };
+    if (o.stream != hip.counting) try hip.runtime.check(host.d.api.hipMemcpyHtoDAsync(
+        @ptrFromInt(dst),
+        host.staging.bytes[s.from..].ptr,
+        s.len,
+        o.stream,
+    ));
+    return .{
+        .ids = dst + s.ids,
+        .pos = dst + s.pos,
+        .ends = dst + s.ends,
+        .complete = dst + s.complete,
+        .local = dst + s.local,
+        .words = dst + s.words,
+        .scales = dst + s.scales,
+        .biases = dst + s.biases,
+        .bound = s.bound,
+    };
 }
 
 /// The n-gram layer over a segment's rows (from the forward's row `row0`): h += gated + silu(conv) over `cin`.
-fn ple(o: Ops, m: *const model.Model, host: *Host, c: *cache.Caches, h: Tensor, call: Call, cin: u64, in: Inputs, row0: usize) !void {
+fn ple(
+    o: Ops,
+    m: *const model.Model,
+    host: *Host,
+    c: *cache.Caches,
+    h: Tensor,
+    call: Call,
+    cin: u64,
+    in: Inputs,
+    row0: usize,
+) !void {
     const d = m.dims;
     const rows = call.tokens.len;
     const t = host.tables;
@@ -167,17 +261,62 @@ fn ple(o: Ops, m: *const model.Model, host: *Host, c: *cache.Caches, h: Tensor, 
     defer o.arena.release(mark);
     const emb = try take(o, m.act, rows * d.ple_dim);
     const first = row0 * ngram.heads;
-    try o.l.tf_embed_rows(@ptrFromInt(in.words + first * t.wordBytes()), @ptrFromInt(in.scales + first * t.tableBytes()), @ptrFromInt(in.biases + first * t.tableBytes()), @backingInt(Kind.bf16), @ptrFromInt(in.local), @intCast(rows * ngram.heads), t.bits, @intCast(t.group), @intCast(t.dims), @ptrFromInt(emb.ptr), @backingInt(m.act), o.stream);
+    try o.l.tf_embed_rows(
+        @ptrFromInt(in.words + first * t.wordBytes()),
+        @ptrFromInt(in.scales + first * t.tableBytes()),
+        @ptrFromInt(in.biases + first * t.tableBytes()),
+        @backingInt(Kind.bf16),
+        @ptrFromInt(in.local),
+        @intCast(rows * ngram.heads),
+        t.bits,
+        @intCast(t.group),
+        @intCast(t.dims),
+        @ptrFromInt(emb.ptr),
+        @backingInt(m.act),
+        o.stream,
+    );
     const kv = try o.project(emb, m.ple.kv, rows, false);
     const gated = try take(o, m.act, rows * d.wide());
     const tail = c.layout.tail_rows * d.wide() * m.act.size();
     try hip.raw.copy(.{ .r = host.d, .ptr = @ptrFromInt(cin), .len = tail }, 0, c.tail(), tail, o.stream);
     const kind = @backingInt(m.act);
-    try o.l.fn_ple_gate(@ptrFromInt(kv.ptr), @ptrFromInt(h.ptr), @ptrFromInt(m.ple.key_scale), @ptrFromInt(m.ple.query_scale), @ptrFromInt(m.ple.conv_scale), @ptrFromInt(gated.ptr), @ptrFromInt(cin + tail), kind, @intCast(rows), @intCast(d.streams), @intCast(d.hidden), d.eps, o.stream);
-    try o.l.fn_ple_conv(@ptrFromInt(cin), @ptrFromInt(m.ple.conv), @ptrFromInt(gated.ptr), @ptrFromInt(h.ptr), @ptrFromInt(h.ptr), kind, @intCast(rows), @intCast(d.wide()), @intCast(d.ple_taps), @intCast(d.ngram), o.stream);
+    try o.l.fn_ple_gate(
+        @ptrFromInt(kv.ptr),
+        @ptrFromInt(h.ptr),
+        @ptrFromInt(m.ple.key_scale),
+        @ptrFromInt(m.ple.query_scale),
+        @ptrFromInt(m.ple.conv_scale),
+        @ptrFromInt(gated.ptr),
+        @ptrFromInt(cin + tail),
+        kind,
+        @intCast(rows),
+        @intCast(d.streams),
+        @intCast(d.hidden),
+        d.eps,
+        o.stream,
+    );
+    try o.l.fn_ple_conv(
+        @ptrFromInt(cin),
+        @ptrFromInt(m.ple.conv),
+        @ptrFromInt(gated.ptr),
+        @ptrFromInt(h.ptr),
+        @ptrFromInt(h.ptr),
+        kind,
+        @intCast(rows),
+        @intCast(d.wide()),
+        @intCast(d.ple_taps),
+        @intCast(d.ngram),
+        o.stream,
+    );
     // a prompt's rows are kept: the tail moves on now; a window's waits for its keep
     if (!call.window) {
-        try hip.raw.copy(.{ .r = host.d, .ptr = @ptrFromInt(c.tail()), .len = tail }, 0, cin + rows * d.wide() * m.act.size(), tail, o.stream);
+        try hip.raw.copy(
+            .{ .r = host.d, .ptr = @ptrFromInt(c.tail()), .len = tail },
+            0,
+            cin + rows * d.wide() * m.act.size(),
+            tail,
+            o.stream,
+        );
         c.history = ngram.after(c.history, call.tokens);
     }
 }
@@ -198,14 +337,27 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
     try o.embedRows(m.embed, dev_ids, rows * d.streams, h);
     var cins: [max_segs]u64 = undefined;
     if (segs.len > max_segs) return error.TooManyStreams;
-    for (segs, cins[0..segs.len]) |g, *cin| cin.* = if (window) g.c.cin.base() else try o.arena.take((g.c.layout.tail_rows + g.tokens.len) * d.wide() * m.act.size());
+    for (segs, cins[0..segs.len]) |g, *cin| cin.* = if (window)
+        g.c.cin.base()
+    else
+        try o.arena.take((g.c.layout.tail_rows + g.tokens.len) * d.wide() * m.act.size());
     for (m.layers, 0..) |layer, i| {
         const mark = o.arena.mark();
         defer o.arena.release(mark);
         if (i == m.ple.layer) {
             var off: usize = 0;
             for (segs, cins[0..segs.len]) |g, cin| {
-                try ple(o, m, host, g.c, at(h, off * d.wide()), .{ .tokens = g.tokens, .pos = g.pos, .window = window }, cin, in, off);
+                try ple(
+                    o,
+                    m,
+                    host,
+                    g.c,
+                    at(h, off * d.wide()),
+                    .{ .tokens = g.tokens, .pos = g.pos, .window = window },
+                    cin,
+                    in,
+                    off,
+                );
                 off += g.tokens.len;
             }
         }
@@ -214,7 +366,19 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
         const mixed = try hcPre(o, m, layer.ahc, x, rows, inject);
         const branch = switch (layer.mixer) {
             .linear => |l| try mixers.linear(o, m, l, segs, i, mixed, rows, window),
-            .sparse => |s| try mixers.sparse(o, m, d, s, segs, i, mixed, rows, dev_pos, host, .{ .ends = in.ends, .complete = in.complete, .bound = in.bound }),
+            .sparse => |s| try mixers.sparse(
+                o,
+                m,
+                d,
+                s,
+                segs,
+                i,
+                mixed,
+                rows,
+                dev_pos,
+                host,
+                .{ .ends = in.ends, .complete = in.complete, .bound = in.bound },
+            ),
         };
         try hcBranch(o, m, h, branch, inject, x, layer.mhc.scale, rows);
         const mixed2 = try hcPre(o, m, layer.mhc, x, rows, inject);

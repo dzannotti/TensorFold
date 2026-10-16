@@ -21,3 +21,7 @@ zig-out/
 
 # Versioned GUI build resources, generated app engines stay ignored in app/.gitignore.
 !app/build/
+
+# Strix Halo bench and quality outputs
+bench-out/
+tools/strix/baselines/last*.json
