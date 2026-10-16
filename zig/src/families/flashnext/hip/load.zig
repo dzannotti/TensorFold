@@ -5,6 +5,7 @@ const core = @import("core");
 const config = @import("../config.zig");
 const tensors = @import("tensors.zig");
 const model = @import("model.zig");
+const int4ar = @import("int4ar.zig");
 
 const quant = core.quant;
 const Tensor = core.checkpoint.Tensor;
@@ -45,10 +46,10 @@ const Loader = struct {
 
     /// A projection, its rows and inputs checked against the model's description where it gives them.
     fn proj(l: *const Loader, k: []const u8) !Host {
-        const h = try quant.read(l.a, l.t, k);
+        const h = if (l.t.cfg.gptq) try int4ar.read(l.a, l.t, k) else try quant.read(l.a, l.t, k);
         const want = (try tensors.shape(l.t.cfg, k)) orelse return h;
         const n, const width = switch (h) {
-            .mlx => |m| .{ m.words.shape[0], m.scales.shape[1] * m.group },
+            .mlx => |m| .{ m.words.shape[0], m.words.shape[1] * 32 / m.bits },
             else => return h,
         };
         if (n != want.n or width != want.k) return error.UnexpectedShape;
@@ -177,10 +178,25 @@ const Loader = struct {
     }
 
     fn moe(l: *const Loader, base: []const u8, c: *const config.Config, whole: bool) !model.Routed {
-        var r = try quant.experts.routed(l.a, l.t, try l.key("{s}.{s}", .{ base, tensors.moe.prefix }), .{ .experts = c.experts, .hidden = c.hidden, .top_k = c.topk });
+        const prefix = try l.key("{s}.{s}", .{ base, tensors.moe.prefix });
+        const spec: quant.experts.Shape = .{ .experts = c.experts, .hidden = c.hidden, .top_k = c.topk };
+        var shared: ?hip.moe.Shared = null;
+        var r = if (!l.t.cfg.gptq) try quant.experts.routed(l.a, l.t, prefix, spec) else blk: {
+            var x = try quant.experts.router(l.a, l.t, prefix, spec);
+            if (try int4ar.gptqRouted(l.a, l.t, prefix)) {
+                // the trunk: GPTQ routed experts stacked alone, the healed shared expert (its own width) beside them
+                if (l.rank != null and !whole) return error.UnsupportedTensorParallel;
+                x.experts = try int4ar.gptqExperts(l.a, l.t, prefix, c.experts);
+                const s = tensors.moe.shared;
+                const gate_up = try stackRows(l.a, try l.proj(try l.named(base, s[0])), try l.proj(try l.named(base, s[1])));
+                shared = .{ .gate_up = try l.put(gate_up, false), .down = try l.put(try l.proj(try l.named(base, s[2])), false), .width = gate_up.rows() / 2 };
+            } else x.experts = try int4ar.floatExperts(l.a, l.t, prefix, c.experts);
+            break :blk x;
+        };
         if (!whole) if (l.rank) |rk| try quant.experts.sliceRank(l.a, &r, rk);
         const u = l.up.uploader();
         return .{
+            .shared = shared,
             .rows32 = (try u.tensor(r.rows32)).ptr,
             .rows16 = (try u.tensor(r.router)).ptr,
             .top_k = r.top_k,
@@ -238,14 +254,8 @@ fn floats(a: Allocator, t: Tensor) ![]f32 {
 fn stackRows(a: Allocator, top: Host, under: Host) !Host {
     const t = top.mlx;
     const u = under.mlx;
-    if (t.bits != u.bits or t.group != u.group or t.words.shape[1] != u.words.shape[1]) return error.UnexpectedTensor;
-    return .{ .mlx = .{
-        .words = try join(a, t.words, u.words),
-        .scales = try join(a, t.scales, u.scales),
-        .biases = try join(a, t.biases, u.biases),
-        .bits = t.bits,
-        .group = t.group,
-    } };
+    if (t.bits != u.bits or t.group != u.group or t.code != u.code or t.words.shape[1] != u.words.shape[1]) return error.UnexpectedTensor;
+    return .{ .mlx = .{ .words = try join(a, t.words, u.words), .scales = try join(a, t.scales, u.scales), .biases = try join(a, t.biases, u.biases), .bits = t.bits, .group = t.group, .code = t.code } };
 }
 
 fn join(a: Allocator, x: Tensor, y: Tensor) !Tensor {
@@ -316,7 +326,12 @@ pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoi
     const l: Loader = .{ .a = arena.allocator(), .t = &tables, .up = .{ .r = d, .buffers = &w.buffers, .gpa = gpa }, .rank = rank, .around_one = try aroundOne(arena.allocator(), &tables, c.layers) };
     const world_n: usize = if (rank) |r| r.world else 1;
     const dims = try model.Dims.of(c, world_n);
-    const head = try l.proj(tensors.lm_head);
+    // the head outlives the per-layer resets (a repacked one is allocated, not a view of the map)
+    var head_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer head_arena.deinit();
+    var hl = l;
+    hl.a = head_arena.allocator();
+    const head = try hl.proj(tensors.lm_head);
     w.layers = try gpa.alloc(model.Layer, c.layers);
     var ple: ?model.Ple = null;
     for (0..c.layers) |i| {
@@ -329,7 +344,8 @@ pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoi
     w.model = .{
         .dims = dims,
         .act = act,
-        .embed = try l.put(try l.proj(tensors.embed), false),
+        // the embedding is a row gather: a float table stays as stored
+        .embed = try l.put(if (c.gptq) try quant.read(l.a, l.t, tensors.embed) else try l.proj(tensors.embed), false),
         .layers = w.layers,
         .mix = try l.hc(tensors.mixer, false),
         .head = try l.put(try l.rows(head, &.{c.vocab}), false),

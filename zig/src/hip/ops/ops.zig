@@ -89,6 +89,7 @@ pub const Ops = struct {
     pub const addWide = tp.addWide;
     pub const moeLocalize = tp.moeLocalize;
     pub const moeForeignItems = tp.moeForeignItems;
+    pub const moePutSlot = tp.moePutSlot;
     pub const moeZeroForeign = tp.moeZeroForeign;
 };
 

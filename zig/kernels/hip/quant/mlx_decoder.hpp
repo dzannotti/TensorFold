@@ -117,6 +117,26 @@ struct MlxDecoder {
     __device__ static float scale_value(const Args& a, const Term& t) { return table_float(a.scale, t.scale); }
     __device__ static float bias_value(const Args& a, const Term& t) { return table_float(a.bias, t.bias); }
 
+    // The tiles' term word (scale | bias << 16) and the stream tile's raw pair as floats (coded decoders read them
+    // otherwise, quant/coded.hpp).
+    static constexpr bool kTerms = true;
+    template <class Terms>
+    __device__ static float term_scale(const Terms& t, uint32_t g) {
+        return t.widen(static_cast<unsigned short>(g & 0xffffu));
+    }
+    template <class Terms>
+    __device__ static float term_bias(const Terms& t, uint32_t g) {
+        return t.widen(static_cast<unsigned short>(g >> 16));
+    }
+    template <class Terms>
+    __device__ static float stream_scale(const Terms& t, unsigned short s, unsigned short) {
+        return t.widen(s);
+    }
+    template <class Terms>
+    __device__ static float stream_bias(const Terms& t, unsigned short, unsigned short b) {
+        return t.widen(b);
+    }
+
     // A group's sum: its dot against the codes times the scale, and the sum of x times the bias.
     __device__ static float fold_scale(float acc, float dot, float scale) { return fmaf(dot, scale, acc); }
     __device__ static float fold_bias(float acc, float sum_x, float bias) { return fmaf(sum_x, bias, acc); }
