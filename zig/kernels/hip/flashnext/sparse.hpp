@@ -21,7 +21,10 @@ __device__ __forceinline__ float sparse_widen(uint16_t b, int kind) {
 }
 
 // Block (g, r, p): kv head g's query heads (G at most), row r, part p of its keys, 32 keys staged at a time.
-template <int kSparseGroup>
+// STAGED: a 16-bit cache's tile of keys and values through 16-byte loads all in flight (a round's few rows: latency);
+// else the keys a value at a time and the values from memory (a prompt's many rows: the small LDS keeps more blocks a
+// CU). Both sum the same products in the same order.
+template <int kSparseGroup, bool STAGED>
 __device__ void sparse_parts(const float* q, const void* k, const void* v, int cache_kind, const int* ids,
                              long long id_stride, const int* count, const int* sparse, float* parts_o, float* parts_ms,
                              int heads, int kv_heads, int dims, long long cap, float scale, int parts) {
@@ -30,8 +33,8 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
     __shared__ float ps[kSparseGroup][kSparseTile];
     __shared__ float fs[kSparseGroup], m[kSparseGroup], l[kSparseGroup];
     __shared__ long long keys[kSparseTile];
-    __shared__ uint16_t vt[kSparseTile][kSparseMostDims];  // a 16-bit cache's tile of values
-    const bool wide = cache_kind != 0 && dims % 8 == 0;
+    __shared__ uint16_t vt[STAGED ? kSparseTile : 1][STAGED ? kSparseMostDims : 1];  // a staged tile's values
+    const bool wide = STAGED && cache_kind != 0 && dims % 8 == 0;
     const int g = blockIdx.x, r = blockIdx.y, part = blockIdx.z;
     const int group = heads / kv_heads;
     const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
@@ -70,7 +73,7 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
                 const int i = (t + u * kSparseWaves * 32) * 8;
                 if (i >= tn * dims) continue;
                 const int j = i / dims, d = i % dims;
-                *reinterpret_cast<uint4*>(&vt[j][d]) = vr[u];
+                if constexpr (STAGED) *reinterpret_cast<uint4*>(&vt[j][d]) = vr[u];
                 const uint32_t w[4] = {kr[u].x, kr[u].y, kr[u].z, kr[u].w};
 #pragma unroll
                 for (int e = 0; e < 8; ++e) kt[j][d + e] = sparse_widen(static_cast<uint16_t>(w[e >> 1] >> (16 * (e & 1))), cache_kind);
@@ -110,7 +113,12 @@ __device__ void sparse_parts(const float* q, const void* k, const void* v, int c
 #pragma unroll
             for (int h = 0; h < kSparseGroup; ++h) o[h] *= h < group ? fs[h] : 1.f;
             for (int j = 0; j < tn; ++j) {
-                const float vd = wide ? sparse_widen(vt[j][d], cache_kind) : load(v, cache_kind, head_base + keys[j] * dims + d);
+                float vd;
+                if constexpr (STAGED) {
+                    vd = wide ? sparse_widen(vt[j][d], cache_kind) : load(v, cache_kind, head_base + keys[j] * dims + d);
+                } else {
+                    vd = load(v, cache_kind, head_base + keys[j] * dims + d);
+                }
 #pragma unroll
                 for (int h = 0; h < kSparseGroup; ++h) {
                     if (h < group) o[h] += ps[h][j] * vd;
@@ -134,7 +142,7 @@ extern "C" __global__ void __launch_bounds__(kSparseWaves * 32)
 tf_fn_sparse_parts6(const float* q, const void* k, const void* v, int cache_kind, const int* ids, long long id_stride,
                     const int* count, const int* sparse, float* parts_o, float* parts_ms, int heads, int kv_heads,
                     int dims, long long cap, float scale, int parts) {
-    sparse_parts<6>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
+    sparse_parts<6, false>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
                     scale, parts);
 }
 
@@ -142,8 +150,24 @@ extern "C" __global__ void __launch_bounds__(kSparseWaves * 32)
 tf_fn_sparse_parts12(const float* q, const void* k, const void* v, int cache_kind, const int* ids, long long id_stride,
                      const int* count, const int* sparse, float* parts_o, float* parts_ms, int heads, int kv_heads,
                      int dims, long long cap, float scale, int parts) {
-    sparse_parts<12>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
+    sparse_parts<12, false>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
                      scale, parts);
+}
+
+extern "C" __global__ void __launch_bounds__(kSparseWaves * 32)
+tf_fn_sparse_parts6_staged(const float* q, const void* k, const void* v, int cache_kind, const int* ids, long long id_stride,
+                           const int* count, const int* sparse, float* parts_o, float* parts_ms, int heads, int kv_heads,
+                           int dims, long long cap, float scale, int parts) {
+    sparse_parts<6, true>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims, cap,
+                          scale, parts);
+}
+
+extern "C" __global__ void __launch_bounds__(kSparseWaves * 32)
+tf_fn_sparse_parts12_staged(const float* q, const void* k, const void* v, int cache_kind, const int* ids,
+                            long long id_stride, const int* count, const int* sparse, float* parts_o, float* parts_ms,
+                            int heads, int kv_heads, int dims, long long cap, float scale, int parts) {
+    sparse_parts<12, true>(q, k, v, cache_kind, ids, id_stride, count, sparse, parts_o, parts_ms, heads, kv_heads, dims,
+                           cap, scale, parts);
 }
 
 // Block (h, r), a thread a dim: the parts of head h of row r combined in part order, fp32 rows-major out.

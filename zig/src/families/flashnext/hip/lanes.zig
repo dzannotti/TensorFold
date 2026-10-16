@@ -67,7 +67,7 @@ const Times = struct {
     fn draft(t: *Times) void {
         if (!t.on or t.at[3] == 0) return;
         t.sum[2] += t.at[4] - t.at[3];
-        if (t.n == 100) {
+        if (t.n >= 100) {
             const n: f64 = @floatFromInt(t.n * 1000);
             std.log.info("fn times (us a round): submit {d:.0}, verify+draw {d:.0}, keep+draft {d:.0}, between {d:.0}", .{ @as(f64, @floatFromInt(t.sum[0])) / n, @as(f64, @floatFromInt(t.sum[1])) / n, @as(f64, @floatFromInt(t.sum[2])) / n, @as(f64, @floatFromInt(t.sum[3])) / n });
             t.* = .{ .on = true };
