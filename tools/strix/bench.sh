@@ -4,7 +4,8 @@
 # draft:false), bench_openai and sparkbench decode at LEVELS (default 1), and prefill at PREFILL_SIZES (default 8192,
 # empty skips). Run it under the exclusive GPU lock (tools/strix/gpu-lock.sh: `bench tools/strix/bench.sh ...`).
 # Env: BIN (default zig-out/native-hip/bin/tensorfold-native), TF_ENV (a file to source first, e.g. the ROCm SDK's
-# env.sh), SERVE_ENV (VAR=value pairs for the server), OUT (default ./bench-out), PORT (default 8099).
+# env.sh), SERVE_ENV (VAR=value pairs for the server), OUT (default ./bench-out), PORT (default 8099), RESERVE_GIB
+# (host memory the server leaves free, default 24: the prompt cache takes the rest).
 set -u
 label=$1 dir=$2 drafter=$3; shift 3
 [ -n "${TF_ENV:-}" ] && source "$TF_ENV"
@@ -12,7 +13,7 @@ cd "$(dirname "$0")/../.."
 bin=${BIN:-zig-out/native-hip/bin/tensorfold-native} port=${PORT:-8099} out=${OUT:-bench-out}/$label
 mkdir -p "$(dirname "$out")"
 draft=(); [ "$drafter" != - ] && draft=(--drafter "$drafter")
-env ${SERVE_ENV:-} timeout 3600 "$bin" serve "$dir" --name m --port $port --context 32768 --parallel 8 "${draft[@]}" "$@" > "$out.log" 2>&1 &
+env TENSORFOLD_MEMORY_RESERVE_GIB=${RESERVE_GIB:-24} ${SERVE_ENV:-} timeout 3600 "$bin" serve "$dir" --name m --port $port --context 32768 --parallel 8 "${draft[@]}" "$@" > "$out.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null' EXIT
 for i in $(seq 300); do curl -sf localhost:$port/v1/models >/dev/null && break; kill -0 $pid 2>/dev/null || { tail -5 "$out.log"; exit 1; }; sleep 2; done
