@@ -237,6 +237,24 @@ __device__ __forceinline__ void prompt_tile(const Affine& a) {
 
 // ---- the dequantizing prompt tile: weights to bf16 in LDS, one WMMA chain over all of K ----
 
+// A raw buffer over `p` (gfx11's word 3: 32-bit dwords, raw out-of-range checks) so a load is a scalar base and
+// offset plus one vector offset, no 64-bit address adds.
+__device__ inline __amdgpu_buffer_rsrc_t prompt_rsrc(const void* p) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0x7fffffff, 0x31004000);
+}
+
+template <class T>
+__device__ inline T prompt_load(__amdgpu_buffer_rsrc_t r, uint32_t lane, uint32_t uniform) {
+    if constexpr (sizeof(T) == 16) {
+        return __builtin_bit_cast(T, __builtin_amdgcn_raw_buffer_load_b128(r, lane, uniform, 0));
+    } else if constexpr (sizeof(T) == 8) {
+        return __builtin_bit_cast(T, __builtin_amdgcn_raw_buffer_load_b64(r, lane, uniform, 0));
+    } else {
+        static_assert(sizeof(T) == 2, "16, 8 or 2 bytes");
+        return __builtin_bit_cast(T, __builtin_amdgcn_raw_buffer_load_b16(r, lane, uniform, 0));
+    }
+}
+
 // Two floats as a BF16 pair (lo, hi), each rounded to nearest (ties away from zero: one add, not RNE's two).
 __device__ inline uint32_t prompt_pack_rn(float lo, float hi) {
     return __builtin_amdgcn_perm(__float_as_uint(hi) + 0x8000u, __float_as_uint(lo) + 0x8000u, 0x07060302u);
@@ -254,23 +272,24 @@ struct MlxDq4 {
     static constexpr int kDepth = 4;
     static constexpr int kWords = 4 / P;  // code words a stage
     using Codes = std::conditional_t<P == 1, u32x4, uint2>;
-    const Codes* src;
-    const unsigned short* sp;
-    const unsigned short* bp;
+    __amdgpu_buffer_rsrc_t words, scale, bias;
+    uint32_t wo, to;  // a lane's byte offsets
     Codes W[kDepth];
     uint32_t S[kDepth / 2], B[kDepth / 2];  // a group's terms: loaded with its second stage, after its first was put
 
     __device__ MlxDq4(const Affine& a, int col, int part)
-        : src(reinterpret_cast<const Codes*>(a.words + static_cast<long long>(col) * (a.k >> 3)) + part),
-          sp(static_cast<const unsigned short*>(a.scale.p) + static_cast<long long>(col) * (a.k >> 6)),
-          bp(static_cast<const unsigned short*>(a.bias.p) + static_cast<long long>(col) * (a.k >> 6)) {}
+        : words(prompt_rsrc(a.words)),
+          scale(prompt_rsrc(a.scale.p)),
+          bias(prompt_rsrc(a.bias.p)),
+          wo(static_cast<uint32_t>(col) * static_cast<uint32_t>(a.k >> 1) + part * sizeof(Codes)),
+          to(static_cast<uint32_t>(col) * static_cast<uint32_t>(a.k >> 5)) {}
 
     template <int J>
     __device__ void fetch(int s) {
-        W[J] = src[P * s];
+        W[J] = prompt_load<Codes>(words, wo, 16 * s);
         if constexpr (J & 1) {
-            S[J / 2] = sp[s >> 1];
-            B[J / 2] = bp[s >> 1];
+            S[J / 2] = prompt_load<unsigned short>(scale, to, 2 * (s >> 1));
+            B[J / 2] = prompt_load<unsigned short>(bias, to, 2 * (s >> 1));
         }
     }
 
@@ -348,11 +367,12 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     // m0, the last column. Stages past the end reload the last (their slots are never put).
     const int xr = tid >> 2;
     const int xq = tid & 3;
-    const u32x4* xsrc[XC];
+    const __amdgpu_buffer_rsrc_t xbase = prompt_rsrc(a.x);
+    uint32_t xo[XC];  // a lane's byte offsets of its rows' chunks
 #pragma unroll
     for (int i = 0; i < XC; ++i) {
         const int r = xr + XR * i;
-        xsrc[i] = reinterpret_cast<const u32x4*>(static_cast<const uint16_t*>(a.x) + static_cast<long long>(m0 + (r < rows ? r : 0)) * a.k) + xq;
+        xo[i] = static_cast<uint32_t>(m0 + (r < rows ? r : 0)) * static_cast<uint32_t>(2 * a.k) + 16 * xq;
     }
     const int c = tid / P;
     const int part = tid % P;
@@ -362,7 +382,7 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     u32x4 X[XC];
     auto fetch_x = [&](int s) {
 #pragma unroll
-        for (int i = 0; i < XC; ++i) X[i] = xsrc[i][4 * last(s)];
+        for (int i = 0; i < XC; ++i) X[i] = prompt_load<u32x4>(xbase, xo[i], 64 * last(s));
     };
     auto put_x = [&](int p) {
 #pragma unroll

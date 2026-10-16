@@ -484,13 +484,15 @@ pub const Kernels = struct {
 
     /// Whether a prefill product takes the dequantizing prompt tile at any row count: the prompt tile's shapes, BF16 tables.
     pub fn dqTakes(k: *const Kernels, a: Arg) bool {
-        return !k.prompt_fold and k.promptTakes(a) and a.scale.kind == 1;
+        // its buffer loads take 31-bit byte offsets into x and the words
+        const fits = @as(u64, @intCast(a.m)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31 and @as(u64, @intCast(a.n)) * @as(u64, @intCast(a.k)) / 2 < 1 << 31;
+        return !k.prompt_fold and k.promptTakes(a) and a.scale.kind == 1 and fits;
     }
 
-    /// The dequantizing prompt tile: 256 x 128 blocks where k is long against n (they read x half as often per
-    /// weight), else 128 x 256. Either shape adds each output's k in the same order, so the choice never moves a bit.
+    /// The dequantizing prompt tile: 256 x 128 blocks where n and k are far apart (gate/up, down, k/v: timed faster),
+    /// else 128 x 256. Either shape adds each output's k in the same order, so the choice never moves a bit.
     pub fn dqGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
-        return k.dqShape(r, a, s, a.k >= 3 * a.n);
+        return k.dqShape(r, a, s, a.k >= 3 * a.n or a.n >= 3 * a.k);
     }
 
     /// The dequantizing prompt tile at 256 x 128 (`tall`) or 128 x 256 blocks.
