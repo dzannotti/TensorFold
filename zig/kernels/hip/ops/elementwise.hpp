@@ -68,15 +68,22 @@ extern "C" __global__ void tf_copy_cols(const void* src, long long stride, int o
     else static_cast<uint16_t*>(dst)[i] = static_cast<const uint16_t*>(src)[from];
 }
 
-// y[r, n] = x[r, :] . w[n, :] over float weights of `w_kind` (MTP fc, an EXL3 pack's small projections), a wave a value
-// in a fixed order, so a row's bits never depend on the others.
-extern "C" __global__ void tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
-    int col = blockIdx.x, r = blockIdx.y;
-    if (col >= n || r >= rows) return;
+// y[r, n] = x[r, :] . w[n, :] over float weights of `w_kind` (MTP fc, an EXL3 pack's small projections), a block of 256
+// a value: each thread's strided terms, then the waves' sums and the block's in a fixed order, so a row's bits depend on
+// K alone.
+extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
+    __shared__ float part[8];
+    const int col = blockIdx.x, r = blockIdx.y;
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < k; i += 32) acc += load(x, kind, static_cast<long long>(r) * k + i) * load(w, w_kind, static_cast<long long>(col) * k + i);
+    for (int i = threadIdx.x; i < k; i += 256) acc += load(x, kind, static_cast<long long>(r) * k + i) * load(w, w_kind, static_cast<long long>(col) * k + i);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
-    if (threadIdx.x == 0) store(out, kind, static_cast<long long>(r) * n + col, acc);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = part[0];
+        for (int j = 1; j < 8; ++j) sum += part[j];
+        store(out, kind, static_cast<long long>(r) * n + col, sum);
+    }
 }
 
 }  // namespace

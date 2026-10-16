@@ -92,5 +92,5 @@ pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int,
     try a.add(rows);
     try a.add(n);
     try a.add(k);
-    try l.go(l.op.dense_rows, dim(n, rows, 1), dim(32, 1, 1), 0, s, &a);
+    try l.go(l.op.dense_rows, dim(n, rows, 1), dim(256, 1, 1), 0, s, &a);
 }

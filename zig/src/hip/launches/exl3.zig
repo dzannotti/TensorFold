@@ -1,4 +1,4 @@
-//! EXL3 projections (quant/exl3.hip): the input rotation, the row-invariant WMMA product and the split sums' finish.
+//! EXL3 projections (quant/exl3.hip): the input rotation and the row-invariant WMMA product.
 
 const std = @import("std");
 const Launcher = @import("../launches.zig").Launcher;
@@ -29,6 +29,9 @@ pub const Arg = extern struct {
     out_kind: c_int,
 };
 
+/// quant/exl3.hip's kExl3Counters: (column block, row block) pairs a split launch may take.
+const arrivals = 65536;
+
 /// The row tiles of a launch (16 rows each): 1 and 2 for a round, 8 for a prompt's chunk; the sums are the same.
 const row_tiles = [_]u32{ 1, 2, 8 };
 
@@ -39,12 +42,11 @@ fn built(halves: usize, codebook: usize) bool {
 
 pub const Fns = struct {
     rotate: Function,
-    finish: Function,
     /// By half bits, codebook (3inst, mcg, mul1) and row tiles.
     product: [17][3][row_tiles.len]?Function,
 
     pub fn load(m: Module) Error!Fns {
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .finish = try m.function("tf_exl3_finish"), .product = @splat(@splat(@splat(null))) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .product = @splat(@splat(@splat(null))) };
         inline for (0..17) |h| inline for (0..3) |cb| {
             if (comptime built(h, cb)) inline for (row_tiles, 0..) |mt, i| {
                 f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, mt }));
@@ -55,11 +57,12 @@ pub const Fns = struct {
 };
 
 /// The K splits of a (K, N) product: enough 128-column blocks to fill the GPU, from the shape alone (bits never
-/// depend on the call's rows). Each split's tiles stay a multiple of the kernel's 4 k steps.
+/// depend on the call's rows); a column block's last split block adds the splits' sums in order. Each split's tiles
+/// stay a multiple of the kernel's 4 k steps.
 pub fn splits(k: u32, n: u32) u32 {
     const blocks = n / 128;
     var s: u32 = 1;
-    while (blocks * s < 320 and s < 16 and ((k / 16) / (2 * s)) % 4 == 0) s *= 2;
+    while (blocks * s < 320 and s < 8 and ((k / 16) / (2 * s)) % 4 == 0) s *= 2;
     return s;
 }
 
@@ -102,23 +105,19 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
         try a.add(@as(c_int, @intCast(k)));
         try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
-    {
-        var a: Args = .{};
-        try a.add(arg);
-        const rows = 16 * row_tiles[tile];
-        try l.go(f, dim(n / 128, sp, (m + rows - 1) / rows), dim(256, 1, 1), 0, s, &a);
-    }
-    if (sp > 1) {
-        var a: Args = .{};
-        try a.add(arg);
-        try l.go(l.exl3.finish, dim(n / 128, m, 1), dim(32, 1, 1), 0, s, &a);
-    }
+    const rows = 16 * row_tiles[tile];
+    const blocks = (m + rows - 1) / rows;
+    // the split blocks' arrival counts (quant/exl3.hip) cover every block of a launch
+    if (sp > 1 and blocks * (n / 128) > arrivals) return invalid("exl3 arrivals");
+    var a: Args = .{};
+    try a.add(arg);
+    try l.go(f, dim(n / 128, sp, blocks), dim(256, 1, 1), 0, s, &a);
 }
 
 test "splits keep whole tile runs and depend on the shape alone" {
     for ([_][2]u32{ .{ 5120, 17408 }, .{ 17408, 5120 }, .{ 5120, 1024 }, .{ 6144, 5120 }, .{ 5120, 248320 }, .{ 128, 128 } }) |kn| {
         const s = splits(kn[0], kn[1]);
-        try std.testing.expect(s >= 1 and s <= 16);
+        try std.testing.expect(s >= 1 and s <= 8);
         try std.testing.expectEqual(@as(u32, 0), ((kn[0] / 16) / s) % 4);
     }
 }

@@ -179,24 +179,18 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x
     *reinterpret_cast<uint2*>(xh + at) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
 }
 
-// The split sums of a row's 128 columns added in split order and finished: one wave a block of a row.
-extern "C" __global__ void __launch_bounds__(32) tf_exl3_finish(Exl3 a) {
-    const int lane = threadIdx.x, row = blockIdx.y, col0 = blockIdx.x * 128;
-    const long long at = static_cast<long long>(row) * a.n + col0 + 4 * lane;
-    float4 s = *reinterpret_cast<const float4*>(a.partial + at);
-    for (int q = 1; q < a.splits; ++q) {
-        const float4 u = *reinterpret_cast<const float4*>(a.partial + static_cast<long long>(q) * a.m * a.n + at);
-        s.x += u.x;
-        s.y += u.y;
-        s.z += u.z;
-        s.w += u.w;
-    }
-    float v[4] = {s.x, s.y, s.z, s.w};
-    exl3_store(a, v, lane, row, col0);
-}
+// Arrivals of a product's split blocks at each (column block, row block): the last one finishes the sums and resets
+// its count, so every launch on a stream finds them zero. Launches index it by (row block, column block).
+constexpr int kExl3Counters = 65536;
+__device__ int exl3_arrivals[kExl3Counters];
 
 // k steps a slab stages (a prompt's 8 row tiles); a split's tiles are a multiple of it and of a round's 4 in flight.
 constexpr int kExl3Slab = 4;
+
+// A raw buffer over `p`: loads take a lane's 32-bit offset and a uniform one, with no per-lane address arithmetic.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t exl3_buffer(const void* p) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, 0x7fffffff, 0x31004000);
+}
 
 // A tile's WMMA B fragment for this lane from its two windows' words (window w at bit `off[w]` of r[w][0..]): column
 // c = lane % 16, rows 8 h .. decoded here (h = lane / 16), the other half's through the LDS crossbar.
@@ -267,10 +261,10 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 
     if constexpr (MT <= 2) {
         constexpr int D = 4;  // tiles in flight a wave
-        // uniform bases with per-lane byte offsets: a load takes a scalar address and a 32-bit lane offset
-        const char* tp = reinterpret_cast<const char*>(a.trellis + static_cast<long long>(blockIdx.x) * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
-        const long long tstep = a.stride_k * 4;
-        const char* xp = reinterpret_cast<const char*>(a.xh + kt0 * 16);
+        // buffers over the block's tiles and x: a load takes a lane's byte offset and the tile's uniform one
+        const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(blockIdx.x) * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
+        const int tstep = static_cast<int>(a.stride_k * 4);
+        const __amdgpu_buffer_rsrc_t xb = exl3_buffer(a.xh + kt0 * 16);
         uint32_t idx[2][LW];
 #pragma unroll
         for (int w = 0; w < 2; ++w)
@@ -288,14 +282,16 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         // every load is unconditional on a clamped tile, so the wait counters never drain the ring
         auto fetch = [&](int i, uint32_t (&r)[2][LW], u32x8e (&x)[MT]) {
             const int t = i < tiles ? i : tiles - 1;
-            const char* tile = tp + t * tstep;
 #pragma unroll
             for (int w = 0; w < 2; ++w)
 #pragma unroll
-                for (int j = 0; j < LW; ++j) r[w][j] = *reinterpret_cast<const uint32_t*>(tile + idx[w][j]);
-            const char* xt = xp + t * 32;
+                for (int j = 0; j < LW; ++j) r[w][j] = __builtin_amdgcn_raw_buffer_load_b32(tb, idx[w][j], t * tstep, 0);
 #pragma unroll
-            for (int mt = 0; mt < MT; ++mt) x[mt] = *reinterpret_cast<const u32x8e*>(xt + xo[mt]);
+            for (int mt = 0; mt < MT; ++mt) {
+                const u32x4e lo = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt], t * 32, 0);
+                const u32x4e hi = __builtin_amdgcn_raw_buffer_load_b128(xb, xo[mt] + 16, t * 32, 0);
+                x[mt] = __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+            }
         };
 #pragma unroll
         for (int i = 0; i < D - 1; ++i) fetch(i, ring[i], xa[i]);
@@ -403,6 +399,29 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
                 const int row = m0 + mt * 16 + 2 * e + h;
                 if (row < a.m) a.partial[(static_cast<long long>(blockIdx.y) * a.m + row) * a.n + col0 + wave * 16 + c] = acc[mt][e];
             }
+        // the last split block to arrive adds every split's sums in split order (the same bits whichever arrives last)
+        __shared__ int last;
+        __threadfence();
+        __syncthreads();
+        int* arrived = &exl3_arrivals[blockIdx.z * gridDim.x + blockIdx.x];
+        if (tid == 0) last = atomicAdd(arrived, 1) == a.splits - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        for (int r = wave; r < R; r += 8) {
+            const int row = m0 + r;
+            if (row >= a.m) break;
+            const long long at = static_cast<long long>(row) * a.n + col0 + 4 * lane;
+            // volatile loads bypass the non-coherent vector caches, where another CU's sums may be stale
+            float v[4] = {0, 0, 0, 0};
+            for (int q = 0; q < a.splits; ++q) {
+                const u32x4e u = *reinterpret_cast<const volatile u32x4e*>(a.partial + static_cast<long long>(q) * a.m * a.n + at);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] += __uint_as_float(u[j]);
+            }
+            exl3_store(a, v, lane, row, col0);
+        }
+        if (tid == 0) *arrived = 0;
         return;
     }
 #pragma unroll

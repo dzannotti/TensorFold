@@ -92,3 +92,44 @@ test "EXL3 products match the format's fp64 decoder and keep every row's bits at
     var rng: base.Rng = .{ .state = 0x45584c33 };
     for (cases) |c| try run(t, &rng, c);
 }
+
+test "EXL3 packs' dense rows over fp16 weights (in_proj_a and b) match fp64 and keep each row's bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x64656e73 };
+    const k = 5120;
+    const n = 48;
+    const rows = 16;
+    const w = try gpa.alloc(f16, n * k);
+    defer gpa.free(w);
+    for (w) |*v| v.* = @floatCast(0.05 * rng.unit());
+    const x = try gpa.alloc(u16, rows * k);
+    defer gpa.free(x);
+    for (x) |*v| v.* = base.bf16Bits(rng.unit());
+    var dw = try Buffer.fromHost(t, w);
+    defer dw.free();
+    var dx = try Buffer.fromHost(t, x);
+    defer dx.free();
+    var out = try Buffer.alloc(t, rows * n * 2);
+    defer out.free();
+    const all = try gpa.alloc(u16, rows * n);
+    defer gpa.free(all);
+    const one = try gpa.alloc(u16, n);
+    defer gpa.free(one);
+    // act.hpp kinds: bf16 x (2), fp16 weights (1)
+    try t.on.tf_dense_rows(@ptrFromInt(dx.ptr), 2, @ptrFromInt(dw.ptr), 1, @ptrFromInt(out.ptr), rows, n, k, t.stream.handle);
+    try t.stream.synchronize();
+    try out.download(0, std.mem.sliceAsBytes(all));
+    for (0..rows) |r| for (0..n) |c| {
+        var want: f64 = 0;
+        for (0..k) |i| want += base.bf16Value(x[r * k + i]) * @as(f64, w[c * k + i]);
+        const got = base.bf16Value(all[r * n + c]);
+        try base.expect(@abs(got - want) <= 1e-2 * (1 + @abs(want)), "dense rows ({d}, {d}): {d} vs {d}", .{ r, c, got, want });
+    };
+    for (0..rows) |r| {
+        try t.on.tf_dense_rows(@ptrFromInt(dx.ptr + r * k * 2), 2, @ptrFromInt(dw.ptr), 1, @ptrFromInt(out.ptr), 1, n, k, t.stream.handle);
+        try t.stream.synchronize();
+        try out.download(0, std.mem.sliceAsBytes(one));
+        try base.expect(std.mem.eql(u16, one, all[r * n ..][0..n]), "dense rows: row {d} alone differs", .{r});
+    }
+}
