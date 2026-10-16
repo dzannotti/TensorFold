@@ -97,6 +97,9 @@ pub const Launcher = struct {
         kv_write: Function,
         score: [2]Function, // fp16, bf16
         apply: [2]Function,
+        /// Split attention (flash decoding) over 256-key splits, and its in-order finish.
+        flash: [2]Function,
+        flash_sum: Function,
         keep: Function,
         gather: Function,
         gdn: [2]Function, // dk 128, 16
@@ -176,6 +179,8 @@ pub const Launcher = struct {
             .kv_write = try pl.function("tf_plan_kv_write"),
             .score = .{ try pl.function("tf_plan_score_f16"), try pl.function("tf_plan_score_bf16") },
             .apply = .{ try pl.function("tf_plan_apply_f16"), try pl.function("tf_plan_apply_bf16") },
+            .flash = .{ try pl.function("tf_plan_flash_f16"), try pl.function("tf_plan_flash_bf16") },
+            .flash_sum = try pl.function("tf_plan_flash_sum"),
             .keep = try pl.function("tf_plan_keep"),
             .gather = try pl.function("tf_plan_gather"),
             .gdn = .{ try gd.function("tf_gdn_plan_128"), try gd.function("tf_gdn_plan_16") },
@@ -327,6 +332,9 @@ pub const Launcher = struct {
     pub const tf_gated_delta = recurrence.tf_gated_delta;
     pub const planKvWrite = plan.planKvWrite;
     pub const planCausal = plan.planCausal;
+    pub const planFlash = plan.planFlash;
+    pub const flashTakes = plan.flashTakes;
+    pub const flash_keys = plan.flash_keys;
     pub const planGatedDelta = plan.planGatedDelta;
     pub const planKeep = plan.planKeep;
     pub const planGdnReplay = plan.planGdnReplay;

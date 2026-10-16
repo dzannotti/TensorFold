@@ -147,7 +147,8 @@ pub const Checkpoint = struct {
         }
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         errdefer arena.deinit();
-        var m = try readMtp(arena.allocator(), t, c.spec(), c.hf());
+        // a side file keeps its own conventions (an MLX head beside a Hugging Face checkpoint's shards)
+        var m = try readMtp(arena.allocator(), t, c.spec(), if (opened) |o| o.renamed != null else c.hf());
         m.arena = arena;
         m.owned = opened;
         m.io = c.io;

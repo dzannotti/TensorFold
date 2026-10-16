@@ -238,6 +238,12 @@ pub const Model = struct {
             defer h.deinit();
             if (rank != null and h.head == null) h.head = head orelse embed;
             m.mtp = try u.mtp(h);
+            // a bf16 output head costs a draft step its whole read: the head drafts with an 8-bit copy (the verify
+            // still reads the bf16 head, so no reply changes)
+            const main = head orelse embed;
+            if (m.mtp.?.head == null and main == .dense and main.dense.weight.dtype == .bf16) {
+                m.mtp.?.head = try u.projection(.{ .mlx = try quant.mlx.quantize8(scratch.allocator(), main.dense.weight) });
+            }
             ck.main.release("mtp.");
         };
         return m;

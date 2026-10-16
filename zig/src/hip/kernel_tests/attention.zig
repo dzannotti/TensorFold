@@ -152,6 +152,25 @@ fn decode(t: *Rig, rng: *rig.Rng, heads: usize, kv_heads: usize, d: usize, pos: 
         reference(t, c, hq[at_q..][0..d], h, group, span, d, @intCast(pos[r] + 1), scale, want[at_q..][0..d]);
     };
     try std.testing.expect(worst(planned, want) < 1e-5);
+    // the split walk (flash decoding): within the same bound, and each row's bits the same alone as with the others
+    const splits = (span + plan.flash_keys - 1) / plan.flash_keys;
+    var part = try t.alloc(rows * heads * splits * d * 4);
+    defer part.free();
+    var ml = try t.alloc(rows * heads * splits * 2 * 4);
+    defer ml.free();
+    try t.on.planFlash(at(q), at(outs[1]), at(part), at(ml), p, 0, heads, kv_heads, d, span, scale, t.kind(), s);
+    try t.stream.synchronize();
+    const split = try rig.download(f32, outs[1]);
+    defer gpa.free(split);
+    try std.testing.expect(worst(split, want) < 1e-5);
+    var lone = p;
+    lone.rows = 1;
+    lone.args.pos = at(dev_pos) + 4 * (rows - 1);
+    try t.on.planFlash(at(q) + 4 * (rows - 1) * heads * d, at(outs[0]), at(part), at(ml), lone, 0, heads, kv_heads, d, span, scale, t.kind(), s);
+    try t.stream.synchronize();
+    const alone = try rig.download(f32, outs[0]);
+    defer gpa.free(alone);
+    try std.testing.expectEqualSlices(u32, @ptrCast(split[(rows - 1) * heads * d ..][0 .. heads * d]), @ptrCast(alone[0 .. heads * d]));
 }
 
 test "the planned decode walk over pages writes the flat walk's bits for grouped heads, within 1e-5 of float64" {

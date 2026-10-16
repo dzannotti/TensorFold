@@ -206,6 +206,43 @@ pub fn elements(h: Host) usize {
     return n_rows * h.scales.shape[h.scales.rank - 1] * h.group;
 }
 
+/// A bf16 weight [N, K] rounded to 8-bit codes a 64-group (min and range in fp16 tables, the scale rounded up so the
+/// top code fits): a draft head's copy of a bf16 output head, never what a verified token reads.
+pub fn quantize8(a: Allocator, w: Tensor) !Host {
+    const n = w.shape[0];
+    const k = w.shape[1];
+    const g = 64;
+    if (w.dtype != .bf16 or w.rank != 2 or k % g != 0) return refuse("draft head", "not a bf16 [N, K] weight");
+    const words = try a.alloc(u8, n * k);
+    const scales = try a.alloc(u16, n * (k / g));
+    const biases = try a.alloc(u16, n * (k / g));
+    const src = std.mem.bytesAsSlice(u16, w.bytes);
+    var v: [g]f32 = undefined;
+    for (0..n * (k / g)) |gi| {
+        for (&v, 0..) |*e, j| e.* = @bitCast(@as(u32, std.mem.littleToNative(u16, src[gi * g + j])) << 16);
+        var lo = v[0];
+        var hi = v[0];
+        for (v) |e| {
+            lo = @min(lo, e);
+            hi = @max(hi, e);
+        }
+        const b: f16 = @floatCast(lo);
+        var sc: f16 = @floatCast((hi - @as(f32, b)) / 255.0);
+        while (@as(f32, sc) * 255.0 < hi - @as(f32, b)) sc = std.math.nextAfter(f16, sc, std.math.inf(f16));
+        if (sc == 0) sc = 1;
+        for (v, 0..) |e, j| words[gi * g + j] = @intFromFloat(std.math.clamp(@round((e - @as(f32, b)) / @as(f32, sc)), 0, 255));
+        scales[gi] = @bitCast(sc);
+        biases[gi] = @bitCast(b);
+    }
+    return .{
+        .words = .{ .dtype = .i32, .rank = 2, .shape = .{ n, k / 4, 1, 1, 1 }, .bytes = words },
+        .scales = .{ .dtype = .f16, .rank = 2, .shape = .{ n, k / g, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(scales) },
+        .biases = .{ .dtype = .f16, .rank = 2, .shape = .{ n, k / g, 1, 1, 1 }, .bytes = std.mem.sliceAsBytes(biases) },
+        .bits = 8,
+        .group = g,
+    };
+}
+
 /// fp64 dequantization of every row of `h` (leading dimensions folded), scale * code + bias, into `out` [rows, K].
 pub fn reference(h: Host, out: []f64) error{UnexpectedTensor}!void {
     const rank = h.words.rank;

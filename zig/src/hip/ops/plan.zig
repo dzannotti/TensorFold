@@ -77,6 +77,12 @@ pub fn kvWrite(o: Ops, keys: u64, values: Tensor, p: Plan, layer: usize, kv_head
 
 /// One query a row (rows, heads, d) fp32 over its slot's caches up to its position, the walk over `span` keys.
 pub fn causal(o: Ops, q: u64, kind: t.Kind, out: u64, p: Plan, layer: usize, heads: usize, kv_heads: usize, d: usize, span: usize, scale: f32) Error!void {
+    if (launches.Launcher.flashTakes(heads, kv_heads, d)) {
+        const splits = (span + launches.Launcher.flash_keys - 1) / launches.Launcher.flash_keys;
+        const part = try o.arena.of(f32, p.rows * heads * splits * d);
+        const ml = try o.arena.of(f32, p.rows * heads * splits * 2);
+        return (try launcher(o)).planFlash(q, out, part, ml, p, layer, heads, kv_heads, d, span, scale, @backingInt(kind), o.stream);
+    }
     const tiles = (span + 127) / 128;
     const scores = try o.arena.of(f32, p.rows * heads * span);
     const stats = try o.arena.of(f32, p.rows * heads * 2);
