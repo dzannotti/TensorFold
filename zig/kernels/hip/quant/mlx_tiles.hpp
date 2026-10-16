@@ -11,6 +11,7 @@
 #include "tiles/gemm.hpp"
 #include "tiles/gemm_kp.hpp"
 #include "tiles/matrix_gemm.hpp"
+#include "tiles/matrix_prompt.hpp"
 #include "tiles/stream.hpp"
 
 namespace tf {
@@ -35,6 +36,19 @@ __global__ void __launch_bounds__(32 * WAVES) affine_gemm_kp(Affine a) {
 template <int BITS>
 __global__ void __launch_bounds__(256) affine_wmma_gemm(Affine a) {
     wmma_gemm_tile<MlxDecoder<BITS>, BF16Act, WmmaBF16, F32Out>(a);
+}
+
+// ---- the prompt tile (4-bit, group 64) on the matrix cores of gfx11, and the x group sums it reads ----
+
+template <int BITS>
+__global__ void __launch_bounds__(256) affine_wmma_prompt(Affine a) {
+    static_assert(BITS == 4, "the prompt tile decodes 4-bit words");
+    prompt_tile<ActOut<WmmaBF16>>(a);
+}
+
+template <int BITS>
+__global__ void __launch_bounds__(256) affine_prompt_sums(Affine a) {
+    prompt_sums(a);
 }
 
 // ---- the decode stream tile ----

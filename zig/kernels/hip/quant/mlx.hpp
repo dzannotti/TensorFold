@@ -36,6 +36,7 @@ struct Affine {
     int fp16;  // 0 is bf16, 1 is fp16
     Routing route = {};
     __half* out16 = nullptr;  // set: the decode tile rounds each output to fp16 here instead of writing out
+    const float* sums = nullptr;  // the prompt tile's x group sums, (k / 64, m)
 };
 
 // A routed block takes item ``z``: its expert's weights and its rows. False when the item has no rows.

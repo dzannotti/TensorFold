@@ -43,6 +43,19 @@ __device__ inline typename T::elem narrow_product(float a, float b) {
     }
 }
 
+// F32Out, or the product rounded to T where `out16` is set: a prompt's tile does the cast it would otherwise launch.
+template <typename T>
+struct ActOut {
+    template <class Args>
+    __device__ static void store(const Args& a, int row, int col, float v) {
+        if (a.out16 != nullptr) {
+            static_cast<typename T::elem*>(static_cast<void*>(a.out16))[out_row(a, row) * a.n + col] = narrow<T>(v);
+        } else {
+            a.out[out_row(a, row) * a.n + col] = v;
+        }
+    }
+};
+
 // silu(gate) * up in the activation type, both clamped by limit first when it is above 0 (moe_act_kernel's arithmetic).
 template <typename T>
 __device__ inline typename T::elem swiglu(float g, float u, float limit) {
