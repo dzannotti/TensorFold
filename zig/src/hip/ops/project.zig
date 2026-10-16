@@ -55,8 +55,23 @@ pub fn exl3(o: Ops, x: Tensor, proj: Projection, w: quant.exl3.Matrix, m: usize,
     return out;
 }
 
+/// matmul(silu_mul(gate, up), proj) in x's kind without the activation's row, for a round's EXL3 rows (null: the
+/// format or row count does not take it; nothing launched). The same bits as tf_silu_mul then `project`.
+pub fn projectSiluMul(o: Ops, gate: Tensor, up: Tensor, proj: Projection, m: usize) Error!?Tensor {
+    const w = switch (proj.handle) {
+        .exl3 => |h| h,
+        else => return null,
+    };
+    if (!o.window or m == 0 or m > 32 or proj.partial or gate.kind == .f32 or up.kind != gate.kind) return null;
+    const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * gate.kind.size()), .kind = gate.kind };
+    const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+    try exl3_launch.projectSilu(o.l, gate.ptr, up.ptr, gate.kind.table(), w, proj.n, proj.k, m, out.ptr, gate.kind.table(), scratch, o.stream);
+    return out;
+}
+
 /// Up to four products of the same `m` rows in one launch; false, nothing launched, when no grouped tile takes them.
 pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor) Error!bool {
+    if (ps.len > 0 and ps[0].handle == .exl3) return exl3Group(o, x, ps, m, outs);
     var ws: [4]Affine = undefined;
     if (ps.len > ws.len) return false;
     for (ps, ws[0..ps.len]) |pr, *w| switch (pr.handle) {
@@ -64,6 +79,36 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
         .dense, .exl3 => return false,
     };
     return affineGroup(o, x, ws[0..ps.len], m, outs);
+}
+
+/// An EXL3 pack's products: each EXL3 one on its own (a launch each streams its weights fastest), the two dense rows of
+/// one shape that take tf_dense_rows (the packs' fp16 in_proj_a and b) in one launch; false, nothing launched, without
+/// such a pair.
+fn exl3Group(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor) Error!bool {
+    var d: [2]usize = undefined;
+    var nd: usize = 0;
+    for (ps, 0..) |pr, at| switch (pr.handle) {
+        .dense => {
+            if (nd == 2) return false;
+            d[nd] = at;
+            nd += 1;
+        },
+        .exl3 => {},
+        .mlx => return false,
+    };
+    if (nd != 2) return false;
+    const a = ps[d[0]];
+    const b = ps[d[1]];
+    const wa = a.handle.dense;
+    const wb = b.handle.dense;
+    if (a.n != b.n or a.k != b.k or wa.kind != wb.kind or wa.kind == .bf16) return false;
+    for (ps, outs[0..ps.len]) |pr, *out| if (pr.handle == .exl3) {
+        out.* = try project(o, x, pr, m, false);
+    };
+    outs[d[0]] = .{ .ptr = try o.arena.take(m * a.n * x.kind.size()), .kind = x.kind };
+    outs[d[1]] = .{ .ptr = try o.arena.take(m * b.n * x.kind.size()), .kind = x.kind };
+    try o.l.tf_dense_rows_pair(p(x.ptr), @backingInt(x.kind), p(wa.weight), p(wb.weight), @backingInt(actKind(wa.kind)), p(outs[d[0]].ptr), p(outs[d[1]].ptr), int(m), int(a.n), int(a.k), o.stream);
+    return true;
 }
 
 /// The routed gate and up with the activation as the epilogue; null when the format or the tile does not take it.

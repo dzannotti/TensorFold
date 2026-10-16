@@ -206,7 +206,9 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
     const int split = blockIdx.x, kv = blockIdx.y, r0 = blockIdx.z;
     const int splits = gridDim.x;
     const int group = heads / kv_heads;
-    const int per = min(kFlashRows, kFlashQueries / group);
+    // a short walk (few splits) gives every row its own block: the queries' LDS reads bind a block, so spreading them
+    // over more CUs beats reading each key once for four rows (a query's sums are the same either way)
+    const int per = splits * kv_heads * rows < 640 ? 1 : min(kFlashRows, kFlashQueries / group);
     const int n = flash_run(plan, r0, rows, per);
     if (n == 0) return;
     const int head0 = kv * group;
@@ -300,12 +302,22 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
     for (int j = 0; j < kFlashQueries; ++j) acc[j] = 0.f;
     constexpr int U = 8;
     int i = 0;
+    // the next U keys' values load while these U are summed (the sums' order unchanged)
+    uint16_t next[U];
+    if (U <= stop) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) next[u] = values[vrow[u] + t];
+    }
     for (; i + U <= stop; i += U) {
         float v[U];
 #pragma unroll
         for (int u = 0; u < U; ++u) {
-            const uint16_t h = values[vrow[i + u] + t];
+            const uint16_t h = next[u];
             v[u] = KIND == 2 ? __uint_as_float(static_cast<uint32_t>(h) << 16) : __half2float(__ushort_as_half(h));
+        }
+        if (i + 2 * U <= stop) {
+#pragma unroll
+            for (int u = 0; u < U; ++u) next[u] = values[vrow[i + U + u] + t];
         }
 #pragma unroll
         for (int u = 0; u < U; ++u)

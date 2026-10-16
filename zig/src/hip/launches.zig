@@ -119,6 +119,7 @@ pub const Launcher = struct {
         router16: [2]Function,
         tail: Function,
         conv_split: Function,
+        conv_split_rows: Function,
         rms2: Function,
         gnorm_out: Function,
         select: Function,
@@ -141,6 +142,7 @@ pub const Launcher = struct {
         conv_prefill: Function,
         gdn_gate_prefill: Function,
         dense_rows: Function,
+        dense_rows_pair: Function,
         dense_wave: [3]Function, // 1, 4 and 16 rows a pass
         moe_route: Function,
         router_rows: [2]Function, // fp16, bf16
@@ -178,7 +180,7 @@ pub const Launcher = struct {
         const pl = l.mods[@backingInt(kernels.Group.plan)];
         l.fuse = choices.fuse;
         l.wide = choices.wide;
-        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router16 = .{ try dec.function("tf_router_rows16_f16"), try dec.function("tf_router_rows16_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
+        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router16 = .{ try dec.function("tf_router_rows16_f16"), try dec.function("tf_router_rows16_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .conv_split_rows = try dec.function("tf_conv_split_rows"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
         l.plan = .{
             .kv_write = try pl.function("tf_plan_kv_write"),
             .score = .{ try pl.function("tf_plan_score_f16"), try pl.function("tf_plan_score_bf16") },
@@ -214,6 +216,7 @@ pub const Launcher = struct {
             .conv_prefill = try ops.function("tf_conv_prefill"),
             .gdn_gate_prefill = try ops.function("tf_gdn_gate_prefill"),
             .dense_rows = try ops.function("tf_dense_rows"),
+            .dense_rows_pair = try ops.function("tf_dense_rows_pair"),
             .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4"), try ops.function("tf_dense_wave16") },
             .moe_route = try ops.function("tf_moe_route"),
             .router_rows = .{ try ops.function("tf_router_rows_f16"), try ops.function("tf_router_rows_bf16") },
@@ -359,6 +362,7 @@ pub const Launcher = struct {
     pub const tf_add = elementwise.tf_add;
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
+    pub const tf_dense_rows_pair = elementwise.tf_dense_rows_pair;
     pub const denseWave = elementwise.denseWave;
     pub const fn_hc_norm = flashnext.hcNorm;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
@@ -383,6 +387,7 @@ pub const Launcher = struct {
     pub const dftTopkMerge = draft.topkMerge;
     pub const exl3Project = exl3.project;
     pub const exl3Scratch = exl3.scratchBytes;
+    pub const exl3Silu = exl3.projectSilu;
     pub const hadamard = exl3.hadamard;
 
     /// Launches on `s`; the counting stream runs nothing.
