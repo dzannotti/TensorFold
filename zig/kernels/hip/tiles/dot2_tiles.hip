@@ -351,6 +351,8 @@ using Dot = DotF16;
 template __global__ void affine_wmma_prompt<4>(Affine);
 template __global__ void affine_wmma_prompt_dq<4, 128>(Affine);
 template __global__ void affine_wmma_prompt_dq<4, 256>(Affine);
+template __global__ void dense_wmma_prompt<128>(Affine);
+template __global__ void dense_wmma_prompt<256>(Affine);
 template __global__ void affine_prompt_sums<4>(Affine);
 #else
 #define TF_WMMA(BITS)

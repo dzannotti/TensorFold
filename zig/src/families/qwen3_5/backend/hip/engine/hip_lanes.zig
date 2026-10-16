@@ -83,8 +83,10 @@ pub const Hip = struct {
     /// Each stream's id on every rank.
     ids: std.AutoHashMapUnmanaged(*const lanes.Stream, u32) = .empty,
     /// Nanoseconds and calls the backend's verifies, keeps and drafts took; the core's own work is the rest.
-    spent: [3]u64 = @splat(0),
-    calls: [3]u64 = @splat(0),
+    /// verify, keep, draft, and the host's time between one backend call's end and the next one's start
+    spent: [4]u64 = @splat(0),
+    calls: [4]u64 = @splat(0),
+    last_end: u64 = 0,
     next_id: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) !*Hip {
@@ -140,12 +142,18 @@ pub const Hip = struct {
     }
 
     fn timed(h: *Hip, which: usize, began: u64) void {
-        h.spent[which] += costs.nowNs() - began;
+        const end = costs.nowNs();
+        h.spent[which] += end - began;
         h.calls[which] += 1;
+        if (h.last_end != 0 and began > h.last_end and began - h.last_end < 500_000_000) {
+            h.spent[3] += began - h.last_end;
+            h.calls[3] += 1;
+        }
+        h.last_end = end;
     }
 
     pub fn deinit(h: *Hip) void {
-        const names = [_][]const u8{ "verify", "keep", "draft" };
+        const names = [_][]const u8{ "verify", "keep", "draft", "host gap" };
         for (names, h.spent, h.calls) |name, ns, n| if (n > 0) std.log.info("backend {s}: {d} calls, {d:.0} us each", .{ name, n, @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e3 });
         if (h.link != null) h.send(&.{@backingInt(worker.Op.stop)}) catch {};
         h.ids.deinit(h.gpa);

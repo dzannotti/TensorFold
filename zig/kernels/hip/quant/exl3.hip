@@ -200,6 +200,43 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x
     *reinterpret_cast<uint2*>(xh + to) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
 }
 
+// out [rows, k] = x [rows, k] times blockdiag(H128) / sqrt(128), rounded once to x's kind (act numbering: 1 fp16, 2
+// bf16): the input rotation of ciru_q8's experts (weights stored as W H, so W x = (W H)(H x)). A wave a 128-block, 8
+// a block; each row on its own, so a row's bits never depend on the rows beside it. `out` may be `x`.
+extern "C" __global__ void __launch_bounds__(256) tf_had128(const void* x, int kind, void* out, int k, long long waves) {
+    const int lane = threadIdx.x & 31;
+    const long long w = static_cast<long long>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (w >= waves) return;
+    const int per = k >> 7;
+    const long long at = (w / per) * k + (w % per) * 128 + 4 * lane;
+    const uint2 raw = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(x) + at);
+    const uint32_t r[2] = {raw.x, raw.y};
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        if (kind == 2) {
+            v[2 * j] = __uint_as_float(r[j] << 16);
+            v[2 * j + 1] = __uint_as_float(r[j] & 0xffff0000u);
+        } else {
+            const h16x2 xv = __builtin_bit_cast(h16x2, r[j]);
+            v[2 * j] = static_cast<float>(xv[0]);
+            v[2 * j + 1] = static_cast<float>(xv[1]);
+        }
+    }
+    exl3_fwht(v, lane);
+    uint32_t o[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const float lo = v[2 * j] * kExl3Had, hi = v[2 * j + 1] * kExl3Had;
+        if (kind == 2) {
+            o[j] = __builtin_bit_cast(uint16_t, static_cast<__bf16>(lo)) | (static_cast<uint32_t>(__builtin_bit_cast(uint16_t, static_cast<__bf16>(hi))) << 16);
+        } else {
+            o[j] = __builtin_bit_cast(uint32_t, h16x2{static_cast<_Float16>(lo), static_cast<_Float16>(hi)});
+        }
+    }
+    *reinterpret_cast<uint2*>(static_cast<uint16_t*>(out) + at) = make_uint2(o[0], o[1]);
+}
+
 // Arrivals of a product's split blocks at each (column block, row block): the last one finishes the sums and resets
 // its count, so every launch on a stream finds them zero. Launches index it by (row block, column block).
 constexpr int kExl3Counters = 65536;

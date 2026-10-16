@@ -100,6 +100,9 @@ pub const Launcher = struct {
         kv_write: Function,
         score: [2]Function, // fp16, bf16
         apply: [2]Function,
+        /// Split attention (flash decoding) over 256-key splits, and its in-order finish.
+        flash: [2]Function,
+        flash_sum: Function,
         keep: Function,
         gather: Function,
         gdn: [2]Function, // dk 128, 16
@@ -138,6 +141,7 @@ pub const Launcher = struct {
         conv_prefill: Function,
         gdn_gate_prefill: Function,
         dense_rows: Function,
+        dense_wave: [3]Function, // 1, 4 and 16 rows a pass
         moe_route: Function,
         router_rows: [2]Function, // fp16, bf16
         router_tile: [2]Function,
@@ -179,6 +183,8 @@ pub const Launcher = struct {
             .kv_write = try pl.function("tf_plan_kv_write"),
             .score = .{ try pl.function("tf_plan_score_f16"), try pl.function("tf_plan_score_bf16") },
             .apply = .{ try pl.function("tf_plan_apply_f16"), try pl.function("tf_plan_apply_bf16") },
+            .flash = .{ try pl.function("tf_plan_flash_f16"), try pl.function("tf_plan_flash_bf16") },
+            .flash_sum = try pl.function("tf_plan_flash_sum"),
             .keep = try pl.function("tf_plan_keep"),
             .gather = try pl.function("tf_plan_gather"),
             .gdn = .{ try gd.function("tf_gdn_plan_128"), try gd.function("tf_gdn_plan_16") },
@@ -208,6 +214,7 @@ pub const Launcher = struct {
             .conv_prefill = try ops.function("tf_conv_prefill"),
             .gdn_gate_prefill = try ops.function("tf_gdn_gate_prefill"),
             .dense_rows = try ops.function("tf_dense_rows"),
+            .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4"), try ops.function("tf_dense_wave16") },
             .moe_route = try ops.function("tf_moe_route"),
             .router_rows = .{ try ops.function("tf_router_rows_f16"), try ops.function("tf_router_rows_bf16") },
             .router_tile = .{ try ops.function("tf_router_tile_f16"), try ops.function("tf_router_tile_bf16") },
@@ -332,6 +339,9 @@ pub const Launcher = struct {
     pub const tf_gated_delta = recurrence.tf_gated_delta;
     pub const planKvWrite = plan.planKvWrite;
     pub const planCausal = plan.planCausal;
+    pub const planFlash = plan.planFlash;
+    pub const flashTakes = plan.flashTakes;
+    pub const flash_keys = plan.flash_keys;
     pub const planGatedDelta = plan.planGatedDelta;
     pub const planKeep = plan.planKeep;
     pub const planGdnReplay = plan.planGdnReplay;
@@ -349,6 +359,7 @@ pub const Launcher = struct {
     pub const tf_add = elementwise.tf_add;
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
+    pub const denseWave = elementwise.denseWave;
     pub const fn_hc_norm = flashnext.hcNorm;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
     pub const fn_hc_gates = flashnext.hcGates;
@@ -372,6 +383,7 @@ pub const Launcher = struct {
     pub const dftTopkMerge = draft.topkMerge;
     pub const exl3Project = exl3.project;
     pub const exl3Scratch = exl3.scratchBytes;
+    pub const hadamard = exl3.hadamard;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {

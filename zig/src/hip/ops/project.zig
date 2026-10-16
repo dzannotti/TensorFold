@@ -274,7 +274,16 @@ pub fn embedAffine(o: Ops, table: Affine, ids: u64, n: usize, out: Tensor) Error
 }
 
 /// x (rows, k) of x's kind times float weights (n, k), out (rows, n) in x's kind: an unquantized projection.
+/// bf16 by bf16 (a ciru_q8 checkpoint's projections) takes the prompt's WMMA tile in prefill (every row count, so a
+/// prompt's bits never depend on its cut), a wave a column elsewhere (a row's bits never depend on the round's rows).
 pub fn denseRows(o: Ops, x: Tensor, w: quant.dense.Matrix, out: Tensor, rows: usize, n: usize, k: usize) Error!void {
+    if (x.kind == .bf16 and out.kind == .bf16 and w.kind == .bf16 and k % 256 == 0) {
+        if (o.prefill) {
+            const arg: affine_launch.Arg = .{ .x = x.ptr, .words = w.weight, .scale = .{ .p = 0, .kind = 1 }, .bias = .{ .p = 0, .kind = 1 }, .out = 0, .m = int(rows), .n = int(n), .k = int(k), .bits = 16, .group = 0, .fp16 = 0, .out16 = out.ptr };
+            if (try o.l.affine.densePromptGo(o.l.r, arg, o.stream)) return;
+        }
+        return o.l.denseWave(x.ptr, w.weight, out.ptr, rows, n, k, o.stream);
+    }
     try o.l.tf_dense_rows(p(x.ptr), @backingInt(x.kind), p(w.weight), @backingInt(actKind(w.kind)), p(out.ptr), int(rows), int(n), int(k), o.stream);
 }
 

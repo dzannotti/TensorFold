@@ -82,6 +82,23 @@ pub fn tf_copy_cols(l: *const Launcher, src: C, stride: c_longlong, offset: c_in
     try l.flat(l.op.copy_cols, @as(i64, rows) * cols, s, &a);
 }
 
+/// out (rows, n) bf16 = x (rows, k) bf16 times bf16 w (n, k), k a multiple of 256: a wave a column (ops/elementwise.hpp).
+pub fn denseWave(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, s: S) Error!void {
+    if (rows == 0 or k % 256 != 0) return util.invalid("dense wave");
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(w);
+    try a.add(out);
+    try a.add(@as(c_int, @intCast(rows)));
+    try a.add(@as(c_int, @intCast(n)));
+    try a.add(@as(c_int, @intCast(k)));
+    // every variant adds a row's products in the same order: the rows a pass never move a bit. Past 4 rows the tile is
+    // ALU-bound (16 rows: wave4 702 us, wave16 1050 us on 9216 x 2048; 1 and 4 rows ~240 GB/s): many rows want WMMA
+    const which: usize = if (rows == 1) 0 else 1;
+    const per: usize = ([_]usize{ 1, 4, 16 })[which];
+    try l.go(l.op.dense_wave[which], dim(@divFloor(n + 7, 8), @divFloor(rows + per - 1, per), 1), dim(256, 1, 1), 0, s, &a);
+}
+
 pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int, out: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));

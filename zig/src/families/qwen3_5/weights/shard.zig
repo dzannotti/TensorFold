@@ -52,7 +52,8 @@ pub const Shard = struct {
     }
 };
 
-/// core's `parseHeader` without its refusals of rank and dtype; sizes and ranges are still checked.
+/// core's `parseHeader` without its refusals of rank and dtype: dimensions past the max rank fold into the last kept one
+/// (ciru's [E, N/16, K/32, 2, 16, 16] codes read as [E, N/16, K/32, 2, 256]); sizes and ranges are still checked.
 fn parse(arena: std.mem.Allocator, json: []const u8, data_len: usize) !st.Header {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     var out: st.Header = .empty;
@@ -62,12 +63,13 @@ fn parse(arena: std.mem.Allocator, json: []const u8, data_len: usize) !st.Header
         const o = kv.value_ptr.object;
         const dtype = st.DType.parse(o.get("dtype").?.string) orelse continue;
         const shape = o.get("shape").?.array.items;
-        if (shape.len > st.max_rank) continue;
-        var e: st.Entry = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .begin = 0, .end = 0 };
+        var e: st.Entry = .{ .dtype = dtype, .rank = @intCast(@min(shape.len, st.max_rank)), .shape = @splat(1), .begin = 0, .end = 0 };
         var n: usize = dtype.size();
         for (shape, 0..) |d, i| {
-            e.shape[i] = @intCast(d.integer);
-            n *= e.shape[i];
+            const at = @min(i, st.max_rank - 1);
+            const v: usize = @intCast(d.integer);
+            e.shape[at] = if (i > at) e.shape[at] * v else v;
+            n *= v;
         }
         const offs = o.get("data_offsets").?.array.items;
         e.begin = @intCast(offs[0].integer);
@@ -78,7 +80,7 @@ fn parse(arena: std.mem.Allocator, json: []const u8, data_len: usize) !st.Header
     return out;
 }
 
-test "a tensor above the max rank and an unknown dtype are left out" {
+test "a tensor above the max rank folds its last dimensions, an unknown dtype is left out" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const json =
@@ -87,8 +89,9 @@ test "a tensor above the max rank and an unknown dtype are left out" {
         \\ "q9": {"dtype": "Q9_UNKNOWN", "shape": [2], "data_offsets": [10, 12]}}
     ;
     const h = try parse(arena.allocator(), json, 12);
-    try std.testing.expectEqual(@as(usize, 1), h.count());
+    try std.testing.expectEqual(@as(usize, 2), h.count());
     try std.testing.expect(h.contains("a"));
+    try std.testing.expectEqual(@as(u8, 5), h.get("patch").?.rank);
 }
 
 test "released pages read back the same bytes" {

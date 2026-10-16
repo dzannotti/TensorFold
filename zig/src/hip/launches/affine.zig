@@ -156,6 +156,8 @@ pub const Kernels = struct {
     /// The dequantizing prompt tile (weights to bf16 in LDS, one WMMA chain over K) at 128 x 256 and 256 x 128 a
     /// block: every prefill row count takes it.
     prompt_dq: [2]Function,
+    /// The same core over bf16 weights at 128 x 256 and 256 x 128 a block: a prompt's dense products.
+    dense_prompt: [2]Function,
     /// Unless TF_PROMPT_DQ is set: the exact-fold prompt tile (the 128-row block's bits). The dequantizing tile is faster
     /// (~13% at 8k) but moves KL vs bf16 from 0.1115 to 0.1122, so it stays opt-in until quality is settled.
     prompt_fold: bool,
@@ -198,6 +200,10 @@ pub const Kernels = struct {
             k.prompt_dq = .{
                 try tiles_obj.function(r ++ "21affine_wmma_prompt_dqILi4ELi128EEEvNS0_6AffineE"),
                 try tiles_obj.function(r ++ "21affine_wmma_prompt_dqILi4ELi256EEEvNS0_6AffineE"),
+            };
+            k.dense_prompt = .{
+                try tiles_obj.function(r ++ "17dense_wmma_promptILi128EEEvNS0_6AffineE"),
+                try tiles_obj.function(r ++ "17dense_wmma_promptILi256EEEvNS0_6AffineE"),
             };
         }
         k.prompt_fold = std.c.getenv("TF_PROMPT_DQ") == null;
@@ -569,6 +575,20 @@ pub const Kernels = struct {
         try args.add(a);
         const bm: c_int = if (tall) 256 else 128;
         try go(r, k.prompt_dq[@intFromBool(tall)], .{ .x = cdiv(a.n, @divExact(32768, bm)) * cdiv(a.m, bm) }, .{ .x = 256 }, s, &args);
+    }
+
+    /// A prompt's bf16 product: out16 (m, n) = x (m, k) times bf16 `words` (n, k), on the prompt core; false where the
+    /// GPU has no gfx11 matrix cores or the buffer offsets do not fit. Each output is one WMMA chain over k in order:
+    /// its bits never depend on m or the block shape.
+    pub fn densePromptGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!bool {
+        const fits = @as(u64, @intCast(a.m)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31 and @as(u64, @intCast(a.n)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31;
+        if (!k.matrix or k.mode == .off or !fits or @mod(a.k, 32) != 0 or a.x % 16 != 0 or a.words % 16 != 0 or a.fp16 != 0) return false;
+        const tall = true; // 256 x 128 measured faster on every ciru shape (8192 x 2048: 25 vs 17 TFLOPS; the head 42 vs 26)
+        const bm: c_int = if (tall) 256 else 128;
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, k.dense_prompt[@intFromBool(tall)], .{ .x = cdiv(a.n, @divExact(32768, bm)) * cdiv(a.m, bm) }, .{ .x = 256 }, s, &args);
+        return true;
     }
 
     /// x's group sums into `a.sums` for the prompt tile: each row's 64 values a group added in order from zero.

@@ -41,6 +41,12 @@ pub fn moeAct(o: Ops, both: u64, out: Tensor, pairs: usize, width: usize, limit:
     try o.l.tf_moe_act(f(both), p(out.ptr), @backingInt(out.kind), int(pairs), int(width), limit, o.stream);
 }
 
+/// out (rows, k) = x rotated by 128-block Hadamards, in x's kind (ciru_q8's expert inputs); `out` may be x's own.
+pub fn had128(o: Ops, x: Tensor, out: u64, rows: usize, k: usize) Error!void {
+    if (x.kind == .f32) return error.BadShape;
+    try o.l.hadamard(x.ptr, @backingInt(x.kind), out, @intCast(k), rows, o.stream);
+}
+
 pub fn moeCombine(o: Ops, y: u64, wts: u64, out: Tensor, r: usize, slots: usize, d: usize) Error!void {
     try o.l.tf_moe_combine(f(y), f(wts), p(out.ptr), @backingInt(out.kind), int(r), int(slots), int(d), o.stream);
 }

@@ -54,10 +54,11 @@ pub const Config = struct {
         // a checkpoint that declares no quantization is the float release (bf16): every projection dense
         const table: quant.Config = quant.detect(a, .{ .root = doc, .quantization = declared }) catch |e|
             if (declared.count() == 0) .{ .dense = {} } else return e;
-        // an EXL3 tensor's width is its own: the geometry records a nominal one (a float one: 16 bits, no groups)
+        // an EXL3 tensor's width is its own, a ciru_q8 checkpoint's experts are 8-bit, a float release's 16 bits: the
+        // geometry records a nominal one
         const width: Width = switch (table) {
             .exl3 => .{ .bits = 4, .group = 128 },
-            .dense => .{ .bits = 16, .group = 0 },
+            .dense => if (declared.count() == 0) .{ .bits = 16, .group = 0 } else .{ .bits = 8, .group = 128 },
             .mlx => try table.width(""),
         };
         const spec = try shared.geometry(tower, width.bits, width.group);

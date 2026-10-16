@@ -31,14 +31,23 @@ pub fn suffixCandidates(gpa: Allocator, context: []const u32, longest: usize, sh
         out.deinit(gpa);
     }
     if (context.len < shortest + 1 or shortest == 0) return out.toOwnedSlice(gpa);
-    var n = @min(longest, context.len - 1);
+    const top = @min(longest, context.len - 1);
+    // one pass over the context: each end e's shared suffix with the context's (most ends fail at their first token),
+    // newest first; then the lengths from the longest down take them in the same order a scan per length would
+    var ends: std.ArrayList([2]usize) = .empty;
+    defer ends.deinit(gpa);
+    var e = context.len - 1;
+    while (e >= shortest) : (e -= 1) {
+        var l: usize = 0;
+        while (l < @min(top, e) and context[e - 1 - l] == context[context.len - 1 - l]) l += 1;
+        if (l >= shortest) try ends.append(gpa, .{ e, l });
+    }
+    var n = top;
     while (n >= shortest and out.items.len < most) : (n -= 1) {
-        const tail = context[context.len - n ..];
-        var i = context.len - n;
-        while (i > 0 and out.items.len < most) {
-            i -= 1;
-            if (!std.mem.eql(u32, context[i .. i + n], tail)) continue;
-            const next = context[i + n .. @min(i + n + span, context.len)];
+        for (ends.items) |x| {
+            if (out.items.len >= most) break;
+            if (x[1] < n) continue;
+            const next = context[x[0]..@min(x[0] + span, context.len)];
             if (seen(out.items, next)) continue;
             try out.append(gpa, .{ .tokens = try gpa.dupe(u32, next), .weight = @floatFromInt(n) });
         }
@@ -131,6 +140,43 @@ test "suffix candidates find what followed earlier occurrences, longest match fi
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualSlices(u32, &.{ 7, 6, 2 }, got[0].tokens);
     try std.testing.expectEqualSlices(u32, &.{ 9, 8, 1 }, got[1].tokens);
+}
+
+test "the one-pass suffix candidates match a scan per length on random contexts" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    for (0..200) |_| {
+        var ctx: [300]u32 = undefined;
+        const len = rnd.intRangeAtMost(usize, 3, ctx.len);
+        const vocab = rnd.intRangeAtMost(u32, 2, 6);
+        for (ctx[0..len]) |*t| t.* = rnd.uintLessThan(u32, vocab);
+        const c = ctx[0..len];
+        const got = try suffixCandidates(gpa, c, 16, 2, 4, 8);
+        defer freeProposals(gpa, got);
+        // the reference: every length from the longest down, every window newest first
+        var want: std.ArrayList(Proposal) = .empty;
+        defer {
+            for (want.items) |p| gpa.free(p.tokens);
+            want.deinit(gpa);
+        }
+        var n = @min(@as(usize, 16), c.len - 1);
+        while (n >= 2 and want.items.len < 8) : (n -= 1) {
+            var i = c.len - n;
+            while (i > 0 and want.items.len < 8) {
+                i -= 1;
+                if (!std.mem.eql(u32, c[i .. i + n], c[c.len - n ..])) continue;
+                const next = c[i + n .. @min(i + n + 4, c.len)];
+                if (seen(want.items, next)) continue;
+                try want.append(gpa, .{ .tokens = try gpa.dupe(u32, next), .weight = @floatFromInt(n) });
+            }
+        }
+        try std.testing.expectEqual(want.items.len, got.len);
+        for (want.items, got) |w, g| {
+            try std.testing.expectEqualSlices(u32, w.tokens, g.tokens);
+            try std.testing.expectEqual(w.weight, g.weight);
+        }
+    }
 }
 
 test "graft without a trunk keeps shared prefixes once and respects the budget" {

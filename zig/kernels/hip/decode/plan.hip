@@ -152,6 +152,193 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
     }
 }
 
+// ---- split attention over a plan's rows (flash decoding): a block a (256-key split, KV head, row) ----
+// A thread scores one key for the block's query heads (16-byte key loads, queries from LDS), each head's split max and
+// exp-sum go through LDS in key order, then a thread a dimension adds the split's values in key order. The finish adds
+// the splits in order: a row's bits depend on its own keys alone, never on the round's rows or span.
+constexpr int kFlashKeys = 256;
+
+template <int KIND>
+__device__ __forceinline__ void flash_widen8(uint4 w, float* v) {
+    const uint32_t u[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (KIND == 2) {
+            v[2 * i] = __uint_as_float(u[i] << 16);
+            v[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+        } else {
+            v[2 * i] = __half2float(__ushort_as_half(static_cast<unsigned short>(u[i] & 0xffffu)));
+            v[2 * i + 1] = __half2float(__ushort_as_half(static_cast<unsigned short>(u[i] >> 16)));
+        }
+    }
+}
+
+// Rows a block takes together: a chain's rows of one slot read each key and value once for all of them.
+constexpr int kFlashRows = 4;
+// Query vectors a block holds (rows times query heads a KV head).
+constexpr int kFlashQueries = 32;
+
+// Row r leads a block when it starts a run of chain rows (no ancestors) of its slot, at most kFlashRows long; a tree row
+// or a row outside its slot's range leads alone. Returns the run's length (0: another row leads it).
+__device__ __forceinline__ int flash_run(const PlanArgs& plan, int r, int rows, int per) {
+    const int slot = plan.slot[r];
+    const int first = plan.first[slot];
+    const int end = first + plan.count[slot];
+    if (plan.anc[r] != 0 || r < first || r >= end) return 1;
+    if ((r - first) % per != 0 && plan.anc[r - 1] == 0) return 0;
+    int n = 1;
+    while (n < per && r + n < end && r + n < rows && plan.anc[r + n] == 0) ++n;
+    return n;
+}
+
+template <int KIND>
+__device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__ part, float* __restrict__ ml, int span,
+                                int heads, int kv_heads, int d, float scale, PlanArgs plan, int layer, int rows) {
+    // the queries, then (once every score is in registers) the split's weights over them
+    __shared__ __attribute__((aligned(16))) float lds[kFlashQueries * 256];
+    float* const qs = lds;
+    float (*const ps)[kFlashQueries] = reinterpret_cast<float (*)[kFlashQueries]>(lds);
+    static_assert(kFlashKeys * kFlashQueries <= kFlashQueries * 256, "the weights fit where the queries were");
+    __shared__ long long vrow[kFlashKeys];
+    __shared__ float stat[kFlashQueries][2];
+    __shared__ int visl[kFlashRows];
+    const int t = threadIdx.x;
+    const int split = blockIdx.x, kv = blockIdx.y, r0 = blockIdx.z;
+    const int splits = gridDim.x;
+    const int group = heads / kv_heads;
+    const int per = min(kFlashRows, kFlashQueries / group);
+    const int n = flash_run(plan, r0, rows, per);
+    if (n == 0) return;
+    const int head0 = kv * group;
+    const int nq = n * group;  // query j: row r0 + j / group, head head0 + j % group
+    const int key0 = split * kFlashKeys;
+    int widest = 0;
+    for (int i = 0; i < n; ++i) widest = max(widest, min(plan.pos[r0 + i] + 1, span));
+    if (t < kFlashRows) visl[t] = t < n ? min(plan.pos[r0 + t] + 1, span) : 0;
+    if (key0 >= widest) {  // a split past every row's keys: nothing to add
+        if (t < nq) ml[((static_cast<long long>(r0 + t / group) * heads + head0 + t % group) * splits + split) * 2 + 1] = 0.f;
+        return;
+    }
+    for (int i = t; i < nq * d; i += blockDim.x) {
+        const int j = i / d;
+        qs[i] = q[(static_cast<long long>(r0 + j / group) * heads + head0 + j % group) * d + i % d];
+    }
+    const int slot = plan.slot[r0];
+    const unsigned long long* desc = plan_desc(plan, slot);
+    const unsigned* table = plan_pages(plan, desc);
+    const int key = key0 + t;
+    const bool live = key < widest;
+    const long long base = live ? page_at(table, plan.pool, kv, plan_key(plan.anc[r0], plan_len(plan, slot), key), d) : 0;
+    vrow[t] = base;
+    __syncthreads();
+    float s[kFlashQueries];
+#pragma unroll
+    for (int j = 0; j < kFlashQueries; ++j) s[j] = 0.f;
+    if (live) {
+        const uint4* kp = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(reinterpret_cast<const void*>(desc[plan_first(layer)])) + base);
+        // 64 dims of the key in flight at once (d a multiple of 64), added in dimension order
+        for (int c0 = 0; c0 < d / 8; c0 += 8) {
+            uint4 kk[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) kk[u] = kp[c0 + u];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int c = c0 + u;
+                float k8[8];
+                flash_widen8<KIND>(kk[u], k8);
+#pragma unroll
+                for (int j = 0; j < kFlashQueries; ++j) {
+                    if (j < nq) {
+                        const float4 a = *reinterpret_cast<const float4*>(qs + j * d + 8 * c);
+                        const float4 b = *reinterpret_cast<const float4*>(qs + j * d + 8 * c + 4);
+                        s[j] += a.x * k8[0];
+                        s[j] += a.y * k8[1];
+                        s[j] += a.z * k8[2];
+                        s[j] += a.w * k8[3];
+                        s[j] += b.x * k8[4];
+                        s[j] += b.y * k8[5];
+                        s[j] += b.z * k8[6];
+                        s[j] += b.w * k8[7];
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();  // every query read: their LDS takes the weights
+#pragma unroll
+    for (int j = 0; j < kFlashQueries; ++j)
+        if (j < nq) ps[t][j] = key < visl[j / group] ? s[j] * scale : -INFINITY;
+    __syncthreads();
+    // a wave a query: the split's max, then exp and sum, each in key order
+    const int lane = t & 31, wave = t >> 5;
+    for (int j = wave; j < nq; j += blockDim.x >> 5) {
+        float m = -INFINITY;
+        for (int i = lane; i < kFlashKeys; i += 32) m = fmaxf(m, ps[i][j]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor(m, off, 32));
+        float sum = 0.f;
+        for (int i = lane; i < kFlashKeys; i += 32) {
+            // a row with no key in this split weighs every key zero (its sum 0 drops the split in the finish)
+            const float e = m == -INFINITY ? 0.f : expf(ps[i][j] - m);
+            ps[i][j] = e;
+            sum += e;
+        }
+        sum = wave_sum(sum);
+        if (lane == 0) stat[j][0] = m, stat[j][1] = sum;
+    }
+    __syncthreads();
+    if (t < nq) {
+        const long long at = ((static_cast<long long>(r0 + t / group) * heads + head0 + t % group) * splits + split) * 2;
+        ml[at] = stat[t][0];
+        ml[at + 1] = stat[t][1];
+    }
+    if (t >= d) return;
+    const uint16_t* values = static_cast<const uint16_t*>(reinterpret_cast<const void*>(desc[plan_second(layer)]));
+    const int stop = min(kFlashKeys, widest - key0);
+    float acc[kFlashQueries];
+#pragma unroll
+    for (int j = 0; j < kFlashQueries; ++j) acc[j] = 0.f;
+    constexpr int U = 8;
+    int i = 0;
+    for (; i + U <= stop; i += U) {
+        float v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const uint16_t h = values[vrow[i + u] + t];
+            v[u] = KIND == 2 ? __uint_as_float(static_cast<uint32_t>(h) << 16) : __half2float(__ushort_as_half(h));
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int j4 = 0; j4 < kFlashQueries; j4 += 4) {
+                if (j4 < nq) {
+                    const float4 p = *reinterpret_cast<const float4*>(&ps[i + u][j4]);
+                    acc[j4] += p.x * v[u];
+                    acc[j4 + 1] += p.y * v[u];
+                    acc[j4 + 2] += p.z * v[u];
+                    acc[j4 + 3] += p.w * v[u];
+                }
+            }
+    }
+    for (; i < stop; ++i) {
+        const uint16_t h = values[vrow[i] + t];
+        const float v = KIND == 2 ? __uint_as_float(static_cast<uint32_t>(h) << 16) : __half2float(__ushort_as_half(h));
+#pragma unroll
+        for (int j4 = 0; j4 < kFlashQueries; j4 += 4) {
+            if (j4 < nq) {
+                const float4 p = *reinterpret_cast<const float4*>(&ps[i][j4]);
+                acc[j4] += p.x * v;
+                acc[j4 + 1] += p.y * v;
+                acc[j4 + 2] += p.z * v;
+                acc[j4 + 3] += p.w * v;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kFlashQueries; ++j)
+        if (j < nq) part[((static_cast<long long>(r0 + j / group) * heads + head0 + j % group) * splits + split) * d + t] = acc[j];
+}
+
 // The words of a row copied by a block row of threads, four at a time.
 __device__ __forceinline__ void copy_words(unsigned int* to, const unsigned int* from, int words) {
     const int stride = gridDim.x * blockDim.x;
@@ -194,6 +381,36 @@ tf_plan_apply_f16(const float* scores, const float* stats, float* partials, int 
 __global__ void __launch_bounds__(256)
 tf_plan_apply_bf16(const float* scores, const float* stats, float* partials, int span, int heads, int kv_heads, int d, PlanArgs plan, int layer) {
     plan_apply_body<2>(scores, stats, partials, span, heads, kv_heads, d, plan, layer);
+}
+
+__global__ void __launch_bounds__(256)
+tf_plan_flash_f16(const float* q, float* part, float* ml, int span, int heads, int kv_heads, int d, float scale, PlanArgs plan, int layer, int rows) {
+    plan_flash_body<1>(q, part, ml, span, heads, kv_heads, d, scale, plan, layer, rows);
+}
+
+__global__ void __launch_bounds__(256)
+tf_plan_flash_bf16(const float* q, float* part, float* ml, int span, int heads, int kv_heads, int d, float scale, PlanArgs plan, int layer, int rows) {
+    plan_flash_body<2>(q, part, ml, span, heads, kv_heads, d, scale, plan, layer, rows);
+}
+
+// The splits of a (head, row) added in order: out = sum_s e^(m_s - M) acc_s / sum_s e^(m_s - M) l_s.
+__global__ void __launch_bounds__(256)
+tf_plan_flash_sum(const float* part, const float* ml, float* out, int splits, int d) {
+    const int head = blockIdx.x, batch = blockIdx.y, t = threadIdx.x;
+    if (t >= d) return;
+    const long long hr = static_cast<long long>(batch) * gridDim.x + head;
+    const float* m = ml + hr * splits * 2;
+    float top = -INFINITY;
+    for (int s = 0; s < splits; ++s)
+        if (m[2 * s + 1] > 0.f) top = fmaxf(top, m[2 * s]);
+    float acc = 0.f, total = 0.f;
+    for (int s = 0; s < splits; ++s) {
+        if (!(m[2 * s + 1] > 0.f)) continue;
+        const float w = expf(m[2 * s] - top);
+        total += w * m[2 * s + 1];
+        acc += w * part[(hr * splits + s) * d + t];
+    }
+    out[hr * d + t] = acc / total;
 }
 
 // A prompt pass's rotated, rounded keys and values (16-bit) into positions pos0 .. pos0 + len of a stream's pages.

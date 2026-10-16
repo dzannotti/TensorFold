@@ -50,8 +50,8 @@ pub const Session = struct {
         replayed: u64,
         submit_ns: u64,
         /// Nanoseconds and calls of the backend's verifies, keeps and drafts.
-        spent: [3]u64,
-        calls: [3]u64,
+        spent: [4]u64,
+        calls: [4]u64,
 
         pub fn tokens(d: Done) usize {
             var n: usize = 0;
@@ -104,8 +104,8 @@ pub const Session = struct {
     }
 };
 
-fn delta(now: [3]u64, before: [3]u64) [3]u64 {
-    var out: [3]u64 = undefined;
+fn delta(now: [4]u64, before: [4]u64) [4]u64 {
+    var out: [4]u64 = undefined;
     for (&out, now, before) |*o, a, b| o.* = a - b;
     return out;
 }

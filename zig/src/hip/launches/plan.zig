@@ -39,6 +39,41 @@ pub fn planKvWrite(l: *const Launcher, keys: u64, values: u64, kind: c_int, p: P
     try l.flat(l.plan.kv_write, @intCast(p.rows * kv_heads * d), s, &a);
 }
 
+/// Keys a split of the flash walk (plan.hip's kFlashKeys).
+pub const flash_keys = 256;
+
+/// Whether the flash walk takes the shape: d a multiple of 64 up to 256, at most 16 query heads a KV head.
+pub fn flashTakes(heads: usize, kv_heads: usize, d: usize) bool {
+    return d % 64 == 0 and d <= 256 and kv_heads > 0 and heads % kv_heads == 0 and heads / kv_heads <= 16;
+}
+
+/// planCausal's result by 256-key splits (flash decoding): `part` (rows, heads, splits, d) and `ml` (rows, heads,
+/// splits, 2) fp32 scratch, then the splits added in order. A row's bits depend on its own keys alone.
+pub fn planFlash(l: *const Launcher, q: u64, out: u64, part: u64, ml: u64, p: PlanRef, layer: usize, heads: usize, kv_heads: usize, d: usize, span: usize, scale: f32, kind: c_int, s: S) Error!void {
+    if (!flashTakes(heads, kv_heads, d) or kind < 1 or kind > 2) return invalid("flash attention");
+    const splits = cdiv(span, flash_keys);
+    var a: Args = .{};
+    try a.add(q);
+    try a.add(part);
+    try a.add(ml);
+    try a.add(@as(c_int, @intCast(span)));
+    try a.add(@as(c_int, @intCast(heads)));
+    try a.add(@as(c_int, @intCast(kv_heads)));
+    try a.add(@as(c_int, @intCast(d)));
+    try a.add(scale);
+    try a.add(p.args);
+    try a.add(@as(c_int, @intCast(layer)));
+    try a.add(@as(c_int, @intCast(p.rows)));
+    try l.go(l.plan.flash[@intCast(kind - 1)], dim(splits, kv_heads, p.rows), dim(256, 1, 1), 0, s, &a);
+    var b: Args = .{};
+    try b.add(part);
+    try b.add(ml);
+    try b.add(out);
+    try b.add(@as(c_int, @intCast(splits)));
+    try b.add(@as(c_int, @intCast(d)));
+    try l.go(l.plan.flash_sum, dim(heads, p.rows, 1), dim(256, 1, 1), 0, s, &b);
+}
+
 /// One query a row (rows, heads, d) fp32 over its slot's caches up to its position; the walk covers `span` keys.
 pub fn planCausal(l: *const Launcher, q: u64, out: u64, scores: u64, stats: u64, partials: u64, p: PlanRef, layer: usize, heads: usize, kv_heads: usize, d: usize, span: usize, scale: f32, kind: c_int, s: S) Error!void {
     if (d > 256 or heads < 1 or kv_heads < 1 or @rem(heads, kv_heads) != 0 or kind < 1 or kind > 2) return invalid("planned attention");

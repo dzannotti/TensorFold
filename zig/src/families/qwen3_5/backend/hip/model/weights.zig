@@ -26,6 +26,8 @@ pub const Experts = struct {
     width: usize,
     dims: usize,
     count: usize,
+    /// Inputs rotated by 128-block Hadamards first (ciru_q8).
+    rotated: bool = false,
 };
 
 /// Router rows [E + 1, D], the shared gate row last: bf16 as the Python holds them and `rows32` widened.
@@ -111,6 +113,7 @@ const Uploader = struct {
                         .width = e.width,
                         .dims = e.dims,
                         .count = e.count,
+                        .rotated = e.rotated,
                     },
                     .top_k = r.top_k,
                     .remap = if (r.remap) |t| try u.tensor(t) else null,
@@ -235,6 +238,12 @@ pub const Model = struct {
             defer h.deinit();
             if (rank != null and h.head == null) h.head = head orelse embed;
             m.mtp = try u.mtp(h);
+            // a bf16 output head costs a draft step its whole read: the head drafts with an 8-bit copy (the verify
+            // still reads the bf16 head, so no reply changes)
+            const main = head orelse embed;
+            if (m.mtp.?.head == null and main == .dense and main.dense.weight.dtype == .bf16) {
+                m.mtp.?.head = try u.projection(.{ .mlx = try quant.mlx.quantize8(scratch.allocator(), main.dense.weight) });
+            }
             ck.main.release("mtp.");
         };
         return m;

@@ -13,14 +13,15 @@ const join = types.join;
 pub const id: types.Format = .dense;
 pub const decoder: types.Decoder = .dense;
 
-/// A float weight is not named by the config: nothing here declares it.
+/// A float weight is not named by the config: only a ciru_q8 checkpoint (bf16 but its routed experts) declares it.
 pub const Config = void;
 
-pub fn detect(a: Allocator, src: types.Sources) Allocator.Error!?Config {
+pub fn detect(a: Allocator, src: types.Sources) (Allocator.Error || error{UnsupportedQuantization})!?Config {
     _ = a;
-    _ = src;
-    return null;
+    return if (try ciru.declared(src.quantization)) {} else null;
 }
+
+const ciru = @import("ciru.zig");
 
 pub const Host = struct { weight: Tensor };
 
