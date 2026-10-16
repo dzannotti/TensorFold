@@ -147,7 +147,8 @@ pub const Kernels = struct {
     /// The dequantizing prompt tile (weights to bf16 in LDS, one WMMA chain over K) at 128 x 256 and 256 x 128 a
     /// block: every prefill row count takes it.
     prompt_dq: [2]Function,
-    /// TF_PROMPT_FOLD set: the exact-fold prompt tile (the 128-row block's bits) instead of the dequantizing one.
+    /// Unless TF_PROMPT_DQ is set: the exact-fold prompt tile (the 128-row block's bits). The dequantizing tile is faster
+    /// (~13% at 8k) but moves KL vs bf16 from 0.1115 to 0.1122, so it stays opt-in until quality is settled.
     prompt_fold: bool,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
@@ -187,7 +188,7 @@ pub const Kernels = struct {
                 try tiles_obj.function(r ++ "21affine_wmma_prompt_dqILi4ELi256EEEvNS0_6AffineE"),
             };
         }
-        k.prompt_fold = std.c.getenv("TF_PROMPT_FOLD") != null;
+        k.prompt_fold = std.c.getenv("TF_PROMPT_DQ") == null;
         return k;
     }
 
