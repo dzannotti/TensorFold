@@ -63,12 +63,15 @@ pub const Launcher = struct {
     gdn_gate: Triple,
     gated_delta_tile: [2]Function, // dk 128, 16
     gated_delta_wave: [2]Function,
+    /// The prompt scan with 8 value rows a wave, 4 waves a block (dk 128).
+    gated_delta_rows: Function,
     score_keys: Triple, // by cache kind
     apply_values: Triple,
     causal: Triple,
     fa_prefill: Triple,
     fa_wide: [2]Function, // the 64-row prefill tile, fp16 and bf16 caches
     fa_paged: [2]Function, // the same tile over a stream's pages
+    fa_paged_wmma: Function, // its bf16 tile on gfx11's matrix cores, the same bits
     softmax_stats: Function,
     sum_partials: Function,
     op: Ops,
@@ -178,6 +181,7 @@ pub const Launcher = struct {
         };
         l.fa_wide = .{ try pre.function("tf_fa_wide_f16"), try pre.function("tf_fa_wide_bf16") };
         l.fa_paged = .{ try pre.function("tf_fa_paged_f16"), try pre.function("tf_fa_paged_bf16") };
+        l.fa_paged_wmma = try pre.function("tf_fa_paged_wmma");
         l.op = .{
             .embed_rows = try ops.function("tf_embed_rows"),
             .embed_dense = try ops.function("tf_embed_dense"),
@@ -239,6 +243,7 @@ pub const Launcher = struct {
             try gd.function(ns ++ "16gated_delta_tileILi128ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "16gated_delta_tileILi16ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
         };
+        l.gated_delta_rows = try gd.function("tf_gdn_rows_128_8_4");
         l.gated_delta_wave = .{
             try gd.function(ns ++ "18gated_delta_kernelILi128EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "18gated_delta_kernelILi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),

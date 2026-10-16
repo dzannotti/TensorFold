@@ -330,6 +330,42 @@ fn tierProduct(t: *Rig, m: usize, n: usize, k: usize, bits: c_int, group: c_int,
         }
         diff += d;
     }
+    if (k_ptr.promptTakes(arg)) diff += try promptProduct(t, arg, outs[big], written);
+    return diff;
+}
+
+/// The prompt tile (its sums first) against the 128-row block's fp32 words, and its bf16 output against their rounding.
+fn promptProduct(t: *Rig, arg_in: affine.Arg, want: Buffer, want_host: []const u8) !usize {
+    const m: usize = @intCast(arg_in.m);
+    const n: usize = @intCast(arg_in.n);
+    var sums = try Buffer.alloc(t.base, m * @as(usize, @intCast(@divExact(arg_in.k, 64))) * 4);
+    defer sums.free();
+    var out = try Buffer.alloc(t.base, m * n * 4);
+    defer out.free();
+    try out.fill8(0xA5, null);
+    var arg = arg_in;
+    arg.sums = sums.ptr;
+    arg.out = out.ptr;
+    try t.kernels.sumsGo(&t.base.r, arg, t.base.stream.handle);
+    try t.kernels.blockGo(&t.base.r, arg, t.base.stream.handle, 1, .matrix);
+    try t.base.stream.synchronize();
+    var diff = try data.sameOnDevice(want, out, m * n * 4);
+    if (diff != 0) std.debug.print("the prompt tile differs from the 128-row block in {d} words (m {d} n {d} k {d})\n", .{ diff, m, n, arg.k });
+    arg.out = 0;
+    arg.out16 = out.ptr;
+    try t.kernels.blockGo(&t.base.r, arg, t.base.stream.handle, 1, .matrix);
+    try t.base.stream.synchronize();
+    const got = try gpa.alloc(u16, m * n);
+    defer gpa.free(got);
+    try out.download(0, std.mem.sliceAsBytes(got));
+    var rounded: usize = 0;
+    for (got, 0..) |g, i| {
+        const u = std.mem.readInt(u32, want_host[4 * i ..][0..4], .little);
+        const bf: u16 = if (std.math.isNan(@as(f32, @bitCast(u)))) 0x7fc0 else @truncate((u + ((u >> 16) & 1) + 0x7fff) >> 16);
+        if (g != bf) rounded += 1;
+    }
+    if (rounded != 0) std.debug.print("the prompt tile's bf16 differs from the rounded fp32 in {d} values\n", .{rounded});
+    diff += rounded;
     return diff;
 }
 

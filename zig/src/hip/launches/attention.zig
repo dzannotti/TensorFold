@@ -118,7 +118,8 @@ pub fn pagedCausal(l: *const Launcher, q: u64, k: u64, v: u64, table: u64, out: 
     try a.add(@as(c_int, @intCast(q_pos0)));
     try a.add(table);
     try a.add(@as(c_int, @intCast(count)));
-    try l.go(l.fa_paged[@intCast(cache_kind)], dim(cdiv(qlen, 64), heads, 1), dim(256, 1, 1), 0, s, &a);
+    const f = if (cache_kind == 1 and l.affine.matrix) l.fa_paged_wmma else l.fa_paged[@intCast(cache_kind)];
+    try l.go(f, dim(cdiv(qlen, 64), heads, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 pub fn tf_attn_gate(l: *const Launcher, att: CF, qg: C, out: P, kind: c_int, len: c_int, heads: c_int, d: c_int, rows_major: c_int, s: S) Error!void {

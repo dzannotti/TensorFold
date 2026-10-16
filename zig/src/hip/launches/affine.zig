@@ -40,6 +40,8 @@ pub const Arg = extern struct {
     fp16: c_int,
     route: Routing = .{},
     out16: u64 = 0,
+    /// The prompt tile's x group sums, (k / 64, m) fp32 (`sumsGo`); 0 keeps the 128-row WMMA tile.
+    sums: u64 = 0,
 };
 
 /// quant/mlx_tiles.hpp's StreamSides: up to four products that share x, K, width and group in one launch.
@@ -60,7 +62,7 @@ pub const StreamSides = extern struct {
 pub const Side = struct { words: u64, scale: u64, bias: u64, n: c_int, out: u64 };
 
 comptime {
-    std.debug.assert(@sizeOf(GroupTable) == 16 and @sizeOf(Routing) == 24 and @sizeOf(Arg) == 112 and @sizeOf(StreamSides) == 184);
+    std.debug.assert(@sizeOf(GroupTable) == 16 and @sizeOf(Routing) == 24 and @sizeOf(Arg) == 120 and @sizeOf(StreamSides) == 184);
 }
 
 /// Everything a launch needs beside the kernels.
@@ -139,6 +141,9 @@ pub const Kernels = struct {
     block: [bit_widths.len]Function,
     gemm: [bit_widths.len]Function,
     wmma_gemm: [bit_widths.len]Function,
+    /// tiles/matrix_prompt.hpp: the pipelined 4-bit group-64 tile and the x group sums it reads; gfx11 only.
+    prompt: Function,
+    prompt_sums: Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -169,6 +174,10 @@ pub const Kernels = struct {
         k.tiled = try dot2_obj.function(r ++ "17affine_dot2_tiledENS0_6AffineE");
         k.reference = try dot2_obj.function(r ++ "18affine_dot2_kernelENS0_6AffineE");
         k.fill = try dot2_obj.function(r ++ "13fill_byte_lutEP6__half");
+        if (k.matrix) {
+            k.prompt = try tiles_obj.function(r ++ "18affine_wmma_promptILi4EEEvNS0_6AffineE");
+            k.prompt_sums = try tiles_obj.function(r ++ "18affine_prompt_sumsILi4EEEvNS0_6AffineE");
+        }
         return k;
     }
 
@@ -457,11 +466,28 @@ pub const Kernels = struct {
         try go(r, k.fold, .{ .x = cdiv(a.n, fast_n), .y = @intCast(a.m) }, .{ .x = fast_n }, s, &fold);
     }
 
+    /// Whether the prompt tile takes a matrix-core product once its sums are set: 4-bit, group 64, 16-bit tables, bf16 x.
+    pub fn promptTakes(k: *const Kernels, a: Arg) bool {
+        return k.matrix and a.bits == 4 and a.group == 64 and @mod(a.k, 64) == 0 and a.route.items == 0 and a.fp16 == 0 and
+            a.scale.kind != 0 and a.scale.kind == a.bias.kind and a.x % 16 == 0 and a.words % 16 == 0;
+    }
+
+    /// x's group sums into `a.sums` for the prompt tile: each row's 64 values a group added in order from zero.
+    pub fn sumsGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, k.prompt_sums, .{ .x = cdiv(a.m, 8) }, .{ .x = 256 }, s, &args);
+    }
+
     /// The 128 x 128 tile of a kind over every item of a plan (or the plain product).
     pub fn blockGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream, items: c_int, kind: BlockKind) Error!void {
         const b = bitIndex(a.bits) orelse return refuse("bits");
         var args: hl.Args = .{};
         try args.add(a);
+        if (kind == .matrix and a.sums != 0) {
+            if (!k.promptTakes(a)) return refuse("prompt tile");
+            return go(r, k.prompt, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
+        }
         const f = switch (kind) {
             .matrix => k.wmma_gemm[b],
             .gemm => k.gemm[b],

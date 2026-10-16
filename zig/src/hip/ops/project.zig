@@ -1,5 +1,6 @@
 //! The products on a projection of any format, dispatched on its tag; `affine*` are the MLX affine path behind them.
 
+const std = @import("std");
 const t = @import("types.zig");
 const quant = @import("core").quant;
 const launches = @import("../launches.zig");
@@ -103,29 +104,32 @@ pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tenso
     if (x.kind == .f32 or (fp16 and o.bf16) or (!fp16 and !o.bf16)) return error.BadShape;
     const n: usize = w.n;
     const kind = w.tables.table();
-    var half = false;
     const z = o.l;
     const shape = shapeOf(o, x, w, m);
     const tile = z.affine.choose(.project, if (o.prefill) .prefill else .decode, shape) orelse return error.BadShape;
-    half = !f32_out and !o.prefill and tile.roundsAct(shape);
+    var arg: affine_launch.Arg = .{
+        .x = x.ptr,
+        .words = w.words,
+        .scale = .{ .p = w.scale, .kind = kind },
+        .bias = .{ .p = w.bias, .kind = kind },
+        .out = 0,
+        .m = int(m),
+        .n = int(n),
+        .k = int(w.k),
+        .bits = w.bits,
+        .group = w.group,
+        .fp16 = @intFromBool(fp16),
+    };
+    // a prompt's 4-bit group-64 product on the matrix cores takes the prompt tile, which rounds as the cast below would
+    const prompt = o.prefill and std.mem.endsWith(u8, tile.id, ".prefill.matrix") and z.affine.promptTakes(arg);
+    const half = !f32_out and if (prompt) true else !o.prefill and tile.roundsAct(shape);
     const out = try o.arena.take(m * n * @as(usize, if (half) 2 else 4));
-    {
-        const arg: affine_launch.Arg = .{
-            .x = x.ptr,
-            .words = w.words,
-            .scale = .{ .p = w.scale, .kind = kind },
-            .bias = .{ .p = w.bias, .kind = kind },
-            .out = if (half) 0 else out,
-            .m = int(m),
-            .n = int(n),
-            .k = int(w.k),
-            .bits = w.bits,
-            .group = w.group,
-            .fp16 = @intFromBool(fp16),
-            .out16 = if (half) out else 0,
-        };
-        try tile.launch(&z.affine, .{ .r = z.r, .s = o.stream, .arg = arg });
+    if (half) arg.out16 = out else arg.out = out;
+    if (prompt) {
+        arg.sums = try o.arena.take(m * (@as(usize, w.k) / 64) * 4);
+        try z.affine.sumsGo(z.r, arg, o.stream);
     }
+    try tile.launch(&z.affine, .{ .r = z.r, .s = o.stream, .arg = arg });
     if (half) return .{ .ptr = out, .kind = x.kind };
     if (f32_out) return .{ .ptr = out, .kind = .f32 };
     const narrow = try o.arena.take(m * n * 2);
