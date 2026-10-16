@@ -64,8 +64,9 @@ pub fn planCausal(l: *const Launcher, q: u64, out: u64, scores: u64, stats: u64,
     try a.add(scale);
     try a.add(p.args);
     try a.add(layer_c);
-    // a warp scores a key for the block's heads: four warps a block, the heads' queries in shared memory
-    try l.go(l.plan.score[which], dim(cdiv(span, 4), blocks, rows), dim(128, 1, 1), @intCast(group * d * 4), s, &a);
+    // a warp scores a key for the block's heads: four warps a block, 4 keys each (plan.hip's kScoreKeys), the heads'
+    // queries in shared memory
+    try l.go(l.plan.score[which], dim(cdiv(span, 16), blocks, rows), dim(128, 1, 1), @intCast(group * d * 4), s, &a);
     var b: Args = .{};
     try b.add(scores);
     try b.add(stats);

@@ -101,31 +101,44 @@ __device__ __forceinline__ void store_kind(void* p, int kind, long long i, float
 constexpr int kTailThreads = 512;
 constexpr int kTailWidth = 8192;
 
-// One row a block, one launch: x = round(x + t), t = y or the slot-ordered weighted sum; normed = rms(x) * weight.
-__device__ void tail_body(void* x, const void* y, const float* wts, const float* weight, void* normed, int kind,
-                          int slots, int width, float eps) {
-    __shared__ float row_v[kTailWidth];
-    __shared__ float part[kTailThreads / 32];
+// One row a block, one launch: x = round(x + t), t = y or the slot-ordered weighted sum; normed = rms(x) * weight. The
+// kind fixed and U strides' loads in flight before their sums, which run in stride order.
+template <int KIND>
+__device__ __forceinline__ void tail_kind(void* x, const void* y, const float* wts, const float* weight, void* normed,
+                                          int slots, int width, float eps, float* row_v, float* part) {
+    constexpr int kind = KIND, U = 8;
     const int row = blockIdx.x;
     const long long at = static_cast<long long>(row) * width;
-    float sum = 0.f;
-    for (int i = threadIdx.x; i < width; i += kTailThreads) {
-        float t;
+    const auto term = [&](int i) {
         if (slots > 0) {
             float acc = 0.f;
             for (int s = 0; s < slots; ++s) {
                 acc += static_cast<const float*>(y)[(static_cast<long long>(row) * slots + s) * width + i] *
                        wts[row * slots + s];
             }
-            t = round_kind(acc, kind);
-        } else {
-            t = load_kind(y, kind, at + i);
+            return round_kind(acc, kind);
         }
-        const float v = round_kind(load_kind(x, kind, at + i) + t, kind);
+        return load_kind(y, kind, at + i);
+    };
+    const auto add = [&](int i, float xv, float t, float& sum) {
+        const float v = round_kind(xv + t, kind);
         store_kind(x, kind, at + i, v);
         row_v[i] = v;
         sum += v * v;
+    };
+    float sum = 0.f;
+    int i0 = threadIdx.x;
+    for (; i0 + kTailThreads * (U - 1) < width; i0 += kTailThreads * U) {
+        float ts[U], xs[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            ts[u] = term(i0 + kTailThreads * u);
+            xs[u] = load_kind(x, kind, at + i0 + kTailThreads * u);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) add(i0 + kTailThreads * u, xs[u], ts[u], sum);
     }
+    for (; i0 < width; i0 += kTailThreads) add(i0, load_kind(x, kind, at + i0), term(i0), sum);
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sum;
@@ -139,6 +152,14 @@ __device__ void tail_body(void* x, const void* y, const float* wts, const float*
         if (weight != nullptr) value *= weight[i];
         store_kind(normed, kind, at + i, value);
     }
+}
+
+__device__ void tail_body(void* x, const void* y, const float* wts, const float* weight, void* normed, int kind,
+                          int slots, int width, float eps) {
+    __shared__ float row_v[kTailWidth];
+    __shared__ float part[kTailThreads / 32];
+    if (kind == 1) tail_kind<1>(x, y, wts, weight, normed, slots, width, eps, row_v, part);
+    else tail_kind<2>(x, y, wts, weight, normed, slots, width, eps, row_v, part);
 }
 
 // Conv launch arguments: x (rows, channels), taps, state, snapshots; q, k (rows, kw), v (rows, vw) out; norm, gate.
@@ -216,6 +237,14 @@ __device__ void conv_split_body(const ConvArgs& launch) {
     if (live) {
         for (int tap = 0; tap < kept; ++tap) history[tap] = c.state[static_cast<long long>(tap) * c.channels + channel];
     }
+    // a round's inputs (32 rows at most) fetched at once, each thread's own column of them: the row walk waits on none
+    __shared__ float inputs[32][128];
+    const bool staged = c.rows <= 32;
+    const auto input = [&](int r) { return staged ? inputs[r][threadIdx.x] : load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel); };
+    if (live && staged) {
+#pragma unroll 8
+        for (int r = 0; r < c.rows; ++r) inputs[r][threadIdx.x] = load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel);
+    }
     for (int r = 0; r < c.rows; ++r) {
         float y = 0.f;
         float sample = 0.f;
@@ -229,7 +258,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
                 if (up != 0) {
                     const int a = 31 - __clz(up);
                     up &= ~(1u << a);
-                    history[tap] = load_kind(c.x, c.kind, static_cast<long long>(a) * c.channels + channel);
+                    history[tap] = input(a);
                     ++used;
                 } else {
                     history[tap] = c.state[static_cast<long long>(tap + used) * c.channels + channel];
@@ -239,7 +268,7 @@ __device__ void conv_split_body(const ConvArgs& launch) {
         if (live) {
             float acc = 0.f;
             for (int tap = 0; tap < kept; ++tap) acc += history[tap] * taps[tap];
-            sample = load_kind(c.x, c.kind, static_cast<long long>(r) * c.channels + channel);
+            sample = input(r);
             acc += sample * taps[kept];
             y = acc * (1.f / (1.f + expf(-acc)));
         }

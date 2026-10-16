@@ -72,27 +72,38 @@ extern "C" __global__ void tf_copy_cols(const void* src, long long stride, int o
 // a column and kDenseRows rows: each thread's strided terms, then the waves' sums and the block's in a fixed
 // order, so a row's bits depend on K alone. A thread loads 8 strides' terms before adding them in order.
 constexpr int kDenseRows = 4;
-extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
+template <int XK, int WK>
+__device__ __forceinline__ void dense_rows_body(const void* x, const void* w, void* out, int rows, int n, int k) {
     constexpr int R = kDenseRows, U = 8;
+    constexpr int kind = XK, w_kind = WK;  // the kinds fixed: no branch between a thread's loads
     __shared__ float part[R][8];
     const int col = blockIdx.x, r0 = blockIdx.y * R;
+    // rows past the call's read its last row: their sums are never stored
+    const unsigned char* xr[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) xr[j] = static_cast<const unsigned char*>(x) + static_cast<long long>(min(r0 + j, rows - 1)) * k * (kind == 0 ? 4 : 2);
+    const void* wr = static_cast<const unsigned char*>(w) + static_cast<long long>(col) * k * (w_kind == 0 ? 4 : 2);
     float acc[R];
 #pragma unroll
     for (int j = 0; j < R; ++j) acc[j] = 0.0f;
-    for (int i0 = threadIdx.x; i0 < k; i0 += 256 * U) {
+    int i0 = threadIdx.x;
+    for (; i0 + 256 * (U - 1) < k; i0 += 256 * U) {
         float wv[U], xv[R][U];
 #pragma unroll
         for (int u = 0; u < U; ++u) {
-            const int i = i0 + 256 * u;
-            wv[u] = i < k ? load(w, w_kind, static_cast<long long>(col) * k + i) : 0.0f;
+            wv[u] = load(wr, w_kind, i0 + 256 * u);
 #pragma unroll
-            for (int j = 0; j < R; ++j) xv[j][u] = i < k && r0 + j < rows ? load(x, kind, static_cast<long long>(r0 + j) * k + i) : 0.0f;
+            for (int j = 0; j < R; ++j) xv[j][u] = load(xr[j], kind, i0 + 256 * u);
         }
 #pragma unroll
         for (int u = 0; u < U; ++u)
-            if (i0 + 256 * u < k)
 #pragma unroll
-                for (int j = 0; j < R; ++j) acc[j] += xv[j][u] * wv[u];
+            for (int j = 0; j < R; ++j) acc[j] += xv[j][u] * wv[u];
+    }
+    for (; i0 < k; i0 += 256) {
+        const float wv = load(wr, w_kind, i0);
+#pragma unroll
+        for (int j = 0; j < R; ++j) acc[j] += load(xr[j], kind, i0) * wv;
     }
 #pragma unroll
     for (int j = 0; j < R; ++j) {
@@ -106,6 +117,21 @@ extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, i
         for (int q = 1; q < 8; ++q) sum += part[j][q];
         store(out, kind, static_cast<long long>(r0 + j) * n + col, sum);
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {
+#define TF_DENSE_W(XK)                                                    \
+    if (w_kind == 0) dense_rows_body<XK, 0>(x, w, out, rows, n, k);       \
+    else if (w_kind == 1) dense_rows_body<XK, 1>(x, w, out, rows, n, k);  \
+    else dense_rows_body<XK, 2>(x, w, out, rows, n, k);
+    if (kind == 0) {
+        TF_DENSE_W(0)
+    } else if (kind == 1) {
+        TF_DENSE_W(1)
+    } else {
+        TF_DENSE_W(2)
+    }
+#undef TF_DENSE_W
 }
 
 }  // namespace
