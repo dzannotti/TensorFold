@@ -44,7 +44,25 @@ pub const Drafted = struct {
     }
 
     pub fn backend(x: *Drafted) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = heldTokens, .release = release } };
+        const V = be.Backend.VTable;
+        const plain: V = .{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = heldTokens, .release = release };
+        // the target's logprob rows pass through: the drafter changes no row the target verifies
+        const rows = comptime blk: {
+            var v = plain;
+            v.first_row = firstRow;
+            break :blk v;
+        };
+        const prompt = comptime blk: {
+            var v = rows;
+            v.prompt_rows = true;
+            break :blk v;
+        };
+        const t = x.target.vtable;
+        return .{ .ptr = x, .vtable = if (t.first_row == null) &plain else if (t.prompt_rows) &prompt else &rows };
+    }
+
+    fn firstRow(ptr: *anyopaque, s: *Stream) anyerror!@import("logprob.zig").Row {
+        return self(ptr).target.firstRow(s);
     }
 
     /// A stream's held drafts as host tokens, for a grammar to walk before the verify (fillers: the pending token).
