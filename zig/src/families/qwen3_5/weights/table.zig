@@ -13,6 +13,9 @@ pub const Error = error{ MissingTensor, NoSafetensors } || config.Error || std.m
 
 const Where = struct { file: usize, stored: []const u8 };
 
+/// The text tower's Hugging Face prefixes (ExLlamaV3 packs keep them) and the MLX names the loader reads.
+const hf_names = [_][2][]const u8{ .{ "model.language_model.", "language_model.model." }, .{ "lm_head.", "language_model.lm_head." } };
+
 pub const Table = struct {
     gpa: std.mem.Allocator,
     files: []Shard,
@@ -20,6 +23,8 @@ pub const Table = struct {
     /// A key prefix the table drops (`language_model.`), as `_Shards(strip=)`.
     strip: []const u8,
     quant: formats.Config,
+    /// Hugging Face names (`model.language_model.`, `lm_head.`) under the MLX ones; holds the renamed keys.
+    renamed: ?std.heap.ArenaAllocator = null,
 
     /// Maps `paths` (later files win a repeated name, as the Python dict does).
     pub fn open(gpa: std.mem.Allocator, io: Io, paths: []const []const u8, strip: []const u8, quant: formats.Config) !Table {
@@ -35,14 +40,21 @@ pub const Table = struct {
         }
         var t: Table = .{ .gpa = gpa, .files = files, .strip = strip, .quant = quant };
         errdefer t.where.deinit(gpa);
+        errdefer if (t.renamed) |*r| r.deinit();
         for (files, 0..) |*f, i| for (f.names.keys()) |key| {
-            const short = if (strip.len > 0 and std.mem.startsWith(u8, key, strip)) key[strip.len..] else key;
+            var short = if (strip.len > 0 and std.mem.startsWith(u8, key, strip)) key[strip.len..] else key;
+            for (hf_names) |pair| if (std.mem.startsWith(u8, short, pair[0])) {
+                if (t.renamed == null) t.renamed = .init(gpa);
+                short = try std.mem.concat(t.renamed.?.allocator(), u8, &.{ pair[1], short[pair[0].len..] });
+                break;
+            };
             try t.where.put(gpa, short, .{ .file = i, .stored = key });
         };
         return t;
     }
 
     pub fn close(t: *Table, io: Io) void {
+        if (t.renamed) |*r| r.deinit();
         for (t.files) |*f| f.close(io);
         t.gpa.free(t.files);
         t.where.deinit(t.gpa);
@@ -82,7 +94,7 @@ pub const Table = struct {
     pub fn width(t: *const Table, key: []const u8) config.Error!formats.mlx.Width {
         const q = switch (t.quant) {
             .mlx => |m| m,
-            .dense => return error.UnsupportedQuantization,
+            .dense, .exl3 => return error.UnsupportedQuantization,
         };
         if (q.overrides.get(key)) |w| return w orelse error.UnsupportedQuantization;
         if (t.strip.len > 0) {

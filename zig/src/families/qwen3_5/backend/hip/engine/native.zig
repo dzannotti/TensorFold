@@ -132,8 +132,14 @@ fn prepare(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip.De
         return refuse(a, problem, "--parallel {d} needs {d:.2} GiB at a {d}-token window, and the HIP memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.streams, gibs(asked), window, gibs(room), streams });
     }
     const need = served(e, streams, capacity) catch |err| return refuse(a, problem, "the native HIP engine cannot count its scratch ({s})", .{@errorName(err)});
+    // a drafter loads after the plan: its weights, head and each stream's rings stay out of the prompt cache
+    const drafter: usize = if (o.drafter) |ddir| blk: {
+        const m = e.model();
+        const b = draft_mod.Draft.deviceBytes(gpa, io, ddir, .{ .hidden = m.spec.hidden, .vocab = m.head.n, .layers = m.spec.n_layers }, o.drafter_bits) catch break :blk 0;
+        break :blk b.fixed + b.stream * streams;
+    } else 0;
     // the prompt cache: --prompt-cache-gib, else what the streams leave
-    const left = room - need;
+    const left = room -| (need + drafter);
     const policy = dev.policy;
     const keep: usize = policy.slots;
     var budget: usize = if (o.cache_gib) |g| @intFromFloat(g * (1 << 30)) else left;
@@ -198,7 +204,6 @@ fn openEngine(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, dev: hip
     // a lone rank times its forwards for the depth rule; the ranks of a group draft without costs
     var backend = own.backend.backend();
     if (o.drafter) |ddir| {
-        // ponytail: the drafter's buffers come after the memory plan, which does not count them yet
         const d = draft_mod.Draft.init(gpa, io, p.e, ddir, o.drafter_bits, p.streams) catch |err| return refuse(a, problem, "the drafter {s} does not load ({s})", .{ ddir, @errorName(err) });
         own.draft = d;
         const x = try gpa.create(lanes.drafted.Drafted);

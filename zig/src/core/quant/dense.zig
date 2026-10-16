@@ -1,4 +1,5 @@
-//! Weights kept in float: fp32 [N, K], the unquantized projections a conversion leaves (an MTP head's fc).
+//! Weights kept in float [N, K], fp32, bf16 or fp16 as stored: the unquantized projections a conversion leaves (an MTP
+//! head's fc, an EXL3 pack's embedding).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -26,14 +27,18 @@ pub const Host = struct { weight: Tensor };
 /// Whether `key` holds a float matrix with no table of scales beside it.
 pub fn matches(t: anytype, key: []const u8) bool {
     var buf: [256]u8 = undefined;
-    const w = t.get(join(&buf, &.{ key, ".weight" })) catch return false;
+    const name = join(&buf, &.{ key, ".weight" });
+    if (!t.has(name)) return false;
+    const w = t.get(name) catch return false;
     return convert.isFloat(w.dtype) and w.rank == 2 and !t.has(join(&buf, &.{ key, ".scales" }));
 }
 
-/// The float weight widened to fp32.
+/// The float weight as stored when the kernels read its type, else widened to fp32.
 pub fn read(a: Allocator, t: anytype, key: []const u8) !Host {
     var buf: [256]u8 = undefined;
-    return .{ .weight = try convert.float32(a, try t.get(join(&buf, &.{ key, ".weight" }))) };
+    const w = try t.get(join(&buf, &.{ key, ".weight" }));
+    if (w.dtype == .f32 or w.dtype == .bf16 or w.dtype == .f16) return .{ .weight = w };
+    return .{ .weight = try convert.float32(a, w) };
 }
 
 pub fn rows(h: Host) usize {
@@ -72,14 +77,20 @@ pub fn upload(u: types.Uploader, h: Host) !Device {
     return .{ .weight = try u.tensor(h.weight) };
 }
 
-/// What the kernels read: the fp32 weight's address.
-pub const Matrix = struct { weight: u64 };
+/// What the kernels read: the weight's address and type.
+pub const Matrix = struct { weight: u64, kind: types.Tables };
 
 pub const View = struct { n: u32, k: u32, matrix: Matrix };
 
 pub fn view(d: Device, stacked: bool) error{UnsupportedTables}!View {
     const lead: usize = @intFromBool(stacked);
-    return .{ .n = @intCast(d.weight.dim(lead)), .k = @intCast(d.weight.dim(lead + 1)), .matrix = .{ .weight = d.weight.ptr } };
+    const kind: types.Tables = switch (d.weight.dtype) {
+        .f32 => .f32,
+        .bf16 => .bf16,
+        .f16 => .f16,
+        else => return error.UnsupportedTables,
+    };
+    return .{ .n = @intCast(d.weight.dim(lead)), .k = @intCast(d.weight.dim(lead + 1)), .matrix = .{ .weight = d.weight.ptr, .kind = kind } };
 }
 
 pub fn elements(h: Host) usize {
@@ -89,7 +100,7 @@ pub fn elements(h: Host) usize {
 /// The weight as fp64, row by row.
 pub fn reference(h: Host, out: []f64) error{UnexpectedTensor}!void {
     if (out.len != h.weight.numel()) return error.UnexpectedTensor;
-    for (out, 0..) |*o, i| o.* = convert.load(.f32, h.weight.bytes, i);
+    for (out, 0..) |*o, i| o.* = convert.load(h.weight.dtype, h.weight.bytes, i);
 }
 
 test "a float weight halves along K and cuts its rows" {

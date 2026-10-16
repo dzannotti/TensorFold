@@ -24,16 +24,30 @@ pub fn float(a: std.mem.Allocator, t: *const Table, key: []const u8) Error!Tenso
     return convert.float32(a, src);
 }
 
-/// `_conv`: a depthwise conv weight as fp32 (channels, kernel); a trailing 1 is squeezed.
-pub fn conv(a: std.mem.Allocator, t: *const Table, key: []const u8) Error!Tensor {
+/// `_conv`: a depthwise conv weight as fp32 (channels, kernel); a trailing 1 is squeezed, and with `hf` the
+/// Hugging Face (channels, 1, kernel) layout's middle 1 (the same bytes).
+pub fn conv(a: std.mem.Allocator, t: *const Table, key: []const u8, hf: bool) Error!Tensor {
     var w = try float(a, t, key);
     if (w.rank == 3 and w.shape[2] == 1) {
         w.rank = 2;
     } else if (w.rank == 3 and w.shape[1] == 1) {
-        return refuse(key, "still in the unsanitized (channels, 1, kernel) layout");
+        if (!hf) return refuse(key, "still in the unsanitized (channels, 1, kernel) layout");
+        w.shape[1] = w.shape[2];
+        w.rank = 2;
     }
     if (w.rank != 2) return refuse(key, "conv weight must be (channels, kernel)");
     return w;
+}
+
+/// `_float` of a zero-centered RMSNorm weight (Hugging Face's `1 + w`) when `centered`, the 1 added.
+pub fn norm(a: std.mem.Allocator, t: *const Table, key: []const u8, centered: bool) Error!Tensor {
+    const w = try float(a, t, key);
+    if (!centered) return w;
+    const out = try a.alloc(f32, w.numel());
+    for (out, std.mem.bytesAsSlice(f32, w.bytes)) |*o, v| o.* = v + 1;
+    var r = w;
+    r.bytes = std.mem.sliceAsBytes(out);
+    return r;
 }
 
 /// `_packed`: a projection in whichever format its tensors are in.
