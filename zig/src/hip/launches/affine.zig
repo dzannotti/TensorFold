@@ -583,7 +583,7 @@ pub const Kernels = struct {
     pub fn densePromptGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!bool {
         const fits = @as(u64, @intCast(a.m)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31 and @as(u64, @intCast(a.n)) * @as(u64, @intCast(a.k)) * 2 < 1 << 31;
         if (!k.matrix or k.mode == .off or !fits or @mod(a.k, 32) != 0 or a.x % 16 != 0 or a.words % 16 != 0 or a.fp16 != 0) return false;
-        const tall = a.k >= 3 * a.n;
+        const tall = true; // 256 x 128 measured faster on every ciru shape (8192 x 2048: 25 vs 17 TFLOPS; the head 42 vs 26)
         const bm: c_int = if (tall) 256 else 128;
         var args: hl.Args = .{};
         try args.add(a);

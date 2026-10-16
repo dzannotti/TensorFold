@@ -134,7 +134,7 @@ __device__ __forceinline__ float dense_dot8(uint4 x, uint4 w, float acc) {
 
 template <int R>
 __device__ __forceinline__ void dense_wave_body(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
-    constexpr int U = 4;
+    constexpr int U = R >= 8 ? 1 : 4;  // strides in flight: many rows bring their own loads
     const int lane = threadIdx.x & 31;
     const int col = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (col >= n) return;
@@ -176,6 +176,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_dense_wave1(const uint16_t*
 
 extern "C" __global__ void __launch_bounds__(256) tf_dense_wave4(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
     dense_wave_body<4>(x, w, out, rows, n, k);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_dense_wave16(const uint16_t* x, const uint16_t* w, uint16_t* out, int rows, int n, int k) {
+    dense_wave_body<16>(x, w, out, rows, n, k);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, int kind, const void* w, int w_kind, void* out, int rows, int n, int k) {

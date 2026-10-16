@@ -92,8 +92,10 @@ pub fn denseWave(l: *const Launcher, x: u64, w: u64, out: u64, rows: usize, n: u
     try a.add(@as(c_int, @intCast(rows)));
     try a.add(@as(c_int, @intCast(n)));
     try a.add(@as(c_int, @intCast(k)));
-    const four = rows > 1;
-    try l.go(l.op.dense_wave[@intFromBool(four)], dim(@divFloor(n + 7, 8), if (four) @divFloor(rows + 3, 4) else 1, 1), dim(256, 1, 1), 0, s, &a);
+    // every variant adds a row's products in the same order: the rows a pass never move a bit
+    const which: usize = if (rows == 1) 0 else if (rows <= 4) 1 else 2;
+    const per: usize = ([_]usize{ 1, 4, 16 })[which];
+    try l.go(l.op.dense_wave[which], dim(@divFloor(n + 7, 8), @divFloor(rows + per - 1, per), 1), dim(256, 1, 1), 0, s, &a);
 }
 
 pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int, out: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {

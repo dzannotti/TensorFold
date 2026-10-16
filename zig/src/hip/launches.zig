@@ -138,7 +138,7 @@ pub const Launcher = struct {
         conv_prefill: Function,
         gdn_gate_prefill: Function,
         dense_rows: Function,
-        dense_wave: [2]Function, // 1 and 4 rows a pass
+        dense_wave: [3]Function, // 1, 4 and 16 rows a pass
         moe_route: Function,
         router_rows: [2]Function, // fp16, bf16
         router_tile: [2]Function,
@@ -210,7 +210,7 @@ pub const Launcher = struct {
             .conv_prefill = try ops.function("tf_conv_prefill"),
             .gdn_gate_prefill = try ops.function("tf_gdn_gate_prefill"),
             .dense_rows = try ops.function("tf_dense_rows"),
-            .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4") },
+            .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4"), try ops.function("tf_dense_wave16") },
             .moe_route = try ops.function("tf_moe_route"),
             .router_rows = .{ try ops.function("tf_router_rows_f16"), try ops.function("tf_router_rows_bf16") },
             .router_tile = .{ try ops.function("tf_router_tile_f16"), try ops.function("tf_router_tile_bf16") },
