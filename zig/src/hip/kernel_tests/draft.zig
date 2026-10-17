@@ -661,7 +661,7 @@ test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1; TF
                         const b: dft.Mat = .{ .words = at(words) + c2 * wbytes, .scale = at(tables) + c2 * 2 * tbytes, .bias = at(tables) + c2 * 2 * tbytes + tbytes, .out = at(out), .n = @intCast(sh.n), .ld = @intCast(ld) };
                         try t.on.dftMlx(if (vt.pair) .pair else .plain, at(x), m, sh.k, 0, a, b, .{}, t.stream.handle);
                     } else {
-                        const arg: affine.Arg = .{ .x = at(x), .words = w, .scale = .{ .p = sc, .kind = 1 }, .bias = .{ .p = sc + tbytes, .kind = 1 }, .out = 0, .out16 = at(out), .m = m, .n = @intCast(sh.n), .k = @intCast(sh.k), .bits = 4, .group = 64, .fp16 = 0 };
+                        const arg: affine.Arg = .{ .x = at(x), .words = w, .scale = .{ .p = sc, .kind = 1 }, .bias = .{ .p = sc + tbytes, .kind = 1 }, .out = 0, .out16 = at(out), .m = @intCast(m), .n = @intCast(sh.n), .k = @intCast(sh.k), .bits = 4, .group = 64, .fp16 = 0 };
                         try t.on.affine.verifyGo(&t.r, arg, .{}, @intCast(sh.n), t.stream.handle);
                     }
                 }
