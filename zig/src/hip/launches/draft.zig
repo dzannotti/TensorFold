@@ -29,6 +29,10 @@ pub const Fns = struct {
     norm_rope_qk_256: Function,
     attn_256: Function,
     attn_merge_256: Function,
+    /// DSpark's whole-vocabulary Markov chain: a step over bf16 or affine-4 markov_w2, the tokens taken.
+    markov_step: Function,
+    markov_step_q4: Function,
+    markov_take: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -48,6 +52,9 @@ pub const Fns = struct {
             .norm_rope_qk_256 = try m.function("tf_dft_norm_rope_qk_256"),
             .attn_256 = try m.function("tf_dft_attn_256"),
             .attn_merge_256 = try m.function("tf_dft_attn_merge_256"),
+            .markov_step = try m.function("tf_dft_markov_step"),
+            .markov_step_q4 = try m.function("tf_dft_markov_step_q4"),
+            .markov_take = try m.function("tf_dft_markov_take"),
         };
     }
 };
@@ -287,4 +294,39 @@ pub fn mlx(l: *const Launcher, kind: Kind, x: u64, m: usize, k: usize, ldx: usiz
     try p.add(extern struct { x: u64, m: c_int, k: c_int, a: Mat, b: Mat, dyn: u64, base: u64, res: u64, group: c_int, block: c_int, ldx: c_int }{ .x = x, .m = @intCast(m), .k = @intCast(k), .a = a, .b = b, .dyn = cv.dyn, .base = cv.base, .res = cv.res, .group = @intCast(cv.group), .block = @intCast(cv.block), .ldx = @intCast(ldx) });
     const tiles = (@as(usize, @intCast(a.n)) + 15) / 16 + if (kind == .pair) (@as(usize, @intCast(b.n)) + 15) / 16 else 0;
     try l.go(l.dft.mlx[@intFromEnum(kind)], dim(tiles, 1, 1), dim(128, 1, 1), 0, s, &p);
+}
+
+/// DSpark's Markov weights on the device: markov_w1 bf16 (vocab, 256); markov_w2 bf16 (vocab, 256), or affine-4 group 64
+/// (`scales` non-zero): MLX words (vocab, 32), bf16 scales and biases (vocab, 4).
+pub const Markov = struct { w1: u64, w2: u64, scales: u64 = 0, biases: u64 = 0, vocab: usize };
+
+/// Step `step` of `streams` chains (draft.hip tf_dft_markov_step): keys[s * block + step] = the best of
+/// logits[s * block + step] + w2 . w1[prev] over the vocabulary, prev ids[s * block] (step 0) or the step before's.
+pub fn markovStep(l: *const Launcher, logits: u64, ldl: usize, m: Markov, ids: u64, keys: u64, streams: usize, block: usize, step: usize, s: S) Error!void {
+    if (streams == 0 or step >= block or m.vocab == 0) return invalid("dft markov step");
+    var a: Args = .{};
+    try a.add(logits);
+    try a.add(@as(c_int, @intCast(ldl)));
+    try a.add(m.w1);
+    try a.add(m.w2);
+    if (m.scales != 0) {
+        try a.add(m.scales);
+        try a.add(m.biases);
+    }
+    try a.add(ids);
+    try a.add(keys);
+    try a.add(@as(c_int, @intCast(m.vocab)));
+    try a.add(@as(c_int, @intCast(block)));
+    try a.add(@as(c_int, @intCast(step)));
+    try l.go(if (m.scales != 0) l.dft.markov_step_q4 else l.dft.markov_step, dim((m.vocab + 1023) / 1024, streams, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// The `n` chain tokens out of their keys into `out` (i32), the keys zeroed.
+pub fn markovTake(l: *const Launcher, keys: u64, out: u64, n: usize, s: S) Error!void {
+    if (n == 0) return;
+    var a: Args = .{};
+    try a.add(keys);
+    try a.add(out);
+    try a.add(@as(c_int, @intCast(n)));
+    try l.go(l.dft.markov_take, dim((n + 255) / 256, 1, 1), dim(256, 1, 1), 0, s, &a);
 }

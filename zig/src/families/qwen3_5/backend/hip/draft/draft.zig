@@ -61,7 +61,7 @@ const Ctx = struct {
 const Layout = struct { desc: usize, ids: usize, rows: usize, top_ids: usize, top_vals: usize, hp: usize, total: usize };
 
 /// The hold's launches by streams held at once and rows a block.
-const Key = struct { streams: u32, block: u32 };
+const Key = struct { streams: u32, block: u32, steps: u32 = 0 };
 
 /// Events between an eager hold's launches, by label.
 const Prof = struct {
@@ -104,6 +104,8 @@ pub const Draft = struct {
     /// Rows a block holds this hold: the config's, or with DSpark the most drafts an item asks for (vLLM's and
     /// llama.cpp's block is the drafts asked for: num_speculative_tokens, n_max).
     blk: usize = 0,
+    /// The Markov chain's steps this hold: the most drafts an item asks for (rows past them are never read).
+    steps: usize = 0,
     held_rows: usize = 0,
     hp_dev: u64 = 0,
     graphs: graph_cache.Cache(Key, u64),
@@ -121,6 +123,10 @@ pub const Draft = struct {
     /// TF_DRAFT_DUMP=file: every absorbed row's taps and every lone hold's inputs and results appended (a reference's
     /// inputs, tools/strix/dspark_ref.py), from the first request on.
     dump: ?*std.c.FILE = null,
+    /// DSpark's Markov weights on the device and its chains' keys (c.full_vocab: the bias over the whole vocabulary).
+    markov: ?dft.Markov = null,
+    markov_buf: ?hip.DeviceBuffer = null,
+    keys: ?hip.DeviceBuffer = null,
 
     /// The drafter in `dir` over the target engine `e`, `bits` 4 (affine-4) or 0 (bf16), for up to `cap` streams a hold.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, bits: u8, cap: usize) !*Draft {
@@ -141,6 +147,9 @@ pub const Draft = struct {
         errdefer d.w.deinit(gpa);
         try d.draftHead();
         errdefer if (d.head_buf) |*b| b.free();
+        if (c.full_vocab) try d.markovWeights(bits);
+        errdefer if (d.markov_buf) |*b| b.free();
+        errdefer if (d.keys) |*b| b.free();
         const at = d.layout();
         d.stage = try hip.HostBuffer.alloc(&e.driver, at.total);
         errdefer d.stage.free();
@@ -195,11 +204,13 @@ pub const Draft = struct {
         const at = d.layout();
         const slot = ctx.slot orelse return;
         const n = ctx.held_n orelse return;
-        d.put(std.mem.asBytes(&[4]u32{ 2, @intCast(B), @intCast(c.topk), @intCast(n) }));
+        // the whole-vocabulary chain keeps no top-k: k 0
+        const k: usize = if (d.markov != null) 0 else c.topk;
+        d.put(std.mem.asBytes(&[4]u32{ 2, @intCast(B), @intCast(k), @intCast(n) }));
         d.put(std.mem.asBytes(&[2]i64{ @intCast(ctx.end), @intCast(ctx.begin) }));
         d.put(d.stage.bytes[at.ids + slot * B * 4 ..][0 .. B * 4]);
-        d.put(d.stage.bytes[at.top_ids + slot * B * c.topk * 4 ..][0 .. B * c.topk * 4]);
-        d.put(d.stage.bytes[at.top_vals + slot * B * c.topk * 2 ..][0 .. B * c.topk * 2]);
+        d.put(d.stage.bytes[at.top_ids + slot * B * k * 4 ..][0 .. B * k * 4]);
+        d.put(d.stage.bytes[at.top_vals + slot * B * k * 2 ..][0 .. B * k * 2]);
         d.put(std.mem.sliceAsBytes(ctx.held[0..n]));
         _ = fflush(d.dump.?);
     }
@@ -220,6 +231,8 @@ pub const Draft = struct {
         d.stage.free();
         d.arena.deinit();
         if (d.head_buf) |*b| b.free();
+        if (d.markov_buf) |*b| b.free();
+        if (d.keys) |*b| b.free();
         d.w.deinit(d.gpa);
         if (d.dump) |f| _ = std.c.fclose(f);
         d.ev.deinit();
@@ -231,12 +244,46 @@ pub const Draft = struct {
     pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, target: config.Target, bits: u8) !struct { fixed: usize, stream: usize } {
         const c = try Config.read(gpa, io, dir, target);
         const head: usize = if (target.vocab == stock_vocab) width() * target.hidden * 5 / 8 else 0; // 4-bit rows, g64 tables
-        return .{ .fixed = try weights.deviceBytes(gpa, io, dir, c, bits) + head + (256 << 20), .stream = c.ringBytes() };
+        const markov: usize = if (c.full_vocab) c.vocab * (512 + if (bits == 0) @as(usize, 512) else 144) else 0;
+        return .{ .fixed = try weights.deviceBytes(gpa, io, dir, c, bits) + head + markov + (256 << 20), .stream = c.ringBytes() };
     }
 
     /// Drafts the current hold's blocks yield.
     fn drafts(d: *const Draft) usize {
         return if (d.c.dspark) d.blk else d.c.drafts();
+    }
+
+    /// markov_w1 bf16 and markov_w2 bf16 or affine-4 (as the drafter's other weights) on the device, and the chains' keys.
+    fn markovWeights(d: *Draft, bits: u8) !void {
+        const c = d.c;
+        const V = c.vocab;
+        const q4 = bits != 0;
+        const w1_bytes = V * c.rank * 2;
+        const w2_bytes = if (q4) V * c.rank / 2 else V * c.rank * 2;
+        const s_at = std.mem.alignForward(usize, w1_bytes + w2_bytes, 256);
+        const b_at = s_at + V * 4 * 2;
+        var buf = try hip.DeviceBuffer.alloc(&d.e.driver, if (q4) b_at + V * 4 * 2 else s_at);
+        errdefer buf.free();
+        try buf.upload(0, std.mem.sliceAsBytes(d.w.predecessor));
+        if (q4) {
+            const gpa = d.gpa;
+            const words = try gpa.alloc(u32, V * c.rank / 8);
+            defer gpa.free(words);
+            const scales = try gpa.alloc(u16, V * c.rank / 64);
+            defer gpa.free(scales);
+            const biases = try gpa.alloc(u16, V * c.rank / 64);
+            defer gpa.free(biases);
+            weights.quantize(d.w.successor, V, c.rank, words, scales, biases);
+            try buf.upload(w1_bytes, std.mem.sliceAsBytes(words));
+            try buf.upload(s_at, std.mem.sliceAsBytes(scales));
+            try buf.upload(b_at, std.mem.sliceAsBytes(biases));
+        } else try buf.upload(w1_bytes, std.mem.sliceAsBytes(d.w.successor));
+        var keys = try hip.DeviceBuffer.alloc(&d.e.driver, d.cap * c.block * 8);
+        errdefer keys.free();
+        try keys.fill8(0);
+        d.markov = .{ .w1 = buf.base(), .w2 = buf.base() + w1_bytes, .scales = if (q4) buf.base() + s_at else 0, .biases = if (q4) buf.base() + b_at else 0, .vocab = V };
+        d.markov_buf = buf;
+        d.keys = keys;
     }
 
     fn headRows(d: *const Draft) usize {
@@ -262,7 +309,8 @@ pub const Draft = struct {
         }
         // a bf16 head (MiniCPM's 248144 rows) quantized whole on the MLX layout, which takes 16-column tiles
         if (full.partial or full.n % (if (dense and weights.mlx_layout) @as(u32, 16) else 32) != 0) return error.UnsupportedDraftHead;
-        d.restricted = full.n == stock_vocab;
+        // DSpark drafts over its whole head (vLLM qwen3_dspark.py lm_head: draft_vocab_size rows)
+        d.restricted = full.n == stock_vocab and !d.c.dspark;
         const all = [_][2]u32{.{ 0, full.n }};
         const parts: []const [2]u32 = if (d.restricted) &spans else &all;
         const k: usize = full.k;
@@ -647,6 +695,13 @@ pub const Draft = struct {
         const logits = head_sel[0];
         try d.tick(o, "head+sel");
         const head_n = d.headRows();
+        if (d.markov) |mk| {
+            // the chain over the whole vocabulary, a step a row, its tokens where the top-k ids go
+            for (0..@max(d.steps, 1)) |i| try o.l.dftMarkovStep(logits.ptr, head_n, mk, base + at.ids, d.keys.?.base(), streams, B, i, o.stream);
+            try o.l.dftMarkovTake(d.keys.?.base(), base + at.top_ids, M, o.stream);
+            try d.tick(o, "markov");
+            return 0;
+        }
         if (head_n % topk_chunks == 0 and topk_chunks * c.topk <= 1024) {
             // each row as topk_chunks rows, their top-k merged: the same set as the whole row's
             const chunk = head_n / topk_chunks;
@@ -671,7 +726,7 @@ pub const Draft = struct {
         const o = d.ops(false);
         const stream = d.stream;
         d.graphs.rounds += 1;
-        const entry = if (d.use_graphs) try d.graphs.find(.{ .streams = @intCast(streams), .block = @intCast(d.blk) }) else null;
+        const entry = if (d.use_graphs) try d.graphs.find(.{ .streams = @intCast(streams), .block = @intCast(d.blk), .steps = @intCast(if (d.markov != null) d.steps else 0) }) else null;
         if (entry) |e| switch (e.state) {
             .ready => {
                 try e.exec.?.launchOn(stream);
@@ -703,6 +758,8 @@ pub const Draft = struct {
             // later rows sharpen the earlier ones': a lone stream drafts over all 15)
             d.blk = @min(c.block, @max(1, 16 / items.len));
             for (items) |it| d.blk = @max(d.blk, @min(it.depth, c.block));
+            d.steps = 0;
+            for (items) |it| d.steps = @max(d.steps, @min(it.depth, d.blk));
         }
         const B = d.blk;
         const at = d.layout();
@@ -737,8 +794,12 @@ pub const Draft = struct {
         d.hold_busy = true;
         const hp = try d.launchHold(items.len);
         const rows = items.len * B;
-        try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * c.topk * 4], d.stream.handle);
-        try hip.raw.download(d.dev, at.top_vals, d.stage.bytes[at.top_vals..][0 .. rows * c.topk * 2], d.stream.handle);
+        if (d.markov != null) {
+            try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * 4], d.stream.handle);
+        } else {
+            try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * c.topk * 4], d.stream.handle);
+            try hip.raw.download(d.dev, at.top_vals, d.stage.bytes[at.top_vals..][0 .. rows * c.topk * 2], d.stream.handle);
+        }
         if (d.w.selector != null) try hipDownload(d, hp, d.stage.bytes[at.hp..][0 .. rows * c.rank * 2]);
         d.synced = false;
         d.held_rows = rows;
@@ -795,6 +856,12 @@ pub const Draft = struct {
                 ctx.held[i] = d.choice(first + ctx.depths[i], pred, ctx.ranks[i]);
             }
             ctx.held_n = n;
+            return;
+        }
+        if (d.markov != null) {
+            const chain = std.mem.bytesAsSlice(i32, d.stage.bytes[d.layout().top_ids..][first * 4 ..][0 .. d.drafts() * 4]);
+            for (ctx.held[0..d.drafts()], chain) |*h, t| h.* = @intCast(t);
+            ctx.held_n = ctx.depth;
             return;
         }
         var pred = ctx.pending;

@@ -839,3 +839,124 @@ __device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
 extern "C" __global__ void __launch_bounds__(128) tf_dft_mlx(DftMlx p) { dft_mlx_tile<4, false, false>(p); }
 extern "C" __global__ void __launch_bounds__(128) tf_dft_mlx_pair(DftMlx p) { dft_mlx_tile<4, false, true>(p); }
 extern "C" __global__ void __launch_bounds__(128) tf_dft_mlx_conv(DftMlx p) { dft_mlx_tile<4, true, false>(p); }
+
+// ---- DSpark's sequential Markov head over the whole vocabulary ----
+// vLLM qwen3_dspark.py DSparkMarkovHead.bias + v1/worker/gpu/spec_decode/dspark/speculator.py _sample_sequential (no
+// dspark_draft_topk), llama.cpp src/models/dflash.cpp build_dspark_markov_head: row i's draft is
+// argmax_t L[s, i, t] + markov_w2[t] . markov_w1[prev], prev the block's anchor (i 0) or row i - 1's draft, the first
+// (lowest) id of equal scores (torch argmax, ggml_argmax). The bias in fp32 as ggml's mul_mat; L the head's bf16 logits.
+
+namespace {
+
+// A score and its token as one max-ordered key: the score's ordered bits, then ~token (equal scores: the lower id).
+__device__ __forceinline__ unsigned long long markov_key(float f, uint32_t t) {
+    const uint32_t u = __float_as_uint(f);
+    const uint32_t k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return (static_cast<unsigned long long>(k) << 32) | static_cast<uint32_t>(~t);
+}
+
+__device__ __forceinline__ unsigned long long shfl_max64(unsigned long long v, int m) {
+    const uint32_t lo = __shfl_xor(static_cast<uint32_t>(v), m, 32);
+    const uint32_t hi = __shfl_xor(static_cast<uint32_t>(v >> 32), m, 32);
+    const unsigned long long o = (static_cast<unsigned long long>(hi) << 32) | lo;
+    return o > v ? o : v;
+}
+
+// Rank 256: lane l of a wave takes elements 32 (l % 8) .. + 31 of token 4 i + l / 8 (four tokens a wave a pass).
+// W2 bf16 rows of 256 (Q4 false) or affine-4 group 64: words (V, 32) low nibble first, bf16 scales and biases (V, 4).
+template <bool Q4>
+__device__ __forceinline__ void markov_step(const uint16_t* L, int ldl, const uint16_t* W1, const void* W2, const uint16_t* W2s,
+                                            const uint16_t* W2b, const int* ids, unsigned long long* keys, int V, int block,
+                                            int step) {
+    const int s = blockIdx.y, lane = threadIdx.x & 31, wave = threadIdx.x >> 5, j = lane & 7, q = lane >> 3;
+    const int row = s * block + step;
+    const uint32_t prev = step == 0 ? static_cast<uint32_t>(ids[s * block]) : ~static_cast<uint32_t>(keys[row - 1]);
+    float e[32], esum = 0.f;
+    {
+        const uint4* p = reinterpret_cast<const uint4*>(W1 + static_cast<size_t>(prev) * 256 + 32 * j);
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const uint4 v = p[c];
+            const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int h = 0; h < 4; h++) {
+                e[8 * c + 2 * h] = bf(static_cast<uint16_t>(w[h] & 0xffffu));
+                e[8 * c + 2 * h + 1] = bf(static_cast<uint16_t>(w[h] >> 16));
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < 32; m++) esum += e[m];
+    }
+    const uint16_t* lrow = L + static_cast<size_t>(row) * ldl;
+    unsigned long long best = 0;
+    const int first = blockIdx.x * 1024 + wave * 128;
+    for (int it = 0; it < 32; it++) {
+        const int t = first + 4 * it + q;
+        float dot = 0.f;
+        if (t < V) {
+            if constexpr (Q4) {
+                const uint4 v = reinterpret_cast<const uint4*>(static_cast<const uint32_t*>(W2) + static_cast<size_t>(t) * 32)[j];
+                const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+                float acc = 0.f;
+#pragma unroll
+                for (int h = 0; h < 4; h++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++) acc = fmaf(static_cast<float>((w[h] >> (4 * i)) & 15u), e[8 * h + i], acc);
+                dot = fmaf(bf(W2s[static_cast<size_t>(t) * 4 + (j >> 1)]), acc, bf(W2b[static_cast<size_t>(t) * 4 + (j >> 1)]) * esum);
+            } else {
+                const uint4* p = reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(W2) + static_cast<size_t>(t) * 256 + 32 * j);
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const uint4 v = p[c];
+                    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                    for (int h = 0; h < 4; h++) {
+                        dot = fmaf(bf(static_cast<uint16_t>(w[h] & 0xffffu)), e[8 * c + 2 * h], dot);
+                        dot = fmaf(bf(static_cast<uint16_t>(w[h] >> 16)), e[8 * c + 2 * h + 1], dot);
+                    }
+                }
+            }
+        }
+        dot += __shfl_xor(dot, 1, 32);
+        dot += __shfl_xor(dot, 2, 32);
+        dot += __shfl_xor(dot, 4, 32);
+        if (t < V) {
+            const float score = bf(lrow[t]) + dot;
+            if (score == score) {
+                const unsigned long long k = markov_key(score, static_cast<uint32_t>(t));
+                best = k > best ? k : best;
+            }
+        }
+    }
+    best = shfl_max64(best, 8);
+    best = shfl_max64(best, 16);
+    __shared__ unsigned long long waves[8];
+    if (lane == 0) waves[wave] = best;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < 8; w++) best = waves[w] > best ? waves[w] : best;
+        atomicMax(keys + row, best);
+    }
+}
+
+}  // namespace
+
+// Step `step` of every stream's chain: keys[s * block + step] max-reduced (zero before; tf_dft_markov_take zeroes).
+// Grid (V / 1024 rounded up, streams), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) tf_dft_markov_step(const uint16_t* L, int ldl, const uint16_t* W1, const uint16_t* W2,
+                                                                     const int* ids, unsigned long long* keys, int V, int block, int step) {
+    markov_step<false>(L, ldl, W1, W2, nullptr, nullptr, ids, keys, V, block, step);
+}
+extern "C" __global__ void __launch_bounds__(256) tf_dft_markov_step_q4(const uint16_t* L, int ldl, const uint16_t* W1, const uint32_t* W2,
+                                                                        const uint16_t* W2s, const uint16_t* W2b, const int* ids,
+                                                                        unsigned long long* keys, int V, int block, int step) {
+    markov_step<true>(L, ldl, W1, W2, W2s, W2b, ids, keys, V, block, step);
+}
+
+// The chains' tokens out of their keys, the keys zeroed for the next hold. Grid (n / 256 rounded up), 256 threads.
+extern "C" __global__ void tf_dft_markov_take(unsigned long long* keys, int* out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = static_cast<int>(~static_cast<uint32_t>(keys[i]));
+    keys[i] = 0;
+}
