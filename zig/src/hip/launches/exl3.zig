@@ -32,16 +32,19 @@ pub const Arg = extern struct {
 /// quant/exl3.hip's kExl3Counters: (column block, row block) pairs a split launch may take.
 const arrivals = 65536;
 
-/// A launch's tile: 16-row tiles (1 and 2 for a round, 8 for a prompt's chunk) by the 128-column blocks a wave walks
+/// A launch's tile: 16-row tiles (1, 2 and 4 for a round, 8 for a prompt's chunk) by the 128-column blocks a wave walks
 /// (2 on the widest products, sharing x); every row's and column's sums are the same.
 const Tile = struct { rows: u32, cols: u32 };
-const tiles = [_]Tile{ .{ .rows = 1, .cols = 1 }, .{ .rows = 2, .cols = 1 }, .{ .rows = 8, .cols = 1 }, .{ .rows = 1, .cols = 2 }, .{ .rows = 2, .cols = 2 } };
+const tiles = [_]Tile{ .{ .rows = 1, .cols = 1 }, .{ .rows = 2, .cols = 1 }, .{ .rows = 8, .cols = 1 }, .{ .rows = 1, .cols = 2 }, .{ .rows = 2, .cols = 2 }, .{ .rows = 4, .cols = 1 } };
 
 /// The tile of an `m`-row product with `n` columns.
 fn tileOf(m: usize, n: u32) usize {
     const wide = n % 256 == 0 and n / 256 >= 320;
     if (m <= 16) return if (wide) 3 else 0;
     if (m <= 32) return if (wide) 4 else 1;
+    // past 32 rows, 64-row blocks (each weight decoded once for four WMMAs): at 64 rows gate 3b 360 us against 840 on
+    // the 128-row tile padded, and two of them beat it at 128 rows too
+    if (m <= 128) return 5;
     return 2;
 }
 
@@ -142,7 +145,7 @@ fn product(l: *const Launcher, f: Function, sp: u32, x: u64, up: u64, x_kind: c_
         try a.add(scratch);
         try a.add(@as(c_int, @intCast(k)));
         // a round's row tiles read x by k steps (quant/exl3.hip)
-        try a.add(@as(c_int, if (tile.rows <= 2) @intCast(m) else 0));
+        try a.add(@as(c_int, if (tile.rows <= 4) @intCast(m) else 0));
         try l.go(if (up != 0) l.exl3.rotate_silu else l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
     const rows = 16 * tile.rows;

@@ -359,7 +359,7 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) acc[n][mt] = odd[n][mt] = f32x8e{0, 0, 0, 0, 0, 0, 0, 0};
 
-    if constexpr (MT <= 2) {
+    if constexpr (MT <= 4) {
         constexpr int D = 4;  // tiles in flight a wave
         // buffers over the block's tiles and x: a load takes a lane's byte offset and the tile's uniform one
         const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(bx) * NT * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
@@ -383,9 +383,12 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
         }
         // the tiles' words D - 1 k steps ahead (DRAM), x XD - 1 ahead (L2: a round's 16 rows miss L0 often enough
         // that one step ahead leaves them waiting)
-        constexpr int XD = 3;
+        // four row tiles (64 rows) hold x one step ahead in a ring of two: their 4 WMMAs a step cover the wait
+        constexpr int XD = MT > 2 ? 2 : 3;
+        constexpr int XR = MT > 2 ? 2 : D;
+        static_assert(D % XR == 0, "x slots repeat every D steps");
         uint32_t ring[D][NT][2][LW];
-        u32x8e xa[D][MT];
+        u32x8e xa[XR][MT];
         // every load is unconditional on a clamped tile, so the wait counters never drain the ring
         auto fetch = [&](int i, uint32_t (&r)[NT][2][LW]) {
             const int t = i < tiles ? i : tiles - 1;
@@ -408,20 +411,20 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
 #pragma unroll
         for (int i = 0; i < D - 1; ++i) fetch(i, ring[i]);
 #pragma unroll
-        for (int i = 0; i < XD - 1; ++i) xfetch(i, xa[i]);
+        for (int i = 0; i < XD - 1; ++i) xfetch(i, xa[i % XR]);
         // the launch takes `tiles` a multiple of D
         for (int i0 = 0; i0 < tiles; i0 += D) {
 #pragma unroll
             for (int rb = 0; rb < D; ++rb) {
                 fetch(i0 + rb + D - 1, ring[(rb + D - 1) % D]);
-                xfetch(i0 + rb + XD - 1, xa[(rb + XD - 1) % D]);
+                xfetch(i0 + rb + XD - 1, xa[(rb + XD - 1) % XR]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
 #pragma unroll
                     for (int mt = 0; mt < MT; ++mt) {
                         f32x8e& sum = !ONE && (rb & 1) ? odd[n][mt] : acc[n][mt];
-                        sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb][mt]), b, sum);
+                        sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb % XR][mt]), b, sum);
                     }
                 }
             }
@@ -874,7 +877,8 @@ __global__ void __launch_bounds__(BM * BN / 128) exl3_prompt(Exl3 a) {
     template __global__ void exl3_chain<K2, 1, 2>(Exl3);                      \
     template __global__ void exl3_chain<K2, 2, 1>(Exl3);                      \
     template __global__ void exl3_chain<K2, 2, 2>(Exl3);                      \
-    template __global__ void exl3_chain<K2, 8, 1>(Exl3);
+    template __global__ void exl3_chain<K2, 8, 1>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 4, 1>(Exl3);
 TF_EXL3_PROMPT(4)
 TF_EXL3_PROMPT(6)
 TF_EXL3_PROMPT(8)
@@ -891,7 +895,8 @@ TF_EXL3_PROMPT(16)
     template __global__ void exl3_product<K2, CB, 1, 2>(Exl3);                \
     template __global__ void exl3_product<K2, CB, 2, 1>(Exl3);                \
     template __global__ void exl3_product<K2, CB, 2, 2>(Exl3);                \
-    template __global__ void exl3_product<K2, CB, 8, 1>(Exl3);
+    template __global__ void exl3_product<K2, CB, 8, 1>(Exl3);                \
+    template __global__ void exl3_product<K2, CB, 4, 1>(Exl3);
 #define TF_EXL3_CB(K2) TF_EXL3_MT(K2, 0) TF_EXL3_MT(K2, 1) TF_EXL3_MT(K2, 2)
 TF_EXL3_CB(4)
 TF_EXL3_CB(6)
