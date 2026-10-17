@@ -112,3 +112,19 @@ pub fn tf_dense_rows(l: *const Launcher, x: C, kind: c_int, w: C, w_kind: c_int,
     // ops/elementwise.hpp's kDenseRows rows a block
     try l.go(l.op.dense_rows, dim(n, @divFloor(rows + 3, 4), 1), dim(256, 1, 1), 0, s, &a);
 }
+
+/// Two `tf_dense_rows` of one x and shape (an EXL3 pack's in_proj_a and b) in one launch.
+pub fn tf_dense_rows_pair(l: *const Launcher, x: C, kind: c_int, w0: C, w1: C, w_kind: c_int, out0: P, out1: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(ad(x));
+    try a.add(kind);
+    try a.add(ad(w0));
+    try a.add(ad(w1));
+    try a.add(w_kind);
+    try a.add(ad(out0));
+    try a.add(ad(out1));
+    try a.add(rows);
+    try a.add(n);
+    try a.add(k);
+    try l.go(l.op.dense_rows_pair, dim(n, @divFloor(rows + 3, 4), 2), dim(256, 1, 1), 0, s, &a);
+}

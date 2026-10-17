@@ -377,6 +377,10 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
     }
 }
 
+// Value rows a wave of a round's chain scan or keep runs (the tile's RW: the same sums); the launch's 8 waves a block
+// over dv / 8 blocks serve a tree's rows, a chain taking the first dv / (8 kPlanRW) blocks.
+constexpr int kPlanRW = 2;
+
 // A round's windows in one launch, a grid plane a slot; rows, state and snapshots come from the plan, same scan.
 template <int DK>
 __device__ __forceinline__ void
@@ -396,10 +400,11 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
                                      y + row0 * value_heads * dv, length, key_heads, value_heads, dv, plan.anc + row0, 0);
         return;
     }
-    gated_delta_tile_body<DK, 8, 16>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
-                                     gate + row0 * value_heads, beta + row0 * value_heads, state,
-                                     y + row0 * value_heads * dv, length, key_heads, value_heads, dv, nullptr, 0,
-                                     !replayed);
+    if (static_cast<int>(blockIdx.x) * 8 * kPlanRW >= dv) return;
+    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(q + row0 * key_heads * DK, k + row0 * key_heads * DK,
+                                                        v + row0 * value_heads * dv, gate + row0 * value_heads,
+                                                        beta + row0 * value_heads, state, y + row0 * value_heads * dv,
+                                                        length, key_heads, value_heads, dv, nullptr, 0, !replayed);
 }
 
 // A keep: each slot's state run from the round's start through its kept rows, by the same scan on the inputs kept.
@@ -423,9 +428,10 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
                                      plan.count[slot], key_heads, value_heads, dv, nullptr, path);
         return;
     }
-    gated_delta_tile_body<DK, 8, 16>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
-                                     gate + row0 * value_heads, beta + row0 * value_heads, state, nullptr, n, key_heads,
-                                     value_heads, dv, nullptr, 0);
+    if (static_cast<int>(blockIdx.x) * 8 * kPlanRW >= dv) return;
+    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+                                                        gate + row0 * value_heads, beta + row0 * value_heads, state,
+                                                        nullptr, n, key_heads, value_heads, dv, nullptr, 0);
 }
 
 }  // namespace rocm

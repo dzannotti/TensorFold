@@ -197,4 +197,22 @@ extern "C" __global__ void __launch_bounds__(256) tf_dense_rows(const void* x, i
 #undef TF_DENSE_W
 }
 
+// Two tf_dense_rows of one x (an EXL3 pack's in_proj_a and b), a grid plane each: the same blocks, the same bits.
+extern "C" __global__ void __launch_bounds__(256) tf_dense_rows_pair(const void* x, int kind, const void* w0, const void* w1, int w_kind, void* out0, void* out1, int rows, int n, int k) {
+    const void* w = blockIdx.z == 0 ? w0 : w1;
+    void* out = blockIdx.z == 0 ? out0 : out1;
+#define TF_DENSE_W(XK)                                                    \
+    if (w_kind == 0) dense_rows_body<XK, 0>(x, w, out, rows, n, k);       \
+    else if (w_kind == 1) dense_rows_body<XK, 1>(x, w, out, rows, n, k);  \
+    else dense_rows_body<XK, 2>(x, w, out, rows, n, k);
+    if (kind == 0) {
+        TF_DENSE_W(0)
+    } else if (kind == 1) {
+        TF_DENSE_W(1)
+    } else {
+        TF_DENSE_W(2)
+    }
+#undef TF_DENSE_W
+}
+
 }  // namespace

@@ -52,6 +52,7 @@ fn built(halves: usize, codebook: usize) bool {
 
 pub const Fns = struct {
     rotate: Function,
+    rotate_silu: Function,
     /// ciru_q8's input rotation: 128-block Hadamards, no signs, in the activation's kind.
     had: Function,
     /// By half bits, codebook (3inst, mcg, mul1) and tile.
@@ -59,7 +60,7 @@ pub const Fns = struct {
 
     pub fn load(m: Module) Error!Fns {
         @setEvalBranchQuota(200_000);
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .rotate_silu = try m.function("tf_exl3_rotate_silu"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))) };
         inline for (0..17) |h| inline for (0..3) |cb| {
             if (comptime built(h, cb)) inline for (tiles, 0..) |t, i| {
                 f.product[h][cb][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12exl3_productILi{d}ELi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, cb, t.rows, t.cols }));
@@ -88,6 +89,16 @@ pub fn scratchBytes(m: usize, k: u32, n: u32) usize {
 /// y [m, n] (`out_kind`: 0 fp32, 1 bf16, 2 fp16) = x [m, k] (`x_kind` 1 bf16, 2 fp16) times the EXL3 matrix;
 /// `scratch` holds `scratchBytes(m, k, n)`.
 pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
+    return projectOf(l, x, 0, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+/// `project` of tf_silu_mul(gate, up) (both [m, k] of `x_kind`), the activation made by the rotation: the same bits.
+pub fn projectSilu(l: *const Launcher, gate: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
+    if (up == 0) return invalid("exl3 silu");
+    return projectOf(l, gate, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+fn projectOf(l: *const Launcher, x: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
     const cb: usize = @backingInt(w.codebook);
     const tile = tiles[tileOf(m, n)];
@@ -112,13 +123,14 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
     {
         var a: Args = .{};
         try a.add(x);
+        if (up != 0) try a.add(up);
         try a.add(x_kind);
         try a.add(w.suh);
         try a.add(scratch);
         try a.add(@as(c_int, @intCast(k)));
         // a round's row tiles read x by k steps (quant/exl3.hip)
         try a.add(@as(c_int, if (tile.rows <= 2) @intCast(m) else 0));
-        try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
+        try l.go(if (up != 0) l.exl3.rotate_silu else l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
     const rows = 16 * tile.rows;
     const blocks = (m + rows - 1) / rows;

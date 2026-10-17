@@ -108,6 +108,8 @@ pub const Hip = struct {
             std.log.warn("lane costs not timed: {s}", .{@errorName(err)});
             h.costs = .{};
         };
+        const c = h.costs.window[0..h.costs.windows];
+        if (c.len >= 16) std.log.info("verify ms by rows: 1 {d:.2}, 4 {d:.2}, 8 {d:.2}, 12 {d:.2}, 16 {d:.2}", .{ c[0].ms, c[3].ms, c[7].ms, c[11].ms, c[15].ms });
     }
 
     /// Keep up to `slots` snapshots and the pages the rest of `budget` bytes buys in the prefix tree (none: off).
