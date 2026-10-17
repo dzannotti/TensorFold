@@ -389,6 +389,7 @@ pub const Launcher = struct {
     pub const dftMlx = draft.mlx;
     pub const dftTopkMerge = draft.topkMerge;
     pub const exl3Project = exl3.project;
+    pub const exl3Prompt = exl3.prompt;
     pub const exl3Scratch = exl3.scratchBytes;
     pub const exl3Silu = exl3.projectSilu;
     pub const hadamard = exl3.hadamard;
