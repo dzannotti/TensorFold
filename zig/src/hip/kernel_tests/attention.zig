@@ -242,3 +242,90 @@ test "the paged prompt tile writes the flat tile's bits, within the cache type's
     try prompt(t, &rng, 24, 4, 256, 192, 64);
     try prompt(t, &rng, 16, 4, 128, 128, 128);
 }
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+// The split walk at a long context on Qwen3.6-35B-A3B's heads (TF_FLASH_BENCH=1; TF_FLASH_SPAN keys, default 65536):
+// a chain of 1, 2, 4 and 8 rows, microseconds a launch pair and the cache's GB/s, and a checksum of the output bits.
+test "flash decode timings at a long context (TF_FLASH_BENCH=1)" {
+    _ = std.c.getenv("TF_FLASH_BENCH") orelse return;
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0xF1A5 };
+    const span: usize = if (std.c.getenv("TF_FLASH_SPAN")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 65536;
+    const heads = 16;
+    const kv_heads = 2;
+    const d = 256;
+    const scale: f32 = 1 / @sqrt(@as(f32, d));
+    const c = try Cache.make(t, &rng, kv_heads, span, d);
+    defer c.free();
+    const pk = try c.pool(c.k, kv_heads, span, d);
+    defer gpa.free(pk);
+    const pv = try c.pool(c.v, kv_heads, span, d);
+    defer gpa.free(pv);
+    var pool_k = try t.upload(pk);
+    defer pool_k.free();
+    var pool_v = try t.upload(pv);
+    defer pool_v.free();
+    const words = 4;
+    const desc = try gpa.alloc(u64, words + (c.table.len + 1) / 2);
+    defer gpa.free(desc);
+    @memset(desc, 0);
+    desc[2] = at(pool_k);
+    desc[3] = at(pool_v);
+    @memcpy(std.mem.sliceAsBytes(desc[words..])[0 .. c.table.len * 4], std.mem.sliceAsBytes(c.table));
+    var dev_desc = try t.upload(desc);
+    defer dev_desc.free();
+    const desc_ptr = [_]u64{at(dev_desc)};
+    var descs = try t.upload(&desc_ptr);
+    defer descs.free();
+    for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+        const hq = try gpa.alloc(f32, rows * heads * d);
+        defer gpa.free(hq);
+        for (hq) |*x| x.* = rng.unit();
+        var q = try t.upload(hq);
+        defer q.free();
+        const pos = try gpa.alloc(i32, rows);
+        defer gpa.free(pos);
+        for (pos, 0..) |*p, i| p.* = @intCast(span - rows + i);
+        var dev_pos = try t.upload(pos);
+        defer dev_pos.free();
+        const zeros = try gpa.alloc(i32, rows);
+        defer gpa.free(zeros);
+        @memset(zeros, 0);
+        var slot = try t.upload(zeros);
+        defer slot.free();
+        const first = [_]i32{0};
+        const count = [_]i32{@intCast(rows)};
+        var dev_first = try t.upload(&first);
+        defer dev_first.free();
+        var dev_count = try t.upload(&count);
+        defer dev_count.free();
+        const p: plan.PlanRef = .{ .rows = rows, .slots = 1, .args = .{ .pos = at(dev_pos), .slot = at(slot), .first = at(dev_first), .count = at(dev_count), .desc = at(descs), .anc = at(slot), .pages = words, .pool = @intCast(c.table.len) } };
+        const splits = (span + plan.flash_keys - 1) / plan.flash_keys;
+        var part = try t.alloc(rows * heads * splits * d * 4);
+        defer part.free();
+        var ml = try t.alloc(rows * heads * splits * 2 * 4);
+        defer ml.free();
+        var out = try t.alloc(rows * heads * d * 4);
+        defer out.free();
+        const s = t.stream.handle;
+        try t.on.planFlash(at(q), at(out), at(part), at(ml), p, 0, heads, kv_heads, d, span, scale, t.kind(), s);
+        try t.stream.synchronize();
+        const n = 20;
+        const t0 = nowNs();
+        for (0..n) |_| try t.on.planFlash(at(q), at(out), at(part), at(ml), p, 0, heads, kv_heads, d, span, scale, t.kind(), s);
+        try t.stream.synchronize();
+        const us = @as(f64, @floatFromInt(nowNs() - t0)) / 1e3 / n;
+        const got = try rig.download(u32, out);
+        defer gpa.free(got);
+        var h: u64 = 1469598103934665603;
+        for (got) |w| h = (h ^ w) *% 1099511628211;
+        const bytes: f64 = @floatFromInt(2 * kv_heads * span * d * 2);
+        std.debug.print("flash span {d} rows {d}: {d:.1} us, {d:.0} GB/s, bits {x}\n", .{ span, rows, us, bytes / us / 1e3, h });
+    }
+}
