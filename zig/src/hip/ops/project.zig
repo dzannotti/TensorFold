@@ -188,10 +188,13 @@ pub fn affine(o: Ops, x: Tensor, w: Affine, m: usize, f32_out: bool) Error!Tenso
     // (the dequantizing one at every row count, so a prompt's bits never depend on where it is cut)
     const dq = o.prefill and z.affine.dqTakes(arg);
     const prompt = dq or (o.prefill and std.mem.endsWith(u8, tile.id, ".prefill.matrix") and z.affine.promptTakes(arg));
-    const half = !f32_out and if (prompt) true else !o.prefill and tile.roundsAct(shape);
+    const int4 = o.prefill and !f32_out and z.affine.int4Takes(arg);
+    const half = !f32_out and if (prompt or int4) true else !o.prefill and tile.roundsAct(shape);
     const out = try o.arena.take(m * n * @as(usize, if (half) 2 else 4));
     if (half) arg.out16 = out else arg.out = out;
-    if (dq) {
+    if (int4) {
+        try z.affine.int4Go(z.r, arg, try o.arena.take(affine_launch.Kernels.int4Scratch(arg.m, arg.k)), o.stream);
+    } else if (dq) {
         try z.affine.dqGo(z.r, arg, o.stream);
     } else {
         if (prompt) {

@@ -219,7 +219,7 @@ const headers = [_][]const u8{
     "common/wmma.hpp",            "quant/act.hpp",        "quant/mlx.hpp",       "quant/mlx_decoder.hpp", "quant/mlx_pieces.hpp",
     "quant/mlx_tiles.hpp",        "tiles/dot2.hpp",       "tiles/epilogue.hpp",  "tiles/gemm.hpp",        "tiles/gemm_kp.hpp",
     "tiles/matrix_gemm.hpp",      "tiles/plan.hpp",       "tiles/stream.hpp",    "flashnext/streams.hpp", "flashnext/ngram.hpp",
-    "tiles/wmma_verify.hpp",      "tiles/matrix_prompt.hpp", "quant/coded.hpp",   "quant/coded_dq.hpp",    "quant/coded_tiles.hpp",
+    "tiles/wmma_verify.hpp",      "tiles/matrix_prompt.hpp", "tiles/matrix_int4.hpp", "quant/coded.hpp",   "quant/coded_dq.hpp",    "quant/coded_tiles.hpp",
     "flashnext/indexer.hpp",      "flashnext/sparse.hpp",
 };
 

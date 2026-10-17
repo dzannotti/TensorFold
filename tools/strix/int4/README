@@ -1,0 +1,10 @@
+TF_PROMPT_INT4 experiment (W4A4 iu4 WMMA prefill for MLX 4-bit group 64, gfx11). Verdict: fails the quality gate; kept opt-in.
+
+Build: hipcc -w --offload-arch=gfx1151 -O2 -ffp-contract=off -std=c++20 -DTF_WAVE=32 -DTF_DOT2_F16=1 -DTF_DOT2_BF16=1 \
+  -DTF_SDOT4=1 -DTF_SDOT8=1 -DTF_MATRIX=1 -I zig/kernels/hip tools/strix/int4/<file>.hip -o /tmp/x   (run under `bench`)
+  peak.hip   register-only WMMA rates: bf16, iu8, iu4, iu4 with the per-64-group fp32 fold
+  bench.hip  [M]: a W4A4 tile vs the bf16 dequant prompt tile on 27B shapes, checked against a scalar int reference
+  check.hip  M N K [rotate]: tiles/matrix_int4.hpp's quantizer and tile vs its bf16 emulation (TF_PROMPT_INT4=2's path)
+Modes: TF_PROMPT_INT4=1 the int4 tile; =2 the same quantization emulated through the bf16 tile; =3 the emulation over each
+group's 64-point Hadamard rotation (weights rotated exactly, no requantization: a bound). TF_PROMPT_INT4_K=<k> limits it
+to products of that k. decode_after_prompt.py scores `tf-qwen35-test logits ... --f32 --decode-from=P` pairs.

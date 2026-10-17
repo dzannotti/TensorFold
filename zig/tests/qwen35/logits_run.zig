@@ -1,4 +1,4 @@
-//! `logits <model dir> <ids.npy> <out.npy> [--f32] [--decode]`: every row's logits for tools/truth/score.py to score.
+//! `logits <model dir> <ids.npy> <out.npy> [--f32] [--decode | --decode-from=P]`: every row's logits for tools/truth/score.py to score.
 
 const std = @import("std");
 const hip = @import("hip");
@@ -11,7 +11,8 @@ const Engine = qwen35.engine.Engine;
 /// Rows a head projection covers at once.
 pub const chunk = 32;
 
-pub const Mode = struct { decode: bool = false, wide: bool = false };
+/// `from` > 0 (a multiple of `chunk`): rows before it in one prompt pass, the rest teacher-forced one-row decode rounds.
+pub const Mode = struct { decode: bool = false, wide: bool = false, from: usize = 0 };
 
 /// Takes each block of rows as it is read: rows `first..first + count` of `vocab` logits, `bytes` in the kind's layout.
 pub const Sink = struct {
@@ -40,17 +41,31 @@ pub fn stream(gpa: std.mem.Allocator, e: *Engine, ids: []const u32, mode: Mode, 
     const o: hip.ops.Ops = e.ops(&e.prompts);
     var ids_dev = try hip.DeviceBuffer.fromHost(&e.driver, std.mem.sliceAsBytes(ids));
     defer ids_dev.free();
-    const hidden = try qwen35.forward.span(o, m, &caches, ids_dev.base(), if (mode.decode) 1 else ids.len, 0, null);
+    const prompt_rows = if (mode.from > 0) mode.from else if (mode.decode) 1 else ids.len;
+    const hidden = try qwen35.forward.span(o, m, &caches, ids_dev.base(), prompt_rows, 0, null);
 
     const width = vocab(e) * kindOf(e, mode).size();
     const block = try gpa.alloc(u8, chunk * width);
     defer gpa.free(block);
-    if (mode.decode) {
+    if (mode.from > 0) {
+        var row: usize = 0;
+        while (row < mode.from) : (row += chunk) {
+            const at = e.prompts.mark();
+            const logits = try o.project(qwen35.forward.at(hidden, row * m.spec.hidden), m.head, chunk, mode.wide);
+            try e.stream.synchronize();
+            try hip.runtime.check(e.driver.api.hipMemcpyDtoH(block.ptr, @ptrFromInt(logits.ptr), chunk * width));
+            e.prompts.release(at);
+            try sink.put(sink.ctx, row, chunk, block[0 .. chunk * width]);
+        }
+    }
+    if (mode.decode or mode.from > 0) {
         // row 0 from its one-row prefill, then each token a one-row round at its slot, kept before the next
-        const first = try o.project(hidden, m.head, 1, mode.wide);
-        try e.stream.synchronize();
-        try hip.runtime.check(e.driver.api.hipMemcpyDtoH(block.ptr, @ptrFromInt(first.ptr), width));
-        for (1..ids.len) |i| {
+        if (mode.from == 0) {
+            const first = try o.project(hidden, m.head, 1, mode.wide);
+            try e.stream.synchronize();
+            try hip.runtime.check(e.driver.api.hipMemcpyDtoH(block.ptr, @ptrFromInt(first.ptr), width));
+        }
+        for (@max(1, mode.from)..ids.len) |i| {
             const rows = [1]Engine.Rows{.{ .caches = &caches, .pos = i, .tokens = ids[i..][0..1] }};
             const reqs = [1]qwen35.draw.Request{.{ .sampling = null, .position = i + 1 }};
             var drawn: [1]u32 = undefined;
@@ -94,7 +109,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void
     if (args.len < 3) return error.MissingArgument;
     var mode: Mode = .{};
     for (args[3..]) |a| {
-        if (std.mem.eql(u8, a, "--f32")) mode.wide = true else if (std.mem.eql(u8, a, "--decode")) mode.decode = true else return error.UnknownOption;
+        if (std.mem.eql(u8, a, "--f32")) mode.wide = true else if (std.mem.eql(u8, a, "--decode")) mode.decode = true else if (std.mem.startsWith(u8, a, "--decode-from=")) {
+            mode.from = try std.fmt.parseInt(usize, a["--decode-from=".len..], 10);
+            if (mode.from % chunk != 0) return error.BadDecodeFrom;
+        } else return error.UnknownOption;
     }
     const ids = try ids_file.load(gpa, io, args[1]);
     defer gpa.free(ids);

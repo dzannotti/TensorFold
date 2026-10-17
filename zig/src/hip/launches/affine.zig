@@ -44,6 +44,9 @@ pub const Arg = extern struct {
     sums: u64 = 0,
 };
 
+/// tiles/matrix_int4.hpp's Int4Prompt: the opt-in W4A4 prompt product's buffers.
+pub const Int4Arg = extern struct { x: u64, xq: u64, xs: u64, sums: u64, words: u64, scale: u64, bias: u64, out: u64, m: c_int, n: c_int, k: c_int, mp: c_int, fake: u64 = 0, rotate: c_int = 0 };
+
 /// quant/mlx_tiles.hpp's StreamSides: up to four products that share x, K, width and group in one launch.
 pub const StreamSides = extern struct {
     words: [4]u64 = @splat(0),
@@ -161,6 +164,16 @@ pub const Kernels = struct {
     /// Unless TF_PROMPT_DQ is set: the exact-fold prompt tile (the 128-row block's bits). The dequantizing tile is faster
     /// (~13% at 8k) but moves KL vs bf16 from 0.1115 to 0.1122, so it stays opt-in until quality is settled.
     prompt_fold: bool,
+    /// TF_PROMPT_INT4=1: prompt products take the W4A4 tile (tiles/matrix_int4.hpp: x to int4 a 64-group). Changes bits.
+    int4_on: bool,
+    /// TF_PROMPT_INT4=2: the check path, x's int4 codes dequantized to bf16 through the bf16 tile instead.
+    int4_fake: bool,
+    /// TF_PROMPT_INT4=3: the check path over each 64-group's Hadamard rotation (the weights rotated exactly: a bound).
+    int4_rotate: bool,
+    /// TF_PROMPT_INT4_K=<k>: only products of that k take it (0: every one).
+    int4_k: c_int,
+    int4_quant: Function,
+    int4_tile: Function,
     kp: [bit_widths.len][kp_tiles.len]Function,
     span: [2]Function,
     fold: Function,
@@ -207,6 +220,15 @@ pub const Kernels = struct {
             };
         }
         k.prompt_fold = std.c.getenv("TF_PROMPT_DQ") == null;
+        const int4_env: u8 = if (std.c.getenv("TF_PROMPT_INT4")) |v| v[0] else '0';
+        k.int4_on = k.matrix and (int4_env == '1' or int4_env == '2' or int4_env == '3');
+        k.int4_fake = int4_env == '2' or int4_env == '3';
+        k.int4_rotate = int4_env == '3';
+        k.int4_k = if (std.c.getenv("TF_PROMPT_INT4_K")) |v| std.fmt.parseInt(c_int, std.mem.span(v), 10) catch 0 else 0;
+        if (k.int4_on) {
+            k.int4_quant = try tiles_obj.function(r ++ "17int4_prompt_quantENS0_10Int4PromptE");
+            k.int4_tile = try tiles_obj.function(r ++ "11int4_promptENS0_10Int4PromptE");
+        }
         return k;
     }
 
@@ -589,6 +611,37 @@ pub const Kernels = struct {
         try args.add(a);
         try go(r, k.dense_prompt[@intFromBool(tall)], .{ .x = cdiv(a.n, @divExact(32768, bm)) * cdiv(a.m, bm) }, .{ .x = 256 }, s, &args);
         return true;
+    }
+
+    /// Whether the W4A4 prompt tile takes a prefill product: the prompt tile's shapes, BF16 tables, switch on.
+    pub fn int4Takes(k: *const Kernels, a: Arg) bool {
+        // the head (n past 65536) keeps the bf16 tile: a served prompt's head runs its last row alone
+        return k.int4_on and k.promptTakes(a) and a.scale.kind == 1 and a.n < 65536 and (k.int4_k == 0 or k.int4_k == a.k);
+    }
+
+    /// The bytes of scratch int4Go takes for (m, k): codes, then scales and sums at a 128-row stride.
+    pub fn int4Scratch(m: c_int, kk: c_int) usize {
+        const mp: usize = @intCast(@divTrunc(m + 127, 128) * 128);
+        return @as(usize, @intCast(m)) * @as(usize, @intCast(kk)) * 5 / 2 + 2 * mp * @as(usize, @intCast(@divExact(kk, 64))) * 4;
+    }
+
+    /// out16 (m, n) bf16 = x times the MLX words through the W4A4 tile, `scratch` holding int4Scratch bytes.
+    pub fn int4Go(k: *const Kernels, r: *const runtime.Runtime, a: Arg, scratch: u64, s: abi.Stream) Error!void {
+        const mp = @divTrunc(a.m + 127, 128) * 128;
+        const xq = scratch;
+        const xs = xq + @as(u64, @intCast(a.m)) * @as(u64, @intCast(a.k)) / 2;
+        const sums = xs + @as(u64, @intCast(mp)) * @as(u64, @intCast(@divExact(a.k, 64))) * 4;
+        const fake = sums + @as(u64, @intCast(mp)) * @as(u64, @intCast(@divExact(a.k, 64))) * 4;
+        const ia: Int4Arg = .{ .x = a.x, .xq = xq, .xs = xs, .sums = sums, .words = a.words, .scale = a.scale.p, .bias = a.bias.p, .out = a.out16, .m = a.m, .n = a.n, .k = a.k, .mp = mp, .fake = if (k.int4_fake) fake else 0, .rotate = @intFromBool(k.int4_rotate) };
+        var args: hl.Args = .{};
+        try args.add(ia);
+        try go(r, k.int4_quant, .{ .x = cdiv(a.m * @divExact(a.k, 64), 256) }, .{ .x = 256 }, s, &args);
+        if (k.int4_fake) {
+            var b = a;
+            b.x = fake;
+            return k.dqGo(r, b, s);
+        }
+        try go(r, k.int4_tile, .{ .x = cdiv(a.n, 128) * cdiv(a.m, 128) }, .{ .x = 256 }, s, &args);
     }
 
     /// x's group sums into `a.sums` for the prompt tile: each row's 64 values a group added in order from zero.

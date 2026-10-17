@@ -7,6 +7,7 @@
 #include "tiles/matrix_gemm.hpp"
 #include "quant/mlx_tiles.hpp"
 #include "tiles/wmma_verify.hpp"
+#include "tiles/matrix_int4.hpp"
 
 namespace tf {
 namespace rocm {
@@ -354,6 +355,8 @@ template __global__ void affine_wmma_prompt_dq<4, 256>(Affine);
 template __global__ void dense_wmma_prompt<128>(Affine);
 template __global__ void dense_wmma_prompt<256>(Affine);
 template __global__ void affine_prompt_sums<4>(Affine);
+__global__ void __launch_bounds__(256) int4_prompt_quant(Int4Prompt a) { int4_quant_x(a); }
+__global__ void __launch_bounds__(256) int4_prompt(Int4Prompt a) { int4_prompt_tile(a); }
 #else
 #define TF_WMMA(BITS)
 #endif
