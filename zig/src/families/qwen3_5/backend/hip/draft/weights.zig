@@ -66,9 +66,9 @@ pub const Layer = struct {
     gate: Linear,
     up: Linear,
     down: Linear,
-    attn_conv: Linear, // kernel_projection: hidden -> the dynamic coefficients
+    attn_conv: ?Linear, // kernel_projection: hidden -> the dynamic coefficients (DSpark: none)
     attn_base: u64, // base_kernel (2 branches, 2 lags, hidden) bf16
-    mlp_conv: Linear,
+    mlp_conv: ?Linear,
     mlp_base: u64,
 };
 
@@ -76,10 +76,10 @@ pub const Weights = struct {
     fc: Linear, // the taps' concatenation -> hidden
     hidden_norm: u64,
     final_norm: u64,
-    selector: Linear, // hidden_projection: hidden -> rank
+    selector: ?Linear, // hidden_projection: hidden -> rank (DSpark's vanilla Markov head has none)
     kv: Linear, // every layer's k then v: what an absorbed row writes into the rings, in one product
     k_norms: u64, // every layer's k_norm, fp32 (layers, head_dim)
-    predecessor: []u16, // codebooks (vocab, rank) bf16, on the host
+    predecessor: []u16, // codebooks (vocab, rank) bf16, on the host (DSpark: markov_w1, markov_w2)
     successor: []u16,
     layers: []Layer,
     arena: hip.DeviceBuffer,
@@ -137,6 +137,8 @@ const Loader = struct {
     bits: u8,
     arena: ?hip.DeviceBuffer,
     at: usize = 0,
+    /// No zero columns past a power-of-two K (DSpark: its 2048-wide inputs come packed, not padded as the o rows are).
+    no_pad: bool = false,
 
     fn take(l: *Loader, bytes: usize) u64 {
         const at = std.mem.alignForward(usize, l.at, 256);
@@ -165,7 +167,7 @@ const Loader = struct {
         }
         if (k % 64 != 0) return error.UnsupportedDraftConfig;
         const groups = k / 64;
-        const kp = k + pad(k); // the stored rows' K
+        const kp = k + if (l.no_pad) 0 else pad(k); // the stored rows' K
         const gp = kp / 64;
         const words = l.take(n * kp / 2);
         const scales = l.take(n * gp * 2);
@@ -254,11 +256,11 @@ fn named(buf: []u8, i: usize, suffix: []const u8) []const u8 {
 }
 
 /// Every device weight placed by `l` (counted when it has no buffer): the same order both passes.
-fn place(l: *Loader, c: Config, layers: []Layer) !struct { fc: Linear, hidden_norm: u64, final_norm: u64, selector: Linear, kv: Linear, k_norms: u64 } {
+fn place(l: *Loader, c: Config, layers: []Layer) !struct { fc: Linear, hidden_norm: u64, final_norm: u64, selector: ?Linear, kv: Linear, k_norms: u64 } {
     const fc = try l.linear(&.{"fc.weight"}, c.hidden * c.n_taps);
     const hidden_norm = try l.norm("hidden_norm.weight", c.hidden);
     const final_norm = try l.norm("norm.weight", c.hidden);
-    const selector = try l.linear(&.{"candidate_selector.hidden_projection.weight"}, c.hidden);
+    const selector: ?Linear = if (c.dspark) null else try l.linear(&.{"candidate_selector.hidden_projection.weight"}, c.hidden);
     var bufs: [2 * 16][96]u8 = undefined;
     var kv_names: [2 * 16][]const u8 = undefined;
     var kn_names: [16][]const u8 = undefined;
@@ -282,14 +284,16 @@ fn place(l: *Loader, c: Config, layers: []Layer) !struct { fc: Linear, hidden_no
             .gate = try l.linear(&.{named(&b[0], i, "mlp.gate_proj.weight")}, c.hidden),
             .up = try l.linear(&.{named(&b[0], i, "mlp.up_proj.weight")}, c.hidden),
             .down = try l.linear(&.{named(&b[0], i, "mlp.down_proj.weight")}, c.intermediate),
-            .attn_conv = try l.linear(&.{named(&b[0], i, "attention_conv.kernel_projection.weight")}, c.hidden),
-            .attn_base = try l.raw(named(&b[0], i, "attention_conv.base_kernel"), &.{ 2, 2, c.hidden }),
-            .mlp_conv = try l.linear(&.{named(&b[0], i, "mlp_conv.kernel_projection.weight")}, c.hidden),
-            .mlp_base = try l.raw(named(&b[0], i, "mlp_conv.base_kernel"), &.{ 2, 2, c.hidden }),
+            .attn_conv = if (c.dspark) null else try l.linear(&.{named(&b[0], i, "attention_conv.kernel_projection.weight")}, c.hidden),
+            .attn_base = if (c.dspark) 0 else try l.raw(named(&b[0], i, "attention_conv.base_kernel"), &.{ 2, 2, c.hidden }),
+            .mlp_conv = if (c.dspark) null else try l.linear(&.{named(&b[0], i, "mlp_conv.kernel_projection.weight")}, c.hidden),
+            .mlp_base = if (c.dspark) 0 else try l.raw(named(&b[0], i, "mlp_conv.base_kernel"), &.{ 2, 2, c.hidden }),
         };
-        if (y.qkv.rows() != c.qWidth() + 2 * c.kvWidth() or y.attn_conv.rows() != c.dynamic() or y.gate.rows() != c.intermediate) return error.UnexpectedTensor;
+        if (y.qkv.rows() != c.qWidth() + 2 * c.kvWidth() or y.gate.rows() != c.intermediate) return error.UnexpectedTensor;
+        if (y.attn_conv) |a| if (a.rows() != c.dynamic()) return error.UnexpectedTensor;
     }
-    if (fc.rows() != c.hidden or selector.rows() != c.rank or kv.rows() != 2 * c.layers * c.kvWidth()) return error.UnexpectedTensor;
+    if (fc.rows() != c.hidden or kv.rows() != 2 * c.layers * c.kvWidth()) return error.UnexpectedTensor;
+    if (selector) |sel| if (sel.rows() != c.rank) return error.UnexpectedTensor;
     return .{ .fc = fc, .hidden_norm = hidden_norm, .final_norm = final_norm, .selector = selector, .kv = kv, .k_norms = k_norms };
 }
 
@@ -298,7 +302,7 @@ pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: Confi
     mlx_layout = mlxLayout();
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    var l: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = null };
+    var l: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = null, .no_pad = c.dspark };
     const layers = try gpa.alloc(Layer, c.layers);
     defer gpa.free(layers);
     _ = try place(&l, c, layers);
@@ -312,15 +316,18 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, r: *const hip.Runtime, dir: []co
     defer ck.close();
     const layers = try gpa.alloc(Layer, c.layers);
     errdefer gpa.free(layers);
-    var count: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = null };
+    var count: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = null, .no_pad = c.dspark };
     _ = try place(&count, c, layers);
     var arena = try hip.DeviceBuffer.alloc(r, count.at);
     errdefer arena.free();
-    var l: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = arena };
+    var l: Loader = .{ .gpa = gpa, .ck = &ck, .bits = bits, .arena = arena, .no_pad = c.dspark };
     const top = try place(&l, c, layers);
-    const predecessor = try hostBf16(gpa, &ck, "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank });
+    const predecessor = try hostBf16(gpa, &ck, if (c.dspark) "markov_head.markov_w1.weight" else "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank });
     errdefer gpa.free(predecessor);
-    const successor = try hostBf16(gpa, &ck, "candidate_selector.successor_codebook", &.{ c.vocab, c.rank });
+    const successor = try hostBf16(gpa, &ck, if (c.dspark) "markov_head.markov_w2.weight" else "candidate_selector.successor_codebook", &.{ c.vocab, c.rank });
+    errdefer gpa.free(successor);
+    // the confidence head only truncates drafts (llama.cpp's --spec-draft-p-min, vLLM's adaptive verification; both off by default)
+    if (c.dspark) try ck.skip("confidence_head.");
     if (ck.unused() != 0) return error.UnexpectedTensor;
     return .{ .fc = top.fc, .hidden_norm = top.hidden_norm, .final_norm = top.final_norm, .selector = top.selector, .kv = top.kv, .k_norms = top.k_norms, .predecessor = predecessor, .successor = successor, .layers = layers, .arena = arena };
 }

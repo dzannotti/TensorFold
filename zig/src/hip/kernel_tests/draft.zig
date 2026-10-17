@@ -6,7 +6,7 @@ const Rig = rig.Rig;
 const gpa = rig.gpa;
 const at = rig.at;
 
-const hd = dft.head_dim;
+const head_dim = dft.head_dim;
 
 fn bfv(b: u16) f32 {
     return @floatCast(rig.bf16Value(b));
@@ -30,7 +30,7 @@ fn randoms(rng: *rig.Rng, n: usize, scale: f32) ![]u16 {
 }
 
 /// The reference of norm_rope4: rms norm with an fp32 weight, rotate-half at `pos`, both rounded.
-fn normRope(x: []const u16, w: []const f32, eps: f32, theta: f32, pos: i64, out: *[hd]f32) void {
+fn normRope(comptime hd: usize, x: []const u16, w: []const f32, eps: f32, theta: f32, pos: i64, out: *[hd]f32) void {
     var sum: f32 = 0;
     for (0..hd) |d| sum += bfv(x[d]) * bfv(x[d]);
     const inv = 1.0 / @sqrt(sum / hd + eps);
@@ -77,6 +77,11 @@ test "gather: rows from anywhere, back to back" {
 }
 
 test "ring put: every layer's keys normed and rotated into slot pos % R, values transposed" {
+    try ringPut(128);
+    try ringPut(256);
+}
+
+fn ringPut(comptime hd: usize) !void {
     const t = try Rig.open(1 << 16);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0xd2 };
@@ -106,7 +111,7 @@ test "ring put: every layer's keys normed and rotated into slot pos % R, values 
     defer drows.free();
     var dnorm = try t.upload(&knorm);
     defer dnorm.free();
-    try t.on.dftRingPut(at(dkv), stride, at(drows), n, at(dnorm), layers, kvh, R, eps, theta, t.stream.handle);
+    try t.on.dftRingPut(at(dkv), stride, at(drows), n, at(dnorm), layers, kvh, R, eps, theta, hd, t.stream.handle);
     try t.stream.synchronize();
     const got = [2][]u16{ try rig.download(u16, rings[0]), try rig.download(u16, rings[1]) };
     defer for (got) |g| gpa.free(g);
@@ -114,7 +119,7 @@ test "ring put: every layer's keys normed and rotated into slot pos % R, values 
     for (where, 0..) |w, r| for (0..layers) |l| for (0..kvh) |h| {
         const slot: usize = @intCast(@mod(w.pos, R));
         const k = kv[r * stride + l * 2 * kvw + h * hd ..][0..hd];
-        normRope(k, knorm[l * hd ..][0..hd], eps, theta, w.pos, &want);
+        normRope(hd, k, knorm[l * hd ..][0..hd], eps, theta, w.pos, &want);
         const ring = got[w.s][l * 2 * R * kvw ..];
         for (0..hd) |d| try rig.expect(near(ring[slot * kvw + h * hd + d], want[d], w.pos), "key row {d} layer {d} head {d} dim {d}: {d} vs {d}", .{ r, l, h, d, bfv(ring[slot * kvw + h * hd + d]), want[d] });
         const vt = ring[R * kvw + h * hd * R ..];
@@ -123,6 +128,7 @@ test "ring put: every layer's keys normed and rotated into slot pos % R, values 
 }
 
 test "norm rope: block rows at their streams' positions, from strided rows" {
+    const hd = head_dim;
     const t = try Rig.open(1 << 16);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0xd3 };
@@ -153,7 +159,7 @@ test "norm rope: block rows at their streams' positions, from strided rows" {
     var want: [hd]f32 = undefined;
     for (0..rows) |r| for (0..heads) |h| {
         const pos = desc[r / block].pos0 + @as(i64, @intCast(r % block));
-        normRope(x[r * stride + h * hd ..][0..hd], &w, eps, theta, pos, &want);
+        normRope(hd, x[r * stride + h * hd ..][0..hd], &w, eps, theta, pos, &want);
         for (0..hd) |d| try rig.expect(near(got[(r * heads + h) * hd + d], want[d], pos), "row {d} head {d} dim {d}: {d} vs {d}", .{ r, h, d, bfv(got[(r * heads + h) * hd + d]), want[d] });
     };
 }
@@ -206,6 +212,11 @@ test "dynamic conv: both branches bit for bit, the lag stopping at each block's 
 }
 
 test "block attention: each row's window over a wrapped ring, the context's start, and the whole block" {
+    try blockAttn(128);
+    try blockAttn(256);
+}
+
+fn blockAttn(comptime hd: usize) !void {
     const t = try Rig.open(1 << 20);
     defer t.close();
     var rng: rig.Rng = .{ .state = 0xd5 };
@@ -254,9 +265,9 @@ test "block attention: each row's window over a wrapped ring, the context's star
     var out = try t.alloc(rows * heads * hd * 2);
     defer out.free();
     for ([_]usize{ 1, 3, 16 }) |splits| {
-        var part = try t.alloc(dft.partBytes(streams, kvh, splits));
+        var part = try t.alloc(dft.partBytes(streams, kvh, splits, hd));
         defer part.free();
-        try t.on.dftAttn(.{ .q = at(dq), .kb = at(dkb), .vb = at(dvb), .vstride = vstride, .desc = at(dd), .layer = layer, .streams = streams, .block = block, .heads = heads, .kv_heads = kvh, .ring_rows = R, .window = window, .splits = splits, .part = at(part), .out = at(out) }, t.stream.handle);
+        try t.on.dftAttn(.{ .q = at(dq), .kb = at(dkb), .vb = at(dvb), .vstride = vstride, .desc = at(dd), .layer = layer, .streams = streams, .block = block, .heads = heads, .kv_heads = kvh, .ring_rows = R, .window = window, .splits = splits, .part = at(part), .out = at(out), .hd = hd }, t.stream.handle);
         try t.stream.synchronize();
         const got = try rig.download(u16, out);
         defer gpa.free(got);

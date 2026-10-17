@@ -9,7 +9,6 @@
 
 namespace {
 
-constexpr int HD = 128;  // the drafter's head width (q, k, v)
 
 __device__ __forceinline__ float bf(uint16_t h) { return __uint_as_float(static_cast<uint32_t>(h) << 16); }
 
@@ -28,24 +27,27 @@ __device__ __forceinline__ float wave_sum(float x) {
     return x;
 }
 
-// Per-head RMS norm (fp32 weight) then rotate-half RoPE at `pos` of 128 values, 4 a lane; returns this lane's 4.
-__device__ __forceinline__ void norm_rope4(const uint16_t* x, const float* w, float eps, float theta, long long pos, float out[4]) {
+// Per-head RMS norm (fp32 weight) then rotate-half RoPE at `pos` of HD values (128 or 256), HD / 32 a lane; returns
+// this lane's.
+template <int HD>
+__device__ __forceinline__ void norm_rope4(const uint16_t* x, const float* w, float eps, float theta, long long pos, float out[HD / 32]) {
+    constexpr int E = HD / 32;
     const int t = threadIdx.x & 31;
-    float v[4], acc = 0.f;
+    float v[E], acc = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        v[i] = bf(x[4 * t + i]);
+    for (int i = 0; i < E; i++) {
+        v[i] = bf(x[E * t + i]);
         acc += v[i] * v[i];
     }
     acc = wave_sum(acc);
     const float inv = rsqrtf(acc / static_cast<float>(HD) + eps);
-    float n[4];
+    float n[E];
 #pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(v[i] * inv * w[4 * t + i]);
+    for (int i = 0; i < E; i++) n[i] = rbf(v[i] * inv * w[E * t + i]);
     // the partner of element d is d +- HD / 2: lane t's partners sit on lane t ^ 16
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const int d = 4 * t + i;
+    for (int i = 0; i < E; i++) {
+        const int d = E * t + i;
         const float partner = __shfl_xor(n[i], 16, 32);
         const int j = d < HD / 2 ? d : d - HD / 2;
         const float angle = static_cast<float>(pos) * powf(theta, -static_cast<float>(j) / static_cast<float>(HD / 2));
@@ -79,8 +81,10 @@ extern "C" __global__ void tf_dft_gather(const DftRow* rows, int width, uint4* o
 
 // Absorbed rows' keys and values into every layer's ring: KV row (stride `stride`) holds layer l's k at 2 l kvw, v after.
 // A layer's ring: keys (R, kv_heads, HD) then values transposed by 16-slot tiles (kv_heads, R / 16, HD, 16). Grid (rows, layers * kv_heads), 32 threads.
-extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put(const uint16_t* KV, long long stride, const DftRow* rows, const float* knorm,
-                                                                 int kv_heads, int R, float eps, float theta) {
+template <int HD>
+__device__ __forceinline__ void dft_ring_put(const uint16_t* KV, long long stride, const DftRow* rows, const float* knorm, int kv_heads, int R,
+                                             float eps, float theta) {
+    constexpr int E = HD / 32;
     const int r = blockIdx.x;
     const int layer = blockIdx.y / kv_heads, h = blockIdx.y % kv_heads;
     const int kvw = kv_heads * HD;
@@ -88,26 +92,36 @@ extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put(const uint16_t*
     const size_t slot = static_cast<size_t>(pos % R);
     uint16_t* ring = reinterpret_cast<uint16_t*>(rows[r].ring) + static_cast<size_t>(layer) * 2 * R * kvw;
     const uint16_t* k = KV + r * stride + static_cast<size_t>(layer) * 2 * kvw + h * HD;
-    float out[4];
-    norm_rope4(k, knorm + layer * HD, eps, theta, pos, out);
+    float out[E];
+    norm_rope4<HD>(k, knorm + layer * HD, eps, theta, pos, out);
     const int t = threadIdx.x;
 #pragma unroll
-    for (int i = 0; i < 4; i++) ring[slot * kvw + h * HD + 4 * t + i] = tobf(out[i]);
+    for (int i = 0; i < E; i++) ring[slot * kvw + h * HD + E * t + i] = tobf(out[i]);
     const uint16_t* v = k + kvw;
     uint16_t* vt = ring + static_cast<size_t>(R) * kvw + static_cast<size_t>(h) * HD * R;
 #pragma unroll
-    for (int i = 0; i < 4; i++) vt[(slot / 16) * HD * 16 + static_cast<size_t>(4 * t + i) * 16 + slot % 16] = v[4 * t + i];
+    for (int i = 0; i < E; i++) vt[(slot / 16) * HD * 16 + static_cast<size_t>(E * t + i) * 16 + slot % 16] = v[E * t + i];
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put(const uint16_t* KV, long long stride, const DftRow* rows, const float* knorm,
+                                                                 int kv_heads, int R, float eps, float theta) {
+    dft_ring_put<128>(KV, stride, rows, knorm, kv_heads, R, eps, theta);
+}
+extern "C" __global__ void __launch_bounds__(32) tf_dft_ring_put_256(const uint16_t* KV, long long stride, const DftRow* rows,
+                                                                     const float* knorm, int kv_heads, int R, float eps, float theta) {
+    dft_ring_put<256>(KV, stride, rows, knorm, kv_heads, R, eps, theta);
 }
 
 // Block rows' q or k heads normed and rotated at desc[row / block].pos0 + row % block; OUT packed (rows, heads, HD).
 // Grid (rows * heads), 32 threads.
 extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope(const uint16_t* X, long long stride, const float* W, uint16_t* OUT,
                                                                   const DftDesc* desc, int block, int heads, float eps, float theta) {
+    constexpr int HD = 128;
     const int head = blockIdx.x % heads;
     const int row = blockIdx.x / heads;
     const long long pos = desc[row / block].pos0 + row % block;
     float out[4];
-    norm_rope4(X + row * stride + head * HD, W, eps, theta, pos, out);
+    norm_rope4<HD>(X + row * stride + head * HD, W, eps, theta, pos, out);
     uint16_t* o = OUT + (static_cast<size_t>(row) * heads + head) * HD + 4 * threadIdx.x;
 #pragma unroll
     for (int i = 0; i < 4; i++) o[i] = tobf(out[i]);
@@ -152,20 +166,34 @@ extern "C" __global__ void __launch_bounds__(256) tf_dft_rms(const hip_bfloat16*
 }
 
 // tf_dft_norm_rope on the q heads (rows x heads blocks) then the k heads at X + koff (rows x kv_heads), in one launch.
-extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope_qk(const uint16_t* X, long long stride, long long koff, const float* WQ,
-                                                                     const float* WK, uint16_t* QO, uint16_t* KO, const DftDesc* desc,
-                                                                     int block, int rows, int heads, int kv_heads, float eps, float theta) {
+template <int HD>
+__device__ __forceinline__ void dft_norm_rope_qk(const uint16_t* X, long long stride, long long koff, const float* WQ, const float* WK,
+                                                 uint16_t* QO, uint16_t* KO, const DftDesc* desc, int block, int rows, int heads,
+                                                 int kv_heads, float eps, float theta) {
+    constexpr int E = HD / 32;
     const bool q = static_cast<int>(blockIdx.x) < rows * heads;
     const int b = q ? blockIdx.x : blockIdx.x - rows * heads;
     const int hs = q ? heads : kv_heads;
     const int head = b % hs;
     const int row = b / hs;
     const long long pos = desc[row / block].pos0 + row % block;
-    float out[4];
-    norm_rope4((q ? X : X + koff) + row * stride + head * HD, q ? WQ : WK, eps, theta, pos, out);
-    uint16_t* o = (q ? QO : KO) + (static_cast<size_t>(row) * hs + head) * HD + 4 * threadIdx.x;
+    float out[E];
+    norm_rope4<HD>((q ? X : X + koff) + row * stride + head * HD, q ? WQ : WK, eps, theta, pos, out);
+    uint16_t* o = (q ? QO : KO) + (static_cast<size_t>(row) * hs + head) * HD + E * threadIdx.x;
 #pragma unroll
-    for (int i = 0; i < 4; i++) o[i] = tobf(out[i]);
+    for (int i = 0; i < E; i++) o[i] = tobf(out[i]);
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope_qk(const uint16_t* X, long long stride, long long koff, const float* WQ,
+                                                                     const float* WK, uint16_t* QO, uint16_t* KO, const DftDesc* desc,
+                                                                     int block, int rows, int heads, int kv_heads, float eps, float theta) {
+    dft_norm_rope_qk<128>(X, stride, koff, WQ, WK, QO, KO, desc, block, rows, heads, kv_heads, eps, theta);
+}
+extern "C" __global__ void __launch_bounds__(32) tf_dft_norm_rope_qk_256(const uint16_t* X, long long stride, long long koff,
+                                                                         const float* WQ, const float* WK, uint16_t* QO, uint16_t* KO,
+                                                                         const DftDesc* desc, int block, int rows, int heads, int kv_heads,
+                                                                         float eps, float theta) {
+    dft_norm_rope_qk<256>(X, stride, koff, WQ, WK, QO, KO, desc, block, rows, heads, kv_heads, eps, theta);
 }
 
 // y[t, c] = sum over lags l of (BASE[l, c] + DYN[t, l, c / group]) * x[t - l, c] in bf16 steps, x before a block's first row 0;
@@ -222,10 +250,13 @@ constexpr int kQueries = 64;  // a stream's block rows times the query heads of 
 // Block attention, split over the keys: query (m, g) of a stream's key head sees ring positions
 // [max(begin, pos0 + m - window + 1), pos0) and every block row. Split y of `splits` walks its share of 16-position tiles,
 // writing unnormalized PART (splits, 64 queries, HD) fp32 and STATS (max, sum) per (stream, key head).
-// Q (rows, heads, HD), KB (rows, kv_heads, HD) packed; VB rows `vstride` apart. Grid (streams * kv_heads, splits), 128 threads.
-extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB, long long vstride,
-                                                             const DftDesc* desc, int layer, int block, int heads, int kv_heads, int R,
-                                                             int window, float* PART, float* STATS) {
+// Q (rows, heads, HD), KB (rows, kv_heads, HD) packed; VB rows `vstride` apart. Grid (streams * kv_heads, splits, HD / HO),
+// 128 threads: z owns output dims [HO z, HO z + HO) (a 256-wide head's whole output would not fit the registers).
+template <int HD>
+__device__ __forceinline__ void dft_attn(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB, long long vstride, const DftDesc* desc,
+                                         int layer, int block, int heads, int kv_heads, int R, int window, float* PART, float* STATS) {
+    constexpr int HO = HD < 128 ? HD : 128;
+    const int od = HO * blockIdx.z;
     const int stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads;
     const int split = blockIdx.y, splits = gridDim.y;
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -254,9 +285,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
     const int tiles = static_cast<int>((d.pos0 - base + kTile - 1) / kTile);
     const int t0 = static_cast<int>(static_cast<long long>(tiles) * split / splits);
     const int t1 = static_cast<int>(static_cast<long long>(tiles) * (split + 1) / splits);
-    f32x8 o[HD / 16];
+    f32x8 o[HO / 16];
 #pragma unroll
-    for (int i = 0; i < HD / 16; i++) o[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < HO / 16; i++) o[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0};
     float mx = -INFINITY, l = 0.f;
     // one tile of 16 keys: s[i] the score of key 2 i + half for this lane's query; vfrag(i) V^T's rows 16 i.. of the tile
     auto step = [&](f32x8 s, auto&& vfrag) {
@@ -293,7 +324,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
         for (int k = 0; k < 16; k++) pk[k] = (k & 1) == half ? mine[k >> 1] : other[k >> 1];
         const bf16x16 pf = __builtin_bit_cast(bf16x16, pk);
 #pragma unroll
-        for (int i = 0; i < HD / 16; i++) {
+        for (int i = 0; i < HO / 16; i++) {
             f32x8 c = o[i];
 #pragma unroll
             for (int e = 0; e < 8; e++) c[e] *= alpha;
@@ -314,7 +345,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
             s[i] = (qlive && kpos >= first && kpos < d.pos0) ? s[i] * scale : -INFINITY;
         }
         // the tile's values: (HD, 16) back to back
-        step(s, [&](int i) { return load16(RVT + slot0 * HD + static_cast<size_t>(16 * i + col) * 16); });
+        step(s, [&](int i) { return load16(RVT + slot0 * HD + static_cast<size_t>(od + 16 * i + col) * 16); });
     }
     if (split == splits - 1) {
         // the block's own rows, every one visible to every block row (zeros past the block)
@@ -341,27 +372,39 @@ extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q,
         step(s, [&](int i) {
             uint16_t vv[16];
 #pragma unroll
-            for (int k = 0; k < 16; k++) vv[k] = k < block ? vb[k * vstride + 16 * i + col] : 0;
+            for (int k = 0; k < 16; k++) vv[k] = k < block ? vb[k * vstride + od + 16 * i + col] : 0;
             return __builtin_bit_cast(bf16x16, vv);
         });
     }
     // O^T's tile i: this lane's query, dims 16 i + 2 e + half
     const size_t at = (static_cast<size_t>(blockIdx.x) * splits + split) * kQueries + q;
-    float* part = PART + at * HD;
+    float* part = PART + at * HD + od;
 #pragma unroll
-    for (int i = 0; i < HD / 16; i++) {
+    for (int i = 0; i < HO / 16; i++) {
 #pragma unroll
         for (int e = 0; e < 8; e++) part[16 * i + 2 * e + half] = o[i][e];
     }
-    if (half == 0) {
+    if (half == 0 && blockIdx.z == 0) {
         STATS[2 * at] = mx;
         STATS[2 * at + 1] = l;
     }
 }
 
+extern "C" __global__ void __launch_bounds__(128) tf_dft_attn(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB, long long vstride,
+                                                             const DftDesc* desc, int layer, int block, int heads, int kv_heads, int R,
+                                                             int window, float* PART, float* STATS) {
+    dft_attn<128>(Q, KB, VB, vstride, desc, layer, block, heads, kv_heads, R, window, PART, STATS);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_dft_attn_256(const uint16_t* Q, const uint16_t* KB, const uint16_t* VB,
+                                                                 long long vstride, const DftDesc* desc, int layer, int block, int heads,
+                                                                 int kv_heads, int R, int window, float* PART, float* STATS) {
+    dft_attn<256>(Q, KB, VB, vstride, desc, layer, block, heads, kv_heads, R, window, PART, STATS);
+}
+
 // The splits of tf_dft_attn joined: OUT (rows, heads, HD) bf16, rows ostride apart. Grid (streams * kv_heads, 64 queries), HD threads.
-extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
-                                             uint16_t* OUT, long long ostride) {
+template <int HD>
+__device__ __forceinline__ void dft_attn_merge(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
+                                               uint16_t* OUT, long long ostride) {
     const int stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads;
     const int q = blockIdx.y;
     const int G = heads / kv_heads;
@@ -380,6 +423,15 @@ extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STA
     }
     const int m = q / G, head = kvh * G + q % G;
     OUT[static_cast<size_t>(stream * block + m) * ostride + head * HD + dim] = tobf(acc / l);
+}
+
+extern "C" __global__ void tf_dft_attn_merge(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
+                                             uint16_t* OUT, long long ostride) {
+    dft_attn_merge<128>(PART, STATS, splits, block, heads, kv_heads, OUT, ostride);
+}
+extern "C" __global__ void tf_dft_attn_merge_256(const float* PART, const float* STATS, int splits, int block, int heads, int kv_heads,
+                                                 uint16_t* OUT, long long ostride) {
+    dft_attn_merge<256>(PART, STATS, splits, block, heads, kv_heads, OUT, ostride);
 }
 
 namespace {

@@ -247,6 +247,10 @@ __device__ __forceinline__ void flash_widen8(uint4 w, float* v) {
 
 // Rows a block takes together: a chain's rows of one slot read each key and value once for all of them.
 constexpr int kFlashRows = 4;
+
+// Key i's weight of query j sits at column j ^ fsw(i) of its LDS row: a key's 32 weights stay four float4s, and a
+// column's 32 keys spread over 8 banks, not one (the weights' writes and the stats' walk down a column).
+__device__ __forceinline__ int fsw(int i) { return (i & 7) << 2; }
 // Query vectors a block holds (rows times query heads a KV head).
 constexpr int kFlashQueries = 32;
 
@@ -341,20 +345,20 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
     __syncthreads();  // every query read: their LDS takes the weights
 #pragma unroll
     for (int j = 0; j < kFlashQueries; ++j)
-        if (j < nq) ps[t][j] = key < visl[j / group] ? s[j] * scale : -INFINITY;
+        if (j < nq) ps[t][j ^ fsw(t)] = key < visl[j / group] ? s[j] * scale : -INFINITY;
     __syncthreads();
     // a wave a query: the split's max, then exp and sum, each in key order
     const int lane = t & 31, wave = t >> 5;
     for (int j = wave; j < nq; j += blockDim.x >> 5) {
         float m = -INFINITY;
-        for (int i = lane; i < kFlashKeys; i += 32) m = fmaxf(m, ps[i][j]);
+        for (int i = lane; i < kFlashKeys; i += 32) m = fmaxf(m, ps[i][j ^ fsw(i)]);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor(m, off, 32));
         float sum = 0.f;
         for (int i = lane; i < kFlashKeys; i += 32) {
             // a row with no key in this split weighs every key zero (its sum 0 drops the split in the finish)
-            const float e = m == -INFINITY ? 0.f : expf(ps[i][j] - m);
-            ps[i][j] = e;
+            const float e = m == -INFINITY ? 0.f : expf(ps[i][j ^ fsw(i)] - m);
+            ps[i][j ^ fsw(i)] = e;
             sum += e;
         }
         sum = wave_sum(sum);
@@ -396,7 +400,7 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
 #pragma unroll
             for (int j4 = 0; j4 < kFlashQueries; j4 += 4) {
                 if (j4 < nq) {
-                    const float4 p = *reinterpret_cast<const float4*>(&ps[i + u][j4]);
+                    const float4 p = *reinterpret_cast<const float4*>(&ps[i + u][j4 ^ fsw(i + u)]);
                     acc[j4] += p.x * v[u];
                     acc[j4 + 1] += p.y * v[u];
                     acc[j4 + 2] += p.z * v[u];
@@ -410,7 +414,7 @@ __device__ void plan_flash_body(const float* __restrict__ q, float* __restrict__
 #pragma unroll
         for (int j4 = 0; j4 < kFlashQueries; j4 += 4) {
             if (j4 < nq) {
-                const float4 p = *reinterpret_cast<const float4*>(&ps[i][j4]);
+                const float4 p = *reinterpret_cast<const float4*>(&ps[i][j4 ^ fsw(i)]);
                 acc[j4] += p.x * v;
                 acc[j4 + 1] += p.y * v;
                 acc[j4 + 2] += p.z * v;
