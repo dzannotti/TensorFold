@@ -499,7 +499,7 @@ test "mlx products: the drafter's tiles write the verify tile's bytes, alone, in
             ps[i].free();
             pb[i].free();
         };
-        for ([_]usize{ 1, 5, 16 }) |rows| {
+        for ([_]usize{ 1, 5, 16, 37, 64 }) |rows| {
             const x = try randoms(&rng, rows * k, 2);
             defer gpa.free(x);
             var dx = try t.upload(x);
@@ -526,7 +526,7 @@ test "mlx products: the drafter's tiles write the verify tile's bytes, alone, in
             defer gpa.free(w0);
             // the conv variants: dynConv's branch 1 with a residual over the product
             const group = 16;
-            const block: usize = if (rows == 16) 16 else 4;
+            const block: usize = if (rows % 16 == 0) 16 else 4;
             const dyn = try randoms(&rng, rows * 4 * (n / group), 1);
             defer gpa.free(dyn);
             const cbase = try randoms(&rng, 4 * n, 1);
@@ -595,7 +595,7 @@ test "mlx products: the drafter's rms writes tf_rms's bytes" {
     }
 }
 
-test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1)" {
+test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1; TF_DFT_BENCH_M rows)" {
     if (std.c.getenv("TF_DFT_BENCH") == null) return;
     const affine = @import("../launches/affine.zig");
     const t = try Rig.open(1 << 16);
@@ -619,7 +619,7 @@ test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1)" {
         .{ .name = "selector", .n = 256, .k = 5120 },
     };
     const want: ?[]const u8 = if (std.c.getenv("TF_DFT_BENCH_SHAPE")) |e| std.mem.span(e) else null;
-    const m = 16;
+    const m: usize = if (std.c.getenv("TF_DFT_BENCH_M")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 16;
     const spread = 256 << 20;
     std.debug.print("\nshape        variant     us     GB/s\n", .{});
     for (all) |sh| {

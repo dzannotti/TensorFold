@@ -263,10 +263,12 @@ pub const Conv = struct { dyn: u64 = 0, base: u64 = 0, res: u64 = 0, group: usiz
 /// a.out (m <= 16 rows, a.n) = x (m, k; rows `ldx` apart, 0: k) times `a`, rounded to bf16: the verify split tile's
 /// bits. `.pair` also writes b.out = x b; `.conv` writes dynConv's branch 1 of the product (`cv`). k a multiple of 256.
 pub fn mlx(l: *const Launcher, kind: Kind, x: u64, m: usize, k: usize, ldx: usize, a: Mat, b: Mat, cv: Conv, s: S) Error!void {
-    if (m == 0 or m > 16 or k % 256 != 0 or a.n <= 0 or (kind == .pair and b.n <= 0)) return invalid("dft mlx");
+    // past 16 rows, 16-row tiles side by side; a conv's lag stays in its tile when blocks split 16
+    if (m == 0 or k % 256 != 0 or a.n <= 0 or (kind == .pair and b.n <= 0)) return invalid("dft mlx");
+    if (m > 16 and kind == .conv and 16 % cv.block != 0) return invalid("dft mlx conv rows");
     if (kind == .conv and (cv.res == 0 or @as(usize, @intCast(a.n)) % cv.group != 0)) return invalid("dft mlx conv");
     var p: Args = .{};
     try p.add(extern struct { x: u64, m: c_int, k: c_int, a: Mat, b: Mat, dyn: u64, base: u64, res: u64, group: c_int, block: c_int, ldx: c_int }{ .x = x, .m = @intCast(m), .k = @intCast(k), .a = a, .b = b, .dyn = cv.dyn, .base = cv.base, .res = cv.res, .group = @intCast(cv.group), .block = @intCast(cv.block), .ldx = @intCast(ldx) });
     const tiles = (@as(usize, @intCast(a.n)) + 15) / 16 + if (kind == .pair) (@as(usize, @intCast(b.n)) + 15) / 16 else 0;
-    try l.go(l.dft.mlx[@intFromEnum(kind)], dim(tiles, 1, 1), dim(128, 1, 1), 0, s, &p);
+    try l.go(l.dft.mlx[@intFromEnum(kind)], dim((m + 15) / 16, tiles, 1), dim(128, 1, 1), 0, s, &p);
 }

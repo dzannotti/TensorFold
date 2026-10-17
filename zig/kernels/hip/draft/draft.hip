@@ -638,13 +638,15 @@ __device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
     const int lane = threadIdx.x & 31;
     const int wave = threadIdx.x >> 5;
     const int half = lane >> 4;
-    const int live = p.m < 16 ? p.m : 16;
+    // rows 16 blockIdx.x.. (a launch's row tiles side by side, so a column tile's codes are read once from memory)
+    const int m0 = 16 * static_cast<int>(blockIdx.x);
+    const int live = p.m - m0 < 16 ? p.m - m0 : 16;
     const int K = p.k;
     const int ntrips = K >> 8;
     // PAIR: the first blocks a's tiles, the rest b's (two products of the same x in one launch)
     const int blocks_a = (p.a.n + 15) / 16;
-    const bool second = PAIR && static_cast<int>(blockIdx.x) >= blocks_a;
-    const int bx = second ? blockIdx.x - blocks_a : blockIdx.x;
+    const bool second = PAIR && static_cast<int>(blockIdx.y) >= blocks_a;
+    const int bx = second ? blockIdx.y - blocks_a : blockIdx.y;
     const DftMat& om = second ? p.b : p.a;
     const int col_s = bx * 16 + (lane & 15) < om.n ? bx * 16 + (lane & 15) : om.n - 1;
     const int ld = om.ld ? om.ld : K;
@@ -652,7 +654,7 @@ __device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
     // lane half 0 reads the scales, half 1 the biases
     const uint32_t* sp = reinterpret_cast<const uint32_t*>((half ? om.bias : om.scale) + static_cast<long long>(col_s) * (ld / 64));
     const int xrow = (lane & 15) < live ? (lane & 15) : live - 1;
-    const uint32_t* xg = reinterpret_cast<const uint32_t*>(p.x + static_cast<long long>(xrow) * (p.ldx ? p.ldx : K));
+    const uint32_t* xg = reinterpret_cast<const uint32_t*>(p.x + static_cast<long long>(m0 + xrow) * (p.ldx ? p.ldx : K));
 
     float acc[EPL];
 #pragma unroll
@@ -748,11 +750,11 @@ __device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
         const int e = i * 32 * WV + wave * 32 + lane;
         const int row = e >> 4, cl = e & 15;
         const int col = bx * 16 + cl;
-        if (row >= p.m) continue;
+        if (row >= live) continue;
         if constexpr (CONV) {
             ob[row][cl] = tobf(acc[i]);
         } else if (col < om.n) {
-            om.out[static_cast<long long>(row) * om.n + col] = tobf(acc[i]);
+            om.out[static_cast<long long>(m0 + row) * om.n + col] = tobf(acc[i]);
         }
     }
     if constexpr (CONV) {
@@ -763,14 +765,15 @@ __device__ __forceinline__ void dft_mlx_tile(const DftMlx& p) {
 #pragma unroll
         for (int i = 0; i < EPL; ++i) {
             const int e = i * 32 * WV + wave * 32 + lane;
-            const int t = e >> 4, cl = e & 15;
+            const int tl = e >> 4, cl = e & 15;
             const int col = bx * 16 + cl;
-            if (t >= p.m || col >= D) continue;
+            if (tl >= live || col >= D) continue;
+            const int t = m0 + tl;  // a tile's first row starts a block (16 % block == 0), so lag 1 stays in the tile
             const int g = col / p.group;
             const int lags = t % p.block == 0 ? 1 : 2;
             float total = 0.f;
             for (int l = 0; l < lags; l++) {
-                const float xv = bf(ob[t - l][cl]);
+                const float xv = bf(ob[tl - l][cl]);
                 total = rbf(total + rbf(bf(p.base[(2 + l) * D + col]) * xv));
                 total = rbf(total + rbf(bf(p.dyn[static_cast<size_t>(t) * (4 * groups) + (2 + l) * groups + g]) * xv));
             }
