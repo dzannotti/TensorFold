@@ -609,6 +609,8 @@ __device__ void conv_split_rows_body(const ConvArgs& launch) {
             }
         }
     }
+    // every row has read the state before row 0's thread overwrites it
+    __syncthreads();
     // an unreplayed window (a lone row, or the padding slot) moves the state on by its rows
     if (!live || samples != nullptr || g != 0) return;
     float* const out = reinterpret_cast<float*>(plan_desc(c.plan, slot)[plan_first(c.layer)]);

@@ -896,7 +896,7 @@ fn matOf(p: weights.Q4, out: u64) dft.Mat {
     return .{ .words = p.words, .scale = p.scales, .bias = p.biases, .out = out, .n = @intCast(p.n), .ld = @intCast(p.k) };
 }
 
-/// silu(x gate) * (x up), rounded as tf_silu_mul rounds: one launch on the drafter's tile, else the products and the act.
+/// silu(x gate) * (x up), rounded as tf_silu_mul rounds: the gate|up pair (one launch on the drafter's tile), then the act.
 fn mlpAct(o: Ops, x: Tensor, gate: Linear, up: Linear, rows: usize) !Tensor {
     const gu = try pairProj(o, x, gate, up, rows);
     try o.siluMul(gu[0], gu[1], gu[0], rows * gate.rows());
