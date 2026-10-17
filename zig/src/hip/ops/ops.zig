@@ -36,6 +36,7 @@ pub const Ops = struct {
     pub const project = products.project;
     pub const projectGroup = products.projectGroup;
     pub const projectSiluMul = products.projectSiluMul;
+    pub const densePair = products.densePair;
     pub const projectRoutedAct = products.projectRoutedAct;
     pub const projectRouted = products.projectRouted;
     pub const embedRows = products.embedRows;

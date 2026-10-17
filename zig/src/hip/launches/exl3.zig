@@ -164,13 +164,23 @@ pub const prompt_rows = 128;
 /// and (K, N) alone, never on m or where the prompt is cut; they differ from `project`'s (decode and rounds: K splits,
 /// even and odd k steps on two chains). False, nothing launched, for other matrices.
 pub fn prompt(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!bool {
+    return promptOf(l, x, 0, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+/// `prompt` of tf_silu_mul(gate, up), the activation made by the rotation (tf_exl3_rotate_silu): the same bits.
+pub fn promptSilu(l: *const Launcher, gate: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!bool {
+    if (up == 0) return invalid("exl3 silu");
+    return promptOf(l, gate, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+fn promptOf(l: *const Launcher, x: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!bool {
     if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 prompt");
     if (w.codebook != .mul1 or w.halves % 2 != 0) return false;
     // the tile's buffer loads take 31-bit byte offsets into the rotated x and the trellis
     const words: u64 = 4 * @as(u64, w.halves);
     if (m <= prompt_rows or @as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) {
         const f = l.exl3.chain[w.halves][tileOf(m, n)] orelse return false;
-        try product(l, f, 1, x, 0, x_kind, w, n, k, m, out, out_kind, scratch, s);
+        try product(l, f, 1, x, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
         return true;
     }
     // 256 x 128 (half the decode a weight) but where k is near n (o_proj, out_proj: 128 x 256 measured 25% faster);
@@ -180,12 +190,13 @@ pub fn prompt(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32,
     {
         var a: Args = .{};
         try a.add(x);
+        if (up != 0) try a.add(up);
         try a.add(x_kind);
         try a.add(w.suh);
         try a.add(scratch);
         try a.add(@as(c_int, @intCast(k)));
         try a.add(@as(c_int, 0));
-        try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
+        try l.go(if (up != 0) l.exl3.rotate_silu else l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
     const arg: Arg = .{
         .xh = scratch,

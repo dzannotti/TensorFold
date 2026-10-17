@@ -55,6 +55,7 @@ pub const Launcher = struct {
     r: *const runtime.Runtime,
     mods: [kernels.group_count]Module,
     rms: Triple,
+    rms_wave: Triple,
     conv_decode: Function,
     conv_rows: Function,
     rope_decode: Function,
@@ -143,6 +144,7 @@ pub const Launcher = struct {
         gdn_gate_prefill: Function,
         dense_rows: Function,
         dense_rows_pair: Function,
+        dense_cols_pair: Function,
         dense_wave: [3]Function, // 1, 4 and 16 rows a pass
         moe_route: Function,
         router_rows: [2]Function, // fp16, bf16
@@ -217,6 +219,7 @@ pub const Launcher = struct {
             .gdn_gate_prefill = try ops.function("tf_gdn_gate_prefill"),
             .dense_rows = try ops.function("tf_dense_rows"),
             .dense_rows_pair = try ops.function("tf_dense_rows_pair"),
+            .dense_cols_pair = try ops.function("tf_dense_cols_pair"),
             .dense_wave = .{ try ops.function("tf_dense_wave1"), try ops.function("tf_dense_wave4"), try ops.function("tf_dense_wave16") },
             .moe_route = try ops.function("tf_moe_route"),
             .router_rows = .{ try ops.function("tf_router_rows_f16"), try ops.function("tf_router_rows_bf16") },
@@ -236,6 +239,11 @@ pub const Launcher = struct {
             try act.function(ns ++ "10rms_kernelIfEEvPKT_PKfPS2_if"),
             try act.function(ns ++ "10rms_kernelI6__halfEEvPKT_PKfPS3_if"),
             try act.function(ns ++ "10rms_kernelI12hip_bfloat16EEvPKT_PKfPS3_if"),
+        };
+        l.rms_wave = .{
+            try act.function(ns ++ "15rms_wave_kernelIfEEvPKT_PKfPS2_iif"),
+            try act.function(ns ++ "15rms_wave_kernelI6__halfEEvPKT_PKfPS3_iif"),
+            try act.function(ns ++ "15rms_wave_kernelI12hip_bfloat16EEvPKT_PKfPS3_iif"),
         };
         l.conv_decode = try act.function("tf_conv_decode");
         l.conv_rows = try act.function("tf_conv_rows");
@@ -363,6 +371,7 @@ pub const Launcher = struct {
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
     pub const tf_dense_rows_pair = elementwise.tf_dense_rows_pair;
+    pub const tf_dense_cols_pair = elementwise.tf_dense_cols_pair;
     pub const denseWave = elementwise.denseWave;
     pub const fn_hc_norm = flashnext.hcNorm;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
@@ -392,6 +401,7 @@ pub const Launcher = struct {
     pub const exl3Prompt = exl3.prompt;
     pub const exl3Scratch = exl3.scratchBytes;
     pub const exl3Silu = exl3.projectSilu;
+    pub const exl3PromptSilu = exl3.promptSilu;
     pub const hadamard = exl3.hadamard;
 
     /// Launches on `s`; the counting stream runs nothing.

@@ -57,14 +57,21 @@ pub fn exl3(o: Ops, x: Tensor, proj: Projection, w: quant.exl3.Matrix, m: usize,
     return out;
 }
 
-/// matmul(silu_mul(gate, up), proj) in x's kind without the activation's row, for a round's EXL3 rows (null: the
+/// matmul(silu_mul(gate, up), proj) in x's kind without the activation's row, for a prompt's or a round's EXL3 rows (null: the
 /// format or row count does not take it; nothing launched). The same bits as tf_silu_mul then `project`.
 pub fn projectSiluMul(o: Ops, gate: Tensor, up: Tensor, proj: Projection, m: usize) Error!?Tensor {
     const w = switch (proj.handle) {
         .exl3 => |h| h,
         else => return null,
     };
-    if (!o.window or m == 0 or m > 32 or proj.partial or gate.kind == .f32 or up.kind != gate.kind) return null;
+    if (m == 0 or proj.partial or gate.kind == .f32 or up.kind != gate.kind) return null;
+    if (o.prefill) {
+        const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * gate.kind.size()), .kind = gate.kind };
+        const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+        if (try exl3_launch.promptSilu(o.l, gate.ptr, up.ptr, gate.kind.table(), w, proj.n, proj.k, m, out.ptr, gate.kind.table(), scratch, o.stream)) return out;
+        return null;
+    }
+    if (!o.window or m > 32) return null;
     const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * gate.kind.size()), .kind = gate.kind };
     const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
     try exl3_launch.projectSilu(o.l, gate.ptr, up.ptr, gate.kind.table(), w, proj.n, proj.k, m, out.ptr, gate.kind.table(), scratch, o.stream);
@@ -111,6 +118,27 @@ fn exl3Group(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor
     outs[d[1]] = .{ .ptr = try o.arena.take(m * b.n * x.kind.size()), .kind = x.kind };
     try o.l.tf_dense_rows_pair(p(x.ptr), @backingInt(x.kind), p(wa.weight), p(wb.weight), @backingInt(actKind(wa.kind)), p(outs[d[0]].ptr), p(outs[d[1]].ptr), int(m), int(a.n), int(a.k), o.stream);
     return true;
+}
+
+/// A prompt's two dense products of one x and shape that take tf_dense_rows (an EXL3 pack's fp16 in_proj_a and b) in
+/// one launch reading x once for 16 columns: tf_dense_rows' bits. Null, nothing launched, for other pairs.
+pub fn densePair(o: Ops, x: Tensor, a: Projection, b: Projection, m: usize) Error!?[2]Tensor {
+    if (!o.prefill or m == 0 or x.kind == .f32 or a.partial or b.partial) return null;
+    const wa = switch (a.handle) {
+        .dense => |h| h,
+        else => return null,
+    };
+    const wb = switch (b.handle) {
+        .dense => |h| h,
+        else => return null,
+    };
+    if (a.n != b.n or a.k != b.k or wa.kind != wb.kind or wa.kind == .bf16) return null;
+    const outs: [2]Tensor = .{
+        .{ .ptr = try o.arena.take(m * a.n * x.kind.size()), .kind = x.kind },
+        .{ .ptr = try o.arena.take(m * b.n * x.kind.size()), .kind = x.kind },
+    };
+    try o.l.tf_dense_cols_pair(p(x.ptr), @backingInt(x.kind), p(wa.weight), p(wb.weight), @backingInt(actKind(wa.kind)), p(outs[0].ptr), p(outs[1].ptr), int(m), int(a.n), int(a.k), o.stream);
+    return outs;
 }
 
 /// The routed gate and up with the activation as the epilogue; null when the format or the tile does not take it.

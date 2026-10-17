@@ -119,8 +119,7 @@ fn linear(o: Ops, m: *const view.Model, l: view.Linear, caches: *state.Caches, i
     const s = m.spec;
     const qkv = try o.project(x, l.qkv, rows, false);
     const z = try o.project(x, l.z, rows, false);
-    const a = try o.project(x, l.a, rows, false);
-    const b = try o.project(x, l.b, rows, false);
+    const a, const b = if (try o.densePair(x, l.a, l.b, rows)) |ab| .{ ab[0], ab[1] } else .{ try o.project(x, l.a, rows, false), try o.project(x, l.b, rows, false) };
     const cache = caches.layers[index].linear;
     const ch = view.convChannels(s);
     const mixed = try o.arena.of(f32, rows * ch);

@@ -30,6 +30,13 @@ pub fn tf_rms(l: *const Launcher, x: C, weight: CF, y: P, kind: c_int, rows: c_i
     }
     try a.add(ad(weight));
     try a.add(ad(y));
+    if (rows >= 64) {
+        // many rows: a wave a row (rms_wave_kernel), rms_kernel's sums
+        try a.add(rows);
+        try a.add(width);
+        try a.add(eps);
+        return l.go(l.rms_wave[tri(kind)], dim(cdiv(rows, 8), 1, 1), dim(256, 1, 1), 0, s, &a);
+    }
     try a.add(width);
     try a.add(eps);
     try l.go(l.rms[tri(kind)], dim(rows, 1, 1), dim(256, 1, 1), 0, s, &a);
