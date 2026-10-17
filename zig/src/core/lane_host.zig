@@ -7,6 +7,9 @@ const status = @import("lane_host_status.zig");
 const learn = @import("lane_host_learn.zig");
 const lone = @import("lane_host_lone.zig");
 const fill = @import("lane_host_fill.zig");
+
+/// Prompt rows a lane host fills back to back before a round, when each prompt finishes in its chunk.
+const short_fills = 1024;
 const admit = @import("lane_host_admit.zig");
 const recalls = @import("lane_host_recall.zig");
 const ends = @import("lane_host_end.zig");
@@ -367,10 +370,12 @@ pub const LaneHost = struct {
     }
 
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
-    fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
+    /// True when it finished a prompt within `left` rows (taken off it) and another may go in before the round.
+    fn fillOne(h: *LaneHost, left: *usize) bool {
+        if (h.filling.items.len == 0) return false;
         const at = fill.next(h);
         const job = h.filling.items[at];
+        const rows = job.stream.prompt_len -| job.stream.cached;
         const first = !job.fill_began;
         job.fill_began = true;
         const done = h.core.fillStream(&job.stream, first) catch |e| {
@@ -382,12 +387,15 @@ pub const LaneHost = struct {
                 },
                 else => h.drop(job, h.words(e)),
             };
-            return;
+            return false;
         };
-        if (!done) return;
+        if (!done) return false;
         _ = h.filling.orderedRemove(at);
         h.prefilled(job, job.began);
         _ = h.deliver(job);
+        if (rows >= left.*) return false;
+        left.* -= rows;
+        return true;
     }
 
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
@@ -502,7 +510,10 @@ pub const LaneHost = struct {
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
-            h.fillOne();
+            // short prompts that finish go in together before the next round (eight arriving at once start as one
+            // shared round, not eight); a prompt that takes more chunks still gets one a round
+            var fill_left: usize = if (std.c.getenv("TF_FILL_ONE") != null) 0 else short_fills;
+            while (h.fillOne(&fill_left)) {}
             status.noteLive(h);
             h.lock();
             if (h.closing) {

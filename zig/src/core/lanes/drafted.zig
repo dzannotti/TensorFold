@@ -25,6 +25,11 @@ pub const Drafted = struct {
     absorbs: std.ArrayList(dr.Absorb) = .empty,
     holds: std.ArrayList(dr.Hold) = .empty,
     firsts: std.ArrayList(u32) = .empty,
+    // TF_LANES_DEBUG: ns in held (the wait for a hold), absorb and hold calls; rounds by streams and rows
+    ns: [3]u64 = @splat(0),
+    by_streams: [17]u64 = @splat(0),
+    rows_sum: u64 = 0,
+    rounds: u64 = 0,
 
     /// The wrapper, with the target told the drafter's taps before any forward.
     pub fn init(gpa: Allocator, target: be.Backend, drafter: dr.Drafter) !Drafted {
@@ -32,7 +37,17 @@ pub const Drafted = struct {
         return .{ .gpa = gpa, .target = target, .drafter = drafter };
     }
 
+    fn now() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+
     pub fn deinit(x: *Drafted) void {
+        if (x.rounds > 0 and std.c.getenv("TF_LANES_DEBUG") != null) {
+            const r: f64 = @floatFromInt(x.rounds);
+            std.debug.print("drafted: {d} verifies, {d:.1} rows each; ms a round: held {d:.2} absorb {d:.2} hold {d:.2}; by streams {any}\n", .{ x.rounds, @as(f64, @floatFromInt(x.rows_sum)) / r, @as(f64, @floatFromInt(x.ns[0])) / r / 1e6, @as(f64, @floatFromInt(x.ns[1])) / r / 1e6, @as(f64, @floatFromInt(x.ns[2])) / r / 1e6, x.by_streams });
+        }
         x.lanes.deinit(x.gpa);
         x.windows.deinit(x.gpa);
         x.tokens.deinit(x.gpa);
@@ -86,6 +101,11 @@ pub const Drafted = struct {
         m.speculate_early = false;
         m.drafts = @min(d.depth, if (target.exact_width > 1) target.exact_width - 1 else 0);
         m.mtp_step_ms = d.step_ms;
+        m.shared_drafts = d.shared_depth;
+        m.shared_step_ms = d.shared_step_ms;
+        m.shared_levels = d.shared_levels;
+        // a shared round explores past its streams' kept chains: a deeper draft is priced, so the rule learns it
+        m.explore_depth = d.shared_depth > 0;
         if (d.fixed_hold) m.lane_step_ms = 0;
         m.draft_prior = d.prior;
         m.plain_guard = d.plain_guard;
@@ -151,7 +171,10 @@ pub const Drafted = struct {
             if (w.held > 0 and w.tokens.len != 0) return error.MixedDrafts;
             total += w.held;
         }
-        if (total == 0) return x.target.verify(x.windows.items, out);
+        if (total == 0) {
+            x.count(windows);
+            return x.target.verify(x.windows.items, out);
+        }
         try x.tokens.resize(x.gpa, total);
         x.streams.clearRetainingCapacity();
         x.outs.clearRetainingCapacity();
@@ -171,7 +194,10 @@ pub const Drafted = struct {
             try x.streams.append(x.gpa, w.stream);
             try x.outs.append(x.gpa, slot);
         }
+        const t0 = now();
         if (x.streams.items.len > 0) try x.drafter.held(x.streams.items, x.outs.items);
+        x.ns[0] += now() - t0;
+        x.count(windows);
         return x.target.verify(x.windows.items, out);
     }
 
@@ -224,8 +250,18 @@ pub const Drafted = struct {
             }
             try x.holds.append(x.gpa, .{ .stream = r.stream, .pending = pending, .position = r.position, .depth = r.depth, .lanes = r.lanes });
         }
+        const t0 = now();
         if (x.absorbs.items.len > 0) try x.drafter.absorb(x.absorbs.items);
+        const t1 = now();
         if (x.holds.items.len > 0) try x.drafter.hold(x.holds.items);
+        x.ns[1] += t1 - t0;
+        x.ns[2] += now() - t1;
+    }
+
+    fn count(x: *Drafted, windows: []const be.Window) void {
+        x.rounds += 1;
+        x.by_streams[@min(windows.len, 16)] += 1;
+        for (windows) |w| x.rows_sum += w.rows();
     }
 
     fn dropStream(x: *Drafted, s: *Stream) void {

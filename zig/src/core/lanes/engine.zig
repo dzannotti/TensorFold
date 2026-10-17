@@ -53,6 +53,10 @@ pub const Engine = struct {
                 .k = cfg.k,
                 .prior = cfg.depth_prior,
                 .most_drafts = cfg.most_drafts,
+                .shared_drafts = cfg.shared_drafts,
+                .shared_step_ms = cfg.shared_step_ms,
+                .explore_depth = cfg.explore_depth,
+                .shared_levels = cfg.shared_levels,
                 .family_costs = &cfg.family_costs,
                 .shared_costs = &cfg.shared_costs,
                 .mtp_step_ms = cfg.mtp_step_ms,
@@ -352,6 +356,7 @@ pub const Engine = struct {
                     var chain_kept: usize = 0;
                     for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
                     try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
+                    if (!e.alone and e.rule.explore_depth) try e.rule.observeBeyond(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
                 }
                 var kept_branch: u64 = 0; // the context's graft rows kept, then Recall's
                 var kept_recall: u64 = 0;

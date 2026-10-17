@@ -41,6 +41,20 @@ Quality, from `tools/strix/quality.py` (Qwen3.8-27B against its bf16 weights):
 | MLX 4-bit | 3.1853 | 0.1115 | 91.19% |
 | EXL3 3.5 bpw | 3.2141 | 0.1162 | 91.87% |
 
+## Measured (eight streams, C8)
+
+sparkbench C8 (eight requests at once, aggregate tokens over the first-to-last token window), same lock and method,
+two interleaved runs each against `strix/c1-code`:
+
+| Model | Checkpoint, drafter | Prose C8 | Code C8 | Spark prose / code |
+| --- | --- | --- | --- | --- |
+| Qwen3.8-27B | EXL3 3.5 bpw, DFlash2 | 202.3, 201.5 (was 153.4, 153.7) | 209.8, 220.5 (was 183.1, 183.6) | 220.6 / 323.2 |
+
+A C8 round of eight prose streams (`TF_ROUND_PROFILE=1`): the verify of ~30 rows 88 ms (its EXL3 products ~65 ms of
+it against a 48.6 ms read of the weights; at 32 rows the round tile runs two WMMAs per decoded weight fragment and is
+issue-bound, not bandwidth-bound), then the drafter's hold (32 rows, 12 ms alone) beside the keep's DeltaNet replay
+(2.4 GB of state, 15 ms), 22 ms together, and ~4.5 ms between the GPU's pieces. Host work is ~0.1 ms a round.
+
 ## Reproducing
 
 ```sh
@@ -61,6 +75,9 @@ work python tools/strix/quality.py --model ~/models/Qwen3.8-27B-MLX-4bit   # nee
 | `TF_DRAFT_BLOCK=N` | The DFlash2 drafter's block (default 16) |
 | `TF_DRAFT_PROFILE=1` | Prints the drafter hold's per-launch breakdown at load |
 | `TF_LANES_DEBUG=1` | Prints each finished stream's rounds, planner choices and accepted lanes |
+| `TF_DRAFT_SMALL=N` | A shared round's DFlash2 hold runs only blocks of N (default 4 and 8; 0: always the full block) |
+| `TF_ROUND_PROFILE=1` | Prints a lane round's GPU verify, keep and hold times and the gaps between them |
+| `TF_FILL_ONE=1` | One prompt chunk a round, even for short prompts arriving together |
 | `TF_FN_TIMES=1` | Prints a Flash Next round's host phases |
 
 ## Not done yet
@@ -68,5 +85,6 @@ work python tools/strix/quality.py --model ~/models/Qwen3.8-27B-MLX-4bit   # nee
 - Flash Next NVFP4 is being ported. Flash Next prefill is far behind (the sparse-attention prompt kernel is half its time).
 - The DFlash v1 drafter (the 35B-A3B's) does not load. HIP reads DFlash2 only.
 - MiniCPM-4.7 (ciru_q8) is being ported, text only first.
-- C8 (eight streams) is not tuned yet.
+- C8 code is below the Spark's: a row past 32 costs ~1.4 ms of verify (EXL3 products compute-bound), so code streams
+  get ~5 tokens a round at C8 against ~10 alone.
 - Feature parity against CUDA and Metal: [the matrix](strix-halo-parity.md).

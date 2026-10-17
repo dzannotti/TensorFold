@@ -52,6 +52,10 @@ pub const Rule = struct {
     k: Constants = .{},
     prior: []const f64,
     most_drafts: u32,
+    shared_drafts: u32 = 0, // a shared round's drafts at most (0: most_drafts)
+    shared_step_ms: f64 = 0, // one more draft of a shared round's deepest stream (0: mtp_step_ms)
+    explore_depth: bool = false, // observeBeyond after a shared round
+    shared_levels: [2]u32 = @splat(0), // the depths a shared round's hold runs to (alloc.HeadCost.levels)
     family_costs: *const Table,
     shared_costs: *const Table,
     mtp_step_ms: f64,
@@ -90,6 +94,15 @@ pub const Rule = struct {
             const at: usize = @intCast(j);
             p[at] += r.k.depth_rate * (hit - p[at]);
         }
+    }
+
+    /// A chain kept whole (`accepted` of `proposed`) raises the next depth's estimate as if it had been drafted and kept:
+    /// a depth a shared round never drafts would otherwise stay at the prior and never be priced in.
+    pub fn observeBeyond(r: *Rule, who: Who, proposed: i64, accepted: i64) !void {
+        const p = try r.rates(who);
+        if (proposed <= 0 or accepted < proposed or proposed >= p.len) return;
+        const at: usize = @intCast(proposed);
+        p[at] += r.k.depth_rate * (1.0 - p[at]);
     }
 
     /// Round times by depth: the stream's own under `plain_guard`, else greedy rounds' for a greedy stream.
@@ -215,7 +228,8 @@ pub const Rule = struct {
         var made: usize = 0;
         defer for (probs[0..made]) |p| r.gpa.free(p);
         for (whos, most, probs) |w, *m, *p| {
-            m.* = @min(@as(i64, r.most_drafts), @max(1, w.draft_room - 1));
+            const cap: u32 = if (r.shared_drafts > 0 and whos.len > 1) @min(r.shared_drafts, r.most_drafts) else r.most_drafts;
+            m.* = @min(@as(i64, cap), @max(1, w.draft_room - 1));
             p.* = try alloc.chainProbabilities(r.gpa, try r.rates(w), @intCast(m.*));
             made += 1;
         }
@@ -223,7 +237,8 @@ pub const Rule = struct {
         defer r.gpa.free(ones);
         @memset(ones, 1);
         // drafts priced by their head steps: an overhead that held them would favour the depths it was measured at
-        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads };
+        const shared = r.shared_step_ms > 0 and whos.len > 1;
+        const head: alloc.HeadCost = .{ .step_ms = if (shared) r.shared_step_ms else r.mtp_step_ms, .batched = r.batched_heads, .levels = if (shared) r.shared_levels else @splat(0) };
         const counts = try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), @max(whos.len, r.batch_rows), head);
         defer r.gpa.free(counts);
         if (r.plain_guard) {
@@ -268,6 +283,11 @@ pub const Rule = struct {
     pub fn headMs(r: *const Rule, depths: []const i64) f64 {
         var steps: i64 = 0;
         for (depths) |d| steps = if (r.batched_heads) @max(steps, d) else steps + d;
+        // a shared round's batched hold, priced as budgets priced it
+        if (r.batched_heads and r.shared_step_ms > 0 and depths.len > 1) {
+            const head: alloc.HeadCost = .{ .levels = r.shared_levels };
+            return r.shared_step_ms * @as(f64, @floatFromInt(head.steps(@intCast(@max(steps, 0)))));
+        }
         return r.mtp_step_ms * @as(f64, @floatFromInt(steps));
     }
 
