@@ -313,3 +313,169 @@ test "EXL3 packs' dense rows over fp16 weights (in_proj_a and b) match fp64 and 
         try base.expect(std.mem.eql(u16, one, all[r * n ..][0..n]), "dense rows: row {d} alone differs", .{r});
     }
 }
+
+test "a prompt's EXL3 product of silu_mul(gate, up) made in its rotation keeps tf_silu_mul then the prompt product's bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x70736c75 };
+    const k = 1024;
+    const n: u32 = 512;
+    for ([_]usize{ 37, 300 }) |rows| {
+        const trellis = try gpa.alloc(i16, (k / 16) * (n / 16) * 6 * 8);
+        defer gpa.free(trellis);
+        for (trellis) |*w| w.* = @bitCast(@as(u16, @truncate(rng.next())));
+        const suh = try gpa.alloc(f16, k);
+        defer gpa.free(suh);
+        for (suh) |*s| s.* = @floatCast((1 + 0.1 * rng.unit()) * @as(f32, if (rng.next() & 1 == 0) 1 else -1));
+        const svh = try gpa.alloc(f16, n);
+        defer gpa.free(svh);
+        for (svh) |*s| s.* = @floatCast(0.02 * (1 + 0.1 * rng.unit()));
+        const gu = try gpa.alloc(u16, 2 * rows * k);
+        defer gpa.free(gu);
+        for (gu) |*v| v.* = base.bf16Bits(8 * rng.unit());
+        var dt = try Buffer.fromHost(t, trellis);
+        defer dt.free();
+        var ds = try Buffer.fromHost(t, suh);
+        defer ds.free();
+        var dv = try Buffer.fromHost(t, svh);
+        defer dv.free();
+        var dg = try Buffer.fromHost(t, gu);
+        defer dg.free();
+        var act = try Buffer.alloc(t, rows * k * 2);
+        defer act.free();
+        var out = try Buffer.alloc(t, rows * n * 2);
+        defer out.free();
+        var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(rows, k, n));
+        defer scratch.free();
+        const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = 6, .codebook = .mul1, .columns = n };
+        const up = dg.ptr + rows * k * 2;
+        try t.on.tf_silu_mul(@ptrFromInt(dg.ptr), @ptrFromInt(up), @ptrFromInt(act.ptr), 2, @intCast(rows * k), t.stream.handle);
+        try base.expect(try t.on.exl3Prompt(act.ptr, 1, m, n, k, rows, out.ptr, 1, scratch.ptr, t.stream.handle), "no prompt product", .{});
+        try t.stream.synchronize();
+        const want = try gpa.alloc(u16, rows * n);
+        defer gpa.free(want);
+        try out.download(0, std.mem.sliceAsBytes(want));
+        try out.fill8(0xff, null);
+        try base.expect(try t.on.exl3PromptSilu(dg.ptr, up, 1, m, n, k, rows, out.ptr, 1, scratch.ptr, t.stream.handle), "no fused prompt product", .{});
+        try t.stream.synchronize();
+        const got = try gpa.alloc(u16, rows * n);
+        defer gpa.free(got);
+        try out.download(0, std.mem.sliceAsBytes(got));
+        try base.expect(std.mem.eql(u16, got, want), "the prompt's fused activation product differs ({d} rows)", .{rows});
+    }
+}
+
+test "a prompt's dense pair 8 columns a block keeps tf_dense_rows' bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x636f6c73 };
+    const k = 5120;
+    const n = 48;
+    const rows = 37;
+    const w = try gpa.alloc(f16, 2 * n * k);
+    defer gpa.free(w);
+    for (w) |*v| v.* = @floatCast(0.05 * rng.unit());
+    const x = try gpa.alloc(u16, rows * k);
+    defer gpa.free(x);
+    for (x) |*v| v.* = base.bf16Bits(rng.unit());
+    var dw = try Buffer.fromHost(t, w);
+    defer dw.free();
+    var dx = try Buffer.fromHost(t, x);
+    defer dx.free();
+    var out = try Buffer.alloc(t, 4 * rows * n * 2);
+    defer out.free();
+    const w1 = dw.ptr + n * k * 2;
+    const o = [4]u64{ out.ptr, out.ptr + rows * n * 2, out.ptr + 2 * rows * n * 2, out.ptr + 3 * rows * n * 2 };
+    try out.fill8(0xff, null);
+    try t.on.tf_dense_rows(@ptrFromInt(dx.ptr), 2, @ptrFromInt(dw.ptr), 1, @ptrFromInt(o[0]), rows, n, k, t.stream.handle);
+    try t.on.tf_dense_rows(@ptrFromInt(dx.ptr), 2, @ptrFromInt(w1), 1, @ptrFromInt(o[1]), rows, n, k, t.stream.handle);
+    try t.on.tf_dense_cols_pair(@ptrFromInt(dx.ptr), 2, @ptrFromInt(dw.ptr), @ptrFromInt(w1), 1, @ptrFromInt(o[2]), @ptrFromInt(o[3]), rows, n, k, t.stream.handle);
+    try t.stream.synchronize();
+    const all = try gpa.alloc(u16, 4 * rows * n);
+    defer gpa.free(all);
+    try out.download(0, std.mem.sliceAsBytes(all));
+    try base.expect(std.mem.eql(u16, all[0 .. 2 * rows * n], all[2 * rows * n ..]), "the dense pair's columns differ from tf_dense_rows'", .{});
+}
+
+test "rms norm a wave a row (many rows) keeps rms_kernel's bits (one row at a time)" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x726d7377 };
+    const width = 5120;
+    const rows = 70;
+    const x = try gpa.alloc(u16, rows * width);
+    defer gpa.free(x);
+    for (x) |*v| v.* = base.bf16Bits(4 * rng.unit());
+    const w = try gpa.alloc(f32, width);
+    defer gpa.free(w);
+    for (w) |*v| v.* = @floatCast(1 + 0.5 * rng.unit());
+    var dx = try Buffer.fromHost(t, x);
+    defer dx.free();
+    var dw = try Buffer.fromHost(t, w);
+    defer dw.free();
+    var out = try Buffer.alloc(t, 2 * rows * width * 2);
+    defer out.free();
+    const half = out.ptr + rows * width * 2;
+    // ops kinds: 2 bf16
+    try t.on.tf_rms(@ptrFromInt(dx.ptr), @ptrFromInt(dw.ptr), @ptrFromInt(out.ptr), 2, rows, width, 1e-6, t.stream.handle);
+    for (0..rows) |r| try t.on.tf_rms(@ptrFromInt(dx.ptr + r * width * 2), @ptrFromInt(dw.ptr), @ptrFromInt(half + r * width * 2), 2, 1, width, 1e-6, t.stream.handle);
+    try t.stream.synchronize();
+    const all = try gpa.alloc(u16, 2 * rows * width);
+    defer gpa.free(all);
+    try out.download(0, std.mem.sliceAsBytes(all));
+    try base.expect(std.mem.eql(u16, all[0 .. rows * width], all[rows * width ..]), "rms a wave a row differs from rms_kernel", .{});
+}
+
+test "a prompt's EXL3 product added into the residual rows keeps the product then tf_add's bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x72657364 };
+    const k = 1024;
+    const n: u32 = 512;
+    const rows = 300;
+    const trellis = try gpa.alloc(i16, (k / 16) * (n / 16) * 6 * 8);
+    defer gpa.free(trellis);
+    for (trellis) |*w| w.* = @bitCast(@as(u16, @truncate(rng.next())));
+    const suh = try gpa.alloc(f16, k);
+    defer gpa.free(suh);
+    for (suh) |*s| s.* = @floatCast((1 + 0.1 * rng.unit()) * @as(f32, if (rng.next() & 1 == 0) 1 else -1));
+    const svh = try gpa.alloc(f16, n);
+    defer gpa.free(svh);
+    for (svh) |*s| s.* = @floatCast(0.02 * (1 + 0.1 * rng.unit()));
+    const x = try gpa.alloc(u16, rows * k);
+    defer gpa.free(x);
+    for (x) |*v| v.* = base.bf16Bits(rng.unit());
+    const r0 = try gpa.alloc(u16, rows * n);
+    defer gpa.free(r0);
+    for (r0) |*v| v.* = base.bf16Bits(4 * rng.unit());
+    var dt = try Buffer.fromHost(t, trellis);
+    defer dt.free();
+    var ds = try Buffer.fromHost(t, suh);
+    defer ds.free();
+    var dv = try Buffer.fromHost(t, svh);
+    defer dv.free();
+    var dx = try Buffer.fromHost(t, x);
+    defer dx.free();
+    var want = try Buffer.fromHost(t, r0);
+    defer want.free();
+    var got = try Buffer.fromHost(t, r0);
+    defer got.free();
+    var y = try Buffer.alloc(t, rows * n * 2);
+    defer y.free();
+    var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(rows, k, n));
+    defer scratch.free();
+    const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = 6, .codebook = .mul1, .columns = n };
+    try base.expect(try t.on.exl3Prompt(dx.ptr, 1, m, n, k, rows, y.ptr, 1, scratch.ptr, t.stream.handle), "no prompt product", .{});
+    // ops numbering for tf_add (2 bf16)
+    try t.on.tf_add(@ptrFromInt(want.ptr), @ptrFromInt(y.ptr), @ptrFromInt(want.ptr), 2, rows * n, t.stream.handle);
+    try base.expect(try t.on.exl3Prompt(dx.ptr, 1, m, n, k, rows, got.ptr, 3, scratch.ptr, t.stream.handle), "no residual product", .{});
+    try t.stream.synchronize();
+    const a = try gpa.alloc(u16, rows * n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u16, rows * n);
+    defer gpa.free(b);
+    try want.download(0, std.mem.sliceAsBytes(a));
+    try got.download(0, std.mem.sliceAsBytes(b));
+    try base.expect(std.mem.eql(u16, a, b), "the residual product differs from the product then tf_add", .{});
+    try base.expect(!try t.on.exl3Prompt(dx.ptr, 1, m, n, k, 100, got.ptr, 3, scratch.ptr, t.stream.handle), "a chain call took the residual", .{});
+}

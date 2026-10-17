@@ -62,14 +62,14 @@ pub fn span(ops: Ops, m: *const view.Model, caches: *state.Caches, ids: u64, len
             };
             const normed = try take(o, m.act, rows * s.hidden);
             try o.rms(xs, input_norm, normed, rows, s.hidden, @floatCast(s.eps));
+            // the mixer's and the MLP's last products add into the residual rows where the prompt tile takes it
             const y = switch (layer) {
-                .full => |f| try attention(o, m, f, caches, index, normed, rows, pos0 + start),
-                .linear => |l| try linear(o, m, l, caches, index, normed, rows),
+                .full => |f| try attention(o, m, f, caches, index, normed, rows, pos0 + start, xs),
+                .linear => |l| try linear(o, m, l, caches, index, normed, rows, xs),
             };
-            try residual(o, m, xs, y, rows * s.hidden);
+            if (y) |t| try residual(o, m, xs, t, rows * s.hidden);
             try o.rms(xs, post_norm, normed, rows, s.hidden, @floatCast(s.eps));
-            const z = try mlpRows(o, m, mlp, normed, rows, true);
-            try residual(o, m, xs, z, rows * s.hidden);
+            if (try mlpInto(o, m, mlp, normed, rows, true, xs)) |z| try residual(o, m, xs, z, rows * s.hidden);
         }
         if (trace) |t| t.layer(t.ctx, index, x, len) catch |err| return if (err == error.Cancelled) error.Cancelled else error.HipFailed;
     }
@@ -83,8 +83,9 @@ pub fn scaleOf(head_dim: usize) f32 {
     return @floatCast(std.math.pow(f64, @floatFromInt(head_dim), -0.5));
 }
 
-/// Full attention on `rows` normed rows at `pos`: q and its gate, k, v, norms, RoPE, cache write, prefill tile, o.
-fn attention(o: Ops, m: *const view.Model, f: view.Full, caches: *state.Caches, index: usize, x: Tensor, rows: usize, pos: usize) Error!Tensor {
+/// Full attention on `rows` normed rows at `pos`: q and its gate, k, v, norms, RoPE, cache write, prefill tile, o; null
+/// when o's product went into `res` (projectAdd).
+fn attention(o: Ops, m: *const view.Model, f: view.Full, caches: *state.Caches, index: usize, x: Tensor, rows: usize, pos: usize, res: Tensor) Error!?Tensor {
     const s = m.spec;
     const hd = s.head_dim;
     const qg = try o.project(x, f.q, rows, false);
@@ -111,44 +112,42 @@ fn attention(o: Ops, m: *const view.Model, f: view.Full, caches: *state.Caches, 
     try o.causalPaged(q32, c, att, rows, pos + rows, s.heads, scaleOf(hd), pos);
     const gated = try take(o, m.act, q_rows * hd);
     try o.attnGate(att, qg, gated, rows, s.heads, hd, false);
-    return o.project(gated, f.o, rows, f.o.partial);
+    if (try o.projectAdd(gated, f.o, rows, res)) return null;
+    return try o.project(gated, f.o, rows, f.o.partial);
 }
 
-/// Linear attention: qkv, z, a, b, the conv over [state | rows], norms, gate, recurrence and the gated norm.
-fn linear(o: Ops, m: *const view.Model, l: view.Linear, caches: *state.Caches, index: usize, x: Tensor, rows: usize) Error!Tensor {
+/// Linear attention: qkv, z, a, b, the conv over [state | rows], norms, gate, recurrence and the gated norm; null when
+/// the out product went into `res`.
+fn linear(o: Ops, m: *const view.Model, l: view.Linear, caches: *state.Caches, index: usize, x: Tensor, rows: usize, res: Tensor) Error!?Tensor {
     const s = m.spec;
     const qkv = try o.project(x, l.qkv, rows, false);
     const z = try o.project(x, l.z, rows, false);
-    const a = try o.project(x, l.a, rows, false);
-    const b = try o.project(x, l.b, rows, false);
+    const a, const b = if (try o.densePair(x, l.a, l.b, rows)) |ab| .{ ab[0], ab[1] } else .{ try o.project(x, l.a, rows, false), try o.project(x, l.b, rows, false) };
     const cache = caches.layers[index].linear;
     const ch = view.convChannels(s);
     const mixed = try o.arena.of(f32, rows * ch);
     // the new window lands beside the old one (every row reads the old), then replaces it
     const conv_bytes = (s.conv - 1) * ch * 4;
     const window = try o.arena.take(conv_bytes);
-    try o.convPrefill(qkv, l.conv, cache.conv.base(), mixed, window, rows, ch, s.conv);
+    // q, k and v as three planes, contiguous without copies
+    const kw = s.keyWidth();
+    try o.convPlanes(qkv, l.conv, cache.conv.base(), mixed, window, rows, ch, s.conv, kw, 2 * kw);
     try hip.raw.copy(cache.conv, 0, window, conv_bytes, o.stream);
-    const q, const k, const v = try splitQkv(o, m, .{ .ptr = mixed, .kind = .f32 }, rows);
+    const q, const k, const v = try normQk(o, m, mixed, mixed + rows * kw * 4, mixed + 2 * rows * kw * 4, rows);
     const gate = try o.arena.of(f32, rows * s.value_heads);
     const beta = try o.arena.of(f32, rows * s.value_heads);
     try o.gdnGatePrefill(a, b, l.a_log, l.dt_bias, gate, beta, rows, s.value_heads);
     const y = try o.arena.of(f32, rows * s.valueWidth());
     try o.gatedDelta(q, k, v, gate, beta, cache.state.base(), y, rows, s.key_heads, s.value_heads, s.key_dim, s.value_dim, null);
-    return gatedOut(o, m, l, y, z, rows);
+    const out = try gatedNorm(o, m, l, y, z, rows);
+    if (try o.projectAdd(out, l.out, rows, res)) return null;
+    return try o.project(out, l.out, rows, l.out.partial);
 }
 
-/// The conv output's q and k, normalized (fp32, contiguous), and v (fp32, contiguous).
-pub fn splitQkv(o: Ops, m: *const view.Model, mixed: Tensor, rows: usize) Error!struct { u64, u64, u64 } {
+/// q and k (fp32 planes) normalized into new rows, v as it is.
+fn normQk(o: Ops, m: *const view.Model, qc: u64, kc: u64, v: u64, rows: usize) Error!struct { u64, u64, u64 } {
     const s = m.spec;
     const kw = s.keyWidth();
-    const ch = view.convChannels(s);
-    const qc = try o.arena.of(f32, rows * kw);
-    const kc = try o.arena.of(f32, rows * kw);
-    const v = try o.arena.of(f32, rows * s.valueWidth());
-    try o.copyCols(mixed, ch, 0, qc, rows, kw);
-    try o.copyCols(mixed, ch, kw, kc, rows, kw);
-    try o.copyCols(mixed, ch, 2 * kw, v, rows, s.valueWidth());
     const q = try o.arena.of(f32, rows * kw);
     const k = try o.arena.of(f32, rows * kw);
     const heads = rows * s.key_heads;
@@ -159,6 +158,11 @@ pub fn splitQkv(o: Ops, m: *const view.Model, mixed: Tensor, rows: usize) Error!
 
 /// rms_norm(y, gnorm) * silu(z), rounded to the activation dtype, then the out projection.
 pub fn gatedOut(o: Ops, m: *const view.Model, l: view.Linear, y: u64, z: Tensor, rows: usize) Error!Tensor {
+    return o.project(try gatedNorm(o, m, l, y, z, rows), l.out, rows, l.out.partial);
+}
+
+/// gatedOut's rows before the out projection.
+fn gatedNorm(o: Ops, m: *const view.Model, l: view.Linear, y: u64, z: Tensor, rows: usize) Error!Tensor {
     const s = m.spec;
     const n = rows * s.valueWidth();
     const out = try take(o, m.act, n);
@@ -169,23 +173,29 @@ pub fn gatedOut(o: Ops, m: *const view.Model, l: view.Linear, y: u64, z: Tensor,
         try o.rms(.{ .ptr = y, .kind = .f32 }, l.gnorm, .{ .ptr = yn, .kind = .f32 }, rows * s.value_heads, s.value_dim, @floatCast(s.eps));
         try o.gnormSilu(yn, z, out, n, .silu);
     }
-    return o.project(out, l.out, rows, l.out.partial);
+    return out;
 }
 
 /// _mlp: gate and up, silu(gate) * up, down; or the routed experts (`prefill` is the span's length above one).
 pub fn mlpRows(o: Ops, m: *const view.Model, mlp: view.Mlp, x: Tensor, rows: usize, prefill: bool) Error!Tensor {
+    return (try mlpInto(o, m, mlp, x, rows, prefill, null)).?;
+}
+
+/// mlpRows, its down product added into `res` where a prompt's tile takes it (projectSiluAdd: null returned).
+fn mlpInto(o: Ops, m: *const view.Model, mlp: view.Mlp, x: Tensor, rows: usize, prefill: bool, res: ?Tensor) Error!?Tensor {
     switch (mlp) {
-        .moe => |r| return moe.run(o, m.act, r, x, rows, prefill and rows > 1),
+        .moe => |r| return try moe.run(o, m.act, r, x, rows, prefill and rows > 1),
         .dense => |d| {
             var outs: [4]Tensor = undefined;
             const gate, const up = if (try o.projectGroup(x, &.{ d.gate, d.up }, rows, &outs))
                 .{ outs[0], outs[1] }
             else
                 .{ try o.project(x, d.gate, rows, false), try o.project(x, d.up, rows, false) };
+            if (res) |r| if (try o.projectSiluAdd(gate, up, d.down, rows, r)) return null;
             if (!d.down.partial) if (try o.projectSiluMul(gate, up, d.down, rows)) |y| return y;
             const act = try take(o, m.act, rows * d.gate.n);
             try o.siluMul(gate, up, act, rows * d.gate.n);
-            return o.project(act, d.down, rows, d.down.partial);
+            return try o.project(act, d.down, rows, d.down.partial);
         },
     }
 }

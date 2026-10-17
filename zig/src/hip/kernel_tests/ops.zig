@@ -491,6 +491,23 @@ test "the linear attention's prompt conv and DeltaNet gates sit within 1e-5 of f
     defer gpa.free(go);
     const gn = try rig.download(f32, next);
     defer gpa.free(gn);
+    // the same conv into three planes (the DeltaNet's q, k, v): the same values, each plane contiguous
+    {
+        var planes = try t.alloc(len * channels * 4);
+        defer planes.free();
+        var next2 = try t.alloc(kept * channels * 4);
+        defer next2.free();
+        const p1 = 100;
+        const p2 = 150;
+        try o.convPlanes(tensor(x, act(t)), at(w), at(state), at(planes), at(next2), len, channels, kernel, p1, p2);
+        try t.stream.synchronize();
+        const gp = try rig.download(f32, planes);
+        defer gpa.free(gp);
+        for (0..len) |r| for (0..channels) |c| {
+            const i = if (c < p1) r * p1 + c else if (c < p2) len * p1 + r * (p2 - p1) + c - p1 else len * p2 + r * (channels - p2) + c - p2;
+            try std.testing.expectEqual(@as(u32, @bitCast(go[r * channels + c])), @as(u32, @bitCast(gp[i])));
+        };
+    }
     for (0..channels) |c| {
         const window = struct {
             fn at_(tt: *const Rig, xs: []const u16, ss: []const f32, ch: usize, n_ch: usize, k: usize, kp: usize) f64 {

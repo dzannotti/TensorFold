@@ -49,6 +49,37 @@ __global__ void __launch_bounds__(kRmsThreads) rms_kernel(const T* __restrict__ 
     }
 }
 
+// rms_kernel's arithmetic a wave a row, 8 rows a block, no LDS: lane l's squares of l, l + 32, ... in order, the xor
+// tree, then the row read again for the outputs (from cache): the same bits without one wave summing a staged row.
+template <typename T>
+__global__ void __launch_bounds__(256) rms_wave_kernel(const T* __restrict__ x, const float* __restrict__ weight,
+                                                       T* __restrict__ y, int rows, int width, float eps) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    const T* in = x + static_cast<long long>(row) * width;
+    float sum = 0.f;
+    int i = lane;
+    for (; i + 32 * 7 < width; i += 32 * 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = widen(in[i + 32 * u]);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) sum += v[u] * v[u];
+    }
+    for (; i < width; i += 32) {
+        const float v = widen(in[i]);
+        sum += v * v;
+    }
+    const float inv = rsqrtf(warp_sum(sum) / static_cast<float>(width) + eps);
+    T* out = y + static_cast<long long>(row) * width;
+    for (int j = lane; j < width; j += 32) {
+        float value = widen(in[j]) * inv;
+        if (weight != nullptr) value *= weight[j];
+        narrow(value, out + j);
+    }
+}
+
 // Length 1. Taps run in order, then the state shifts toward the new sample.
 extern "C" __global__ void tf_conv_decode(const float* __restrict__ x, const float* __restrict__ weight,
                                    float* __restrict__ state, float* __restrict__ y, int channels, int kernel) {
@@ -247,6 +278,12 @@ __global__ void gdn_gate_kernel(const T* __restrict__ a, const T* __restrict__ b
 // The template kernels launches.zig resolves.
 template __global__ void rms_kernel<float>(const float* __restrict__ x, const float* __restrict__ weight,
     float* __restrict__ y, int width, float eps);
+template __global__ void rms_wave_kernel<float>(const float* __restrict__ x, const float* __restrict__ weight,
+    float* __restrict__ y, int rows, int width, float eps);
+template __global__ void rms_wave_kernel<__half>(const __half* __restrict__ x, const float* __restrict__ weight,
+    __half* __restrict__ y, int rows, int width, float eps);
+template __global__ void rms_wave_kernel<hip_bfloat16>(const hip_bfloat16* __restrict__ x, const float* __restrict__ weight,
+    hip_bfloat16* __restrict__ y, int rows, int width, float eps);
 template __global__ void rms_kernel<__half>(const __half* __restrict__ x, const float* __restrict__ weight,
     __half* __restrict__ y, int width, float eps);
 template __global__ void rms_kernel<hip_bfloat16>(const hip_bfloat16* __restrict__ x, const float* __restrict__ weight,

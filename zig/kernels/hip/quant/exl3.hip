@@ -18,7 +18,8 @@ typedef unsigned u32x8e __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4e __attribute__((ext_vector_type(4)));
 
 // One product: xh rotated fp16 ([k / 16, m, 16] for a round's row tiles, MT <= 2; [m, k] for a prompt's), the trellis tiles (tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb +
-// (nt % 8) * 4 K2 dwords), out [m, n] of `out_kind` (0 fp32, 1 bf16, 2 fp16), or fp32 partial sums [splits, m, n].
+// (nt % 8) * 4 K2 dwords), out [m, n] of `out_kind` (0 fp32, 1 bf16, 2 fp16; 3, the prompt tile's: bf16 out += the
+// bf16 outputs), or fp32 partial sums [splits, m, n].
 struct Exl3 {
     const __half* xh;
     const uint32_t* trellis;
@@ -759,6 +760,19 @@ __device__ __forceinline__ void exl3_put(const Exl3& a, const float (&v)[4], int
             u[j] = lo | (static_cast<uint32_t>(hi) << 16);
         }
         *reinterpret_cast<uint2*>(static_cast<uint16_t*>(a.out) + at) = make_uint2(u[0], u[1]);
+    } else if (a.out_kind == 3) {
+        // the residual: out (bf16) += the outputs as kind 1 stores them, then tf_add's sum and rounding
+        uint16_t* const o = static_cast<uint16_t*>(a.out) + at;
+        const uint2 xr = *reinterpret_cast<const uint2*>(o);
+        const uint32_t xw[2] = {xr.x, xr.y};
+        uint32_t u[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float y0 = static_cast<float>(static_cast<__bf16>(v[2 * j]));
+            const float y1 = static_cast<float>(static_cast<__bf16>(v[2 * j + 1]));
+            u[j] = exl3_bf16(__uint_as_float(xw[j] << 16) + y0) | (exl3_bf16(__uint_as_float(xw[j] & 0xffff0000u) + y1) << 16);
+        }
+        *reinterpret_cast<uint2*>(o) = make_uint2(u[0], u[1]);
     } else {
         const h16x2 lo = {static_cast<_Float16>(v[0]), static_cast<_Float16>(v[1])};
         const h16x2 hi = {static_cast<_Float16>(v[2]), static_cast<_Float16>(v[3])};

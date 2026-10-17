@@ -211,6 +211,9 @@ const groups = [_][]const u8{
     "tiles/dot2.hip",        "flashnext/flashnext.hip", "draft/draft.hip",         "quant/exl3.hip",
 };
 
+/// The groups built in CU mode on RDNA (wave32).
+const cu_mode = [_][]const u8{"attention/prefill.hip"};
+
 /// What the group sources include, so an edit to one rebuilds them.
 const headers = [_][]const u8{
     "attention/attention_fa.hip", "decode/pages.hpp",     "decode/plan.hpp",     "ops/attention.hpp",     "ops/common.hpp",
@@ -247,6 +250,8 @@ fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, d
         run.addArg(b.fmt("--rocm-path={s}", .{root}));
         run.addArg(b.fmt("--rocm-device-lib-path={s}", .{device_lib orelse b.fmt("{s}/lib/llvm/amdgcn/bitcode", .{root})}));
         run.addArg(b.fmt("--offload-arch={s}", .{arch}));
+        // RDNA: the groups in cu_mode take a CU's own LDS rather than sharing the WGP's (the prompt attention tile 5% faster)
+        if (c.wave == 32) for (cu_mode) |g| if (std.mem.eql(u8, g, source)) run.addArg("-mcumode");
         run.addPrefixedDirectoryArg("-I", b.path("zig/kernels/hip"));
         for (headers) |h| run.addFileInput(b.path(b.fmt("zig/kernels/hip/{s}", .{h})));
         run.addArg("-o");

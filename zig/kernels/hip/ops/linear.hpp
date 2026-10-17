@@ -10,8 +10,10 @@ namespace {
 constexpr int kConvRows = 16;   // rows a conv_prefill thread slides over
 constexpr int kConvTaps = 8;    // most taps it holds
 
+// With p1 > 0 the output is three planes back to back, channels [0, p1), [p1, p2) and [p2, channels) each (len, width)
+// (the DeltaNet's q, k and v, contiguous without copies); p1 = 0: (len, channels).
 extern "C" __global__ void tf_conv_prefill(const void* x, int kind, const float* weight, const float* state, float* out,
-                                    float* new_state, int len, int channels, int kernel) {
+                                    float* new_state, int len, int channels, int kernel, int p1, int p2) {
     // a thread one channel over kConvRows rows, the window sliding in registers (each input read once)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -34,7 +36,13 @@ extern "C" __global__ void tf_conv_prefill(const void* x, int kind, const float*
             float p = win[tap] * w[tap];
             acc = acc + p;
         }
-        out[static_cast<long long>(r) * channels + c] = silu(acc);
+        long long at = static_cast<long long>(r) * channels + c;
+        if (p1 > 0) {
+            if (c < p1) at = static_cast<long long>(r) * p1 + c;
+            else if (c < p2) at = static_cast<long long>(len) * p1 + static_cast<long long>(r) * (p2 - p1) + (c - p1);
+            else at = static_cast<long long>(len) * p2 + static_cast<long long>(r) * (channels - p2) + (c - p2);
+        }
+        out[at] = silu(acc);
         for (int tap = 0; tap + 1 < kernel; ++tap) win[tap] = win[tap + 1];
     }
 }

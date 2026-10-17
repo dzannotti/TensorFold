@@ -119,6 +119,71 @@ __device__ __forceinline__ void dense_rows_body(const void* x, const void* w, vo
     }
 }
 
+// dense_rows_body's sums for C columns a block (a prompt's in_proj_a and b: x read once for C columns, not each): each
+// output's thread terms, butterfly and wave partials in the same order, so the same bits.
+template <int XK, int WK, int C, int R>
+__device__ __forceinline__ void dense_cols_body(const void* x, const void* w, void* out, int rows, int n, int k) {
+    constexpr int U = 1;
+    constexpr int kind = XK, w_kind = WK;
+    __shared__ float part[R][C][8];
+    const int c0 = blockIdx.x * C, r0 = blockIdx.y * R;
+    const unsigned char* xr[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) xr[j] = static_cast<const unsigned char*>(x) + static_cast<long long>(min(r0 + j, rows - 1)) * k * (kind == 0 ? 4 : 2);
+    const unsigned char* wr[C];
+#pragma unroll
+    for (int c = 0; c < C; ++c) wr[c] = static_cast<const unsigned char*>(w) + static_cast<long long>(min(c0 + c, n - 1)) * k * (w_kind == 0 ? 4 : 2);
+    float acc[R][C];
+#pragma unroll
+    for (int j = 0; j < R; ++j)
+#pragma unroll
+        for (int c = 0; c < C; ++c) acc[j][c] = 0.0f;
+    int i0 = threadIdx.x;
+    for (; i0 + 256 * (U - 1) < k; i0 += 256 * U) {
+        float wv[C][U], xv[R][U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+#pragma unroll
+            for (int c = 0; c < C; ++c) wv[c][u] = load(wr[c], w_kind, i0 + 256 * u);
+#pragma unroll
+            for (int j = 0; j < R; ++j) xv[j][u] = load(xr[j], kind, i0 + 256 * u);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int j = 0; j < R; ++j)
+#pragma unroll
+                for (int c = 0; c < C; ++c) acc[j][c] += xv[j][u] * wv[c][u];
+    }
+    for (; i0 < k; i0 += 256) {
+        float xv[R];
+#pragma unroll
+        for (int j = 0; j < R; ++j) xv[j] = load(xr[j], kind, i0);
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            const float wv = load(wr[c], w_kind, i0);
+#pragma unroll
+            for (int j = 0; j < R; ++j) acc[j][c] += xv[j] * wv;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < R; ++j)
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            for (int off = 16; off > 0; off >>= 1) acc[j][c] += __shfl_xor(acc[j][c], off, 32);
+            if ((threadIdx.x & 31) == 0) part[j][c][threadIdx.x >> 5] = acc[j][c];
+        }
+    __syncthreads();
+    if (threadIdx.x < R * C) {
+        const int j = threadIdx.x / C, c = threadIdx.x % C;
+        if (r0 + j < rows && c0 + c < n) {
+            float sum = part[j][c][0];
+            for (int q = 1; q < 8; ++q) sum += part[j][c][q];
+            store(out, kind, static_cast<long long>(r0 + j) * n + c0 + c, sum);
+        }
+    }
+}
+
 // y[r, n] = x[r, :] . w[n, :] over bf16 x and weights, K a multiple of 256 (a ciru_q8 checkpoint's projections): a wave
 // a column, lane l's k at 8 l + 256 s by 16-byte loads, four strides in flight, its products added in k order into
 // one fp32 a row, then the wave's butterfly. A row's bits depend on K alone, never on R or the rows beside it.
@@ -205,6 +270,25 @@ extern "C" __global__ void __launch_bounds__(256) tf_dense_rows_pair(const void*
     if (w_kind == 0) dense_rows_body<XK, 0>(x, w, out, rows, n, k);       \
     else if (w_kind == 1) dense_rows_body<XK, 1>(x, w, out, rows, n, k);  \
     else dense_rows_body<XK, 2>(x, w, out, rows, n, k);
+    if (kind == 0) {
+        TF_DENSE_W(0)
+    } else if (kind == 1) {
+        TF_DENSE_W(1)
+    } else {
+        TF_DENSE_W(2)
+    }
+#undef TF_DENSE_W
+}
+
+// tf_dense_rows_pair's sums (the same bits) 8 columns by 4 rows a block: a prompt's rows read x once for 8 columns
+// (8 x 4 measured fastest of 2-16 rows by 4-48 columns: 593 us against the pair's 972 at 2048 x 5120 x 2 x 48).
+extern "C" __global__ void __launch_bounds__(256) tf_dense_cols_pair(const void* x, int kind, const void* w0, const void* w1, int w_kind, void* out0, void* out1, int rows, int n, int k) {
+    const void* w = blockIdx.z == 0 ? w0 : w1;
+    void* out = blockIdx.z == 0 ? out0 : out1;
+#define TF_DENSE_W(XK)                                                         \
+    if (w_kind == 0) dense_cols_body<XK, 0, 8, 4>(x, w, out, rows, n, k);        \
+    else if (w_kind == 1) dense_cols_body<XK, 1, 8, 4>(x, w, out, rows, n, k);   \
+    else dense_cols_body<XK, 2, 8, 4>(x, w, out, rows, n, k);
     if (kind == 0) {
         TF_DENSE_W(0)
     } else if (kind == 1) {
