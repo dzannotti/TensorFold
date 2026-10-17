@@ -7,6 +7,14 @@
 namespace tf {
 namespace rocm {
 
+// key_heads' bit 16 marks llama.cpp's tiled value-head order (a GGUF's: value head h reads key head h % key_heads,
+// ggml-cuda/gated_delta_net.cu); clear, the Hugging Face order (h / (value_heads / key_heads)).
+constexpr int kGdnHeads = 0xffff;
+__device__ inline int gdn_key_head(int head, int key_heads, int value_heads) {
+    const int n = key_heads & kGdnHeads;
+    return (key_heads >> 16) ? head % n : head / (value_heads / n);
+}
+
 // Lane 0's sum of the xor butterfly (16, 8, 4, 2, 1) on permlanex16 and DPP row_xmask: no LDS round trips, same adds.
 __device__ float lane0_sum(float x) {
     const int u = __float_as_int(x);
@@ -31,7 +39,8 @@ gated_delta_kernel(const float* __restrict__ q, const float* __restrict__ k, con
     const int head = blockIdx.y;
     const int batch = blockIdx.z;
     if (row >= dv) return;
-    const int key_head = head / (value_heads / key_heads);
+    const int key_head = gdn_key_head(head, key_heads, value_heads);
+    key_heads &= kGdnHeads;
 
     float s[4] = {0.f, 0.f, 0.f, 0.f};
     const size_t state_row =
@@ -112,7 +121,8 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
     const int local = threadIdx.y;
     const int row0 = blockIdx.x * ROWS + local * RW;
     const int head = blockIdx.y;
-    const int key_head = head / (value_heads / key_heads);
+    const int key_head = gdn_key_head(head, key_heads, value_heads);
+    key_heads &= kGdnHeads;
     const int tid = local * 32 + lane;
 
     __shared__ float ks[STEPS][DK];
@@ -277,7 +287,8 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS + threadIdx.y;
     const int head = blockIdx.y;
-    const int key_head = head / (value_heads / key_heads);
+    const int key_head = gdn_key_head(head, key_heads, value_heads);
+    key_heads &= kGdnHeads;
     const int n = min(32, length);
 
     float s[4] = {0.f, 0.f, 0.f, 0.f};
@@ -393,6 +404,7 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     const int length = plan.count[slot];
     if (length == 0) return;
     const long long row0 = plan.first[slot];
+    const int kh = key_heads & kGdnHeads;
     const unsigned long long* desc = plan_desc(plan, slot);
     float* state = reinterpret_cast<float*>(desc[plan_second(layer)]);
     // a window of rows leaves the state as the round found it, for its keep to replay; the padding slot's (the last)
@@ -400,13 +412,13 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     const bool padding = slot + 1 == static_cast<int>(gridDim.z);
     const bool replayed = length > 1 && !padding;
     if (replayed && plan.anc[row0] != 0) {
-        gated_delta_tree_body<DK, 8>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+        gated_delta_tree_body<DK, 8>(q + row0 * kh * DK, k + row0 * kh * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state,
                                      y + row0 * value_heads * dv, length, key_heads, value_heads, dv, plan.anc + row0, 0);
         return;
     }
     if (static_cast<int>(blockIdx.x) * 8 * kPlanRW >= dv) return;
-    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(q + row0 * key_heads * DK, k + row0 * key_heads * DK,
+    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(q + row0 * kh * DK, k + row0 * kh * DK,
                                                         v + row0 * value_heads * dv, gate + row0 * value_heads,
                                                         beta + row0 * value_heads, state, y + row0 * value_heads * dv,
                                                         length, key_heads, value_heads, dv, nullptr, 0, !replayed && !padding);
@@ -422,19 +434,20 @@ __device__ __forceinline__ void gated_delta_replay_body(const int* keep, int row
     if (n <= 0 || plan.count[slot] <= 1 || plan.snaps[2 * layer + 1] == 0) return;
     const long long row0 = plan.first[slot];
     const float* k = reinterpret_cast<const float*>(plan.snaps[2 * layer + 1]);
-    const float* v = k + static_cast<long long>(rows) * key_heads * DK;
+    const int kh = key_heads & kGdnHeads;
+    const float* v = k + static_cast<long long>(rows) * kh * DK;
     const float* gate = v + static_cast<long long>(rows) * value_heads * dv;
     const float* beta = gate + static_cast<long long>(rows) * value_heads;
     float* state = reinterpret_cast<float*>(plan_desc(plan, slot)[plan_second(layer)]);
     const unsigned path = plan.anc[row0 + n - 1];
     if (path != 0) {
-        gated_delta_tree_body<DK, 8>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+        gated_delta_tree_body<DK, 8>(nullptr, k + row0 * kh * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state, nullptr,
                                      plan.count[slot], key_heads, value_heads, dv, nullptr, path);
         return;
     }
     if (static_cast<int>(blockIdx.x) * 8 * kPlanRW >= dv) return;
-    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(nullptr, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
+    gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(nullptr, k + row0 * kh * DK, v + row0 * value_heads * dv,
                                                         gate + row0 * value_heads, beta + row0 * value_heads, state,
                                                         nullptr, n, key_heads, value_heads, dv, nullptr, 0);
 }

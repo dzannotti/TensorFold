@@ -209,6 +209,7 @@ const groups = [_][]const u8{
     "ops/ops.hip",           "ops/act.hip",             "attention/attention.hip", "recurrence/gated_delta.hip",
     "attention/prefill.hip", "decode/decode.hip",       "decode/plan.hip",         "tiles/dot2_tiles.hip",
     "tiles/dot2.hip",        "flashnext/flashnext.hip", "draft/draft.hip",         "quant/exl3.hip",
+    "quant/gguf.hip",
 };
 
 /// What the group sources include, so an edit to one rebuilds them.
@@ -220,13 +221,13 @@ const headers = [_][]const u8{
     "quant/mlx_tiles.hpp",        "tiles/dot2.hpp",       "tiles/epilogue.hpp",  "tiles/gemm.hpp",        "tiles/gemm_kp.hpp",
     "tiles/matrix_gemm.hpp",      "tiles/plan.hpp",       "tiles/stream.hpp",    "flashnext/streams.hpp", "flashnext/ngram.hpp",
     "tiles/wmma_verify.hpp",      "tiles/matrix_prompt.hpp", "quant/coded.hpp",   "quant/coded_dq.hpp",    "quant/coded_tiles.hpp",
-    "flashnext/indexer.hpp",      "flashnext/sparse.hpp",
+    "flashnext/indexer.hpp",      "flashnext/sparse.hpp",       "quant/gguf.hpp",
 };
 
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
 
-const stub = "pub const arch = \"\";\npub const images: [12][]align(8) const u8 = @splat(&.{});\n";
+const stub = "pub const arch = \"\";\npub const images: [13][]align(8) const u8 = @splat(&.{});\n";
 
 /// One code object a group for `arch`, built with the caps table's instruction switches, as the `hip_kernels` module.
 fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, arch: []const u8) *std.Build.Module {

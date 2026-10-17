@@ -112,7 +112,7 @@ pub fn keep(o: Ops, m: *const view.Model, p: pops.Plan, counts: u64, hidden: u64
         .kv_heads = s.kv_heads,
         .head_dim = s.head_dim,
     });
-    try pops.gdnReplay(o, counts, p, s.key_heads, s.value_heads, s.key_dim, s.value_dim, s.n_layers);
+    try pops.gdnReplay(o, counts, p, s.keyHeadsArg(), s.value_heads, s.key_dim, s.value_dim, s.n_layers);
 }
 
 fn attentionRows(o: Ops, m: *const view.Model, f: view.Full, r: Round, index: usize, x: Tensor) fwd.Error!Tensor {
@@ -173,6 +173,6 @@ fn linearRows(o: Ops, m: *const view.Model, l: view.Linear, r: Round, index: usi
         q = qc;
         k = kc;
     }
-    try pops.gatedDelta(o, q, k, vv, gate, beta, y, r.plan, index, s.key_heads, s.value_heads, s.key_dim, s.value_dim);
+    try pops.gatedDelta(o, q, k, vv, gate, beta, y, r.plan, index, s.keyHeadsArg(), s.value_heads, s.key_dim, s.value_dim);
     return fwd.gatedOut(o, m, l, y, z, total);
 }

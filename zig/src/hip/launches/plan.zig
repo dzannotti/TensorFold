@@ -139,7 +139,7 @@ fn smallestFactor(n: usize) usize {
 const plan_rw = 2;
 
 pub fn planGatedDelta(l: *const Launcher, q: u64, k: u64, v: u64, gate: u64, beta: u64, y: u64, p: PlanRef, layer: usize, key_heads: usize, value_heads: usize, dk: usize, dv: usize, s: S) Error!void {
-    if ((dk != 16 and dk != 128) or @rem(dv, 8 * plan_rw) != 0 or key_heads < 1 or @rem(value_heads, key_heads) != 0) return invalid("planned gated delta");
+    if ((dk != 16 and dk != 128) or @rem(dv, 8 * plan_rw) != 0 or (key_heads & 0xffff) < 1 or @rem(value_heads, key_heads & 0xffff) != 0) return invalid("planned gated delta");
     var a: Args = .{};
     try a.add(q);
     try a.add(k);
@@ -217,7 +217,7 @@ pub fn planKeep(l: *const Launcher, p: PlanRef, k: Keep, s: S) Error!void {
 
 /// The kept slots' DeltaNet states run through their kept rows, every linear layer in one launch.
 pub fn planGdnReplay(l: *const Launcher, keep: u64, p: PlanRef, key_heads: usize, value_heads: usize, dk: usize, dv: usize, layers: usize, s: S) Error!void {
-    if ((dk != 16 and dk != 128) or @rem(dv, 8 * plan_rw) != 0 or key_heads < 1 or @rem(value_heads, key_heads) != 0) return invalid("planned replay");
+    if ((dk != 16 and dk != 128) or @rem(dv, 8 * plan_rw) != 0 or (key_heads & 0xffff) < 1 or @rem(value_heads, key_heads & 0xffff) != 0) return invalid("planned replay");
     var a: Args = .{};
     try a.add(keep);
     try a.add(@as(c_int, @intCast(p.rows)));

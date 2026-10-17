@@ -65,7 +65,8 @@ def reference(a):
     dt = torch.float32 if a.fp32 else torch.bfloat16
     cfg = AutoConfig.from_pretrained(a.model).text_config
     cfg._attn_implementation = "sdpa"
-    wm = json.load(open(os.path.join(a.model, "model.safetensors.index.json")))["weight_map"]
+    ggufs = sorted(f for f in os.listdir(a.model) if f.endswith(".gguf") and "mmproj" not in f and not f.startswith("mtp"))
+    wm = {} if ggufs else json.load(open(os.path.join(a.model, "model.safetensors.index.json")))["weight_map"]
     files = {}
 
     def raw(name):
@@ -97,13 +98,24 @@ def reference(a):
                 return t.transpose(1, 2).contiguous()  # MLX (C, K, 1) -> torch (C, 1, K)
             return t
 
+    gg = None
+    if ggufs:  # a GGUF: ggml's dequantization (gguf_ref.py, numpy) under the HF names, float32: the same weights
+        sys.path.insert(0, HERE)
+        import gguf_ref
+        gg = gguf_ref.Checkpoint(os.path.join(a.model, ggufs[0]), cfg.linear_num_key_heads, cfg.linear_num_value_heads,
+                                 cfg.linear_key_head_dim, cfg.linear_value_head_dim)
+        names = {k: k for k in gg.names}
+        tensor = lambda name: torch.from_numpy(gg.get(name))
     ids = torch.from_numpy(np.load(a.ids).astype(np.int64))
     n = ids.shape[0]
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
-    embed = tensor("model.language_model.embed_tokens.weight")
-    hidden = embed[ids].to(dev).to(dt)  # (n, SEQ, hidden) bf16, or fp32
-    del embed
+    if gg is not None:
+        hidden = torch.from_numpy(gg.embed_rows(ids.numpy())).to(dev).to(dt)
+    else:
+        embed = tensor("model.language_model.embed_tokens.weight")
+        hidden = embed[ids].to(dev).to(dt)  # (n, SEQ, hidden) bf16, or fp32
+        del embed
     files.clear()
     rope = q.Qwen3_5TextRotaryEmbedding(cfg).to(dev)
     pos = torch.arange(SEQ, device=dev).view(1, 1, -1).expand(3, 1, -1)

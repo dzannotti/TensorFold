@@ -94,7 +94,7 @@ pub const Table = struct {
     pub fn width(t: *const Table, key: []const u8) config.Error!formats.mlx.Width {
         const q = switch (t.quant) {
             .mlx => |m| m,
-            .dense, .exl3 => return error.UnsupportedQuantization,
+            .dense, .exl3, .gguf => return error.UnsupportedQuantization,
         };
         if (q.overrides.get(key)) |w| return w orelse error.UnsupportedQuantization;
         if (t.strip.len > 0) {
@@ -118,6 +118,8 @@ pub const Files = struct {
     }
 
     /// `root.glob("*.safetensors")`: a file whose name holds "mtp" is not the model's; `mtp*` ones are the side files.
+/// A GGUF checkpoint's `*.gguf` files are the model's (its MTP block is inside), but a vision projector (`mmproj`) or
+/// a separate `mtp-` head.
     pub fn list(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Files {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
@@ -129,6 +131,10 @@ pub const Files = struct {
         var it = d.iterate();
         while (try it.next(io)) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
+            if (std.mem.endsWith(u8, e.name, ".gguf")) {
+                if (!containsLower(e.name, "mmproj") and !std.mem.startsWith(u8, e.name, "mtp")) try model.append(a, try std.fs.path.join(a, &.{ dir, e.name }));
+                continue;
+            }
             if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
             const path = try std.fs.path.join(a, &.{ dir, e.name });
             if (std.mem.startsWith(u8, e.name, "mtp")) try side.append(a, path);

@@ -26,6 +26,14 @@ pub const Checkpoint = struct {
         var files = try table.Files.list(gpa, io, dir);
         errdefer files.deinit();
         if (files.model.len == 0) return error.NoSafetensors;
+        // a GGUF's files declare its weights (config.json, the release's own, declares none): llama.cpp's tensors,
+        // value heads in its tiled order (ggml-cuda/gated_delta_net.cu reads key head h % key_heads)
+        if (std.mem.endsWith(u8, files.model[0], ".gguf")) {
+            cfg.quant = .{ .gguf = .{} };
+            cfg.spec.bits = 4;
+            cfg.spec.group = 256;
+            cfg.spec.tiled_heads = true;
+        }
         const main = try Table.open(gpa, io, files.model, "", cfg.quant);
         // a MiniCPM-V checkpoint's vision tower and merger stay on disk: the text tower alone is served
         var vision: usize = 0;
@@ -119,7 +127,7 @@ pub const Checkpoint = struct {
             .a = try sub(a, t, lin, "in_proj_a"),
             .b = try sub(a, t, lin, "in_proj_b"),
             .conv = try subConv(a, t, lin, c.hf()),
-            .a_log = try subFloat(a, t, lin, "A_log"),
+            .a_log = try aLog(a, t, lin),
             .dt_bias = try subFloat(a, t, lin, "dt_bias"),
             .gnorm = try subFloat(a, t, lin, "norm.weight"),
             .out = try sub(a, t, lin, "out_proj"),
@@ -164,6 +172,21 @@ fn sub(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []const u8
 fn subFloat(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []const u8) !Tensor {
     var buf: [192]u8 = undefined;
     return projection.float(a, t, projection.join(&buf, &.{ base, name }));
+}
+
+/// A_log, or a GGUF's ssm_a = -exp(A_log) (conversion/qwen.py) taken back: log(-a) in fp64, rounded once.
+fn aLog(a: std.mem.Allocator, t: *const Table, base: []const u8) !Tensor {
+    var buf: [192]u8 = undefined;
+    const key = projection.join(&buf, &.{ base, "ssm_a" });
+    if (!t.has(key)) return subFloat(a, t, base, "A_log");
+    var w = try projection.float(a, t, key);
+    const out = try a.alloc(f32, w.numel());
+    for (out, std.mem.bytesAsSlice(f32, w.bytes)) |*o, v| {
+        if (!(v < 0)) return error.UnexpectedTensor;
+        o.* = @floatCast(@log(-@as(f64, v)));
+    }
+    w.bytes = std.mem.sliceAsBytes(out);
+    return w;
 }
 
 fn subNorm(a: std.mem.Allocator, t: *const Table, base: []const u8, name: []const u8, centered: bool) !Tensor {

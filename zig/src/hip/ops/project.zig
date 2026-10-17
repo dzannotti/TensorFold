@@ -42,7 +42,20 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
             return out;
         },
         .exl3 => |h| return exl3(o, x, proj, h, m, f32_out),
+        .gguf => |h| return gguf(o, x, proj, h, m, f32_out),
     }
+}
+
+/// matmul(x, proj) on a GGUF matrix (bf16 x): fp32 when `f32_out`, else bf16. A prompt's rows take the prompt product
+/// at any row count (BF16-rounded weights, one chain over k), so they have the same bits however the prompt is cut;
+/// decode and rounds the exact-weight product, whose rows never see each other.
+pub fn gguf(o: Ops, x: Tensor, proj: Projection, w: quant.gguf.Matrix, m: usize, f32_out: bool) Error!Tensor {
+    if (m == 0 or x.kind != .bf16 or proj.partial) return error.BadShape;
+    const kind: t.Kind = if (f32_out) .f32 else x.kind;
+    const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * kind.size()), .kind = kind };
+    if (o.prefill and try o.l.ggufPrompt(x.ptr, w, proj.n, proj.k, m, out.ptr, kind.table(), o.stream)) return out;
+    try o.l.ggufProject(x.ptr, w, proj.n, proj.k, m, out.ptr, kind.table(), o.stream);
+    return out;
 }
 
 /// matmul(x, proj) on an EXL3 matrix: x rotated in, the trellis product, rotated out; fp32 when `f32_out`, else x's kind.
@@ -78,7 +91,7 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
     if (ps.len > ws.len) return false;
     for (ps, ws[0..ps.len]) |pr, *w| switch (pr.handle) {
         .mlx => |h| w.* = affineOf(pr, h),
-        .dense, .exl3 => return false,
+        .dense, .exl3, .gguf => return false,
     };
     return affineGroup(o, x, ws[0..ps.len], m, outs);
 }
@@ -96,7 +109,7 @@ fn exl3Group(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor
             nd += 1;
         },
         .exl3 => {},
-        .mlx => return false,
+        .mlx, .gguf => return false,
     };
     if (nd != 2) return false;
     const a = ps[d[0]];
@@ -117,7 +130,7 @@ fn exl3Group(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor
 pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
     switch (proj.handle) {
         .mlx => |h| return affineRoutedAct(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, limit),
-        .dense, .exl3 => return null,
+        .dense, .exl3, .gguf => return null,
     }
 }
 
@@ -125,7 +138,7 @@ pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: 
 pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize) Error!u64 {
     switch (proj.handle) {
         .mlx => |h| return affineRouted(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows),
-        .dense, .exl3 => return error.BadShape,
+        .dense, .exl3, .gguf => return error.BadShape,
     }
 }
 
@@ -135,6 +148,7 @@ pub fn embedRows(o: Ops, table: Projection, ids: u64, n: usize, out: Tensor) Err
         .mlx => |h| return embedAffine(o, affineOf(table, h), ids, n, out),
         .dense => |h| try o.l.tf_embed_dense(p(h.weight), @backingInt(actKind(h.kind)), @ptrFromInt(ids), int(n), int(table.k), p(out.ptr), @backingInt(out.kind), o.stream),
         .exl3 => return error.BadShape,
+        .gguf => |h| try o.l.ggufRows(h, ids, n, table.k, out.ptr, out.kind.table(), o.stream),
     }
 }
 

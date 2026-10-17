@@ -304,6 +304,14 @@ pub const Spec = struct {
     /// Decode attention by 256-key splits (flash decoding), opted into per model: MiniCPM-V 4.7 (its 64k decode).
     /// The split sums in another order than the default walk, so a model's replies move with the choice.
     flash_decode: bool = false,
+    /// Value heads in llama.cpp's tiled order (a GGUF's linear attention): value head j * key_heads + g reads key head
+    /// g, where the Hugging Face order's head h reads h / (value_heads / key_heads).
+    tiled_heads: bool = false,
+
+    /// The key heads as the recurrence kernels take them: bit 16 marks the tiled order.
+    pub fn keyHeadsArg(s: Spec) usize {
+        return s.key_heads | (@as(usize, @intFromBool(s.tiled_heads)) << 16);
+    }
 
     /// Whether layer `index` is full attention (the others are gated delta-net).
     pub fn full(s: Spec, index: usize) bool {

@@ -42,6 +42,7 @@ const tp = @import("launches/tp.zig");
 const flashnext = @import("launches/flashnext.zig");
 const draft = @import("launches/draft.zig");
 const exl3 = @import("launches/exl3.zig");
+const gguf = @import("launches/gguf.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -95,6 +96,8 @@ pub const Launcher = struct {
     dft: draft.Fns,
     /// EXL3 projections: input rotation, the row-invariant product and the split sums' finish.
     exl3: exl3.Fns,
+    /// GGUF projections: ggml's block quantizations, the row-invariant product, the prompt tile and the row gather.
+    gguf: gguf.Fns,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -298,6 +301,7 @@ pub const Launcher = struct {
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.dft = try draft.Fns.load(l.mods[@backingInt(kernels.Group.draft)]);
         l.exl3 = try exl3.Fns.load(l.mods[@backingInt(kernels.Group.exl3)]);
+        l.gguf = try gguf.Fns.load(l.mods[@backingInt(kernels.Group.gguf)]);
         return l;
     }
 
@@ -393,6 +397,9 @@ pub const Launcher = struct {
     pub const exl3Scratch = exl3.scratchBytes;
     pub const exl3Silu = exl3.projectSilu;
     pub const hadamard = exl3.hadamard;
+    pub const ggufProject = gguf.project;
+    pub const ggufPrompt = gguf.prompt;
+    pub const ggufRows = gguf.rows;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {

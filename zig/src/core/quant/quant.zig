@@ -10,6 +10,8 @@ pub const mlx = @import("mlx.zig");
 pub const keys = @import("keys.zig");
 pub const dense = @import("dense.zig");
 pub const exl3 = @import("exl3.zig");
+/// ggml block quantizations read from GGUF files.
+pub const gguf = @import("gguf.zig");
 pub const experts = @import("experts.zig");
 /// ciru_q8's Hadamard-rotated int8 experts, read as MLX 8-bit stacks.
 pub const ciru = @import("ciru.zig");
@@ -38,11 +40,12 @@ pub fn Module(comptime f: Format) type {
         .mlx => mlx,
         .dense => dense,
         .exl3 => exl3,
+        .gguf => gguf,
     };
 }
 
 /// The order a tensor is offered to the formats: the first that recognizes it reads it.
-const read_order = [_]Format{ .dense, .mlx, .exl3 };
+const read_order = [_]Format{ .dense, .mlx, .exl3, .gguf };
 
 /// What a format module provides, checked at compile time.
 pub fn conforms(comptime M: type) void {
@@ -65,12 +68,13 @@ pub const Config = union(Format) {
     mlx: mlx.Config,
     dense: dense.Config,
     exl3: exl3.Config,
+    gguf: gguf.Config,
 
     /// The tensor's MLX width (the table's own, else the global one).
     pub fn width(c: Config, key: []const u8) error{UnsupportedQuantization}!mlx.Width {
         return switch (c) {
             .mlx => |q| q.width(key),
-            .dense, .exl3 => error.UnsupportedQuantization,
+            .dense, .exl3, .gguf => error.UnsupportedQuantization,
         };
     }
 };
@@ -88,6 +92,7 @@ pub const Host = union(Format) {
     mlx: mlx.Host,
     dense: dense.Host,
     exl3: exl3.Host,
+    gguf: gguf.Host,
 
     /// Output rows N.
     pub fn rows(h: Host) usize {
@@ -152,6 +157,7 @@ pub const Device = union(Format) {
     mlx: mlx.Device,
     dense: dense.Device,
     exl3: exl3.Device,
+    gguf: gguf.Device,
 };
 
 pub fn upload(u: Uploader, h: Host) !Device {
@@ -165,6 +171,7 @@ pub const Handle = union(Format) {
     mlx: mlx.Matrix,
     dense: dense.Matrix,
     exl3: exl3.Matrix,
+    gguf: gguf.Matrix,
 };
 
 /// One product (N, K): the format's handle and its shape. A stack is one expert's shape at the stack's addresses.
@@ -200,6 +207,7 @@ test "every format module provides the interface" {
     comptime conforms(mlx);
     comptime conforms(dense);
     comptime conforms(exl3);
+    comptime conforms(gguf);
 }
 
 test "a projection knows its format and decoder" {
@@ -214,6 +222,7 @@ test {
     _ = mlx;
     _ = dense;
     _ = exl3;
+    _ = gguf;
     _ = experts;
     _ = ciru;
     _ = fp8;
