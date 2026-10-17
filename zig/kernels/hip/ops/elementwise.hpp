@@ -121,9 +121,9 @@ __device__ __forceinline__ void dense_rows_body(const void* x, const void* w, vo
 
 // dense_rows_body's sums for C columns a block (a prompt's in_proj_a and b: x read once for C columns, not each): each
 // output's thread terms, butterfly and wave partials in the same order, so the same bits.
-template <int XK, int WK, int C>
+template <int XK, int WK, int C, int R>
 __device__ __forceinline__ void dense_cols_body(const void* x, const void* w, void* out, int rows, int n, int k) {
-    constexpr int R = kDenseRows, U = 2;
+    constexpr int U = 1;
     constexpr int kind = XK, w_kind = WK;
     __shared__ float part[R][C][8];
     const int c0 = blockIdx.x * C, r0 = blockIdx.y * R;
@@ -280,14 +280,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_dense_rows_pair(const void*
 #undef TF_DENSE_W
 }
 
-// tf_dense_rows_pair's sums (the same bits) 16 columns a block: a prompt's rows read x once for 16 columns.
+// tf_dense_rows_pair's sums (the same bits) 8 columns by 4 rows a block: a prompt's rows read x once for 8 columns
+// (8 x 4 measured fastest of 2-16 rows by 4-48 columns: 593 us against the pair's 972 at 2048 x 5120 x 2 x 48).
 extern "C" __global__ void __launch_bounds__(256) tf_dense_cols_pair(const void* x, int kind, const void* w0, const void* w1, int w_kind, void* out0, void* out1, int rows, int n, int k) {
     const void* w = blockIdx.z == 0 ? w0 : w1;
     void* out = blockIdx.z == 0 ? out0 : out1;
 #define TF_DENSE_W(XK)                                                         \
-    if (w_kind == 0) dense_cols_body<XK, 0, 16>(x, w, out, rows, n, k);        \
-    else if (w_kind == 1) dense_cols_body<XK, 1, 16>(x, w, out, rows, n, k);   \
-    else dense_cols_body<XK, 2, 16>(x, w, out, rows, n, k);
+    if (w_kind == 0) dense_cols_body<XK, 0, 8, 4>(x, w, out, rows, n, k);        \
+    else if (w_kind == 1) dense_cols_body<XK, 1, 8, 4>(x, w, out, rows, n, k);   \
+    else dense_cols_body<XK, 2, 8, 4>(x, w, out, rows, n, k);
     if (kind == 0) {
         TF_DENSE_W(0)
     } else if (kind == 1) {

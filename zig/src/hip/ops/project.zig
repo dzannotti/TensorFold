@@ -57,6 +57,29 @@ pub fn exl3(o: Ops, x: Tensor, proj: Projection, w: quant.exl3.Matrix, m: usize,
     return out;
 }
 
+/// res += matmul(x, proj) (bf16 rows) in a prompt's EXL3 tile, the product's row never stored: the bits of `project` then
+/// tf_add. False, nothing launched, where the tile does not take it (the caller projects and adds).
+pub fn projectAdd(o: Ops, x: Tensor, proj: Projection, m: usize, res: Tensor) Error!bool {
+    const w = switch (proj.handle) {
+        .exl3 => |h| h,
+        else => return false,
+    };
+    if (!o.prefill or m == 0 or proj.partial or x.kind != .bf16 or res.kind != .bf16) return false;
+    const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+    return exl3_launch.prompt(o.l, x.ptr, x.kind.table(), w, proj.n, proj.k, m, res.ptr, 3, scratch, o.stream);
+}
+
+/// res += matmul(silu_mul(gate, up), proj) as projectAdd: the bits of tf_silu_mul, `project` then tf_add.
+pub fn projectSiluAdd(o: Ops, gate: Tensor, up: Tensor, proj: Projection, m: usize, res: Tensor) Error!bool {
+    const w = switch (proj.handle) {
+        .exl3 => |h| h,
+        else => return false,
+    };
+    if (!o.prefill or m == 0 or proj.partial or gate.kind != .bf16 or up.kind != .bf16 or res.kind != .bf16) return false;
+    const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+    return exl3_launch.promptSilu(o.l, gate.ptr, up.ptr, gate.kind.table(), w, proj.n, proj.k, m, res.ptr, 3, scratch, o.stream);
+}
+
 /// matmul(silu_mul(gate, up), proj) in x's kind without the activation's row, for a prompt's or a round's EXL3 rows (null: the
 /// format or row count does not take it; nothing launched). The same bits as tf_silu_mul then `project`.
 pub fn projectSiluMul(o: Ops, gate: Tensor, up: Tensor, proj: Projection, m: usize) Error!?Tensor {
@@ -121,7 +144,7 @@ fn exl3Group(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor
 }
 
 /// A prompt's two dense products of one x and shape that take tf_dense_rows (an EXL3 pack's fp16 in_proj_a and b) in
-/// one launch reading x once for 16 columns: tf_dense_rows' bits. Null, nothing launched, for other pairs.
+/// one launch reading x once for 8 columns: tf_dense_rows' bits. Null, nothing launched, for other pairs.
 pub fn densePair(o: Ops, x: Tensor, a: Projection, b: Projection, m: usize) Error!?[2]Tensor {
     if (!o.prefill or m == 0 or x.kind == .f32 or a.partial or b.partial) return null;
     const wa = switch (a.handle) {

@@ -82,7 +82,7 @@ pub fn tf_conv_split(l: *const Launcher, c: ConvArgs, s: S) Error!void {
     try l.go(if (spread) l.dec.conv_split_rows else l.dec.conv_split, dim(cdiv(c.channels, 128) + gate_blocks, c.slots, 1), dim(128, @as(u32, if (spread) 4 else 1), 1), 0, s, &a);
 }
 
-pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, out: F, new_state: F, len: c_int, channels: c_int, kernel: c_int, s: S) Error!void {
+pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, out: F, new_state: F, len: c_int, channels: c_int, kernel: c_int, p1: c_int, p2: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));
     try a.add(kind);
@@ -93,6 +93,8 @@ pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state:
     try a.add(len);
     try a.add(channels);
     try a.add(kernel);
+    try a.add(p1);
+    try a.add(p2);
     // a thread a channel over 16 rows (conv_prefill_kernel's kConvRows), at most 8 taps
     if (kernel > 8) return invalid("conv_prefill");
     try l.go(l.op.conv_prefill, dim(cdiv(channels, 256), @max(1, cdiv(len, 16)), 1), dim(256, 1, 1), 0, s, &a);

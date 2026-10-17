@@ -179,6 +179,8 @@ fn promptOf(l: *const Launcher, x: u64, up: u64, x_kind: c_int, w: exl3.Matrix, 
     // the tile's buffer loads take 31-bit byte offsets into the rotated x and the trellis
     const words: u64 = 4 * @as(u64, w.halves);
     if (m <= prompt_rows or @as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) {
+        // the residual sum (out_kind 3) is the tile's alone
+        if (out_kind == 3) return false;
         const f = l.exl3.chain[w.halves][tileOf(m, n)] orelse return false;
         try product(l, f, 1, x, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
         return true;

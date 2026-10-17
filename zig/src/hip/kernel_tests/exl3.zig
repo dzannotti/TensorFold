@@ -365,7 +365,7 @@ test "a prompt's EXL3 product of silu_mul(gate, up) made in its rotation keeps t
     }
 }
 
-test "a prompt's dense pair 16 columns a block keeps tf_dense_rows' bits" {
+test "a prompt's dense pair 8 columns a block keeps tf_dense_rows' bits" {
     const t = try base.Rig.open(1 << 20);
     defer t.close();
     var rng: base.Rng = .{ .state = 0x636f6c73 };
@@ -424,4 +424,58 @@ test "rms norm a wave a row (many rows) keeps rms_kernel's bits (one row at a ti
     defer gpa.free(all);
     try out.download(0, std.mem.sliceAsBytes(all));
     try base.expect(std.mem.eql(u16, all[0 .. rows * width], all[rows * width ..]), "rms a wave a row differs from rms_kernel", .{});
+}
+
+test "a prompt's EXL3 product added into the residual rows keeps the product then tf_add's bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x72657364 };
+    const k = 1024;
+    const n: u32 = 512;
+    const rows = 300;
+    const trellis = try gpa.alloc(i16, (k / 16) * (n / 16) * 6 * 8);
+    defer gpa.free(trellis);
+    for (trellis) |*w| w.* = @bitCast(@as(u16, @truncate(rng.next())));
+    const suh = try gpa.alloc(f16, k);
+    defer gpa.free(suh);
+    for (suh) |*s| s.* = @floatCast((1 + 0.1 * rng.unit()) * @as(f32, if (rng.next() & 1 == 0) 1 else -1));
+    const svh = try gpa.alloc(f16, n);
+    defer gpa.free(svh);
+    for (svh) |*s| s.* = @floatCast(0.02 * (1 + 0.1 * rng.unit()));
+    const x = try gpa.alloc(u16, rows * k);
+    defer gpa.free(x);
+    for (x) |*v| v.* = base.bf16Bits(rng.unit());
+    const r0 = try gpa.alloc(u16, rows * n);
+    defer gpa.free(r0);
+    for (r0) |*v| v.* = base.bf16Bits(4 * rng.unit());
+    var dt = try Buffer.fromHost(t, trellis);
+    defer dt.free();
+    var ds = try Buffer.fromHost(t, suh);
+    defer ds.free();
+    var dv = try Buffer.fromHost(t, svh);
+    defer dv.free();
+    var dx = try Buffer.fromHost(t, x);
+    defer dx.free();
+    var want = try Buffer.fromHost(t, r0);
+    defer want.free();
+    var got = try Buffer.fromHost(t, r0);
+    defer got.free();
+    var y = try Buffer.alloc(t, rows * n * 2);
+    defer y.free();
+    var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(rows, k, n));
+    defer scratch.free();
+    const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = 6, .codebook = .mul1, .columns = n };
+    try base.expect(try t.on.exl3Prompt(dx.ptr, 1, m, n, k, rows, y.ptr, 1, scratch.ptr, t.stream.handle), "no prompt product", .{});
+    // ops numbering for tf_add (2 bf16)
+    try t.on.tf_add(@ptrFromInt(want.ptr), @ptrFromInt(y.ptr), @ptrFromInt(want.ptr), 2, rows * n, t.stream.handle);
+    try base.expect(try t.on.exl3Prompt(dx.ptr, 1, m, n, k, rows, got.ptr, 3, scratch.ptr, t.stream.handle), "no residual product", .{});
+    try t.stream.synchronize();
+    const a = try gpa.alloc(u16, rows * n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u16, rows * n);
+    defer gpa.free(b);
+    try want.download(0, std.mem.sliceAsBytes(a));
+    try got.download(0, std.mem.sliceAsBytes(b));
+    try base.expect(std.mem.eql(u16, a, b), "the residual product differs from the product then tf_add", .{});
+    try base.expect(!try t.on.exl3Prompt(dx.ptr, 1, m, n, k, 100, got.ptr, 3, scratch.ptr, t.stream.handle), "a chain call took the residual", .{});
 }

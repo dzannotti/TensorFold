@@ -9,8 +9,13 @@ const f = t.f;
 const int = t.int;
 
 pub fn convPrefill(o: Ops, x: Tensor, weight: u64, state: ?u64, out: u64, new_state: u64, len: usize, channels: usize, kernel: usize) Error!void {
-    if (kernel < 1 or kernel > 8) return error.BadShape;
-    try o.l.tf_conv_prefill(p(x.ptr), @backingInt(x.kind), f(weight), if (state) |s| f(s) else null, f(out), f(new_state), int(len), int(channels), int(kernel), o.stream);
+    return convPlanes(o, x, weight, state, out, new_state, len, channels, kernel, 0, 0);
+}
+
+/// convPrefill into three planes back to back: channels [0, p1), [p1, p2), [p2, channels), each (len, width).
+pub fn convPlanes(o: Ops, x: Tensor, weight: u64, state: ?u64, out: u64, new_state: u64, len: usize, channels: usize, kernel: usize, p1: usize, p2: usize) Error!void {
+    if (kernel < 1 or kernel > 8 or p1 > p2 or p2 > channels) return error.BadShape;
+    try o.l.tf_conv_prefill(p(x.ptr), @backingInt(x.kind), f(weight), if (state) |s| f(s) else null, f(out), f(new_state), int(len), int(channels), int(kernel), int(p1), int(p2), o.stream);
 }
 
 pub fn convDecode(o: Ops, x: u64, weight: u64, state: u64, y: u64, channels: usize, kernel: usize) Error!void {

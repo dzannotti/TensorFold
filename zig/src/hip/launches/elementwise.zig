@@ -129,7 +129,7 @@ pub fn tf_dense_rows_pair(l: *const Launcher, x: C, kind: c_int, w0: C, w1: C, w
     try l.go(l.op.dense_rows_pair, dim(n, @divFloor(rows + 3, 4), 2), dim(256, 1, 1), 0, s, &a);
 }
 
-/// `tf_dense_rows_pair`'s bits 16 columns a block (ops/elementwise.hpp tf_dense_cols_pair), for a prompt's rows.
+/// `tf_dense_rows_pair`'s bits 8 columns by 4 rows a block (ops/elementwise.hpp tf_dense_cols_pair), for a prompt's rows.
 pub fn tf_dense_cols_pair(l: *const Launcher, x: C, kind: c_int, w0: C, w1: C, w_kind: c_int, out0: P, out1: P, rows: c_int, n: c_int, k: c_int, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));
@@ -142,5 +142,5 @@ pub fn tf_dense_cols_pair(l: *const Launcher, x: C, kind: c_int, w0: C, w1: C, w
     try a.add(rows);
     try a.add(n);
     try a.add(k);
-    try l.go(l.op.dense_cols_pair, dim(@divFloor(n + 15, 16), @divFloor(rows + 3, 4), 2), dim(256, 1, 1), 0, s, &a);
+    try l.go(l.op.dense_cols_pair, dim(@divFloor(n + 7, 8), @divFloor(rows + 3, 4), 2), dim(256, 1, 1), 0, s, &a);
 }
