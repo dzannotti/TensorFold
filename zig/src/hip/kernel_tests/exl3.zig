@@ -24,7 +24,7 @@ const cases = [_]Case{
 };
 
 const most_rows = 128;
-const together = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 48, 64, 65, 128 };
+const together = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 34, 40, 48, 63, 64, 65, 66, 80, 96, 97, 100, 112, 120, 127, 128 };
 
 /// One case: the 128 rows against the fp64 reference, then each row count's rows against the same rows alone.
 fn run(t: *base.Rig, rng: *base.Rng, c: Case) !void {

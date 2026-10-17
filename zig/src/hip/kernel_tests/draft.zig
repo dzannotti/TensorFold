@@ -510,7 +510,7 @@ test "mlx products: the drafter's tiles write the verify tile's bytes, alone, in
             ps[i].free();
             pb[i].free();
         };
-        for ([_]usize{ 1, 5, 16, 37, 64 }) |rows| {
+        for ([_]usize{ 1, 5, 16, 17, 33, 37, 40, 48, 63, 64, 65, 128 }) |rows| {
             const x = try randoms(&rng, rows * k, 2);
             defer gpa.free(x);
             var dx = try t.upload(x);
@@ -537,7 +537,7 @@ test "mlx products: the drafter's tiles write the verify tile's bytes, alone, in
             defer gpa.free(w0);
             // the conv variants: dynConv's branch 1 with a residual over the product
             const group = 16;
-            const block: usize = if (rows % 16 == 0) 16 else 4;
+            const block: usize = if (rows % 16 == 0) 16 else if (rows % 8 == 0) 8 else 4;
             const dyn = try randoms(&rng, rows * 4 * (n / group), 1);
             defer gpa.free(dyn);
             const cbase = try randoms(&rng, 4 * n, 1);
