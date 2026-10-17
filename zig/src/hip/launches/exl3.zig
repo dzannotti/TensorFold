@@ -58,12 +58,17 @@ pub const Fns = struct {
     product: [17][3][tiles.len]?Function,
     /// A prompt's product on the dequantizing core (mul1, whole bits): by half bits, 128 x 256 or 256 x 128 blocks.
     prompt: [17][2]?Function,
+    /// `product`'s mul1 tiles on one chain (exl3_chain): a prompt's rows up to `prompt_rows`, by half bits and tile.
+    chain: [17][tiles.len]?Function,
 
     pub fn load(m: Module) Error!Fns {
         @setEvalBranchQuota(200_000);
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))), .prompt = @splat(@splat(null)) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))), .prompt = @splat(@splat(null)), .chain = @splat(@splat(null)) };
         inline for (.{ 4, 6, 8, 10, 12, 14, 16 }) |h| inline for (.{ .{ 128, 256 }, .{ 256, 128 } }, 0..) |b, i| {
             f.prompt[h][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm11exl3_promptILi{d}ELi2ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, b[0], b[1] }));
+        };
+        inline for (.{ 4, 6, 8, 10, 12, 14, 16 }) |h| inline for (tiles, 0..) |t, i| {
+            f.chain[h][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm10exl3_chainILi{d}ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, t.rows, t.cols }));
         };
         inline for (0..17) |h| inline for (0..3) |cb| {
             if (comptime built(h, cb)) inline for (tiles, 0..) |t, i| {
@@ -94,10 +99,13 @@ pub fn scratchBytes(m: usize, k: u32, n: u32) usize {
 /// `scratch` holds `scratchBytes(m, k, n)`.
 pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
-    const cb: usize = @backingInt(w.codebook);
+    const f = l.exl3.product[w.halves][@backingInt(w.codebook)][tileOf(m, n)] orelse return invalid("exl3 width");
+    try product(l, f, splits(k, n), x, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+/// `f`, a product kernel (exl3_product or exl3_chain), over `sp` K splits.
+fn product(l: *const Launcher, f: Function, sp: u32, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     const tile = tiles[tileOf(m, n)];
-    const f = l.exl3.product[w.halves][cb][tileOf(m, n)] orelse return invalid("exl3 width");
-    const sp = splits(k, n);
     const words: i64 = 4 * @as(i64, w.halves);
     const arg: Arg = .{
         .xh = scratch,
@@ -135,15 +143,24 @@ pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32
     try l.go(f, dim(cols, sp, blocks), dim(256, 1, 1), 0, s, &a);
 }
 
-/// `project` for a prompt's rows on the dequantizing tile (quant/exl3.hip exl3_prompt): every output one WMMA chain over
-/// k, so a row's bits depend on its own x and (K, N) alone, never on m or where the prompt is cut, but differ from
-/// `project`'s (decode and rounds). False, nothing launched, where no prompt tile takes the matrix (mul1 whole bits).
+/// Rows above which a prompt's product takes the dequantizing tile: up to them, the product's tiles on one chain
+/// (exl3_chain, the same bits), where the tile's few blocks would each decode their whole K for a few rows.
+pub const prompt_rows = 128;
+
+/// `project` for a prompt's rows (mul1 whole bits): the dequantizing tile (quant/exl3.hip exl3_prompt) above
+/// `prompt_rows`, else exl3_chain. Each output is one WMMA chain over k (no K split), so a row's bits depend on its own x
+/// and (K, N) alone, never on m or where the prompt is cut; they differ from `project`'s (decode and rounds: K splits,
+/// even and odd k steps on two chains). False, nothing launched, for other matrices.
 pub fn prompt(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!bool {
     if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 prompt");
     if (w.codebook != .mul1 or w.halves % 2 != 0) return false;
-    // its buffer loads take 31-bit byte offsets into the rotated x and the trellis
+    // the tile's buffer loads take 31-bit byte offsets into the rotated x and the trellis
     const words: u64 = 4 * @as(u64, w.halves);
-    if (@as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) return false;
+    if (m <= prompt_rows or @as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) {
+        const f = l.exl3.chain[w.halves][tileOf(m, n)] orelse return false;
+        try product(l, f, 1, x, x_kind, w, n, k, m, out, out_kind, scratch, s);
+        return true;
+    }
     // 256 x 128 (half the decode a weight) but where k is near n (o_proj, out_proj: 128 x 256 measured 25% faster);
     // the same bits either way
     const tall = k < n or k >= 3 * n;

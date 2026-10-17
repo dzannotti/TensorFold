@@ -286,9 +286,10 @@ __device__ __forceinline__ h16x16 exl3_fragment(const uint32_t (&r)[2][LW], cons
 // stream; the halves swap theirs. Every row's sum is the same WMMA chain over its K range in K order.
 // A round's row tiles (MT 1, 2) keep a ring of each lane's window words and x fragments in registers; a prompt's (MT 8)
 // stages a slab of k steps (the block's 8 tiles each and its rows' x) through LDS, one slab ahead, a staged tile
-// repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain.
-template <int K2, int CB, int MT, int NT>
-__global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
+// repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain: even and odd k steps
+// on two sums added at the end, or with ONE a single chain over k, exl3_prompt's sums to the bit.
+template <int K2, int CB, int MT, int NT, bool ONE>
+__device__ __forceinline__ void exl3_product_at(const Exl3& a) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TD = 4 * K2;      // dwords a tile
     constexpr int RING = 128 * K2;  // bits a tile
@@ -375,7 +376,7 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
                     const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
 #pragma unroll
                     for (int mt = 0; mt < MT; ++mt) {
-                        f32x8e& sum = rb & 1 ? odd[n][mt] : acc[n][mt];
+                        f32x8e& sum = !ONE && (rb & 1) ? odd[n][mt] : acc[n][mt];
                         sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb & 1][mt]), b, sum);
                     }
                 }
@@ -458,7 +459,7 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const u32x8e x = *reinterpret_cast<const u32x8e*>(l + xat + mt * 16 * XP + i * 32);
-                    f32x8e& sum = i & 1 ? odd[0][mt] : acc[0][mt];
+                    f32x8e& sum = !ONE && (i & 1) ? odd[0][mt] : acc[0][mt];
                     sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, sum);
                 }
             }
@@ -468,10 +469,12 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
         }
     }
 
+    if constexpr (!ONE) {
 #pragma unroll
-    for (int n = 0; n < NT; ++n)
+        for (int n = 0; n < NT; ++n)
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) acc[n][mt] += odd[n][mt];
+            for (int mt = 0; mt < MT; ++mt) acc[n][mt] += odd[n][mt];
+    }
     if (a.splits > 1) {
 #pragma unroll
         for (int n = 0; n < NT; ++n)
@@ -534,6 +537,17 @@ __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
     (void)a;
     __builtin_trap();
 #endif
+}
+
+template <int K2, int CB, int MT, int NT>
+__global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
+    exl3_product_at<K2, CB, MT, NT, false>(a);
+}
+
+// A prompt's rows below exl3_prompt's (mul1, one split): the product's tiles on one chain, exl3_prompt's bits.
+template <int K2, int MT, int NT>
+__global__ void __launch_bounds__(256) exl3_chain(Exl3 a) {
+    exl3_product_at<K2, 2, MT, NT, true>(a);
 }
 
 // ---- a prompt's product: the trellis decoded into LDS as FP16 on prompt_dq_core ----
@@ -811,7 +825,12 @@ __global__ void __launch_bounds__(BM * BN / 128) exl3_prompt(Exl3 a) {
 #if TF_MATRIX
 #define TF_EXL3_PROMPT(K2)                                                    \
     template __global__ void exl3_prompt<K2, 2, 128, 256>(Exl3);              \
-    template __global__ void exl3_prompt<K2, 2, 256, 128>(Exl3);
+    template __global__ void exl3_prompt<K2, 2, 256, 128>(Exl3);              \
+    template __global__ void exl3_chain<K2, 1, 1>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 1, 2>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 2, 1>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 2, 2>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 8, 1>(Exl3);
 TF_EXL3_PROMPT(4)
 TF_EXL3_PROMPT(6)
 TF_EXL3_PROMPT(8)

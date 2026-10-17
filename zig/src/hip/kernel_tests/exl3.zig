@@ -103,8 +103,9 @@ fn run(t: *base.Rig, rng: *base.Rng, c: Case) !void {
         try base.expect(same, "{s}: {d} rows from row {d} differ from the same rows among 128", .{ c.name, rows, first });
     }
 
-    // the prompt tile: 300 rows (past one 256-row block) against fp64, then each row count's rows against the same rows
-    // among the 300 (and the first 128 against the decode product's to its rounding)
+    // the prompt product: 300 rows (past one 256-row block, on the tile) against fp64, then each row count's rows against
+    // the same rows among the 300, up to 128 rows on exl3_chain (and the first 128 against the decode product's to its
+    // rounding)
     const pm = 300;
     const px = try gpa.alloc(u16, pm * c.k);
     defer gpa.free(px);

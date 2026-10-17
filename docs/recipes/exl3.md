@@ -11,9 +11,10 @@ GLM-5.3-Flash.
 - The HIP engine serves qwen3_5 EXL3 packs (the 27B dense) on gfx11: `core/quant/exl3.zig` reads them through the
   format interface, `zig/kernels/hip/quant/exl3.hip` rotates x and runs a WMMA product whose rows have the same bits at
   any row count (decode and drafted rounds). Prompts (mul1, whole bits) take `exl3_prompt` on the dequantizing prompt
-  core instead: each block decodes its trellis tiles once into LDS as the exact fp16 weights and every output is one
-  fp32 WMMA chain over k, so a prompt row's bits never depend on the row count or the chunking (they differ from
-  decode's, as for the MLX checkpoints). Hugging Face names, zero-centered norms and the (C, 1, K) conv of
+  core above 128 rows: each block decodes its trellis tiles once into LDS as the exact fp16 weights and every output is
+  one fp32 WMMA chain over k. Shorter prompt calls take `exl3_chain`, the decode product's tiles on that same single
+  chain with no K split, so the two have the same bits and a prompt row's bits never depend on the row count or the
+  chunking (they differ from decode's split, even/odd chains, as for the MLX checkpoints). Hugging Face names, zero-centered norms and the (C, 1, K) conv of
   ExLlamaV3 packs load as they are; a DFlash2 drafter's head is quantized to affine-4 from the EXL3 head.
 - CUDA projections and routed experts on this format are in review (#740, #741, #806). A model needs them and a loader
   for its EXL3 tensors before it can serve a checkpoint; the 27B on CUDA is the first planned.
