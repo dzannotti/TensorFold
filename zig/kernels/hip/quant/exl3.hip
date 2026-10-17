@@ -379,9 +379,11 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
             const int r = m0 + mt * 16 + c;
             xo[mt] = static_cast<uint32_t>(r < a.m ? r : a.m - 1) * 32u;
         }
-        // the tiles' words D - 1 k steps ahead (DRAM), x one ahead (L2)
+        // the tiles' words D - 1 k steps ahead (DRAM), x XD - 1 ahead (L2: a round's 16 rows miss L0 often enough
+        // that one step ahead leaves them waiting)
+        constexpr int XD = 3;
         uint32_t ring[D][NT][2][LW];
-        u32x8e xa[2][MT];
+        u32x8e xa[D][MT];
         // every load is unconditional on a clamped tile, so the wait counters never drain the ring
         auto fetch = [&](int i, uint32_t (&r)[NT][2][LW]) {
             const int t = i < tiles ? i : tiles - 1;
@@ -403,20 +405,21 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
         };
 #pragma unroll
         for (int i = 0; i < D - 1; ++i) fetch(i, ring[i]);
-        xfetch(0, xa[0]);
+#pragma unroll
+        for (int i = 0; i < XD - 1; ++i) xfetch(i, xa[i]);
         // the launch takes `tiles` a multiple of D
         for (int i0 = 0; i0 < tiles; i0 += D) {
 #pragma unroll
             for (int rb = 0; rb < D; ++rb) {
                 fetch(i0 + rb + D - 1, ring[(rb + D - 1) % D]);
-                xfetch(i0 + rb + 1, xa[(rb + 1) & 1]);
+                xfetch(i0 + rb + XD - 1, xa[(rb + XD - 1) % D]);
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
 #pragma unroll
                     for (int mt = 0; mt < MT; ++mt) {
                         f32x8e& sum = rb & 1 ? odd[n][mt] : acc[n][mt];
-                        sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb & 1][mt]), b, sum);
+                        sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb][mt]), b, sum);
                     }
                 }
             }
