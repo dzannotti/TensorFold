@@ -222,6 +222,57 @@ test "EXL3 products match the format's fp64 decoder and keep every row's bits at
     for (cases) |c| try run(t, &rng, c);
 }
 
+test "an EXL3 product of silu_mul(gate, up) made in its rotation keeps tf_silu_mul then the product's bits" {
+    const t = try base.Rig.open(1 << 20);
+    defer t.close();
+    var rng: base.Rng = .{ .state = 0x73696c75 };
+    const k = 1024;
+    const n: u32 = 512;
+    const rows = 16;
+    const trellis = try gpa.alloc(i16, (k / 16) * (n / 16) * 6 * 8);
+    defer gpa.free(trellis);
+    for (trellis) |*w| w.* = @bitCast(@as(u16, @truncate(rng.next())));
+    const suh = try gpa.alloc(f16, k);
+    defer gpa.free(suh);
+    for (suh) |*s| s.* = @floatCast((1 + 0.1 * rng.unit()) * @as(f32, if (rng.next() & 1 == 0) 1 else -1));
+    const svh = try gpa.alloc(f16, n);
+    defer gpa.free(svh);
+    for (svh) |*s| s.* = @floatCast(0.02 * (1 + 0.1 * rng.unit()));
+    const gu = try gpa.alloc(u16, 2 * rows * k);
+    defer gpa.free(gu);
+    for (gu) |*v| v.* = base.bf16Bits(8 * rng.unit());
+    var dt = try Buffer.fromHost(t, trellis);
+    defer dt.free();
+    var ds = try Buffer.fromHost(t, suh);
+    defer ds.free();
+    var dv = try Buffer.fromHost(t, svh);
+    defer dv.free();
+    var dg = try Buffer.fromHost(t, gu);
+    defer dg.free();
+    var act = try Buffer.alloc(t, rows * k * 2);
+    defer act.free();
+    var out = try Buffer.alloc(t, rows * n * 2);
+    defer out.free();
+    var scratch = try Buffer.alloc(t, launches.Launcher.exl3Scratch(rows, k, n));
+    defer scratch.free();
+    const m: exl3.Matrix = .{ .trellis = dt.ptr, .suh = ds.ptr, .svh = dv.ptr, .bias = 0, .halves = 6, .codebook = .mul1, .columns = n };
+    const up = dg.ptr + rows * k * 2;
+    // ops numbering for tf_silu_mul (2 bf16), EXL3's for the product (1 bf16)
+    try t.on.tf_silu_mul(@ptrFromInt(dg.ptr), @ptrFromInt(up), @ptrFromInt(act.ptr), 2, rows * k, t.stream.handle);
+    try t.on.exl3Project(act.ptr, 1, m, n, k, rows, out.ptr, 1, scratch.ptr, t.stream.handle);
+    try t.stream.synchronize();
+    const want = try gpa.alloc(u16, rows * n);
+    defer gpa.free(want);
+    try out.download(0, std.mem.sliceAsBytes(want));
+    try out.fill8(0xff, null);
+    try t.on.exl3Silu(dg.ptr, up, 1, m, n, k, rows, out.ptr, 1, scratch.ptr, t.stream.handle);
+    try t.stream.synchronize();
+    const got = try gpa.alloc(u16, rows * n);
+    defer gpa.free(got);
+    try out.download(0, std.mem.sliceAsBytes(got));
+    try base.expect(std.mem.eql(u16, got, want), "the fused activation's product differs", .{});
+}
+
 test "EXL3 packs' dense rows over fp16 weights (in_proj_a and b) match fp64 and keep each row's bits" {
     const t = try base.Rig.open(1 << 20);
     defer t.close();

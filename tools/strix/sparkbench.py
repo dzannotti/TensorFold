@@ -36,6 +36,13 @@ def est_tokens(text):  # LlmStreaming.estimateTokenCount: ~4 UTF-16 units per to
 DECODE_PROSE_PROMPT = ("Write a detailed step-by-step explanation of how a hash map works, "
                        "including collision handling, resizing, and time complexity. Be thorough.")
 DECODE_STRUCTURED_PROMPT = "Count from 1 to 200. Output only the numbers, separated by spaces. No other text."
+# Not sparkDash: five prose prompts run one at a time at C1 ("prose5"), their mean a steadier regression signal than
+# the one hash-map reply, whose rate moves with any change that alters its text.
+PROSE_SET = [DECODE_PROSE_PROMPT,
+             "Explain in detail how TCP establishes, maintains and closes a connection, including congestion control.",
+             "Write a thorough essay on the causes and consequences of the French Revolution.",
+             "Describe step by step how a modern CPU executes an instruction, from fetch to retirement. Be thorough.",
+             "Explain how vaccines train the immune system, covering innate and adaptive immunity in detail."]
 CODE_TASK_TAIL = ("Output only Python source. No comments, no docstrings, no markdown fences. "
                   "Then add tests and the helpers this needs. Keep writing code.")
 CODE_TASKS = [f"{n}\n{s}\n{CODE_TASK_TAIL}" for n, s in [
@@ -215,6 +222,21 @@ def repetition(text):
     words = text.split()
     grams = [tuple(words[i:i + 8]) for i in range(len(words) - 7)]
     return 1 - len(set(grams)) / len(grams) if grams else 0.0
+
+
+def run_prose_set(url, model, max_tokens):
+    stream(url, chat_body(model, PROSE_SET[0], 32), 360)
+    rates, reps, texts = [], [], []
+    for prompt in PROSE_SET:
+        r = stream(url, chat_body(model, prompt, max_tokens, min_tokens=max_tokens, ignore_eos=True, stop=[]), 360)
+        rates.append(r["decodeTps"])
+        reps.append(repetition(r["answer"] + r["reasoning"]))
+        texts.append(r["answer"] + r["reasoning"])
+    w = dict(concurrency=1, aggregateDecodeTps=round2(statistics.fmean(rates)), rates=rates,
+             repetition=round2(max(reps)), texts=texts)
+    print(f"decode prose5 C1 mean {w['aggregateDecodeTps']:8.1f}  each {' '.join(f'{x:.1f}' for x in rates)}  "
+          f"rep {w['repetition']:.2f}", flush=True)
+    return [w]
 
 
 def run_decode(url, model, concs, max_tokens, kind):
@@ -699,7 +721,7 @@ def main():
     ap.add_argument("--model")
     ap.add_argument("--mode", choices=["decode", "prefill", "quality", "all"], default="all")
     ap.add_argument("--concurrency", default="1,2,4,8")
-    ap.add_argument("--decode-types", default="prose,code", help="prose,code,structured")
+    ap.add_argument("--decode-types", default="prose,code", help="prose,code,structured,prose5 (five prose prompts at C1, mean)")
     ap.add_argument("--max-tokens", type=int, default=400)  # INFERRED: the UI default (DEFAULT_MAX_TOKENS) was used
     ap.add_argument("--sizes", default="8192,16384,32768,65536,131072")  # INFERRED from the published 8k..128k rows
     ap.add_argument("--quality-data", default="data", help="dir holding gsm8k-200.json and mmlu-285.json")
@@ -709,7 +731,8 @@ def main():
     res = {"baseUrl": a.base_url, "model": a.model}
     if a.mode in ("decode", "all"):
         concs = [int(x) for x in a.concurrency.split(",")]
-        res["decode"] = {k: run_decode(url, a.model, concs, a.max_tokens, k) for k in a.decode_types.split(",")}
+        res["decode"] = {k: run_prose_set(url, a.model, a.max_tokens) if k == "prose5" else
+                         run_decode(url, a.model, concs, a.max_tokens, k) for k in a.decode_types.split(",")}
     if a.mode in ("prefill", "all"):
         res["prefill"] = run_prefill(url, a.model, [int(x) for x in a.sizes.split(",")])
     if a.mode in ("quality", "all"):

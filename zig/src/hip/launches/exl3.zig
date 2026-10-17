@@ -52,6 +52,7 @@ fn built(halves: usize, codebook: usize) bool {
 
 pub const Fns = struct {
     rotate: Function,
+    rotate_silu: Function,
     /// ciru_q8's input rotation: 128-block Hadamards, no signs, in the activation's kind.
     had: Function,
     /// By half bits, codebook (3inst, mcg, mul1) and tile.
@@ -63,7 +64,7 @@ pub const Fns = struct {
 
     pub fn load(m: Module) Error!Fns {
         @setEvalBranchQuota(200_000);
-        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))), .prompt = @splat(@splat(null)), .chain = @splat(@splat(null)) };
+        var f: Fns = .{ .rotate = try m.function("tf_exl3_rotate_in"), .rotate_silu = try m.function("tf_exl3_rotate_silu"), .had = try m.function("tf_had128"), .product = @splat(@splat(@splat(null))), .prompt = @splat(@splat(null)), .chain = @splat(@splat(null)) };
         inline for (.{ 4, 6, 8, 10, 12, 14, 16 }) |h| inline for (.{ .{ 128, 256 }, .{ 256, 128 } }, 0..) |b, i| {
             f.prompt[h][i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm11exl3_promptILi{d}ELi2ELi{d}ELi{d}EEEvNS0_4Exl3E", .{ h, b[0], b[1] }));
         };
@@ -98,13 +99,23 @@ pub fn scratchBytes(m: usize, k: u32, n: u32) usize {
 /// y [m, n] (`out_kind`: 0 fp32, 1 bf16, 2 fp16) = x [m, k] (`x_kind` 1 bf16, 2 fp16) times the EXL3 matrix;
 /// `scratch` holds `scratchBytes(m, k, n)`.
 pub fn project(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
-    if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
-    const f = l.exl3.product[w.halves][@backingInt(w.codebook)][tileOf(m, n)] orelse return invalid("exl3 width");
-    try product(l, f, splits(k, n), x, x_kind, w, n, k, m, out, out_kind, scratch, s);
+    return projectOf(l, x, 0, x_kind, w, n, k, m, out, out_kind, scratch, s);
 }
 
-/// `f`, a product kernel (exl3_product or exl3_chain), over `sp` K splits.
-fn product(l: *const Launcher, f: Function, sp: u32, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
+/// `project` of tf_silu_mul(gate, up) (both [m, k] of `x_kind`), the activation made by the rotation: the same bits.
+pub fn projectSilu(l: *const Launcher, gate: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
+    if (up == 0) return invalid("exl3 silu");
+    return projectOf(l, gate, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+fn projectOf(l: *const Launcher, x: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
+    if (m == 0 or k % 128 != 0 or n % 128 != 0 or n > w.columns or (x_kind != 1 and x_kind != 2)) return invalid("exl3 project");
+    const f = l.exl3.product[w.halves][@backingInt(w.codebook)][tileOf(m, n)] orelse return invalid("exl3 width");
+    try product(l, f, splits(k, n), x, up, x_kind, w, n, k, m, out, out_kind, scratch, s);
+}
+
+/// `f`, a product kernel (exl3_product or exl3_chain), over `sp` K splits; `up` as in projectOf.
+fn product(l: *const Launcher, f: Function, sp: u32, x: u64, up: u64, x_kind: c_int, w: exl3.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     const tile = tiles[tileOf(m, n)];
     const words: i64 = 4 * @as(i64, w.halves);
     const arg: Arg = .{
@@ -125,13 +136,14 @@ fn product(l: *const Launcher, f: Function, sp: u32, x: u64, x_kind: c_int, w: e
     {
         var a: Args = .{};
         try a.add(x);
+        if (up != 0) try a.add(up);
         try a.add(x_kind);
         try a.add(w.suh);
         try a.add(scratch);
         try a.add(@as(c_int, @intCast(k)));
         // a round's row tiles read x by k steps (quant/exl3.hip)
         try a.add(@as(c_int, if (tile.rows <= 2) @intCast(m) else 0));
-        try l.go(l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
+        try l.go(if (up != 0) l.exl3.rotate_silu else l.exl3.rotate, dim(k / 128, m, 1), dim(32, 1, 1), 0, s, &a);
     }
     const rows = 16 * tile.rows;
     const blocks = (m + rows - 1) / rows;
@@ -158,7 +170,7 @@ pub fn prompt(l: *const Launcher, x: u64, x_kind: c_int, w: exl3.Matrix, n: u32,
     const words: u64 = 4 * @as(u64, w.halves);
     if (m <= prompt_rows or @as(u64, m) * k * 2 >= 1 << 31 or @as(u64, k / 16) * (w.columns / 16) * words * 4 >= 1 << 31) {
         const f = l.exl3.chain[w.halves][tileOf(m, n)] orelse return false;
-        try product(l, f, 1, x, x_kind, w, n, k, m, out, out_kind, scratch, s);
+        try product(l, f, 1, x, 0, x_kind, w, n, k, m, out, out_kind, scratch, s);
         return true;
     }
     // 256 x 128 (half the decode a weight) but where k is near n (o_proj, out_proj: 128 x 256 measured 25% faster);

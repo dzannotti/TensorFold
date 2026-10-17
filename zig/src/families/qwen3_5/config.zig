@@ -301,6 +301,9 @@ pub const Spec = struct {
     full_layers: [checks.max_layers]bool = @splat(false),
     mrope: checks.Mrope = .{},
     max_position: usize = 262144,
+    /// Decode attention by 256-key splits (flash decoding), opted into per model: MiniCPM-V 4.7 (its 64k decode).
+    /// The split sums in another order than the default walk, so a model's replies move with the choice.
+    flash_decode: bool = false,
 
     /// Whether layer `index` is full attention (the others are gated delta-net).
     pub fn full(s: Spec, index: usize) bool {

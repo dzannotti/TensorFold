@@ -14,24 +14,31 @@ pub const Fns = struct {
     gather: Function,
     ring_put: Function,
     norm_rope: Function,
+    norm_rope_qk: Function,
+    rms: Function,
     dyn_conv: Function,
     attn: Function,
     attn_merge: Function,
     bf16_rows: Function,
     q4_rows: Function,
     topk_merge: Function,
+    /// The MLX products (draft.hip dft_mlx_tile) by kind.
+    mlx: [3]Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
             .gather = try m.function("tf_dft_gather"),
             .ring_put = try m.function("tf_dft_ring_put"),
             .norm_rope = try m.function("tf_dft_norm_rope"),
+            .norm_rope_qk = try m.function("tf_dft_norm_rope_qk"),
+            .rms = try m.function("tf_dft_rms"),
             .dyn_conv = try m.function("tf_dft_dyn_conv"),
             .attn = try m.function("tf_dft_attn"),
             .attn_merge = try m.function("tf_dft_attn_merge"),
             .bf16_rows = try m.function("tf_dft_bf16_rows"),
             .q4_rows = try m.function("tf_dft_q4_rows"),
             .topk_merge = try m.function("tf_dft_topk_merge"),
+            .mlx = .{ try m.function("tf_dft_mlx"), try m.function("tf_dft_mlx_pair"), try m.function("tf_dft_mlx_conv") },
         };
     }
 };
@@ -86,6 +93,38 @@ pub fn normRope(l: *const Launcher, x: u64, stride: usize, weight: u64, out: u64
     try a.add(eps);
     try a.add(theta);
     try l.go(l.dft.norm_rope, dim(rows * heads, 1, 1), dim(32, 1, 1), 0, s, &a);
+}
+
+/// tf_rms's bits on `rows` bf16 rows of `width` (at most 8192) with an fp32 weight, four blocks a row.
+pub fn rms(l: *const Launcher, x: u64, weight: u64, y: u64, rows: usize, width: usize, eps: f32, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(weight);
+    try a.add(y);
+    try a.add(@as(c_int, @intCast(width)));
+    try a.add(eps);
+    if (width > 8192) return invalid("dft rms");
+    try l.go(l.dft.rms, dim(rows, 4, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// normRope of the q heads (weight wq, into qo) and of the k heads `koff` elements on (wk, into ko), in one launch.
+pub fn normRopeQk(l: *const Launcher, x: u64, stride: usize, koff: usize, wq: u64, wk: u64, qo: u64, ko: u64, desc: u64, block: usize, rows: usize, heads: usize, kv_heads: usize, eps: f32, theta: f32, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(x);
+    try a.add(@as(c_longlong, @intCast(stride)));
+    try a.add(@as(c_longlong, @intCast(koff)));
+    try a.add(wq);
+    try a.add(wk);
+    try a.add(qo);
+    try a.add(ko);
+    try a.add(desc);
+    try a.add(@as(c_int, @intCast(block)));
+    try a.add(@as(c_int, @intCast(rows)));
+    try a.add(@as(c_int, @intCast(heads)));
+    try a.add(@as(c_int, @intCast(kv_heads)));
+    try a.add(eps);
+    try a.add(theta);
+    try l.go(l.dft.norm_rope_qk, dim(rows * (heads + kv_heads), 1, 1), dim(32, 1, 1), 0, s, &a);
 }
 
 /// The two-lag dynamic convolution of `rows` rows (`block` a stream), branch 0 or 1, `res` (0: none) added last.
@@ -210,4 +249,24 @@ pub fn topkMerge(l: *const Launcher, ci: u64, cv: u64, rows: usize, chunks: usiz
     try a.add(ids);
     try a.add(values);
     try l.go(l.dft.topk_merge, dim(rows, 1, 1), dim(chunks * k, 1, 1), 0, s, &a);
+}
+
+/// draft.hip's DftMat: one MLX affine-4 group-64 matrix with bf16 tables and its bf16 output.
+pub const Mat = extern struct { words: u64, scale: u64, bias: u64, out: u64, n: c_int, ld: c_int = 0 };
+
+/// What a launch makes: one product, two of the same x (`a`'s tiles then `b`'s), or one ending in `Conv`.
+pub const Kind = enum { plain, pair, conv };
+
+/// dynConv(product, dyn, base, res) on branch 1, a `.conv` product's end.
+pub const Conv = struct { dyn: u64 = 0, base: u64 = 0, res: u64 = 0, group: usize = 1, block: usize = 1 };
+
+/// a.out (m <= 16 rows, a.n) = x (m, k; rows `ldx` apart, 0: k) times `a`, rounded to bf16: the verify split tile's
+/// bits. `.pair` also writes b.out = x b; `.conv` writes dynConv's branch 1 of the product (`cv`). k a multiple of 256.
+pub fn mlx(l: *const Launcher, kind: Kind, x: u64, m: usize, k: usize, ldx: usize, a: Mat, b: Mat, cv: Conv, s: S) Error!void {
+    if (m == 0 or m > 16 or k % 256 != 0 or a.n <= 0 or (kind == .pair and b.n <= 0)) return invalid("dft mlx");
+    if (kind == .conv and (cv.res == 0 or @as(usize, @intCast(a.n)) % cv.group != 0)) return invalid("dft mlx conv");
+    var p: Args = .{};
+    try p.add(extern struct { x: u64, m: c_int, k: c_int, a: Mat, b: Mat, dyn: u64, base: u64, res: u64, group: c_int, block: c_int, ldx: c_int }{ .x = x, .m = @intCast(m), .k = @intCast(k), .a = a, .b = b, .dyn = cv.dyn, .base = cv.base, .res = cv.res, .group = @intCast(cv.group), .block = @intCast(cv.block), .ldx = @intCast(ldx) });
+    const tiles = (@as(usize, @intCast(a.n)) + 15) / 16 + if (kind == .pair) (@as(usize, @intCast(b.n)) + 15) / 16 else 0;
+    try l.go(l.dft.mlx[@intFromEnum(kind)], dim(tiles, 1, 1), dim(128, 1, 1), 0, s, &p);
 }

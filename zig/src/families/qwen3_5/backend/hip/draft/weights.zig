@@ -8,7 +8,19 @@ const Config = @import("config.zig").Config;
 
 /// Affine-4 group 64 in draft.hip's tiled layout (tf_dft_q4_rows): words, then bf16 scales and biases, `n` columns.
 /// In the MLX layout `k` may hold zero columns past the matrix's own (`pad`): x then comes `k` wide, zeros past.
-pub const Q4 = struct { words: u64, scales: u64, biases: u64, n: usize, k: usize };
+pub const Q4 = struct {
+    words: u64,
+    scales: u64,
+    biases: u64,
+    n: usize,
+    k: usize,
+    /// The matrix's own K when `k` holds padding (0: k): the drafter's tile reads only these.
+    kr: usize = 0,
+
+    pub fn realK(q: Q4) usize {
+        return if (q.kr != 0) q.kr else q.k;
+    }
+};
 
 /// Zero columns a K's rows take in the MLX layout: rows a power of two of bytes apart all fall on the same memory
 /// channels (the verify tile reads a 4096-K product at 64 GB/s, at 4352 at 153).
@@ -195,7 +207,7 @@ const Loader = struct {
                 row += rows;
             }
         }
-        return .{ .q4 = .{ .words = words, .scales = scales, .biases = biases, .n = n, .k = kp } };
+        return .{ .q4 = .{ .words = words, .scales = scales, .biases = biases, .n = n, .k = kp, .kr = k } };
     }
 
     /// The bf16 vectors `names` of `len` each, widened to fp32 back to back.

@@ -24,8 +24,8 @@ else building or running. The Spark column is MiaAI-Lab's published TensorFold n
 
 | Model | Checkpoint, drafter | Prose C1 | Code C1 | Prefill 8k | Spark prose / code / prefill |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3.8-27B | EXL3 3.5 bpw, DFlash2 (block 16) | 57.6 | 128.8 | 380 | 58.3 / 136.9 / 1,793 |
-| Qwen3.8-27B | MLX 4-bit, DFlash2 (block 16) | 43.6 | 112.7 | 562 | same |
+| Qwen3.8-27B | EXL3 3.5 bpw, DFlash2 (block 16) | 59.5 | 133.6 | 437 | 58.3 / 136.9 / 1,793 |
+| Qwen3.8-27B | MLX 4-bit, DFlash2 (block 16) | 44.3 | 115.2 | 562 | same |
 | Qwen3.6-35B-A3B | MLX 4-bit, MTP 3 | 112.0 | 147.6 | 2,394 | ~110 / ~130 / 7,353 |
 | Qwen3.8 Flash Next | INT4-AutoRound, MTP (warm) | 54.2 | 69.1 | 458 | 64.4 / 57.5 / 2,606 |
 | Qwen3.8 Flash Next | MLX 3-bit, MTP (warm) | 49.4 | 64.2 | ~400 | 64.4 / 57.5 / 2,606 (INT4-AR) |

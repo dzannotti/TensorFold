@@ -499,6 +499,135 @@ extern "C" __global__ void __launch_bounds__(kTailThreads)
 
 extern "C" __global__ void __launch_bounds__(128) tf_conv_split(ConvArgs c) { conv_split_body(c); }
 
+// Row groups of tf_conv_split_rows: thread row g of the block takes a slot's rows g, g + kConvGroups, ...
+constexpr int kConvGroups = 4;
+
+// conv_split_body over a round's plan (32 rows a slot at most) with the rows spread over kConvGroups thread rows: a
+// row's taps are its window's inputs (or its ancestors') and the state, never the row before's sums, so each row runs
+// the very ops conv_split_body runs for it, in the same order.
+__device__ void conv_split_rows_body(const ConvArgs& launch) {
+    __shared__ float sq[kConvGroups][128];
+    __shared__ float inv_s[kConvGroups];
+    __shared__ float inputs[32][128];
+    const ConvArgs& c = launch;
+    const int t = threadIdx.x, g = threadIdx.y;
+    const int conv_blocks = (c.channels + 127) / 128;
+    const int slot = blockIdx.y;
+    if (blockIdx.x >= conv_blocks) {
+        // the gates are one pass over every row of the round, from the first slot's blocks
+        if (slot != 0 || g != 0) return;
+        const int i = (blockIdx.x - conv_blocks) * 128 + t;
+        if (c.ga == nullptr || i >= c.gcount) return;
+        const int h = i % c.heads;
+        c.beta[i] = 1.f / (1.f + expf(-load_kind(c.gb, c.kind, i)));
+        const float xg = load_kind(c.ga, c.kind, i) + c.dt_bias[h];
+        const float soft = xg > 20.f ? xg : log1pf(expf(xg));
+        c.gate[i] = expf(-expf(c.a_log[h]) * soft);
+        return;
+    }
+    const int rows = c.plan.count[slot];
+    if (rows == 0) return;
+    const long long row0 = c.plan.first[slot];
+    const float* state = reinterpret_cast<const float*>(plan_desc(c.plan, slot)[plan_first(c.layer)]);
+    const void* x = static_cast<const char*>(c.x) + row0 * c.channels * 2;
+    float* const qn = c.qn + row0 * c.kw;
+    float* const kn = c.kn + row0 * c.kw;
+    float* const v = c.v + row0 * c.vw;
+    // a window of rows keeps its input rows and leaves the window as the round found it, for its keep
+    const bool replayed = rows > 1 && slot + 1 < static_cast<int>(gridDim.y);
+    float* const samples = replayed ? reinterpret_cast<float*>(c.plan.snaps[2 * c.layer]) + row0 * c.channels : nullptr;
+    const unsigned* const anc = c.plan.anc[row0] != 0 ? c.plan.anc + row0 : nullptr;
+    const int channel = blockIdx.x * 128 + t;
+    const bool live = channel < c.channels;
+    const bool head = c.norm == 128 && static_cast<int>(blockIdx.x) * 128 < 2 * c.kw;
+    const float* taps = c.weight + static_cast<long long>(live ? channel : 0) * c.kernel;
+    const int kept = c.kernel - 1;
+    if (live) {
+        for (int r = g; r < rows; r += kConvGroups) inputs[r][t] = load_kind(x, c.kind, static_cast<long long>(r) * c.channels + channel);
+    }
+    __syncthreads();
+    for (int r0 = 0; r0 < rows; r0 += kConvGroups) {
+        const int r = r0 + g;
+        const bool on = live && r < rows;
+        float y = 0.f;
+        if (on) {
+            float history[7];
+            if (anc != nullptr && r > 0) {
+                // the newest taps from the row's ancestors (nearest last), the older from the window the round found
+                unsigned up = anc[r] & ~(1u << r);
+                int used = 0;
+#pragma unroll
+                for (int tap = 6; tap >= 0; --tap) {
+                    if (tap >= kept) continue;
+                    if (up != 0) {
+                        const int a = 31 - __clz(up);
+                        up &= ~(1u << a);
+                        history[tap] = inputs[a][t];
+                        ++used;
+                    } else {
+                        history[tap] = state[static_cast<long long>(tap + used) * c.channels + channel];
+                    }
+                }
+            } else {
+                // a chain row's taps: the window's inputs before it, the state before the window
+#pragma unroll
+                for (int tap = 0; tap < 7; ++tap) {
+                    if (tap >= kept) continue;
+                    const int at = r - kept + tap;
+                    history[tap] = at >= 0 ? inputs[at][t] : state[static_cast<long long>(tap + r) * c.channels + channel];
+                }
+            }
+            float acc = 0.f;
+            for (int tap = 0; tap < kept; ++tap) acc += history[tap] * taps[tap];
+            const float sample = inputs[r][t];
+            acc += sample * taps[kept];
+            y = acc * (1.f / (1.f + expf(-acc)));
+            if (samples != nullptr) samples[static_cast<long long>(r) * c.channels + channel] = sample;
+        }
+        if (head) {
+            // the norm of the head's 128 values, then the scale by its weight
+            sq[g][t] = y * y;
+            __syncthreads();
+            if (t < 32) {
+                float sum = 0.f;
+                for (int j = 0; j < 4; ++j) sum += sq[g][t + 32 * j];
+#pragma unroll
+                for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
+                if (t == 0) inv_s[g] = rsqrtf(sum / 128.f + c.eps);
+            }
+            __syncthreads();
+            const bool is_q = channel < c.kw;
+            y = y * inv_s[g] * (is_q ? c.qw : c.kw_w)[t];
+        }
+        if (on) {
+            if (channel < c.kw) {
+                qn[static_cast<long long>(r) * c.kw + channel] = y;
+            } else if (channel < 2 * c.kw) {
+                kn[static_cast<long long>(r) * c.kw + channel - c.kw] = y;
+            } else {
+                v[static_cast<long long>(r) * c.vw + channel - 2 * c.kw] = y;
+            }
+        }
+    }
+    // every row has read the state before row 0's thread overwrites it
+    __syncthreads();
+    // an unreplayed window (a lone row, or the padding slot) moves the state on by its rows
+    if (!live || samples != nullptr || g != 0) return;
+    float* const out = reinterpret_cast<float*>(plan_desc(c.plan, slot)[plan_first(c.layer)]);
+    float last[7];
+#pragma unroll
+    for (int tap = 0; tap < 7; ++tap) {
+        if (tap >= kept) continue;
+        const int at = rows - kept + tap;
+        last[tap] = at >= 0 ? inputs[at][t] : state[static_cast<long long>(tap + rows) * c.channels + channel];
+    }
+#pragma unroll
+    for (int tap = 0; tap < 7; ++tap)
+        if (tap < kept) out[static_cast<long long>(tap) * c.channels + channel] = last[tap];
+}
+
+extern "C" __global__ void __launch_bounds__(128 * kConvGroups) tf_conv_split_rows(ConvArgs c) { conv_split_rows_body(c); }
+
 extern "C" __global__ void __launch_bounds__(256)
     tf_rms2(const float* x0, const float* w0, float* y0, const float* x1, const float* w1, float* y1, int rows, int width,
             float eps) {

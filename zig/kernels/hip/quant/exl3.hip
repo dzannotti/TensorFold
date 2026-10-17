@@ -171,12 +171,44 @@ __device__ __forceinline__ void exl3_store(const Exl3& a, float (&v)[4], int lan
 
 // x [m, k] (kind 1 bf16, 2 fp16) times suh, rotated by 128-blocks, scaled, rounded to fp16: one wave a block of a row.
 // xh is [m, k], or with `steps` (the call's m) [k / 16, m, 16]: a round's k step of every row in one run.
-extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x, int kind, const __half* suh, __half* xh, int k, int steps) {
+// A float rounded to bf16 (round to nearest even, NaN to 0x7fc0: ops/common.hpp's float_to_bf16), as its bits.
+__device__ __forceinline__ uint32_t exl3_bf16(float f) {
+    if (f != f) return 0x7fc0u;
+    const uint32_t u = __float_as_uint(f);
+    return (u + ((u >> 16) & 1u) + 0x7fffu) >> 16;
+}
+
+__device__ __forceinline__ float exl3_widen(uint32_t h, int kind) {
+    return kind == 1 ? __uint_as_float(h << 16) : static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(h)));
+}
+
+__device__ __forceinline__ uint32_t exl3_round(float v, int kind) {
+    return kind == 1 ? exl3_bf16(v) : static_cast<uint32_t>(__builtin_bit_cast(unsigned short, __float2half_rn(v)));
+}
+
+// tf_silu_mul's value in x's kind (1 bf16, 2 fp16): silu(gate) rounded to the kind, times up, rounded again; as bits.
+__device__ __forceinline__ uint32_t exl3_silu_mul(uint32_t g, uint32_t u, int kind) {
+    const float x = exl3_widen(g, kind);
+    const float s = exl3_widen(exl3_round(x / (1.0f + expf(-x)), kind), kind);
+    return exl3_round(s * exl3_widen(u, kind), kind);
+}
+
+template <bool SILU = false>
+__device__ __forceinline__ void exl3_rotate_body(const void* x, int kind, const __half* suh, __half* xh, int k, int steps, const void* up = nullptr) {
     const int lane = threadIdx.x;
     const int col = blockIdx.x * 128 + 4 * lane;
     const long long at = static_cast<long long>(blockIdx.y) * k + col;
     const long long to = steps > 0 ? (static_cast<long long>(col >> 4) * steps + blockIdx.y) * 16 + (col & 15) : at;
-    const uint2 raw = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(x) + at);
+    uint2 raw = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(x) + at);
+    if constexpr (SILU) {
+        // x is the gate: the down product's input is tf_silu_mul's row, made here
+        const uint2 ur = *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(up) + at);
+        const uint32_t g[2] = {raw.x, raw.y}, u[2] = {ur.x, ur.y};
+        uint32_t o[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) o[j] = exl3_silu_mul(g[j] & 0xffffu, u[j] & 0xffffu, kind) | (exl3_silu_mul(g[j] >> 16, u[j] >> 16, kind) << 16);
+        raw = make_uint2(o[0], o[1]);
+    }
     const uint2 su = *reinterpret_cast<const uint2*>(suh + col);
     float v[4];
     const uint32_t w[2] = {raw.x, raw.y};
@@ -199,6 +231,15 @@ extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x
     const h16x2 lo = {static_cast<_Float16>(v[0] * kExl3Had), static_cast<_Float16>(v[1] * kExl3Had)};
     const h16x2 hi = {static_cast<_Float16>(v[2] * kExl3Had), static_cast<_Float16>(v[3] * kExl3Had)};
     *reinterpret_cast<uint2*>(xh + to) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_in(const void* x, int kind, const __half* suh, __half* xh, int k, int steps) {
+    exl3_rotate_body(x, kind, suh, xh, k, steps);
+}
+
+// tf_exl3_rotate_in of tf_silu_mul(gate, up) without the row between them: the same bits.
+extern "C" __global__ void __launch_bounds__(32) tf_exl3_rotate_silu(const void* gate, const void* up, int kind, const __half* suh, __half* xh, int k, int steps) {
+    exl3_rotate_body<true>(gate, kind, suh, xh, k, steps, up);
 }
 
 // out [rows, k] = x [rows, k] times blockdiag(H128) / sqrt(128), rounded once to x's kind (act numbering: 1 fp16, 2
@@ -288,8 +329,8 @@ __device__ __forceinline__ h16x16 exl3_fragment(const uint32_t (&r)[2][LW], cons
 // stages a slab of k steps (the block's 8 tiles each and its rows' x) through LDS, one slab ahead, a staged tile
 // repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain: even and odd k steps
 // on two sums added at the end, or with ONE a single chain over k, exl3_prompt's sums to the bit.
-template <int K2, int CB, int MT, int NT, bool ONE>
-__device__ __forceinline__ void exl3_product_at(const Exl3& a) {
+template <int K2, int CB, int MT, int NT, bool ONE = false>
+__device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by, int bz, int arrival) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TD = 4 * K2;      // dwords a tile
     constexpr int RING = 128 * K2;  // bits a tile
@@ -302,8 +343,8 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
     const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int c = lane & 15, h = lane >> 4;
     const int tiles = (a.k >> 4) / a.splits;
-    const int kt0 = blockIdx.y * tiles;
-    const int m0 = blockIdx.z * R;
+    const int kt0 = by * tiles;
+    const int m0 = bz * R;
     // the lane's windows: first dword in its tile and bit offset, the same for every tile
     int start[2], off[2];
 #pragma unroll
@@ -321,7 +362,7 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
     if constexpr (MT <= 2) {
         constexpr int D = 4;  // tiles in flight a wave
         // buffers over the block's tiles and x: a load takes a lane's byte offset and the tile's uniform one
-        const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(blockIdx.x) * NT * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
+        const __amdgpu_buffer_rsrc_t tb = exl3_buffer(a.trellis + static_cast<long long>(bx) * NT * a.stride_nb + wave * TD + static_cast<long long>(kt0) * a.stride_k);
         const int tstep = static_cast<int>(a.stride_k * 4);
         // x by k steps ([k / 16, m, 16], tf_exl3_rotate_in): a step's rows are one run
         const __amdgpu_buffer_rsrc_t xb = exl3_buffer(a.xh + static_cast<long long>(kt0) * 16 * a.m);
@@ -394,7 +435,7 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
         constexpr int TBYTES = KS * 8 * TP * 4;
         __shared__ __attribute__((aligned(16))) char lds[2][TBYTES + R * XP];
         const int slabs = tiles / KS;
-        const char* tbase = reinterpret_cast<const char*>(a.trellis + static_cast<long long>(blockIdx.x) * a.stride_nb + static_cast<long long>(kt0) * a.stride_k);
+        const char* tbase = reinterpret_cast<const char*>(a.trellis + static_cast<long long>(bx) * a.stride_nb + static_cast<long long>(kt0) * a.stride_k);
         const long long tslab = a.stride_k * 4 * KS;
         const char* xbase = reinterpret_cast<const char*>(a.xh + kt0 * 16);
         // a thread's staging pieces: where each comes from (past the slab base) and goes, the same every slab; pieces
@@ -483,19 +524,19 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const int row = m0 + mt * 16 + 2 * e + h;
-                    if (row < a.m) a.partial[(static_cast<long long>(blockIdx.y) * a.m + row) * a.n + (blockIdx.x * NT + n) * 128 + wave * 16 + c] = acc[n][mt][e];
+                    if (row < a.m) a.partial[(static_cast<long long>(by) * a.m + row) * a.n + (bx * NT + n) * 128 + wave * 16 + c] = acc[n][mt][e];
                 }
         // the last split block to arrive adds every split's sums in split order (the same bits whichever arrives last)
         __shared__ int last;
         __threadfence();
         __syncthreads();
-        int* arrived = &exl3_arrivals[blockIdx.z * gridDim.x + blockIdx.x];
+        int* arrived = &exl3_arrivals[arrival];
         if (tid == 0) last = atomicAdd(arrived, 1) == a.splits - 1;
         __syncthreads();
         if (!last) return;
         __threadfence();
         for (int n = 0; n < NT; ++n) {
-            const int col0 = (blockIdx.x * NT + n) * 128;
+            const int col0 = (bx * NT + n) * 128;
             for (int r = wave; r < R; r += 8) {
                 const int row = m0 + r;
                 if (row >= a.m) break;
@@ -515,7 +556,7 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
     }
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
-        const int col0 = (blockIdx.x * NT + n) * 128;
+        const int col0 = (bx * NT + n) * 128;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             __syncthreads();
@@ -541,13 +582,13 @@ __device__ __forceinline__ void exl3_product_at(const Exl3& a) {
 
 template <int K2, int CB, int MT, int NT>
 __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
-    exl3_product_at<K2, CB, MT, NT, false>(a);
+    exl3_product_body<K2, CB, MT, NT>(a, blockIdx.x, blockIdx.y, blockIdx.z, blockIdx.z * gridDim.x + blockIdx.x);
 }
 
 // A prompt's rows below exl3_prompt's (mul1, one split): the product's tiles on one chain, exl3_prompt's bits.
 template <int K2, int MT, int NT>
 __global__ void __launch_bounds__(256) exl3_chain(Exl3 a) {
-    exl3_product_at<K2, 2, MT, NT, true>(a);
+    exl3_product_body<K2, 2, MT, NT, true>(a, blockIdx.x, blockIdx.y, blockIdx.z, blockIdx.z * gridDim.x + blockIdx.x);
 }
 
 // ---- a prompt's product: the trellis decoded into LDS as FP16 on prompt_dq_core ----
@@ -842,7 +883,7 @@ TF_EXL3_PROMPT(16)
 #endif
 
 #if TF_MATRIX
-#define TF_EXL3_MT(K2, CB)                                                  \
+#define TF_EXL3_MT(K2, CB)                                                    \
     template __global__ void exl3_product<K2, CB, 1, 1>(Exl3);                \
     template __global__ void exl3_product<K2, CB, 1, 2>(Exl3);                \
     template __global__ void exl3_product<K2, CB, 2, 1>(Exl3);                \

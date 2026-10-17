@@ -17,7 +17,7 @@ pub const Round = struct { plan: pops.Plan, tokens: u64, span: usize, inputs: []
 /// Whether this build and model run lane rounds: the merged decode launches, and shapes the plan kernels take.
 pub fn supported(o: Ops, m: *const view.Model) bool {
     const s = m.spec;
-    return o.fused() and s.key_dim <= 1024 and s.conv <= 8 and (s.key_dim == 128 or s.key_dim == 16) and s.value_dim % 8 == 0 and s.head_dim <= 256 and m.act != .f32;
+    return o.fused() and s.key_dim <= 1024 and s.conv <= 8 and (s.key_dim == 128 or s.key_dim == 16) and s.value_dim % 16 == 0 and s.head_dim <= 256 and m.act != .f32;
 }
 
 /// A linear layer's inputs a keep replays, `rows` rows: the conv inputs, then k, v, gate and beta; zero for attention.
@@ -134,7 +134,7 @@ fn attentionRows(o: Ops, m: *const view.Model, f: view.Full, r: Round, index: us
     try o.qkRope(keys, s.kv_heads * hd, hd, f.k_norm, eps, total, s.kv_heads, hd, s.rotary_dim, theta, r.plan.args.pos, k32, null, 0);
     try pops.kvWrite(o, k32, values, r.plan, index, s.kv_heads, hd);
     const att = try o.arena.of(f32, q_rows * hd);
-    try pops.causal(o, q32, m.act, att, r.plan, index, s.heads, s.kv_heads, hd, r.span, fwd.scaleOf(hd));
+    try pops.causal(o, q32, m.act, att, r.plan, index, s.heads, s.kv_heads, hd, r.span, fwd.scaleOf(hd), s.flash_decode);
     const gated = try fwd.take(o, m.act, q_rows * hd);
     try o.attnGate(att, qg, gated, total, s.heads, hd, true);
     return o.project(gated, f.o, total, f.o.partial);

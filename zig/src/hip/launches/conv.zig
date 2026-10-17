@@ -77,7 +77,9 @@ pub fn tf_conv_split(l: *const Launcher, c: ConvArgs, s: S) Error!void {
     var a: Args = .{};
     try a.add(c);
     const gate_blocks = if (c.ga != 0) cdiv(c.gcount, 128) else 0;
-    try l.go(l.dec.conv_split, dim(cdiv(c.channels, 128) + gate_blocks, c.slots, 1), dim(128, 1, 1), 0, s, &a);
+    // a round of at most 32 rows spreads its rows over the block's 4 thread rows (decode.hip's kConvGroups)
+    const spread = c.plan.count != 0 and c.rows <= 32;
+    try l.go(if (spread) l.dec.conv_split_rows else l.dec.conv_split, dim(cdiv(c.channels, 128) + gate_blocks, c.slots, 1), dim(128, @as(u32, if (spread) 4 else 1), 1), 0, s, &a);
 }
 
 pub fn tf_conv_prefill(l: *const Launcher, x: C, kind: c_int, weight: CF, state: CF, out: F, new_state: F, len: c_int, channels: c_int, kernel: c_int, s: S) Error!void {

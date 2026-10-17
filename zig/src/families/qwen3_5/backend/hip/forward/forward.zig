@@ -182,6 +182,7 @@ pub fn mlpRows(o: Ops, m: *const view.Model, mlp: view.Mlp, x: Tensor, rows: usi
                 .{ outs[0], outs[1] }
             else
                 .{ try o.project(x, d.gate, rows, false), try o.project(x, d.up, rows, false) };
+            if (!d.down.partial) if (try o.projectSiluMul(gate, up, d.down, rows)) |y| return y;
             const act = try take(o, m.act, rows * d.gate.n);
             try o.siluMul(gate, up, act, rows * d.gate.n);
             return o.project(act, d.down, rows, d.down.partial);
