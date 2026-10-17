@@ -10,7 +10,9 @@
 //   q8_0        s = d, mn = -128 d, u = q + 128
 //   iq4_nl/xs   s = d (iq4_xs: d (ls - 32)), mn = -127 s, u = kvalues_iq4nl[q] + 127
 //   iq3_s       s = d (1 + 2 sc), mn = -16 s, u = 16 +- grid magnitude
-// Every s u + mn is exact in fp32 (a zero may come out +0 where ggml's product gives -0) (s has at most 18 significant bits, u at most 8), so a sum s (x . u) + mn (x . 1)
+// kSmall: every code is below 128, so the product's operand can be 128 + u (gg_pairs128; its fold takes mn - 128 s,
+// rounded once). kGroup: the elements one (s, mn) covers, 32 or 16 (q6_K, q3_K). Every s u + mn is exact in fp32 (s has at most 18
+// significant bits, u at most 8; a zero may come out +0 where ggml's product gives -0), so a sum s (x . u) + mn (x . 1)
 // is the dot with ggml's weights up to the fp32 roundings of the two dots.
 // Loads may sit at any byte (q6_K's 210-byte blocks, q8_0's 34): the backend's queues run with unaligned access on.
 
@@ -71,6 +73,8 @@ struct GguQ;
 template <>
 struct GguQ<kQ4_K> {
     static constexpr int kBytes = 144;  // a superblock
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = true;  // codes below 128
     struct Raw {
         u32x4 h, q;
     };
@@ -94,6 +98,8 @@ struct GguQ<kQ4_K> {
 template <>
 struct GguQ<kQ5_K> {
     static constexpr int kBytes = 176;
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = true;  // codes below 128
     struct Raw {
         u32x4 h, qh, q;
     };
@@ -119,6 +125,8 @@ struct GguQ<kQ5_K> {
 template <>
 struct GguQ<kQ6_K> {
     static constexpr int kBytes = 210;
+    static constexpr int kGroup = 16;  // elements a scale and min cover
+    static constexpr bool kSmall = true;  // codes below 128
     struct Raw {
         u32x4 ql, qh;
         uint32_t sw, d;
@@ -146,6 +154,8 @@ struct GguQ<kQ6_K> {
 template <>
 struct GguQ<kQ3_K> {
     static constexpr int kBytes = 110;
+    static constexpr int kGroup = 16;  // elements a scale and min cover
+    static constexpr bool kSmall = true;  // codes below 128
     struct Raw {
         u32x4 hm, qs;
         uint32_t a0, a1, tmp, d;
@@ -179,6 +189,8 @@ struct GguQ<kQ3_K> {
 template <>
 struct GguQ<kQ8_0> {
     static constexpr int kBytes = 8 * 34;
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = false;
     struct Raw {
         u32x4 q;
         uint32_t d;
@@ -202,6 +214,8 @@ struct GguQ<kQ8_0> {
 template <>
 struct GguQ<kIQ4_NL> {
     static constexpr int kBytes = 8 * 18;
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = false;
     struct Raw {
         u32x4 q;
         uint32_t d;
@@ -224,6 +238,8 @@ struct GguQ<kIQ4_NL> {
 template <>
 struct GguQ<kIQ4_XS> {
     static constexpr int kBytes = 136;
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = false;
     struct Raw {
         u32x4 q;
         uint32_t h0, sl;
@@ -248,6 +264,8 @@ struct GguQ<kIQ4_XS> {
 template <>
 struct GguQ<kIQ3_S> {
     static constexpr int kBytes = 110;
+    static constexpr int kGroup = 32;  // elements a scale and min cover
+    static constexpr bool kSmall = true;  // codes below 128
     struct Raw {
         uint32_t d, qs, qh, sg, sc;
     };
@@ -290,6 +308,15 @@ __device__ inline void gg_pairs(const uint32_t (&u)[4], uint32_t (&f)[8]) {
         const float c3 = static_cast<float>(w >> 24);
         f[2 * i] = __builtin_amdgcn_perm(__float_as_uint(c1), __float_as_uint(c0), 0x07060302u);
         f[2 * i + 1] = __builtin_amdgcn_perm(__float_as_uint(c3), __float_as_uint(c2), 0x07060302u);
+    }
+}
+
+// Codes below 128 as BF16 pairs of 128 + u, exactly (0x43 above each byte: 128 + u at exponent 7): one perm a pair.
+__device__ inline void gg_pairs128(const uint32_t (&u)[4], uint32_t (&f)[8]) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        f[2 * i] = __builtin_amdgcn_perm(0x43434343u, u[i], 0x04010400u);
+        f[2 * i + 1] = __builtin_amdgcn_perm(0x43434343u, u[i], 0x04030402u);
     }
 }
 

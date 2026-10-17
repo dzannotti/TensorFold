@@ -400,6 +400,7 @@ pub const Launcher = struct {
     pub const ggufProject = gguf.project;
     pub const ggufPrompt = gguf.prompt;
     pub const ggufRows = gguf.rows;
+    pub const ggufScratch = gguf.scratchBytes;
 
     /// Launches on `s`; the counting stream runs nothing.
     pub fn go(l: *const Launcher, f: Function, grid: Dim3, block: Dim3, shared: u32, s: S, args: *Args) Error!void {

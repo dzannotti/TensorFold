@@ -20,6 +20,7 @@ pub const Arg = extern struct {
     w: u64,
     x: u64,
     out: u64,
+    sums: u64 = 0,
     m: c_int,
     n: c_int,
     k: c_int,
@@ -27,20 +28,33 @@ pub const Arg = extern struct {
     out_kind: c_int,
 };
 
-/// The product's row tiles: 16, 32 or 64 rows a block (more rows take more blocks, the same sums).
-const tiles = [_]u32{ 1, 2, 4 };
+/// The product's row tiles: 16, 32, 64 or 128 rows a block (more rows take more blocks, the same sums).
+const tiles = [_]u32{ 1, 2, 4, 8 };
 
 fn tileOf(m: usize) usize {
     if (m <= 16) return 0;
     if (m <= 32) return 1;
-    return 2;
+    if (m <= 64) return 2;
+    return 3;
+}
+
+/// The elements one (s, mn) covers (quant/gguf.hpp kGroup).
+fn group(t: gguf.Type) u32 {
+    return if (t == .q6_k or t == .q3_k) 16 else 32;
+}
+
+/// Device scratch a product of `m` rows takes: the rows' x sums a group.
+pub fn scratchBytes(m: usize, k: u32) usize {
+    return (m + 15) / 16 * 16 * (k / 16) * 4;
 }
 
 pub const Fns = struct {
     /// By `gguf.kinds` index and row tile.
     product: [gguf.kinds.len][tiles.len]Function,
-    /// The prompt tile's sums for a prompt's few rows, by index and row tile.
-    chain: [gguf.kinds.len][tiles.len]Function,
+    /// The prompt tile's sums for a prompt's few rows, by index and row tile (16 to 64 rows a block).
+    chain: [gguf.kinds.len][tiles.len - 1]Function,
+    /// x's sums over groups of 16 and of 32.
+    sums: [2]Function,
     prompt: [gguf.kinds.len]Function,
     rows: [gguf.kinds.len]Function,
 
@@ -51,11 +65,12 @@ pub const Fns = struct {
             const n = @intFromEnum(t);
             inline for (tiles, 0..) |mt, j| {
                 f.product[i][j] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm12gguf_productILi{d}ELi{d}EEEvNS0_4GgufE", .{ n, mt }));
-                f.chain[i][j] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm10gguf_chainILi{d}ELi{d}EEEvNS0_4GgufE", .{ n, mt }));
+                if (j < tiles.len - 1) f.chain[i][j] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm10gguf_chainILi{d}ELi{d}EEEvNS0_4GgufE", .{ n, mt }));
             }
             f.prompt[i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm11gguf_promptILi{d}EEEvNS0_6AffineE", .{n}));
             f.rows[i] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm9gguf_rowsILi{d}EEEvPKhiPKiiPvi", .{n}));
         }
+        f.sums = .{ try m.function("_ZN2tf4rocm9gguf_sumsILi16EEEvPKDF16bPfii"), try m.function("_ZN2tf4rocm9gguf_sumsILi32EEEvPKDF16bPfii") };
         return f;
     }
 };
@@ -65,12 +80,22 @@ fn index(t: gguf.Type) ?usize {
     return null;
 }
 
-/// y [m, n] (`out_kind`: 0 fp32, 1 bf16, 2 fp16) = x bf16 [m, k] times the GGUF matrix: any m, a row's bits its own.
-pub fn project(l: *const Launcher, x: u64, w: gguf.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, s: S) Error!void {
+/// y [m, n] (`out_kind`: 0 fp32, 1 bf16, 2 fp16) = x bf16 [m, k] times the GGUF matrix: any m, a row's bits its own;
+/// `scratch` holds `scratchBytes(m, k)`.
+pub fn project(l: *const Launcher, x: u64, w: gguf.Matrix, n: u32, k: u32, m: usize, out: u64, out_kind: c_int, scratch: u64, s: S) Error!void {
     const t = index(w.type) orelse return invalid("gguf type");
     if (m == 0 or n == 0 or k % 256 != 0 or out_kind < 0 or out_kind > 2) return invalid("gguf project");
     const tile = tileOf(m);
-    const arg: Arg = .{ .w = w.blocks, .x = x, .out = out, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k), .row_bytes = @intCast(w.row_bytes), .out_kind = out_kind };
+    const g = group(w.type);
+    {
+        var a: Args = .{};
+        try a.add(x);
+        try a.add(scratch);
+        try a.add(@as(c_int, @intCast(m)));
+        try a.add(@as(c_int, @intCast(k)));
+        try l.go(l.gguf.sums[@intFromBool(g == 32)], dim(cdiv(m * (k / g), 256), 1, 1), dim(256, 1, 1), 0, s, &a);
+    }
+    const arg: Arg = .{ .w = w.blocks, .x = x, .out = out, .sums = scratch, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k), .row_bytes = @intCast(w.row_bytes), .out_kind = out_kind };
     var a: Args = .{};
     try a.add(arg);
     try l.go(l.gguf.product[t][tile], dim(cdiv(n, 16), cdiv(m, 16 * tiles[tile]), 1), dim(128, 1, 1), 0, s, &a);
@@ -88,7 +113,7 @@ pub fn prompt(l: *const Launcher, x: u64, w: gguf.Matrix, n: u32, k: u32, m: usi
     if (m == 0 or n == 0 or out_kind < 0 or out_kind > 2 or k % 256 != 0 or x % 16 != 0) return false;
     // the tile's buffer loads take 31-bit byte offsets into x
     if (m <= prompt_rows or out_kind == 2 or @as(u64, m) * k * 2 >= 1 << 31) {
-        const tile = tileOf(m);
+        const tile = @min(tileOf(m), 2);
         const arg: Arg = .{ .w = w.blocks, .x = x, .out = out, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k), .row_bytes = @intCast(w.row_bytes), .out_kind = out_kind };
         var a: Args = .{};
         try a.add(arg);

@@ -79,13 +79,15 @@ fn run(t: *base.Rig, rng: *base.Rng, kind: gguf.Type, k: usize, n: usize) !void 
     defer dx.free();
     var out = try Buffer.alloc(t, pm * n * 4);
     defer out.free();
+    var sc = try Buffer.alloc(t, @import("../launches.zig").Launcher.ggufScratch(pm, @intCast(k)));
+    defer sc.free();
     const all = try gpa.alloc(f32, pm * n);
     defer gpa.free(all);
     const got = try gpa.alloc(f32, pm * n);
     defer gpa.free(got);
 
     // the product: 128 rows against fp64, then each row count's rows against the same rows among the 128
-    try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), most_rows, out.ptr, 0, t.stream.handle);
+    try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), most_rows, out.ptr, 0, sc.ptr, t.stream.handle);
     try t.stream.synchronize();
     try out.download(0, std.mem.sliceAsBytes(all[0 .. most_rows * n]));
     var err: f64 = 0;
@@ -99,7 +101,7 @@ fn run(t: *base.Rig, rng: *base.Rng, kind: gguf.Type, k: usize, n: usize) !void 
     try base.expect(err <= 1e-5 * mag, "{s} product: max error {e} of {e}", .{ name, err, mag });
     for (together) |rows| {
         const first = (rows * 5) % (most_rows - rows + 1);
-        try t.on.ggufProject(dx.ptr + first * k * 2, mat, @intCast(n), @intCast(k), rows, out.ptr, 0, t.stream.handle);
+        try t.on.ggufProject(dx.ptr + first * k * 2, mat, @intCast(n), @intCast(k), rows, out.ptr, 0, sc.ptr, t.stream.handle);
         try t.stream.synchronize();
         try out.download(0, std.mem.sliceAsBytes(got[0 .. rows * n]));
         const same = std.mem.eql(u8, std.mem.sliceAsBytes(got[0 .. rows * n]), std.mem.sliceAsBytes(all[first * n ..][0 .. rows * n]));
@@ -133,8 +135,8 @@ fn run(t: *base.Rig, rng: *base.Rng, kind: gguf.Type, k: usize, n: usize) !void 
     {
         var o16 = try Buffer.alloc(t, @max(16 * n, 3 * k) * 2);
         defer o16.free();
-        try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), 16, out.ptr, 0, t.stream.handle);
-        try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), 16, o16.ptr, 1, t.stream.handle);
+        try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), 16, out.ptr, 0, sc.ptr, t.stream.handle);
+        try t.on.ggufProject(dx.ptr, mat, @intCast(n), @intCast(k), 16, o16.ptr, 1, sc.ptr, t.stream.handle);
         try t.stream.synchronize();
         try out.download(0, std.mem.sliceAsBytes(got[0 .. 16 * n]));
         const h = try gpa.alloc(u16, @max(16 * n, 3 * k));
@@ -209,6 +211,8 @@ test "GGUF timings on the 27B shapes (TF_GGUF_BENCH=1)" {
         try dx.fill8(0x3c, null);
         var out = try Buffer.alloc(t, pm * sh.n * 2);
         defer out.free();
+        var sc = try Buffer.alloc(t, @import("../launches.zig").Launcher.ggufScratch(pm, @intCast(sh.k)));
+        defer sc.free();
         for ([_]usize{ 1, 16, 64, 128, 0 }) |m0| {
             const m = if (m0 == 0) pm else m0;
             var times: [5]f64 = undefined;
@@ -217,7 +221,7 @@ test "GGUF timings on the 27B shapes (TF_GGUF_BENCH=1)" {
                 for (0..4) |_| {
                     if (m0 == 0) {
                         _ = try t.on.ggufPrompt(dx.ptr, mat, @intCast(sh.n), @intCast(sh.k), m, out.ptr, 1, t.stream.handle);
-                    } else try t.on.ggufProject(dx.ptr, mat, @intCast(sh.n), @intCast(sh.k), m, out.ptr, 1, t.stream.handle);
+                    } else try t.on.ggufProject(dx.ptr, mat, @intCast(sh.n), @intCast(sh.k), m, out.ptr, 1, sc.ptr, t.stream.handle);
                 }
                 try t.stream.synchronize();
                 if (r > 0) times[r - 1] = @as(f64, @floatFromInt(nowNs() - t0)) / 4e3;

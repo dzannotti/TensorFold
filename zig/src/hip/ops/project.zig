@@ -54,7 +54,8 @@ pub fn gguf(o: Ops, x: Tensor, proj: Projection, w: quant.gguf.Matrix, m: usize,
     const kind: t.Kind = if (f32_out) .f32 else x.kind;
     const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * kind.size()), .kind = kind };
     if (o.prefill and try o.l.ggufPrompt(x.ptr, w, proj.n, proj.k, m, out.ptr, kind.table(), o.stream)) return out;
-    try o.l.ggufProject(x.ptr, w, proj.n, proj.k, m, out.ptr, kind.table(), o.stream);
+    const scratch = try o.arena.take(launches.Launcher.ggufScratch(m, proj.k));
+    try o.l.ggufProject(x.ptr, w, proj.n, proj.k, m, out.ptr, kind.table(), scratch, o.stream);
     return out;
 }
 

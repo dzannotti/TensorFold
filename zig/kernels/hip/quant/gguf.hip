@@ -1,9 +1,10 @@
 // ggml block-quantized projections read in place from a GGUF file (quant/gguf.hpp's decoders): the product of any row
 // count (decode and lane rounds), the dequantizing prompt tile, and the row gather (embeddings, tests).
 //
-//   gguf_product  each output is, per 16-element piece in k order, a WMMA of x against the piece's exact integer codes
-//                 and one against ones (the row's x sum), folded acc = fma(dot, s, acc), acc = fma(sum, mn, acc): the
-//                 piece's weights are exactly ggml's. A block's four waves take every fourth superblock and add their
+//   gguf_product  each output is, per group of one (s, mn) in k order, the WMMA chain of x against the group's exact
+//                 integer codes folded acc = fma(dot, s, acc), acc = fma(sum, mn, acc) with the row's x sum over the
+//                 group (gguf_sums): the group's weights are exactly ggml's (codes below 128 enter as 128 + u, the fold
+//                 taking mn - 128 s rounded once: within 2^-17 of a quantization step). A block's four waves take every fourth superblock and add their
 //                 sums in wave order, so a row's bits depend on its x and (K, N) alone, never on m or the tile.
 //   gguf_prompt   prompt_dq_tile over the decoders: a stage's weights as ggml's fp32 values rounded once to BF16.
 //   gguf_chain    the prompt tile's sums for a prompt's few rows (up to 128): a wave's 16 columns, one WMMA chain
@@ -89,13 +90,39 @@ __constant__ uint32_t gg_iq3s_grid[512] = {
     0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 };
 
-// One product: blocks [n, row_bytes], x bf16 [m, k], out [m, n] of out_kind (0 fp32, 1 bf16, 2 fp16).
+// One product: blocks [n, row_bytes], x bf16 [m, k], out [m, n] of out_kind (0 fp32, 1 bf16, 2 fp16); sums the
+// rows' x sums a group (gguf_sums' layout), or null for the chain and prompt kernels.
 struct Gguf {
     const uint8_t* w;
     const void* x;
     void* out;
+    const float* sums;
     int m, n, k, row_bytes, out_kind;
 };
+
+// Where row r's sum of group g sits: 16-row tiles, a lane's eight rows 2 e + h of a tile as two 16-byte words.
+__device__ inline long long gg_sum_at(int g, int r, int m) {
+    const int mp = (m + 15) & ~15;
+    return static_cast<long long>(g) * mp + (r & ~15) + (r & 1) * 8 + ((r & 15) >> 1);
+}
+
+// The rows' x sums over each G-element group, added in k order from zero in fp32: a thread a (row, group).
+template <int G>
+__global__ void __launch_bounds__(256) gguf_sums(const __bf16* x, float* sums, int m, int k) {
+    const int groups = k / G;
+    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= static_cast<long long>(groups) * m) return;
+    const int r = static_cast<int>(i / groups), g = static_cast<int>(i % groups);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(x + static_cast<long long>(r) * k + static_cast<long long>(g) * G);
+    float run = 0.f;
+#pragma unroll
+    for (int j = 0; j < G / 2; ++j) {
+        const uint32_t w = src[j];
+        run += __uint_as_float(w << 16);
+        run += __uint_as_float(w & 0xffff0000u);
+    }
+    sums[gg_sum_at(g, r, m)] = run;
+}
 
 __device__ inline void gg_store(void* out, int kind, long long at, float v) {
     if (kind == 0) {
@@ -128,26 +155,41 @@ __global__ void __launch_bounds__(32 * kGgWaves) gguf_product(Gguf a) {
         const int r = m0 + 16 * mt + (lane & 15);
         xr[mt] = static_cast<const __bf16*>(a.x) + static_cast<long long>(r < a.m ? r : a.m - 1) * a.k;
     }
+    constexpr int G = Q::kGroup, PG = G / 16;  // pieces a group
     const f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    const bf16x16 ones = __builtin_bit_cast(bf16x16, u32x8{0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u});
     f32x8 acc[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) acc[mt] = zero;
     for (int sb = wave; sb < nsb; sb += kGgWaves) {
         const uint8_t* blk = row + static_cast<long long>(sb) * Q::kBytes;
 #pragma unroll
-        for (int p = 0; p < 16; ++p) {
-            uint32_t u[4];
+        for (int p0 = 0; p0 < 16; p0 += PG) {
+            bf16x16 b[PG];
             float s, mn;
-            Q::piece(blk, p, u, s, mn);
-            uint32_t f[8];
-            gg_pairs(u, f);
-            const bf16x16 b = __builtin_bit_cast(bf16x16, u32x8{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]});
+#pragma unroll
+            for (int q = 0; q < PG; ++q) {
+                uint32_t u[4];
+                Q::piece(blk, p0 + q, u, s, mn);  // a group's pieces share s and mn
+                uint32_t f[8];
+                if constexpr (Q::kSmall) {
+                    gg_pairs128(u, f);
+                } else {
+                    gg_pairs(u, f);
+                }
+                b[q] = __builtin_bit_cast(bf16x16, u32x8{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]});
+            }
+            if constexpr (Q::kSmall) mn = fmaf(-128.0f, s, mn);  // the operands are 128 + u
+            const int g = (sb * 256 + 16 * p0) / G;
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
-                const bf16x16 x = frag16(reinterpret_cast<const uint32_t*>(xr[mt] + sb * 256 + 16 * p));
-                const f32x8 d = WmmaBF16::mma(x, b, zero);
-                const f32x8 sx = WmmaBF16::mma(x, ones, zero);
+                f32x8 d = zero;
+#pragma unroll
+                for (int q = 0; q < PG; ++q) d = WmmaBF16::mma(frag16(reinterpret_cast<const uint32_t*>(xr[mt] + sb * 256 + 16 * (p0 + q))), b[q], d);
+                const int rt = m0 + 16 * mt < a.m ? m0 + 16 * mt : 0;  // a tile past the call: any sums, never stored
+                const u32x4* sp = reinterpret_cast<const u32x4*>(a.sums + gg_sum_at(g, rt, a.m) + (lane >> 4) * 8);
+                const u32x4 s0 = sp[0], s1 = sp[1];
+                const float sx[8] = {__uint_as_float(s0.x), __uint_as_float(s0.y), __uint_as_float(s0.z), __uint_as_float(s0.w),
+                                     __uint_as_float(s1.x), __uint_as_float(s1.y), __uint_as_float(s1.z), __uint_as_float(s1.w)};
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     acc[mt][e] = fmaf(d[e], s, acc[mt][e]);
@@ -308,6 +350,7 @@ __global__ void __launch_bounds__(256) gguf_rows(const uint8_t* w, int row_bytes
     template __global__ void gguf_product<T, 1>(Gguf);                                                    \
     template __global__ void gguf_product<T, 2>(Gguf);                                                    \
     template __global__ void gguf_product<T, 4>(Gguf);                                                    \
+    template __global__ void gguf_product<T, 8>(Gguf);                                                    \
     template __global__ void gguf_chain<T, 1>(Gguf);                                                      \
     template __global__ void gguf_chain<T, 2>(Gguf);                                                      \
     template __global__ void gguf_chain<T, 4>(Gguf);                                                      \
@@ -322,6 +365,8 @@ TF_GGUF(20)
 TF_GGUF(21)
 TF_GGUF(23)
 #undef TF_GGUF
+template __global__ void gguf_sums<16>(const __bf16*, float*, int, int);
+template __global__ void gguf_sums<32>(const __bf16*, float*, int, int);
 
 }  // namespace rocm
 }  // namespace tf
