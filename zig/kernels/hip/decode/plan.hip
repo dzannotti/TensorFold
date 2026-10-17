@@ -25,8 +25,22 @@ __device__ void plan_kv_write_body(const float* keys, const void* values, int ki
     static_cast<uint16_t*>(reinterpret_cast<void*>(desc[plan_second(layer)]))[to] = static_cast<const uint16_t*>(values)[i];
 }
 
+// wave_sum's xor butterfly (16, 8, 4, 2, 1) on permlanex16 and DPP, the same adds in lane 0 (the only lane it is for).
+__device__ __forceinline__ float lane0_dpp_sum(float x) {
+    const int u = __float_as_int(x);
+    x += __int_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210, 0xfedcba98, false, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x168, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x164, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x162, 0xf, 0xf, false));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x161, 0xf, 0xf, false));
+    return x;
+}
+
 // Query heads a block takes together: they share a KV head, so its keys and values are read once for all of them.
 constexpr int kMaxGroup = 16;
+
+// Query heads a score warp holds in registers (more take the staged path).
+constexpr int kRegGroup = 8;
 
 // Keys a warp scores in turn (tf_plan_score_*): the block's staged queries serve 4 warps times this many keys.
 constexpr int kScoreKeys = 4;
@@ -80,8 +94,53 @@ __device__ void plan_score_body(const float* __restrict__ q, float* __restrict__
     const int visible = min(plan.pos[batch] + 1, span);
     const int warps = blockDim.x >> 5;
     const int key0 = blockIdx.x * warps * kScoreKeys + (threadIdx.x >> 5);
+    const float* qrows = q + (static_cast<long long>(batch) * heads + head0) * d;
+    if (group <= kRegGroup) {
+        // up to kRegGroup heads: the warp's queries in registers, its sums in DPP (no LDS on the way): the same sums
+        const int lane = threadIdx.x & 31;
+        float qreg[kRegGroup][8];
+#pragma unroll
+        for (int g = 0; g < kRegGroup; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int idx = lane + i * 32;
+                qreg[g][i] = g < group && idx < d && key0 < visible ? qrows[g * d + idx] : 0.f;
+            }
+        for (int j = 0; j < kScoreKeys; ++j) {
+            const int key = key0 + j * warps;
+            if (key >= visible) {  // a key past the row's: -inf for every head, as its sums would store
+                if (lane == 0 && key < span)
+                    for (int g = 0; g < group; ++g) scores[(static_cast<long long>(batch) * heads + head0 + g) * span + key] = -INFINITY;
+                continue;
+            }
+            float kreg[8] = {};
+            const int slot = plan.slot[batch];
+            const unsigned long long* desc = plan_desc(plan, slot);
+            const void* keys = reinterpret_cast<const void*>(desc[plan_first(layer)]);
+            const int at = plan_key(plan.anc[batch], plan_len(plan, slot), key);
+            const long long base = page_at(plan_pages(plan, desc), plan.pool, head0 / (heads / kv_heads), at, d);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int idx = lane + i * 32;
+                if (idx < d) kreg[i] = load(keys, KIND, base + idx);
+            }
+#pragma unroll
+            for (int g = 0; g < kRegGroup; ++g) {
+                if (g < group) {
+                    float partial = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int idx = lane + i * 32;
+                        if (idx < d) partial += qreg[g][i] * kreg[i];
+                    }
+                    const float dot = lane0_dpp_sum(partial);
+                    if (lane == 0) scores[(static_cast<long long>(batch) * heads + head0 + g) * span + key] = dot * scale;
+                }
+            }
+        }
+        return;
+    }
     if (blockIdx.x * warps * kScoreKeys < visible) {
-        const float* qrows = q + (static_cast<long long>(batch) * heads + head0) * d;
         for (int i = threadIdx.x; i < group * d; i += blockDim.x) qs[i] = qrows[i];
         __syncthreads();
     }
@@ -131,6 +190,19 @@ __device__ void plan_apply_body(const float* __restrict__ scores, const float* _
     while (key < split) {
         const int edge = min((key / kPageTokens + 1) * kPageTokens, split);
         const long long slot0 = page_row(table[key / kPageTokens], plan.pool, kv, 0, d) + lane;
+        // U keys' values load together, then add in key order: the loop no longer waits on each load (same sums)
+        constexpr int U = 8;
+        for (; key + U <= edge; key += U) {
+            float value[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) value[u] = load(values, KIND, slot0 + static_cast<long long>((key + u) % kPageTokens) * d);
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+#pragma unroll
+                for (int g = 0; g < kMaxGroup; ++g) {
+                    if (g < group) acc[g] += weights[g * 128 + key + u - key0] * value[u];
+                }
+        }
         for (; key < edge; ++key) {
             const float value = load(values, KIND, slot0 + static_cast<long long>(key % kPageTokens) * d);
 #pragma unroll
