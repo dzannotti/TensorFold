@@ -25,7 +25,8 @@ gated_delta_kernel(const float* __restrict__ q, const float* __restrict__ k, con
                    float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
                    float* __restrict__ states) {
     constexpr int SPAN = (DK + 31) / 32;
-    const int lane = threadIdx.x;
+    // a block row is one wave: lane < 32 lets the compiler drop the idx < DK guards (no branch around each load)
+    const int lane = threadIdx.x & 31;
     const int row = blockIdx.x;
     const int head = blockIdx.y;
     const int batch = blockIdx.z;
@@ -106,7 +107,8 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
                       float* __restrict__ states, int batch, bool write_back = true) {
     constexpr int SPAN = (DK + 31) / 32;
     constexpr int WIDTH = 32 * (ROWS / RW);
-    const int lane = threadIdx.x;
+    // a block row is one wave: lane < 32 lets the compiler drop the idx < DK guards (no branch around each load)
+    const int lane = threadIdx.x & 31;
     const int local = threadIdx.y;
     const int row0 = blockIdx.x * ROWS + local * RW;
     const int head = blockIdx.y;
@@ -271,7 +273,8 @@ gated_delta_tree_body(const float* __restrict__ q, const float* __restrict__ k, 
                       float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
                       const unsigned* __restrict__ anc, unsigned path) {
     constexpr int SPAN = (DK + 31) / 32;
-    const int lane = threadIdx.x;
+    // a block row is one wave: lane < 32 lets the compiler drop the idx < DK guards (no branch around each load)
+    const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * ROWS + threadIdx.y;
     const int head = blockIdx.y;
     const int key_head = head / (value_heads / key_heads);
@@ -392,8 +395,10 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     const long long row0 = plan.first[slot];
     const unsigned long long* desc = plan_desc(plan, slot);
     float* state = reinterpret_cast<float*>(desc[plan_second(layer)]);
-    // a window of rows leaves the state as the round found it, for its keep to replay (padding rows keep nothing)
-    const bool replayed = length > 1 && slot + 1 < static_cast<int>(gridDim.z);
+    // a window of rows leaves the state as the round found it, for its keep to replay; the padding slot's (the last)
+    // is scratch no row reads, so its rows write nothing back either (its whole state would be a round's traffic)
+    const bool padding = slot + 1 == static_cast<int>(gridDim.z);
+    const bool replayed = length > 1 && !padding;
     if (replayed && plan.anc[row0] != 0) {
         gated_delta_tree_body<DK, 8>(q + row0 * key_heads * DK, k + row0 * key_heads * DK, v + row0 * value_heads * dv,
                                      gate + row0 * value_heads, beta + row0 * value_heads, state,
@@ -404,7 +409,7 @@ gated_delta_plan_body(const float* q, const float* k, const float* v, const floa
     gated_delta_tile_body<DK, 8 * kPlanRW, 16, kPlanRW>(q + row0 * key_heads * DK, k + row0 * key_heads * DK,
                                                         v + row0 * value_heads * dv, gate + row0 * value_heads,
                                                         beta + row0 * value_heads, state, y + row0 * value_heads * dv,
-                                                        length, key_heads, value_heads, dv, nullptr, 0, !replayed);
+                                                        length, key_heads, value_heads, dv, nullptr, 0, !replayed && !padding);
 }
 
 // A keep: each slot's state run from the round's start through its kept rows, by the same scan on the inputs kept.
