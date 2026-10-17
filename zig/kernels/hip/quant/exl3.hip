@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "common/arch.hpp"
+#include "tiles/matrix_prompt.hpp"
 
 namespace tf {
 namespace rocm {
@@ -326,8 +327,9 @@ __device__ __forceinline__ h16x16 exl3_fragment(const uint32_t (&r)[2][LW], cons
 // stream; the halves swap theirs. Every row's sum is the same WMMA chain over its K range in K order.
 // A round's row tiles (MT 1, 2) keep a ring of each lane's window words and x fragments in registers; a prompt's (MT 8)
 // stages a slab of k steps (the block's 8 tiles each and its rows' x) through LDS, one slab ahead, a staged tile
-// repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain.
-template <int K2, int CB, int MT, int NT>
+// repeating its first 4 dwords after its end so a window never wraps. Both run the same WMMA chain: even and odd k steps
+// on two sums added at the end, or with ONE a single chain over k, exl3_prompt's sums to the bit.
+template <int K2, int CB, int MT, int NT, bool ONE = false>
 __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by, int bz, int arrival) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int TD = 4 * K2;      // dwords a tile
@@ -415,7 +417,7 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
                     const h16x16 b = exl3_fragment<K2, CB, LW>(ring[rb][n], off, c);
 #pragma unroll
                     for (int mt = 0; mt < MT; ++mt) {
-                        f32x8e& sum = rb & 1 ? odd[n][mt] : acc[n][mt];
+                        f32x8e& sum = !ONE && (rb & 1) ? odd[n][mt] : acc[n][mt];
                         sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, xa[rb & 1][mt]), b, sum);
                     }
                 }
@@ -498,7 +500,7 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
                     const u32x8e x = *reinterpret_cast<const u32x8e*>(l + xat + mt * 16 * XP + i * 32);
-                    f32x8e& sum = i & 1 ? odd[0][mt] : acc[0][mt];
+                    f32x8e& sum = !ONE && (i & 1) ? odd[0][mt] : acc[0][mt];
                     sum = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16x16, x), b, sum);
                 }
             }
@@ -508,10 +510,12 @@ __device__ __forceinline__ void exl3_product_body(const Exl3& a, int bx, int by,
         }
     }
 
+    if constexpr (!ONE) {
 #pragma unroll
-    for (int n = 0; n < NT; ++n)
+        for (int n = 0; n < NT; ++n)
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) acc[n][mt] += odd[n][mt];
+            for (int mt = 0; mt < MT; ++mt) acc[n][mt] += odd[n][mt];
+    }
     if (a.splits > 1) {
 #pragma unroll
         for (int n = 0; n < NT; ++n)
@@ -580,6 +584,303 @@ template <int K2, int CB, int MT, int NT>
 __global__ void __launch_bounds__(256) exl3_product(Exl3 a) {
     exl3_product_body<K2, CB, MT, NT>(a, blockIdx.x, blockIdx.y, blockIdx.z, blockIdx.z * gridDim.x + blockIdx.x);
 }
+
+// A prompt's rows below exl3_prompt's (mul1, one split): the product's tiles on one chain, exl3_prompt's bits.
+template <int K2, int MT, int NT>
+__global__ void __launch_bounds__(256) exl3_chain(Exl3 a) {
+    exl3_product_body<K2, 2, MT, NT, true>(a, blockIdx.x, blockIdx.y, blockIdx.z, blockIdx.z * gridDim.x + blockIdx.x);
+}
+
+// ---- a prompt's product: the trellis decoded into LDS as FP16 on prompt_dq_core ----
+
+// The 16-bit state window starting S bits into the words `w` (stream bits MSB first): the register holding it in its
+// high half (exl3_window_hi) or low half, the other half ignored by exl3_hash. Halves of a word are free; any other
+// window is the high half of the 32 stream bits from S, or the low half of those from S - 16, keyed so the register
+// starts in a word's second half: two windows 16 bits apart (4-bit values 4 apart) share one alignbit.
+template <int S>
+constexpr bool exl3_window_hi() { return S % 32 == 0 || S % 32 > 16; }
+
+// exl3_hash's two steps (D = 0) apart, so a batch can issue each over all its states before the next.
+template <uint32_t C, bool HI>
+__device__ __forceinline__ uint32_t exl3_mul_hi(uint32_t src) {
+    uint32_t r;
+    if constexpr (HI) asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u));
+    else asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(r) : "v"(src), "s"(C & 0xffff0000u));
+    return r;
+}
+template <uint32_t C, bool HI>
+__device__ __forceinline__ uint32_t exl3_mul_lo(uint32_t src, uint32_t r) {
+    uint32_t x;
+    if constexpr (HI) asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x) : "v"(src), "s"(C & 0xffffu), "v"(r));
+    else asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x) : "v"(src), "s"(C & 0xffffu), "v"(r));
+    return x;
+}
+template <int S>
+__device__ __forceinline__ uint32_t exl3_window(const uint32_t* w) {
+    constexpr int o = S % 32;
+    if constexpr (o == 0 || o == 16) return w[S / 32];
+    constexpr int K = o > 16 ? S : S - 16;  // K % 32 in (16, 32)
+    return __builtin_amdgcn_alignbit(w[K / 32], w[K / 32 + 1], 32 - K % 32);
+}
+
+// prompt_dq_core's hook over a whole-bit trellis (K2 even), FP16 exact. A stage's 32 k of BN columns are 2 k steps x
+// BN / 16 tiles x 8 runs; run r of a tile is its 32 stream values 32 r.., which are columns r and r + 8 of the tile
+// over all 16 k (exl3.md's placement), its bits the run's B dwords plus the dword before (the window of value 0 starts
+// 16 bits back, wrapping to the tile's end). P = 1: a thread a run, both columns. P = 2: a run's two threads sit in two
+// waves at the same lane, the first wave decoding column r, the second r + 8 (a wave-uniform branch).
+template <int K2, int CB>
+struct Exl3Prompt {
+    template <int P>
+    struct Dq {
+        static_assert(K2 % 2 == 0 && (P == 1 || P == 2), "whole bits; one or two threads a run");
+        static constexpr bool kPlaced = true;
+        static constexpr bool kHalf = true;
+        static constexpr int kDepth = 4;
+        static constexpr int B = K2 / 2;  // bits a value: dwords a run
+        static constexpr int TD = 4 * K2;  // dwords a tile
+        static constexpr int NW = B + 1;
+        __amdgpu_buffer_rsrc_t t;
+        uint32_t pre, own, sstep;  // byte offsets: the dword before the run, the run's first; bytes a stage
+        int col, chunk, half;
+        uint32_t W[kDepth][NW];
+
+        __device__ Dq(const Exl3& a, int n0, int tid, int bn) : t(prompt_rsrc(a.trellis)) {
+            const int u = P == 1 ? tid : (tid >> 6) * 32 + (tid & 31);
+            half = P == 1 ? 0 : __builtin_amdgcn_readfirstlane((tid >> 5) & 1);
+            const int per = bn / 2;  // runs a k step
+            const int ks = u / per, ct = (u % per) >> 3, r = u & 7;
+            const int last = (a.n >> 4) - 1;
+            const int nt = (n0 >> 4) + ct < last ? (n0 >> 4) + ct : last;
+            const uint32_t tile = static_cast<uint32_t>(ks * a.stride_k + (nt >> 3) * a.stride_nb + (nt & 7) * TD);
+            own = 4 * (tile + r * B);
+            pre = 4 * (tile + (r * B + TD - 1) % TD);
+            sstep = static_cast<uint32_t>(8 * a.stride_k);
+            col = ct * 16 + r + 8 * half;
+            chunk = 2 * ks;
+        }
+
+        template <int J>
+        __device__ void fetch(int s) {
+            const uint32_t so = s * sstep;
+            W[J][0] = __builtin_amdgcn_raw_buffer_load_b32(t, pre, so, 0);
+            int i = 0;
+#pragma unroll
+            for (; i + 4 <= B; i += 4) {
+                const u32x4 v = prompt_load<u32x4>(t, own + 4 * i, so);
+                W[J][1 + i] = v.x, W[J][2 + i] = v.y, W[J][3 + i] = v.z, W[J][4 + i] = v.w;
+            }
+            if constexpr (B % 4 == 3) {
+                const auto v = __builtin_amdgcn_raw_buffer_load_b96(t, own + 4 * (B - 3), so, 0);
+                W[J][B - 2] = v[0], W[J][B - 1] = v[1], W[J][B] = v[2];
+            } else if constexpr (B % 4 == 2) {
+                const uint2 v = prompt_load<uint2>(t, own + 4 * (B - 2), so);
+                W[J][B - 1] = v.x, W[J][B] = v.y;
+            } else if constexpr (B % 4 == 1) {
+                W[J][B] = __builtin_amdgcn_raw_buffer_load_b32(t, own + 4 * (B - 1), so, 0);
+            }
+        }
+
+        // Element e of columns H0.. (16 a column, k order): column H0 + e / 16 is r + 8 H of the run, its dword d = e % 16
+        // / 2 holding k 2d, 2d + 1: values 8d + 4H, + 1 for d < 4, 8 (d - 4) + 4H + 2, + 3 above.
+        template <int H0, int E>
+        static constexpr int value() {
+            constexpr int h = H0 + E / 16, d = (E % 16) / 2;
+            return 8 * (d % 4) + 4 * h + 2 * (d / 4) + E % 2;
+        }
+        template <int H0, int E>
+        static constexpr int window() { return 16 + (value<H0, E>() + 1) * B; }
+
+        // NC columns from H0 into words d[c][0..7] (k pairs as half2, first low): mul1, each step of the codebook over
+        // every value before the next, so the dependent steps sit 16 NC instructions apart.
+        template <int H0, int NC>
+        __device__ static void columns(const uint32_t* w, uint32_t (&d)[NC][8]) {
+            static_assert(CB == 2, "the prompt tile decodes mul1");
+            constexpr uint32_t C = 0x83DCD12Du;
+            uint32_t s[16 * NC], x[16 * NC];
+            [&]<int... E>(std::integer_sequence<int, E...>) {
+                ((s[E] = exl3_window<window<H0, E>()>(w)), ...);
+                // the high product half (s C_hi mod 2^16) << 16, then + s C_lo: s C mod 2^32 (exl3_hash)
+                ((x[E] = exl3_mul_hi<C, exl3_window_hi<window<H0, E>()>()>(s[E])), ...);
+                ((x[E] = exl3_mul_lo<C, exl3_window_hi<window<H0, E>()>()>(s[E], x[E])), ...);
+            }(std::make_integer_sequence<int, 16 * NC>{});
+            // fp16 bits of 1024 + each byte sum, packed, then one fma each: h / 147.7 - 10.39
+            uint32_t p[8 * NC];
+#pragma unroll
+            for (int i = 0; i < 8 * NC; ++i) p[i] = __builtin_amdgcn_sad_u8(x[2 * i], 0u, 0x64006400u);
+#pragma unroll
+            for (int i = 0; i < 8 * NC; ++i) p[i] = __builtin_amdgcn_sad_hi_u8(x[2 * i + 1], 0u, p[i]);
+            const h16x2 scale = {__builtin_bit_cast(_Float16, static_cast<unsigned short>(0x1EEE)), __builtin_bit_cast(_Float16, static_cast<unsigned short>(0x1EEE))};
+            const h16x2 bias = {__builtin_bit_cast(_Float16, static_cast<unsigned short>(0xC931)), __builtin_bit_cast(_Float16, static_cast<unsigned short>(0xC931))};
+#pragma unroll
+            for (int i = 0; i < 8 * NC; ++i) d[i / 8][i % 8] = __builtin_bit_cast(uint32_t, __builtin_elementwise_fma(__builtin_bit_cast(h16x2, p[i]), scale, bias));
+        }
+
+        template <int J, class Store>
+        __device__ void put(Store st) const {
+            auto store = [&](const uint32_t (&d)[8], int c) {
+                st(c, chunk, u32x4{d[0], d[1], d[2], d[3]});
+                st(c, chunk + 1, u32x4{d[4], d[5], d[6], d[7]});
+            };
+            if constexpr (P == 1) {
+                uint32_t d[2][8];
+                columns<0, 2>(W[J], d);
+                store(d[0], col);
+                store(d[1], col + 8);
+            } else if (half) {
+                uint32_t d[1][8];
+                columns<1, 1>(W[J], d);
+                store(d[0], col);
+            } else {
+                uint32_t d[1][8];
+                columns<0, 1>(W[J], d);
+                store(d[0], col);
+            }
+        }
+    };
+};
+
+// A row's four finished outputs at col.. in the output kind (exl3_store's tail).
+__device__ __forceinline__ void exl3_put(const Exl3& a, const float (&v)[4], int row, int col) {
+    const long long at = static_cast<long long>(row) * a.n + col;
+    if (a.out_kind == 0) {
+        *reinterpret_cast<float4*>(static_cast<float*>(a.out) + at) = make_float4(v[0], v[1], v[2], v[3]);
+    } else if (a.out_kind == 1) {
+        uint32_t u[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint16_t lo = __builtin_bit_cast(uint16_t, static_cast<__bf16>(v[2 * j]));
+            const uint16_t hi = __builtin_bit_cast(uint16_t, static_cast<__bf16>(v[2 * j + 1]));
+            u[j] = lo | (static_cast<uint32_t>(hi) << 16);
+        }
+        *reinterpret_cast<uint2*>(static_cast<uint16_t*>(a.out) + at) = make_uint2(u[0], u[1]);
+    } else {
+        const h16x2 lo = {static_cast<_Float16>(v[0]), static_cast<_Float16>(v[1])};
+        const h16x2 hi = {static_cast<_Float16>(v[2]), static_cast<_Float16>(v[3])};
+        *reinterpret_cast<uint2*>(static_cast<uint16_t*>(a.out) + at) = make_uint2(__builtin_bit_cast(uint32_t, lo), __builtin_bit_cast(uint32_t, hi));
+    }
+}
+
+// Lane L's partner L ^ M of v: DPP within a 16-lane row, permlanex16 across the two.
+template <int M>
+__device__ __forceinline__ float exl3_xor(float v) {
+    const int u = __builtin_bit_cast(int, v);
+    if constexpr (M == 16) return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(0, u, 0x76543210, 0xfedcba98, false, false));
+    else return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, u, 0x160 + M, 0xf, 0xf, false));
+}
+
+template <int M>
+__device__ __forceinline__ void exl3_fwht_lanes(float (&v)[4], int lane) {
+    float o[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = exl3_xor<M>(v[j]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = (lane & M) ? o[j] - v[j] : v[j] + o[j];
+}
+
+// exl3_fwht's butterflies in its order, the partners through DPP and permlanex16 instead of LDS (the same sums).
+__device__ __forceinline__ void exl3_fwht_dpp(float (&v)[4], int lane) {
+    const float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+    v[0] = a + c;
+    v[1] = b + d;
+    v[2] = a - c;
+    v[3] = b - d;
+    exl3_fwht_lanes<1>(v, lane);
+    exl3_fwht_lanes<2>(v, lane);
+    exl3_fwht_lanes<4>(v, lane);
+    exl3_fwht_lanes<8>(v, lane);
+    exl3_fwht_lanes<16>(v, lane);
+}
+
+// y [m, n] = rot_in(x) W_q rotated out (exl3_store), BM x BN a block, x already rotated into a.xh [m, k]. Each output
+// is one fp32 WMMA chain over k in order: its bits depend on its row and (K, N) alone, never on m or the block shape.
+template <int K2, int CB, int BM, int BN>
+__global__ void __launch_bounds__(BM * BN / 128) exl3_prompt(Exl3 a) {
+#if TF_DEVICE_WMMA_GFX11
+    constexpr int WGM = BM / 64;
+    constexpr int WAVES = BM * BN / 4096;
+    constexpr int PITCH = BN + 4;  // floats a staged row
+    __shared__ __attribute__((aligned(16))) uint32_t lds[2 * (BM + BN) * 16];
+    // a pass stages a 16-row tile of WMP wave rows: all of them where they fit, else half
+    constexpr int WMP = 16 * WGM * PITCH * 4 <= sizeof(lds) ? WGM : WGM / 2;
+    constexpr int SR = 16 * WMP;  // staged rows
+    static_assert(SR * PITCH * 4 <= sizeof(lds), "a pass's sums fit the tile's LDS");
+    int m0, n0;
+    prompt_place_at<BM, BN, 1>(a, blockIdx.x, m0, n0);  // N fastest: 2 and 4 M tiles a band measured 0-2% and 1-5% slower
+    f32x8 acc[4][4];
+    prompt_dq_core<Exl3Prompt<K2, CB>::template Dq, BM, BN>(a, a.xh, m0, n0, lds, acc);
+
+    const int lane = threadIdx.x & 31;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int wm = wave % WGM;
+    const int wn = wave / WGM;
+    const int rl = lane & 15;
+    const int rh = lane >> 4;
+    float* const red = reinterpret_cast<float*>(lds);
+    // a lane's four columns of each 128-column block: svh and the bias, read once
+    float sc[BN / 128][4], bi[BN / 128][4];
+#pragma unroll
+    for (int cb = 0; cb < BN / 128; ++cb) {
+        const int col = (n0 + cb * 128 < a.n ? n0 + cb * 128 : a.n - 128) + 4 * lane;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sc[cb][j] = exl3_half(a.svh, col + j);
+            bi[cb][j] = a.bias != nullptr ? exl3_half(a.bias, col + j) : 0.f;
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < WGM / WMP; ++g) {
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+            if (wm / WMP == g) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) red[((wm % WMP) * 16 + 2 * i + rh) * PITCH + wn * 64 + nt * 16 + rl] = acc[mt][nt][i];
+            }
+            __syncthreads();
+            for (int it = wave; it < SR * (BN / 128); it += WAVES) {
+                const int sr = it % SR, cb = it / SR;
+                const int row = m0 + (g * WMP + (sr >> 4)) * 64 + mt * 16 + (sr & 15);
+                const int col0 = n0 + cb * 128;
+                if (row < a.m && col0 < a.n) {
+                    const float4 u = *reinterpret_cast<const float4*>(red + sr * PITCH + cb * 128 + 4 * lane);
+                    float v[4] = {u.x, u.y, u.z, u.w};
+                    exl3_fwht_dpp(v, lane);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        v[j] = v[j] * kExl3Had * (cb ? sc[BN / 128 - 1][j] : sc[0][j]);
+                        if (a.bias != nullptr) v[j] += cb ? bi[BN / 128 - 1][j] : bi[0][j];
+                    }
+                    exl3_put(a, v, row, col0 + 4 * lane);
+                }
+            }
+            __syncthreads();
+        }
+    }
+#else
+    (void)a;
+    __builtin_trap();
+#endif
+}
+
+#if TF_MATRIX
+#define TF_EXL3_PROMPT(K2)                                                    \
+    template __global__ void exl3_prompt<K2, 2, 128, 256>(Exl3);              \
+    template __global__ void exl3_prompt<K2, 2, 256, 128>(Exl3);              \
+    template __global__ void exl3_chain<K2, 1, 1>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 1, 2>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 2, 1>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 2, 2>(Exl3);                      \
+    template __global__ void exl3_chain<K2, 8, 1>(Exl3);
+TF_EXL3_PROMPT(4)
+TF_EXL3_PROMPT(6)
+TF_EXL3_PROMPT(8)
+TF_EXL3_PROMPT(10)
+TF_EXL3_PROMPT(12)
+TF_EXL3_PROMPT(14)
+TF_EXL3_PROMPT(16)
+#undef TF_EXL3_PROMPT
+#endif
 
 #if TF_MATRIX
 #define TF_EXL3_MT(K2, CB)                                                    \

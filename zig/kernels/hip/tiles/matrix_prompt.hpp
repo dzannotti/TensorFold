@@ -8,6 +8,7 @@
 
 #include "common/wmma.hpp"
 #include "quant/mlx.hpp"
+#include "tiles/epilogue.hpp"
 
 namespace tf {
 namespace rocm {
@@ -42,10 +43,9 @@ __device__ inline void prompt_sync() {
 // sx is kept so a lane's eight rows 2 i + h of a 16-row tile are eight neighbours.
 __device__ inline int prompt_sx_at(int r) { return (r & ~15) | ((r & 1) << 3) | ((r & 15) >> 1); }
 
-// Tile t of a BM x BN launch: bands of 4 M tiles, M fastest, so the blocks in flight share their weights and x in L2.
-template <int BM, int BN>
-__device__ inline void prompt_place_at(const Affine& a, int t, int& m0, int& n0) {
-    constexpr int G = 4;
+// Tile t of a BM x BN launch: bands of G M tiles, M fastest, so the blocks in flight share their weights and x in L2.
+template <int BM, int BN, int G = 4, class A>
+__device__ inline void prompt_place_at(const A& a, int t, int& m0, int& n0) {
     const int nt = (a.n + BN - 1) / BN;
     const int mt = (a.m + BM - 1) / BM;
     const int band = t / (G * nt);
@@ -355,11 +355,28 @@ struct DenseBf16 {
 // each 8 rows of a fragment read (a pass of 128 bytes) hit 8 different bank groups.
 __device__ inline int prompt_at(int r, int c) { return r * 16 + 4 * (c ^ ((r >> 1) & 3)); }
 
-// BM x BN a block of BM * BN / 4096 waves, 64 x 64 a wave (4 x 4 WMMA tiles), 32 k a stage, double-buffered in LDS; x
-// one stage ahead, the weights Hook::kDepth. Each output's sum is one WMMA chain over k in order from zero: its bits
-// depend on k alone, never on m, the block shape or where a prompt is cut.
-template <class Epi, template <int> class HookOf, int BM, int BN>
-__device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
+// Hooks may declare kPlaced (built as (a, n0, tid, BN); put stores st(column, chunk, words) anywhere in the block's
+// columns) and kHalf (FP16 operands: the WMMA's f16 form over FP16 x).
+template <class H>
+constexpr bool prompt_placed() {
+    if constexpr (requires { H::kPlaced; }) return H::kPlaced;
+    else return false;
+}
+template <class H>
+constexpr bool prompt_half() {
+    if constexpr (requires { H::kHalf; }) return H::kHalf;
+    else return false;
+}
+
+typedef _Float16 prompt_f16x16 __attribute__((ext_vector_type(16)));
+
+// The core of the BM x BN block at (m0, n0): BM * BN / 4096 waves, 64 x 64 a wave (4 x 4 WMMA tiles), 32 k a stage,
+// double-buffered in `lds` (2 (BM + BN) 16 words); x [a.m, a.k] one stage ahead, the weights Hook::kDepth. Each
+// output's sum is one WMMA chain over k in order from zero: its bits depend on k alone, never on m, the block shape or
+// where a prompt is cut. Wave (wm, wn) = (wave % (BM / 64), wave / (BM / 64)) ends holding rows 64 wm.., columns
+// 64 wn.. in acc (rows 2 i + lane / 16 of each 16-row tile, column lane % 16), every wave past the last barrier.
+template <template <int> class HookOf, int BM, int BN, class A>
+__device__ __forceinline__ void prompt_dq_core(const A& a, const void* x, int m0, int n0, uint32_t* lds, f32x8 (&acc)[4][4]) {
 #if TF_DEVICE_WMMA_GFX11
     constexpr int NT = BM * BN / 128;  // threads: a wave per 64 x 64
     constexpr int WGM = BM / 64;       // waves down M
@@ -369,15 +386,12 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     using Hook = HookOf<P>;
     constexpr int D = Hook::kDepth;
     static_assert(D % 2 == 0, "a stage's buffer is its slot's parity");
-    __shared__ __attribute__((aligned(16))) uint32_t lds[2 * (BM + BN) * 16];  // x's two buffers, then the weights'
     uint32_t* const xs[2] = {lds, lds + BM * 16};
     uint32_t* const ws[2] = {lds + 2 * BM * 16, lds + 2 * BM * 16 + BN * 16};
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
-    int m0, n0;
-    prompt_place_at<BM, BN>(a, blockIdx.x, m0, n0);
     const int rows = a.m - m0;
     const int stages = a.k >> 5;
 
@@ -385,7 +399,7 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     // m0, the last column. Stages past the end reload the last (their slots are never put).
     const int xr = tid >> 2;
     const int xq = tid & 3;
-    const __amdgpu_buffer_rsrc_t xbase = prompt_rsrc(a.x);
+    const __amdgpu_buffer_rsrc_t xbase = prompt_rsrc(x);
     uint32_t xo[XC];  // a lane's byte offsets of its rows' chunks
 #pragma unroll
     for (int i = 0; i < XC; ++i) {
@@ -394,7 +408,10 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     }
     const int c = tid / P;
     const int part = tid % P;
-    Hook hook(a, n0 + c < a.n ? n0 + c : a.n - 1, part);
+    Hook hook = [&] {
+        if constexpr (prompt_placed<Hook>()) return Hook(a, n0, tid, BN);
+        else return Hook(a, n0 + c < a.n ? n0 + c : a.n - 1, part);
+    }();
     auto last = [&](int s) { return s < stages ? s : stages - 1; };
 
     u32x4 X[XC];
@@ -407,7 +424,11 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
         for (int i = 0; i < XC; ++i) *reinterpret_cast<u32x4*>(xs[p] + prompt_at(xr + XR * i, xq)) = X[i];
     };
     auto put_w = [&]<int J>(std::integral_constant<int, J>, int p) {
-        hook.template put<J>([&](int v, u32x4 d) { *reinterpret_cast<u32x4*>(ws[p] + prompt_at(c, part * (4 / P) + v)) = d; });
+        if constexpr (prompt_placed<Hook>()) {
+            hook.template put<J>([&](int col, int chunk, u32x4 d) { *reinterpret_cast<u32x4*>(ws[p] + prompt_at(col, chunk)) = d; });
+        } else {
+            hook.template put<J>([&](int v, u32x4 d) { *reinterpret_cast<u32x4*>(ws[p] + prompt_at(c, part * (4 / P) + v)) = d; });
+        }
     };
 
     // Wave (wm, wn): rows 64 wm.., columns 64 wn..; a lane reads row (or column) lane % 16 of each 16, its chunks
@@ -415,10 +436,8 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
     const int wm = wave % WGM;
     const int wn = wave / WGM;
     const int rl = lane & 15;
-    const int rh = lane >> 4;
     const int swz = (rl >> 1) & 3;
     const bool live = wm * 64 < rows;
-    f32x8 acc[4][4];
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
 #pragma unroll
@@ -442,7 +461,13 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
-                for (int mt = 0; mt < 4; ++mt) acc[mt][nt] = WmmaBF16::mma(af[mt], bf[nt], acc[mt][nt]);
+                for (int mt = 0; mt < 4; ++mt) {
+                    if constexpr (prompt_half<Hook>()) {
+                        acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(prompt_f16x16, af[mt]), __builtin_bit_cast(prompt_f16x16, bf[nt]), acc[mt][nt]);
+                    } else {
+                        acc[mt][nt] = WmmaBF16::mma(af[mt], bf[nt], acc[mt][nt]);
+                    }
+                }
             }
         }
     };
@@ -472,6 +497,29 @@ __device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
             ((s + J < stages ? step(std::integral_constant<int, J>{}, s + J) : void()), ...);
         }(std::make_integer_sequence<int, D>{});
     }
+#else
+    (void)a, (void)x, (void)m0, (void)n0, (void)lds, (void)acc;
+    __builtin_trap();
+#endif
+}
+
+// The core's block over an MLX-style hook: fp32 out through Epi, or BF16 out16 staged through the wave's own LDS.
+template <class Epi, template <int> class HookOf, int BM, int BN>
+__device__ __forceinline__ void prompt_dq_tile(const Affine& a) {
+#if TF_DEVICE_WMMA_GFX11
+    constexpr int NT = BM * BN / 128;
+    constexpr int WGM = BM / 64;
+    __shared__ __attribute__((aligned(16))) uint32_t lds[2 * (BM + BN) * 16];  // x's two buffers, then the weights'
+    int m0, n0;
+    prompt_place_at<BM, BN>(a, blockIdx.x, m0, n0);
+    f32x8 acc[4][4];
+    prompt_dq_core<HookOf, BM, BN>(a, a.x, m0, n0, lds, acc);
+    const int lane = threadIdx.x & 31;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int wm = wave % WGM;
+    const int wn = wave / WGM;
+    const int rl = lane & 15;
+    const int rh = lane >> 4;
 
     if (a.out16 == nullptr) {
 #pragma unroll

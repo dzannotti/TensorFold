@@ -51,6 +51,8 @@ pub fn exl3(o: Ops, x: Tensor, proj: Projection, w: quant.exl3.Matrix, m: usize,
     const kind: t.Kind = if (f32_out) .f32 else x.kind;
     const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * kind.size()), .kind = kind };
     const scratch = try o.arena.take(exl3_launch.scratchBytes(m, proj.k, proj.n));
+    // a prompt's rows take the prompt product at any row count, so they have the same bits however the prompt is cut
+    if (o.prefill and try exl3_launch.prompt(o.l, x.ptr, x.kind.table(), w, proj.n, proj.k, m, out.ptr, kind.table(), scratch, o.stream)) return out;
     try exl3_launch.project(o.l, x.ptr, x.kind.table(), w, proj.n, proj.k, m, out.ptr, kind.table(), scratch, o.stream);
     return out;
 }
