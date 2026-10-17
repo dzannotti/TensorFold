@@ -1,4 +1,6 @@
-//! The DFlash2 drafter on HIP behind core/lanes/drafter.zig: a ring of tapped keys a stream, every stream's block a hold.
+//! The DFlash2 (or DSpark) drafter on HIP behind core/lanes/drafter.zig: a ring of tapped keys a stream, every stream's
+//! block a hold. DSpark follows vLLM's qwen3_dspark.py + v1/worker/gpu/spec_decode/dspark/speculator.py and llama.cpp's
+//! src/models/dflash.cpp: the same backbone without the convs, every block row a draft, a Markov bias chained per row.
 const std = @import("std");
 const hip = @import("hip");
 const lanes = @import("lanes");
@@ -58,8 +60,8 @@ const Ctx = struct {
 /// Byte offsets of the staging area (pinned, mirrored on the device): uploads first, the hold's results after.
 const Layout = struct { desc: usize, ids: usize, rows: usize, top_ids: usize, top_vals: usize, hp: usize, total: usize };
 
-/// The hold's launches by streams held at once.
-const Key = struct { streams: u32 };
+/// The hold's launches by streams held at once and rows a block.
+const Key = struct { streams: u32, block: u32 };
 
 /// Events between an eager hold's launches, by label.
 const Prof = struct {
@@ -79,8 +81,8 @@ pub const Draft = struct {
     ev: hip.Event,
     c: Config,
     w: weights.Weights,
-    /// The target's head over the draft vocabulary, its rows copied and tiled.
-    head: weights.Q4,
+    /// The target's head over the draft vocabulary, its rows copied and tiled (a bf16 head: the target's own rows).
+    head: Linear,
     head_buf: ?hip.DeviceBuffer,
     restricted: bool,
     /// Streams one hold takes at most, and rows an absorb's table holds.
@@ -99,6 +101,9 @@ pub const Draft = struct {
     hold_busy: bool = false,
     /// The last hold's results reached the host.
     synced: bool = true,
+    /// Rows a block holds this hold: the config's, or with DSpark the most drafts an item asks for (vLLM's and
+    /// llama.cpp's block is the drafts asked for: num_speculative_tokens, n_max).
+    blk: usize = 0,
     held_rows: usize = 0,
     hp_dev: u64 = 0,
     graphs: graph_cache.Cache(Key, u64),
@@ -113,6 +118,9 @@ pub const Draft = struct {
     tree_ms: f64 = 0,
     /// TF_DRAFT_PROFILE: an event after each of an eager hold's launches, for the per-launch breakdown in the logs.
     prof: ?*Prof = null,
+    /// TF_DRAFT_DUMP=file: every absorbed row's taps and every lone hold's inputs and results appended (a reference's
+    /// inputs, tools/strix/dspark_ref.py), from the first request on.
+    dump: ?*std.c.FILE = null,
 
     /// The drafter in `dir` over the target engine `e`, `bits` 4 (affine-4) or 0 (bf16), for up to `cap` streams a hold.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, bits: u8, cap: usize) !*Draft {
@@ -128,6 +136,7 @@ pub const Draft = struct {
         errdefer d.ev.deinit();
         errdefer d.graphs.deinit();
         d.table_rows = @max(c.window, d.cap * 17);
+        d.blk = c.block;
         d.w = try weights.load(gpa, io, &e.driver, dir, c, bits);
         errdefer d.w.deinit(gpa);
         try d.draftHead();
@@ -145,7 +154,7 @@ pub const Draft = struct {
         errdefer d.ks.free();
         const ks = try gpa.alloc(i32, d.cap * c.block);
         defer gpa.free(ks);
-        for (ks, 0..) |*k, r| k.* = if (r % c.block == 0) 0 else @intCast(c.topk);
+        for (ks, 0..) |*k, r| k.* = if (r % c.block == 0 and !c.dspark) 0 else @intCast(c.topk);
         try d.ks.upload(0, std.mem.sliceAsBytes(ks));
         d.ks_chunks = try hip.DeviceBuffer.alloc(&e.driver, d.cap * c.block * topk_chunks * 4);
         errdefer d.ks_chunks.free();
@@ -156,7 +165,43 @@ pub const Draft = struct {
         d.arena = try hip.Arena.init(&e.driver, try d.scratch());
         errdefer d.arena.deinit();
         try d.time();
+        if (std.c.getenv("TF_DRAFT_DUMP")) |path| d.dump = std.c.fopen(path, "wb");
         return d;
+    }
+
+    fn put(d: *Draft, bytes: []const u8) void {
+        if (d.dump) |f| _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
+    }
+
+    /// Record 1: n, width, the rows' positions (i64) and taps (bf16), read back from the target's tap ring.
+    fn dumpAbsorb(d: *Draft, table: []align(1) const dft.Row) !void {
+        try d.stream.synchronize();
+        d.e.drain();
+        const row_w = d.c.n_taps * d.c.hidden;
+        d.put(std.mem.asBytes(&[3]u32{ 1, @intCast(table.len), @intCast(row_w) }));
+        for (table) |r| d.put(std.mem.asBytes(&r.pos));
+        const row = try d.gpa.alloc(u16, row_w);
+        defer d.gpa.free(row);
+        for (table) |r| {
+            try download(&d.e.driver, r.src, std.mem.sliceAsBytes(row));
+            d.put(std.mem.sliceAsBytes(row));
+        }
+    }
+
+    /// Record 2: block, top-k, drafts, pos0, begin, the block's ids, every row's top-k ids and bf16 values, the drafts.
+    fn dumpHold(d: *Draft, ctx: *const Ctx) void {
+        const c = d.c;
+        const B = d.blk;
+        const at = d.layout();
+        const slot = ctx.slot orelse return;
+        const n = ctx.held_n orelse return;
+        d.put(std.mem.asBytes(&[4]u32{ 2, @intCast(B), @intCast(c.topk), @intCast(n) }));
+        d.put(std.mem.asBytes(&[2]i64{ @intCast(ctx.end), @intCast(ctx.begin) }));
+        d.put(d.stage.bytes[at.ids + slot * B * 4 ..][0 .. B * 4]);
+        d.put(d.stage.bytes[at.top_ids + slot * B * c.topk * 4 ..][0 .. B * c.topk * 4]);
+        d.put(d.stage.bytes[at.top_vals + slot * B * c.topk * 2 ..][0 .. B * c.topk * 2]);
+        d.put(std.mem.sliceAsBytes(ctx.held[0..n]));
+        _ = fflush(d.dump.?);
     }
 
     pub fn deinit(d: *Draft) void {
@@ -176,6 +221,7 @@ pub const Draft = struct {
         d.arena.deinit();
         if (d.head_buf) |*b| b.free();
         d.w.deinit(d.gpa);
+        if (d.dump) |f| _ = std.c.fclose(f);
         d.ev.deinit();
         d.stream.deinit();
         d.gpa.destroy(d);
@@ -186,6 +232,15 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, target);
         const head: usize = if (target.vocab == stock_vocab) width() * target.hidden * 5 / 8 else 0; // 4-bit rows, g64 tables
         return .{ .fixed = try weights.deviceBytes(gpa, io, dir, c, bits) + head + (256 << 20), .stream = c.ringBytes() };
+    }
+
+    /// Drafts the current hold's blocks yield.
+    fn drafts(d: *const Draft) usize {
+        return if (d.c.dspark) d.blk else d.c.drafts();
+    }
+
+    fn headRows(d: *const Draft) usize {
+        return d.head.rows();
     }
 
     fn width() usize {
@@ -199,7 +254,14 @@ pub const Draft = struct {
     /// quantized to affine-4 first; any other is refused.
     fn draftHead(d: *Draft) !void {
         const full = d.e.model().head;
-        if (full.partial or full.n % 32 != 0) return error.UnsupportedDraftHead;
+        const dense = full.handle == .dense and full.handle.dense.kind == .bf16 and !full.partial;
+        if (dense and std.c.getenv("TF_DRAFT_HEAD_BF16") != null) {
+            // the references' head: the target's own bf16 rows (4.7x the 4-bit head's bytes)
+            d.head = .{ .bf16 = .{ .w = full.handle.dense.weight, .n = full.n, .k = full.k } };
+            return;
+        }
+        // a bf16 head (MiniCPM's 248144 rows) quantized whole on the MLX layout, which takes 16-column tiles
+        if (full.partial or full.n % (if (dense and weights.mlx_layout) @as(u32, 16) else 32) != 0) return error.UnsupportedDraftHead;
         d.restricted = full.n == stock_vocab;
         const all = [_][2]u32{.{ 0, full.n }};
         const parts: []const [2]u32 = if (d.restricted) &spans else &all;
@@ -232,7 +294,17 @@ pub const Draft = struct {
                 try d.exl3Rows(h, full.n, parts, rows);
                 weights.quantize(rows, n, k, words, scales, biases);
             },
-            .dense => return error.UnsupportedDraftHead,
+            .dense => |h| {
+                if (!dense) return error.UnsupportedDraftHead;
+                const rows = try gpa.alloc(u16, n * k);
+                defer gpa.free(rows);
+                var row: usize = 0;
+                for (parts) |s| {
+                    try download(&d.e.driver, h.weight + @as(u64, s[0]) * k * 2, std.mem.sliceAsBytes(rows[row * k ..][0 .. (s[1] - s[0]) * k]));
+                    row += s[1] - s[0];
+                }
+                weights.quantize(rows, n, k, words, scales, biases);
+            },
         }
         const tw = try gpa.alloc(u32, n * k / 8);
         defer gpa.free(tw);
@@ -252,7 +324,7 @@ pub const Draft = struct {
         try buf.upload(0, std.mem.sliceAsBytes(tw));
         try buf.upload(scale_at, std.mem.sliceAsBytes(ts));
         try buf.upload(bias_at, std.mem.sliceAsBytes(tb));
-        d.head = .{ .words = buf.base(), .scales = buf.base() + scale_at, .biases = buf.base() + bias_at, .n = n, .k = k };
+        d.head = .{ .q4 = .{ .words = buf.base(), .scales = buf.base() + scale_at, .biases = buf.base() + bias_at, .n = n, .k = k } };
         d.head_buf = buf;
     }
 
@@ -382,7 +454,7 @@ pub const Draft = struct {
         const thn: Tensor = .{ .ptr = try o.arena.take(n * c.hidden * 2), .kind = .bf16 };
         try o.rms(th, d.w.hidden_norm, thn, n, c.hidden, c.eps);
         const kv = try proj(o, thn, d.w.kv, n);
-        try o.l.dftRingPut(kv.ptr, d.w.kv.rows(), table, n, d.w.k_norms, c.layers, c.kv_heads, c.ringRows(), c.eps, c.theta, o.stream);
+        try o.l.dftRingPut(kv.ptr, d.w.kv.rows(), table, n, d.w.k_norms, c.layers, c.kv_heads, c.ringRows(), c.eps, c.theta, c.head_dim, o.stream);
     }
 
     /// Each item's rows (from `rows` when given) at start.. into its context, the last `window` of them at most.
@@ -427,6 +499,7 @@ pub const Draft = struct {
             const rows = @min(absorb_rows, n - first);
             try d.absorbPass(d.ops(rows > 16), first, rows);
         }
+        if (d.dump != null) try d.dumpAbsorb(table[0..n]);
     }
 
     // hold: [pending, mask x (block - 1)] a stream -> the layers over the rings -> the draft head's top-k and the selector
@@ -483,8 +556,8 @@ pub const Draft = struct {
         var nb: usize = 0;
         var total_best: f64 = std.math.inf(f64);
         for (0..10) |_| {
-            try d.holdAll(&.{.{ .stream = &s, .pending = 1, .position = ctx.end + 1, .depth = @intCast(d.c.block - 1) }});
-            try d.heldAll(&.{&s}, &.{out[0 .. d.c.block - 1]});
+            try d.holdAll(&.{.{ .stream = &s, .pending = 1, .position = ctx.end + 1, .depth = @intCast(d.c.drafts()) }});
+            try d.heldAll(&.{&s}, &.{out[0..d.c.drafts()]});
             var sums: [64]Sum = undefined;
             var ns: usize = 0;
             var total: f64 = 0;
@@ -515,7 +588,7 @@ pub const Draft = struct {
     /// Every launch of a hold of `streams` streams; the selector's projected rows' address.
     fn holdPass(d: *Draft, o: Ops, streams: usize) !u64 {
         const c = d.c;
-        const B = c.block;
+        const B = d.blk;
         const M = streams * B;
         const at = d.layout();
         const base = d.dev.base();
@@ -531,52 +604,57 @@ pub const Draft = struct {
         const q = try o.arena.take(M * c.qWidth() * 2);
         const kb = try o.arena.take(M * c.kvWidth() * 2);
         const att = d.att.base();
-        const part = try o.arena.take(dft.partBytes(streams, c.kv_heads, splits));
+        const part = try o.arena.take(dft.partBytes(streams, c.kv_heads, splits, c.head_dim));
         const qkv_w = c.qWidth() + 2 * c.kvWidth();
         const mark = o.arena.mark();
         for (d.w.layers, 0..) |l, li| {
             o.arena.release(mark);
             try o.l.dftRms(h.ptr, l.input_norm, x.ptr, M, H, c.eps, o.stream);
             try d.tick(o, "rms");
-            const dyn = try proj(o, x, l.attn_conv, M);
-            try d.tick(o, "attn_conv");
-            try o.l.dftDynConv(x.ptr, dyn.ptr, l.attn_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
-            try d.tick(o, "dyn_conv");
-            const qkv = try proj(o, xin, l.qkv, M);
+            const dyn: ?Tensor = if (l.attn_conv) |ac| try proj(o, x, ac, M) else null;
+            if (dyn) |dy| {
+                try d.tick(o, "attn_conv");
+                try o.l.dftDynConv(x.ptr, dy.ptr, l.attn_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
+                try d.tick(o, "dyn_conv");
+            }
+            const qkv = try proj(o, if (dyn != null) xin else x, l.qkv, M);
             try d.tick(o, "qkv");
-            try o.l.dftNormRopeQk(qkv.ptr, qkv_w, c.qWidth(), l.q_norm, l.k_norm, q, kb, desc, B, M, c.heads, c.kv_heads, c.eps, c.theta, o.stream);
+            try o.l.dftNormRopeQk(qkv.ptr, qkv_w, c.qWidth(), l.q_norm, l.k_norm, q, kb, desc, B, M, c.heads, c.kv_heads, c.eps, c.theta, c.head_dim, o.stream);
             try d.tick(o, "norm_rope");
-            try o.l.dftAttn(.{ .q = q, .kb = kb, .vb = qkv.ptr + (c.qWidth() + c.kvWidth()) * 2, .vstride = qkv_w, .desc = desc, .layer = li, .streams = streams, .block = B, .heads = c.heads, .kv_heads = c.kv_heads, .ring_rows = c.ringRows(), .window = c.window, .splits = splits, .part = part, .out = att, .ostride = d.attWidth() }, o.stream);
+            try o.l.dftAttn(.{ .q = q, .kb = kb, .vb = qkv.ptr + (c.qWidth() + c.kvWidth()) * 2, .vstride = qkv_w, .desc = desc, .layer = li, .streams = streams, .block = B, .heads = c.heads, .kv_heads = c.kv_heads, .ring_rows = c.ringRows(), .window = c.window, .splits = splits, .part = part, .out = att, .ostride = d.attWidth(), .hd = c.head_dim }, o.stream);
             try d.tick(o, "attn");
-            try projConv(o, .{ .ptr = att, .kind = .bf16 }, l.o, M, .{ .dyn = dyn.ptr, .base = l.attn_base, .res = h.ptr, .group = c.group, .block = B }, h2.ptr);
+            try projConv(o, .{ .ptr = att, .kind = .bf16 }, l.o, M, if (dyn) |dy| .{ .dyn = dy.ptr, .base = l.attn_base, .res = h.ptr, .group = c.group, .block = B } else null, h.ptr, h2.ptr);
             try d.tick(o, "o+conv");
             try o.l.dftRms(h2.ptr, l.post_norm, x.ptr, M, H, c.eps, o.stream);
             try d.tick(o, "rms");
-            const mdyn = try proj(o, x, l.mlp_conv, M);
-            try d.tick(o, "mlp_conv");
-            try o.l.dftDynConv(x.ptr, mdyn.ptr, l.mlp_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
-            try d.tick(o, "dyn_conv");
-            const act = try mlpAct(o, xin, l.gate, l.up, M);
+            const mdyn: ?Tensor = if (l.mlp_conv) |mc| try proj(o, x, mc, M) else null;
+            if (mdyn) |md| {
+                try d.tick(o, "mlp_conv");
+                try o.l.dftDynConv(x.ptr, md.ptr, l.mlp_base, 0, xin.ptr, M, H, c.group, 0, B, o.stream);
+                try d.tick(o, "dyn_conv");
+            }
+            const act = try mlpAct(o, if (mdyn != null) xin else x, l.gate, l.up, M);
             try d.tick(o, "gate+up");
-            try projConv(o, act, l.down, M, .{ .dyn = mdyn.ptr, .base = l.mlp_base, .res = h2.ptr, .group = c.group, .block = B }, h.ptr);
+            try projConv(o, act, l.down, M, if (mdyn) |md| .{ .dyn = md.ptr, .base = l.mlp_base, .res = h2.ptr, .group = c.group, .block = B } else null, h2.ptr, h.ptr);
             try d.tick(o, "down+conv");
         }
         o.arena.release(mark);
         // the mask rows' best tokens by the draft head, and every row's selector projection (the pending rows' unused)
         try o.l.dftRms(h.ptr, d.w.final_norm, x.ptr, M, H, c.eps, o.stream);
         try d.tick(o, "rms");
-        // the head and the selector's projection of the same rows in one launch
-        const head_sel = try pairProj(o, x, .{ .q4 = d.head }, d.w.selector, M);
+        // the head and the selector's projection of the same rows in one launch (DSpark: the head alone)
+        const head_sel: [2]Tensor = if (d.w.selector) |sel| try pairProj(o, x, d.head, sel, M) else .{ try proj(o, x, d.head, M), .{ .ptr = 0, .kind = .bf16 } };
         const logits = head_sel[0];
         try d.tick(o, "head+sel");
-        if (d.head.n % topk_chunks == 0 and topk_chunks * c.topk <= 1024) {
+        const head_n = d.headRows();
+        if (head_n % topk_chunks == 0 and topk_chunks * c.topk <= 1024) {
             // each row as topk_chunks rows, their top-k merged: the same set as the whole row's
-            const chunk = d.head.n / topk_chunks;
+            const chunk = head_n / topk_chunks;
             const ci = try o.arena.take(M * topk_chunks * c.topk * 4);
             const cv = try o.arena.take(M * topk_chunks * c.topk * 2);
             try o.topkRows(logits, M * topk_chunks, chunk, d.ks_chunks.base(), c.topk, ci, cv);
             try o.l.dftTopkMerge(ci, cv, M, topk_chunks, c.topk, chunk, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals, o.stream);
-        } else try o.topkRows(logits, M, d.head.n, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals);
+        } else try o.topkRows(logits, M, head_n, d.ks.base(), c.topk, base + at.top_ids, base + at.top_vals);
         try d.tick(o, "topk");
         return head_sel[1].ptr;
     }
@@ -593,7 +671,7 @@ pub const Draft = struct {
         const o = d.ops(false);
         const stream = d.stream;
         d.graphs.rounds += 1;
-        const entry = if (d.use_graphs) try d.graphs.find(.{ .streams = @intCast(streams) }) else null;
+        const entry = if (d.use_graphs) try d.graphs.find(.{ .streams = @intCast(streams), .block = @intCast(d.blk) }) else null;
         if (entry) |e| switch (e.state) {
             .ready => {
                 try e.exec.?.launchOn(stream);
@@ -618,9 +696,15 @@ pub const Draft = struct {
     /// Every item's block over its context as one batch; the results come back with the next `held`.
     fn holdAll(d: *Draft, items: []const dr.Hold) !void {
         const c = d.c;
-        const B = c.block;
         if (items.len > d.cap) return error.TooManyDraftStreams;
         if (d.hold_busy) try d.settle();
+        if (c.dspark) {
+            // the drafts asked for, padded with mask rows while the hold's rows fit one 16-row tile (the trained block's
+            // later rows sharpen the earlier ones': a lone stream drafts over all 15)
+            d.blk = @min(c.block, @max(1, 16 / items.len));
+            for (items) |it| d.blk = @max(d.blk, @min(it.depth, c.block));
+        }
+        const B = d.blk;
         const at = d.layout();
         const desc = std.mem.bytesAsSlice(dft.Desc, d.stage.bytes[at.desc..][0 .. d.cap * @sizeOf(dft.Desc)]);
         const ids = std.mem.bytesAsSlice(i32, d.stage.bytes[at.ids..][0 .. d.cap * B * 4]);
@@ -633,13 +717,13 @@ pub const Draft = struct {
             @memset(ids[i * B + 1 .. (i + 1) * B], @intCast(c.mask));
             ctx.slot = i;
             ctx.pending = it.pending;
-            ctx.depth = @min(it.depth, B - 1);
+            ctx.depth = @min(it.depth, d.drafts());
             ctx.held_n = null;
             ctx.n_lanes = null;
             if (it.lanes) |l| {
                 if (l.parents.len > max_lanes) return error.TooManyLanes;
                 for (l.parents, l.depths, l.ranks, 0..) |par, dep, rank, j| {
-                    if (dep >= B - 1 or rank >= c.topk or par >= @as(i32, @intCast(j)) or par < -1) return error.BadLanes;
+                    if (dep >= c.drafts() or rank >= c.topk or par >= @as(i32, @intCast(j)) or par < -1) return error.BadLanes;
                     ctx.parents[j] = par;
                     ctx.depths[j] = dep;
                     ctx.ranks[j] = rank;
@@ -655,7 +739,7 @@ pub const Draft = struct {
         const rows = items.len * B;
         try hip.raw.download(d.dev, at.top_ids, d.stage.bytes[at.top_ids..][0 .. rows * c.topk * 4], d.stream.handle);
         try hip.raw.download(d.dev, at.top_vals, d.stage.bytes[at.top_vals..][0 .. rows * c.topk * 2], d.stream.handle);
-        try hipDownload(d, hp, d.stage.bytes[at.hp..][0 .. rows * c.rank * 2]);
+        if (d.w.selector != null) try hipDownload(d, hp, d.stage.bytes[at.hp..][0 .. rows * c.rank * 2]);
         d.synced = false;
         d.held_rows = rows;
     }
@@ -665,7 +749,8 @@ pub const Draft = struct {
     }
 
     /// Row `r` of the last hold's `rank`-th candidate after `pred`: its draft-head logit + pred . projected . successor,
-    /// ties to the head's earlier one.
+    /// ties to the head's earlier one. DSpark's vanilla Markov bias has no projection: logit + markov_w1[pred] . markov_w2[t]
+    /// over the row's top-k (vLLM's _sample_sequential_topk).
     fn choice(d: *const Draft, r: usize, pred: u32, rank: usize) u32 {
         const c = d.c;
         const at = d.layout();
@@ -674,7 +759,9 @@ pub const Draft = struct {
         const hp = std.mem.bytesAsSlice(u16, d.stage.bytes[at.hp..][r * c.rank * 2 ..][0 .. c.rank * 2]);
         var ph: [1024]f32 = undefined;
         const p = d.w.predecessor[@as(usize, pred) * c.rank ..][0..c.rank];
-        for (ph[0..c.rank], p, hp) |*x, a, b| x.* = bf16(a) * bf16(b);
+        if (c.dspark) {
+            for (ph[0..c.rank], p) |*x, a| x.* = bf16(a);
+        } else for (ph[0..c.rank], p, hp) |*x, a, b| x.* = bf16(a) * bf16(b);
         var scores: [64]f32 = undefined;
         var tokens: [64]u32 = undefined;
         for (0..c.topk) |j| {
@@ -700,8 +787,8 @@ pub const Draft = struct {
 
     /// The context's drafts from its last hold: the path through each row's best after the one before, or the tree.
     fn choose(d: *Draft, ctx: *Ctx) void {
-        const B = d.c.block;
-        const first = (ctx.slot orelse return) * B + 1;
+        const B = d.blk;
+        const first = (ctx.slot orelse return) * B + d.c.draftRow(0);
         if (ctx.n_lanes) |n| {
             for (0..n) |i| {
                 const pred = if (ctx.parents[i] < 0) ctx.pending else ctx.held[@intCast(ctx.parents[i])];
@@ -711,7 +798,7 @@ pub const Draft = struct {
             return;
         }
         var pred = ctx.pending;
-        for (0..B - 1) |r| {
+        for (0..d.drafts()) |r| {
             ctx.held[r] = d.choice(first + r, pred, 0);
             pred = ctx.held[r];
         }
@@ -729,8 +816,8 @@ pub const Draft = struct {
             ss[i] = undefined;
             ptrs[i] = &ss[i];
             try d.streams.put(d.gpa, &ss[i], ctx);
-            holds[i] = .{ .stream = &ss[i], .pending = 1, .position = ctx.end + 1, .depth = @intCast(d.c.block - 1), .lanes = tree };
-            outs[i] = bufs[i][0..if (tree) |t| t.parents.len else d.c.block - 1];
+            holds[i] = .{ .stream = &ss[i], .pending = 1, .position = ctx.end + 1, .depth = @intCast(d.c.drafts()), .lanes = tree };
+            outs[i] = bufs[i][0..if (tree) |t| t.parents.len else d.c.drafts()];
         }
         defer for (ptrs[0..ctxs.len]) |s| {
             _ = d.streams.remove(s);
@@ -776,6 +863,14 @@ pub const Draft = struct {
         try d.settle();
         _ = d.streams.remove(&s);
         const chain = try d.timeHold(&.{ctx}, null);
+        d.step_ms = chain.wall / @as(f64, @floatFromInt(c.drafts()));
+        d.gpu_ms = chain.gpu;
+        if (c.dspark) {
+            // the references draft chains only: no tree is timed or offered
+            if (std.c.getenv("TF_DRAFT_PROFILE") != null) try d.profile(ctx, taps.base());
+            std.log.info("drafter (DSpark): a hold of {d} drafts takes {d:.2} ms ({d:.2} ms on the GPU); {d:.3} ms a draft", .{ c.drafts(), chain.wall, chain.gpu, d.step_ms });
+            return;
+        }
         // a 16-lane tree: the four best first drafts, the best's own best three, then a chain to the block's end
         var parents = [_]i32{ -1, -1, -1, -1, 0, 0, 1, 4, 4, 5, 7, 10, 11, 12, 8, 6 };
         var ranks = [_]u8{ 0, 1, 2, 3, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0 };
@@ -783,8 +878,6 @@ pub const Draft = struct {
         const tree: Shape = .{ .parents = &parents, .ranks = &ranks, .depths = &depths, .expected = 0 };
         const t = try d.timeHold(&.{ctx}, &tree);
         if (std.c.getenv("TF_DRAFT_PROFILE") != null) try d.profile(ctx, taps.base());
-        d.step_ms = chain.wall / @as(f64, @floatFromInt(c.block - 1));
-        d.gpu_ms = chain.gpu;
         d.tree_ms = t.wall;
         std.log.info("drafter: a hold of {d} drafts takes {d:.2} ms ({d:.2} ms on the GPU), a 16-lane tree {d:.2} ms; {d:.3} ms a draft", .{ c.block - 1, chain.wall, chain.gpu, t.wall, d.step_ms });
     }
@@ -793,7 +886,10 @@ pub const Draft = struct {
         if (!d.synced) try d.settle();
         for (streams, out) |s, o| {
             const ctx = d.streams.get(s) orelse return error.UnknownStream;
-            if (ctx.held_n == null) d.choose(ctx);
+            if (ctx.held_n == null) {
+                d.choose(ctx);
+                if (d.dump != null and streams.len == 1) d.dumpHold(ctx);
+            }
             const n = ctx.held_n orelse return error.TooFewDrafts;
             if (o.len > n) return error.TooFewDrafts;
             @memcpy(o, ctx.held[0..o.len]);
@@ -817,7 +913,7 @@ pub const Draft = struct {
 
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .fixed_hold = true, .prior = prior[0..@min(prior.len, d.c.block - 1)], .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .trees = true };
+        return .{ .depth = @intCast(d.c.drafts()), .step_ms = d.step_ms, .fixed_hold = true, .prior = prior[0..@min(prior.len, d.c.drafts())], .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .trees = !d.c.dspark };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -885,7 +981,12 @@ fn ownTile(rows: usize, n: usize, k: usize) bool {
 }
 
 /// dynConv(x l, cv) on branch 1 into `out`: the product's own launch on the drafter's tile, else the product then the conv.
-fn projConv(o: Ops, x: Tensor, l: Linear, rows: usize, cv: dft.Conv, out: u64) !void {
+/// No conv (DSpark): res + x l.
+fn projConv(o: Ops, x: Tensor, l: Linear, rows: usize, conv: ?dft.Conv, res: u64, out: u64) !void {
+    const cv = conv orelse {
+        const y = try proj(o, x, l, rows);
+        return o.add(.{ .ptr = res, .kind = .bf16 }, y, .{ .ptr = out, .kind = .bf16 }, rows * l.rows());
+    };
     if (l == .q4 and ownTile(rows, l.q4.n, l.q4.realK()))
         return o.l.dftMlx(.conv, x.ptr, rows, l.q4.realK(), l.q4.k, matOf(l.q4, out), matOf(l.q4, 0), cv, o.stream);
     const y = try proj(o, x, l, rows);
@@ -941,3 +1042,5 @@ test "the draft head's columns name the stock vocabulary's two spans" {
     try std.testing.expectEqual(@as(u32, 248032), d.token(98304));
     try std.testing.expectEqual(@as(u32, 248319), d.token(98591));
 }
+
+extern "c" fn fflush(f: *std.c.FILE) c_int;

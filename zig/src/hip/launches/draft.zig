@@ -24,6 +24,11 @@ pub const Fns = struct {
     topk_merge: Function,
     /// The MLX products (draft.hip dft_mlx_tile) by kind.
     mlx: [3]Function,
+    /// The 256-wide heads' (DSpark's) ring put, q/k norm-rope and block attention.
+    ring_put_256: Function,
+    norm_rope_qk_256: Function,
+    attn_256: Function,
+    attn_merge_256: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -39,12 +44,21 @@ pub const Fns = struct {
             .q4_rows = try m.function("tf_dft_q4_rows"),
             .topk_merge = try m.function("tf_dft_topk_merge"),
             .mlx = .{ try m.function("tf_dft_mlx"), try m.function("tf_dft_mlx_pair"), try m.function("tf_dft_mlx_conv") },
+            .ring_put_256 = try m.function("tf_dft_ring_put_256"),
+            .norm_rope_qk_256 = try m.function("tf_dft_norm_rope_qk_256"),
+            .attn_256 = try m.function("tf_dft_attn_256"),
+            .attn_merge_256 = try m.function("tf_dft_attn_merge_256"),
         };
     }
 };
 
-/// The kernels' head width.
+/// The kernels' head width: 128, or 256 through the `_256` kernels (ringPut, normRopeQk and attn take it as `hd`).
 pub const head_dim = 128;
+
+fn wide(hd: usize) Error!bool {
+    if (hd != 128 and hd != 256) return invalid("dft head width");
+    return hd == 256;
+}
 /// The queries one block attention workgroup takes: a stream's block rows times a key head's query heads.
 pub const queries = 64;
 
@@ -66,7 +80,8 @@ pub fn gather(l: *const Launcher, rows: u64, n: usize, width: usize, out: u64, s
 }
 
 /// Every layer's keys (normed with knorm (layers, 128) fp32, rotated) and values of `n` rows into their streams' rings.
-pub fn ringPut(l: *const Launcher, kv: u64, stride: usize, rows: u64, n: usize, knorm: u64, layers: usize, kv_heads: usize, ring_rows: usize, eps: f32, theta: f32, s: S) Error!void {
+pub fn ringPut(l: *const Launcher, kv: u64, stride: usize, rows: u64, n: usize, knorm: u64, layers: usize, kv_heads: usize, ring_rows: usize, eps: f32, theta: f32, hd: usize, s: S) Error!void {
+    const w = try wide(hd);
     if (n == 0) return;
     var a: Args = .{};
     try a.add(kv);
@@ -77,7 +92,7 @@ pub fn ringPut(l: *const Launcher, kv: u64, stride: usize, rows: u64, n: usize, 
     try a.add(@as(c_int, @intCast(ring_rows)));
     try a.add(eps);
     try a.add(theta);
-    try l.go(l.dft.ring_put, dim(n, layers * kv_heads, 1), dim(32, 1, 1), 0, s, &a);
+    try l.go(if (w) l.dft.ring_put_256 else l.dft.ring_put, dim(n, layers * kv_heads, 1), dim(32, 1, 1), 0, s, &a);
 }
 
 /// `rows` block rows' `heads` heads (x rows `stride` apart) normed and rotated at their streams' positions, packed.
@@ -108,7 +123,8 @@ pub fn rms(l: *const Launcher, x: u64, weight: u64, y: u64, rows: usize, width: 
 }
 
 /// normRope of the q heads (weight wq, into qo) and of the k heads `koff` elements on (wk, into ko), in one launch.
-pub fn normRopeQk(l: *const Launcher, x: u64, stride: usize, koff: usize, wq: u64, wk: u64, qo: u64, ko: u64, desc: u64, block: usize, rows: usize, heads: usize, kv_heads: usize, eps: f32, theta: f32, s: S) Error!void {
+pub fn normRopeQk(l: *const Launcher, x: u64, stride: usize, koff: usize, wq: u64, wk: u64, qo: u64, ko: u64, desc: u64, block: usize, rows: usize, heads: usize, kv_heads: usize, eps: f32, theta: f32, hd: usize, s: S) Error!void {
+    const w = try wide(hd);
     var a: Args = .{};
     try a.add(x);
     try a.add(@as(c_longlong, @intCast(stride)));
@@ -124,7 +140,7 @@ pub fn normRopeQk(l: *const Launcher, x: u64, stride: usize, koff: usize, wq: u6
     try a.add(@as(c_int, @intCast(kv_heads)));
     try a.add(eps);
     try a.add(theta);
-    try l.go(l.dft.norm_rope_qk, dim(rows * (heads + kv_heads), 1, 1), dim(32, 1, 1), 0, s, &a);
+    try l.go(if (w) l.dft.norm_rope_qk_256 else l.dft.norm_rope_qk, dim(rows * (heads + kv_heads), 1, 1), dim(32, 1, 1), 0, s, &a);
 }
 
 /// The two-lag dynamic convolution of `rows` rows (`block` a stream), branch 0 or 1, `res` (0: none) added last.
@@ -160,17 +176,19 @@ pub const Attn = struct {
     splits: usize,
     part: u64, // partBytes
     out: u64, // (rows, heads, 128) bf16, rows `ostride` apart
-    ostride: usize = 0, // elements (0: heads x 128)
+    ostride: usize = 0, // elements (0: heads x hd)
+    hd: usize = head_dim, // 128 or 256
 };
 
 /// Scratch the splits of one launch write: partial outputs then their (max, sum).
-pub fn partBytes(streams: usize, kv_heads: usize, splits: usize) usize {
-    return streams * kv_heads * splits * queries * (head_dim + 2) * 4;
+pub fn partBytes(streams: usize, kv_heads: usize, splits: usize, hd: usize) usize {
+    return streams * kv_heads * splits * queries * (hd + 2) * 4;
 }
 
 pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     if (x.block * (x.heads / x.kv_heads) > queries or x.heads % x.kv_heads != 0 or x.ring_rows % 16 != 0 or x.splits == 0) return invalid("dft attn");
-    const stats = x.part + x.streams * x.kv_heads * x.splits * queries * head_dim * 4;
+    const w = try wide(x.hd);
+    const stats = x.part + x.streams * x.kv_heads * x.splits * queries * x.hd * 4;
     var a: Args = .{};
     try a.add(x.q);
     try a.add(x.kb);
@@ -185,7 +203,7 @@ pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     try a.add(@as(c_int, @intCast(x.window)));
     try a.add(x.part);
     try a.add(stats);
-    try l.go(l.dft.attn, dim(x.streams * x.kv_heads, x.splits, 1), dim(2 * queries, 1, 1), 0, s, &a);
+    try l.go(if (w) l.dft.attn_256 else l.dft.attn, dim(x.streams * x.kv_heads, x.splits, @as(usize, if (w) 2 else 1)), dim(2 * queries, 1, 1), 0, s, &a);
     var b: Args = .{};
     try b.add(x.part);
     try b.add(stats);
@@ -194,8 +212,8 @@ pub fn attn(l: *const Launcher, x: Attn, s: S) Error!void {
     try b.add(@as(c_int, @intCast(x.heads)));
     try b.add(@as(c_int, @intCast(x.kv_heads)));
     try b.add(x.out);
-    try b.add(@as(c_longlong, @intCast(if (x.ostride != 0) x.ostride else x.heads * head_dim)));
-    try l.go(l.dft.attn_merge, dim(x.streams * x.kv_heads, queries, 1), dim(head_dim, 1, 1), 0, s, &b);
+    try b.add(@as(c_longlong, @intCast(if (x.ostride != 0) x.ostride else x.heads * x.hd)));
+    try l.go(if (w) l.dft.attn_merge_256 else l.dft.attn_merge, dim(x.streams * x.kv_heads, queries, 1), dim(x.hd, 1, 1), 0, s, &b);
 }
 
 /// out (rows, n) = x (rows, k) times bf16 w (n, k) transposed, rounded to bf16; 64 rows a launch.
