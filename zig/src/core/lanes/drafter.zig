@@ -7,6 +7,9 @@ const Shape = @import("shape.zig").Shape;
 /// What the round loop's depth rule needs from the drafter itself (not from the target, whose own head may not exist).
 pub const Facts = struct {
     depth: u32, // drafts a round at most
+    shared_depth: u32 = 0, // drafts a shared round at most (0: depth): a hold's block is its deepest stream's
+    shared_step_ms: f64 = 0, // a shared round's hold: one more draft of its deepest stream (0: step_ms)
+    shared_levels: [2]u32 = @splat(0), // the depths a shared hold runs to, its blocks less one, narrowest first (0: unused)
     step_ms: f64, // one more draft's cost (timed at load); the rule prices a round as forward(rows) + step_ms x drafts
     fixed_hold: bool = false, // a hold costs the same at any depth (the block drafted at once): the lane planner prices no levels
     prior: []const f64 = &.{}, // acceptance by depth until a stream has its own

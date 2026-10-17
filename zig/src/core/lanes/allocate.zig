@@ -14,13 +14,38 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, 
 pub const HeadCost = struct {
     step_ms: f64 = 0.0,
     batched: bool = false,
+    /// A batched hold drafts to the first of these depths at or past its deepest stream's (0: unused), each priced whole.
+    levels: [2]u32 = @splat(0),
+
+    /// The steps a batched hold of `deepest` drafts runs.
+    pub fn steps(h: HeadCost, deepest: u32) u32 {
+        for (h.levels) |l| if (l >= deepest) return l;
+        return deepest;
+    }
 };
 
-/// allocate, each count also priced by the head steps that draft it.
+/// allocate, each count also priced by the head steps that draft it. With head levels, also each level's best with no
+/// stream past it (a likelier node past a level would otherwise drag every later prefix to the next level's price).
 pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, head: HeadCost) ![]u32 {
+    const best_counts = try gpa.alloc(u32, probs.len);
+    errdefer gpa.free(best_counts);
+    var best = try allocateUpTo(gpa, fixed, probs, costs, overhead_ms, max_rows, head, std.math.maxInt(u32), best_counts);
+    if (head.batched) for (head.levels) |l| if (l > 0) {
+        const counts = try gpa.alloc(u32, probs.len);
+        defer gpa.free(counts);
+        const r = try allocateUpTo(gpa, fixed, probs, costs, overhead_ms, max_rows, head, l, counts);
+        if (r > best) {
+            best = r;
+            @memcpy(best_counts, counts);
+        }
+    };
+    return best_counts;
+}
+
+/// The greedy pass of allocateDrafts with no stream past `cap` drafts: its best rate, its counts in `best_counts`.
+fn allocateUpTo(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, head: HeadCost, cap: u32, best_counts: []u32) !f64 {
     const counts = try gpa.alloc(u32, probs.len);
     defer gpa.free(counts);
-    const best_counts = try gpa.alloc(u32, probs.len);
     @memset(counts, 0);
     @memset(best_counts, 0);
     var rows: u64 = 0;
@@ -35,7 +60,7 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
         var pick: ?usize = null;
         var pick_p: f64 = 0.0;
         for (probs, 0..) |p, s| {
-            if (counts[s] >= p.len) continue;
+            if (counts[s] >= p.len or counts[s] >= cap) continue;
             const v = p[counts[s]];
             if (pick == null or v > pick_p) {
                 pick = s;
@@ -48,14 +73,14 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
         drafts += 1;
         deepest = @max(deepest, counts[s]);
         expected += pick_p;
-        const steps: f64 = @floatFromInt(if (head.batched) deepest else drafts);
+        const steps: f64 = @floatFromInt(if (head.batched) head.steps(deepest) else drafts);
         const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps);
         if (now > best) {
             best = now;
             @memcpy(best_counts, counts);
         }
     }
-    return best_counts;
+    return best;
 }
 
 fn rate(costs: *const Table, timed: bool, total: u64, expected: f64, overhead_ms: f64) f64 {

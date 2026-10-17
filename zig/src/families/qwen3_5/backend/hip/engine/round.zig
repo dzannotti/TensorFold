@@ -29,7 +29,63 @@ const Last = struct { plan: hip.plan_ops.Plan, keep_at: usize, hidden: u64 };
 /// Keep lists in flight: a flush's pinned words stay until its copy has run, which a later round's sync guarantees.
 const keep_ring = 4;
 
+/// TF_ROUND_PROFILE: GPU timestamps of each round's verify, keep and drafter hold (events against one base), summed.
+pub const Prof = struct {
+    pub const v0 = 0;
+    pub const v1 = 1;
+    pub const k0 = 2;
+    pub const k1 = 3;
+    pub const h0 = 4;
+    pub const h1 = 5;
+    base: hip.Event,
+    ev: [6]hip.Event,
+    /// Whether the keep and hold events were recorded since the last read.
+    kept: bool = false,
+    held: bool = false,
+    pv0: f64 = -1,
+    pv1: f64 = -1,
+    /// verify, keep, hold, verify end to hold start, hold end to next verify start, round (verify start to the next's)
+    sum: [6]f64 = @splat(0),
+    n: [6]u64 = @splat(0),
+
+    fn at(p: *Prof, i: usize) f64 {
+        return hip.Event.elapsedMs(p.base, p.ev[i]) catch -1;
+    }
+
+    fn add(p: *Prof, i: usize, ms: f64) void {
+        if (ms < 0 or ms > 1000) return;
+        p.sum[i] += ms;
+        p.n[i] += 1;
+    }
+
+    /// After the round's draw (its stream drained, the hold before it synced): the previous round's pieces and this verify.
+    fn read(p: *Prof) void {
+        const v0t = p.at(v0);
+        const v1t = p.at(v1);
+        p.add(0, v1t - v0t);
+        if (p.kept) p.add(1, p.at(k1) - p.at(k0));
+        if (p.held) {
+            const a = p.at(h0);
+            const b = p.at(h1);
+            p.add(2, b - a);
+            if (p.pv1 >= 0) p.add(3, a - p.pv1);
+            p.add(4, v0t - b);
+        }
+        if (p.pv0 >= 0) p.add(5, v0t - p.pv0);
+        p.pv0 = v0t;
+        p.pv1 = v1t;
+        p.kept = false;
+        p.held = false;
+    }
+
+    fn print(p: *const Prof) void {
+        const names = [_][]const u8{ "verify", "keep", "hold", "verify->hold", "hold->verify", "round" };
+        for (names, p.sum, p.n) |name, x, n| if (n > 0) std.debug.print("round profile: {s} {d:.2} ms ({d})\n", .{ name, x / @as(f64, @floatFromInt(n)), n });
+    }
+};
+
 pub const State = struct {
+    prof: ?*Prof = null,
     buffer: plan.Buffer,
     /// The caches the padding rows run in.
     scratch: state.Caches,
@@ -79,10 +135,21 @@ pub const State = struct {
             .keeps = keeps,
             .votes = votes,
             .before_keep = try hip.Event.init(&e.driver, false),
+            .prof = if (std.c.getenv("TF_ROUND_PROFILE") != null) blk: {
+                const p = try e.gpa.create(Prof);
+                p.* = .{ .base = try hip.Event.init(&e.driver, true), .ev = undefined };
+                for (&p.ev) |*x| x.* = try hip.Event.init(&e.driver, true);
+                try p.base.record(e.stream);
+                break :blk p;
+            } else null,
         };
     }
 
     pub fn deinit(s: *State, e: *Engine) void {
+        if (s.prof) |p| {
+            p.print();
+            e.gpa.destroy(p);
+        }
         s.before_keep.deinit();
         if (s.votes) |*v| v.deinit();
         s.keeps.free();
@@ -158,10 +225,16 @@ pub fn verify(e: *Engine, rows: []const Rows, reqs: []const draw.Request, out: [
     st.layout = l;
     const p: hip.plan_ops.Plan = .{ .args = st.buffer.args(l), .rows = c.shape.rows, .slots = c.shape.slots };
     const r: win.Round = .{ .plan = p, .tokens = st.buffer.dev.base() + 4 * l.tokens, .span = c.shape.span, .inputs = st.snaps, .taps = e.taps[0..e.n_taps], .rings = st.buffer.dev.base() + 4 * l.rings, .ring_rows = @import("engine.zig").tap_rows };
+    if (st.prof) |pf| try pf.ev[Prof.v0].record(e.stream);
     const done = try run(e, c, r);
+    if (st.prof) |pf| try pf.ev[Prof.v1].record(e.stream);
     e.graphs.rounds += 1;
     e.graphs.submit_ns += nowNs() - began;
     try e.drawRows(o, done.y, total, reqs, out, m.tp == null);
+    if (st.prof) |pf| {
+        try e.stream.synchronize();
+        pf.read();
+    }
     st.last = .{ .plan = p, .keep_at = 4 * l.keep, .hidden = done.hidden.ptr };
     return .{ .hidden = done.hidden };
 }
@@ -255,7 +328,12 @@ pub fn flush(e: *Engine) !void {
     @memcpy(words, st.staging[0..slots]);
     @memset(st.staging[0..slots], -1);
     try st.before_keep.record(e.stream);
+    if (st.prof) |pf| try pf.ev[Prof.k0].record(e.stream);
     try st.buffer.dev.uploadAsync(last.keep_at, st.keeps.view(from, from + 4 * slots), e.stream);
     try win.keep(e.ops(&e.rounds), e.model(), last.plan, st.buffer.dev.base() + last.keep_at, last.hidden);
+    if (st.prof) |pf| {
+        try pf.ev[Prof.k1].record(e.stream);
+        pf.kept = true;
+    }
     e.keep_last = true;
 }

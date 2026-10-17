@@ -22,6 +22,10 @@ pub const Model = struct {
     depth_rate: f64 = 0, // the newest round's weight in a depth's acceptance estimate (0: the core's)
     plain_guard: bool = false, // plain rounds compete with drafted depths
     drafts: u32 = 1, // head drafts a round at most
+    shared_drafts: u32 = 0, // and in a shared round (0: drafts), where one stream's depth sets every stream's hold
+    shared_step_ms: f64 = 0, // one more draft of a shared round's deepest stream (0: mtp_step_ms)
+    explore_depth: bool = false, // a shared round's wholly kept chain also raises the next depth's estimate
+    shared_levels: [2]u32 = @splat(0), // the depths a shared round's batched hold runs to (alloc.HeadCost.levels)
     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
     lane_step_ms: ?f64 = null, // a head level's cost to the lane planner (null: mtp_step_ms; 0: a hold costs the same at any depth)
@@ -47,6 +51,10 @@ pub const Config = struct {
     pipelined: bool,
     plain_guard: bool,
     most_drafts: u32,
+    shared_drafts: u32 = 0, // Model.shared_drafts
+    shared_step_ms: f64 = 0,
+    explore_depth: bool = false,
+    shared_levels: [2]u32 = @splat(0),
     family_streams: bool,
     batch_rows: u32,
     batch_streams: u32,
@@ -111,6 +119,10 @@ pub const Config = struct {
             .pipelined = m.gpu_tokens,
             .plain_guard = m.plain_guard,
             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+            .shared_drafts = m.shared_drafts,
+            .shared_step_ms = m.shared_step_ms,
+            .explore_depth = m.explore_depth,
+            .shared_levels = m.shared_levels,
             .family_streams = streams,
             .batch_rows = batch_rows,
             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
