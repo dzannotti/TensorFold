@@ -14,13 +14,40 @@ pub const counts = memory.counts;
 
 /// The model's window (config.json's max_position_embeddings, text_config's first), 0 when it names none.
 pub fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
-    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 0;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return 0;
-    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return 0;
-    if (doc != .object) return 0;
+    const doc = readConfig(a, io, dir) orelse return 0;
     const text = if (doc.object.get("text_config")) |t| (if (t == .object) t else doc) else doc;
     const limit = text.object.get("max_position_embeddings") orelse doc.object.get("max_position_embeddings") orelse return 0;
     return if (limit == .integer and limit.integer > 0) limit.integer else 0;
+}
+
+fn readConfig(a: Allocator, io: std.Io, dir: []const u8) ?std.json.Value {
+    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return null;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return null;
+    return if (doc == .object) doc else null;
+}
+
+/// The rope scaling config.json declares that no HIP family computes (yarn, linear, dynamic, longrope...), null when none.
+pub fn unsupportedRope(a: Allocator, io: std.Io, dir: []const u8) ?[]const u8 {
+    return ropeScaling(readConfig(a, io, dir) orelse return null);
+}
+
+/// `rope_scaling` (HF's legacy key) or `rope_parameters` (transformers v5's), in text_config or at the root, whose
+/// `rope_type` (or `type`) is not "default" ("mrope" is Qwen-VL's name for default frequencies over sections); an
+/// object that names no type but carries a `factor` counts as scaled.
+pub fn ropeScaling(doc: std.json.Value) ?[]const u8 {
+    const text = if (doc.object.get("text_config")) |t| (if (t == .object) t else doc) else doc;
+    for ([_]std.json.Value{ text, doc }) |o| for ([_][]const u8{ "rope_scaling", "rope_parameters" }) |key| {
+        const r = o.object.get(key) orelse continue;
+        if (r != .object) continue;
+        const kind = r.object.get("rope_type") orelse r.object.get("type") orelse {
+            if (r.object.get("factor") != null) return "unnamed";
+            continue;
+        };
+        if (kind != .string) return "unnamed";
+        if (!std.mem.eql(u8, kind.string, "default") and !std.mem.eql(u8, kind.string, "mrope")) return kind.string;
+    };
+    return null;
 }
 
 /// Prompt plus reply tokens a request may use: --context (0: the model's window), else the family default within it.
@@ -79,4 +106,23 @@ test "context windows: the family default inside the model's, 0 for the model's,
     try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
     try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
     try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+}
+
+test "rope scaling: yarn and the rest are named in either key and either tower, default and mrope pass" {
+    const a = std.testing.allocator;
+    const cases = .{
+        .{ "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"default\",\"mrope_section\":[11,11,10]}}}", null },
+        .{ "{\"rope_scaling\":null,\"max_position_embeddings\":32768}", null },
+        .{ "{\"rope_scaling\":{\"type\":\"mrope\",\"mrope_section\":[16,24,24]}}", null },
+        .{ "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":262144}}}", "yarn" },
+        .{ "{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0},\"text_config\":{}}", "yarn" },
+        .{ "{\"text_config\":{\"rope_scaling\":{\"type\":\"linear\",\"factor\":2}}}", "linear" },
+        .{ "{\"rope_scaling\":{\"factor\":8.0}}", "unnamed" },
+    };
+    inline for (cases) |c| {
+        const doc = try std.json.parseFromSlice(std.json.Value, a, c[0], .{});
+        defer doc.deinit();
+        const got = ropeScaling(doc.value);
+        if (@as(?[]const u8, c[1])) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
+    }
 }
