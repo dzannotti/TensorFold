@@ -687,3 +687,81 @@ test "mlx product timings on the drafter's shapes at 16 rows (TF_DFT_BENCH=1; TF
         }
     }
 }
+
+test "markov chain: each step the whole vocabulary's best of logit + w2 . w1[prev], bf16 and affine-4, the keys zeroed after" {
+    const t = try Rig.open(1 << 16);
+    defer t.close();
+    var rng: rig.Rng = .{ .state = 0x3a };
+    const V = 2500; // a partial last workgroup
+    const R = 256;
+    const block = 3;
+    const streams = 2;
+    const logits = try randoms(&rng, streams * block * V, 4);
+    defer gpa.free(logits);
+    const w1 = try randoms(&rng, V * R, 0.3);
+    defer gpa.free(w1);
+    const w2 = try randoms(&rng, V * R, 0.3);
+    defer gpa.free(w2);
+    // affine-4: random codes, scales and biases (the value the kernel must read: s * code + b)
+    const words = try gpa.alloc(u32, V * R / 8);
+    defer gpa.free(words);
+    for (words) |*w| w.* = @truncate(rng.next());
+    const scales = try randoms(&rng, V * 4, 0.05);
+    defer gpa.free(scales);
+    const biases = try randoms(&rng, V * 4, 0.3);
+    defer gpa.free(biases);
+    const ids = [_]i32{ 7, -1, -1, 2499, -1, -1 };
+    var dl = try t.upload(logits);
+    defer dl.free();
+    var d1 = try t.upload(w1);
+    defer d1.free();
+    var d2 = try t.upload(w2);
+    defer d2.free();
+    var dw = try t.upload(@as([]const u32, words));
+    defer dw.free();
+    var ds = try t.upload(scales);
+    defer ds.free();
+    var db = try t.upload(biases);
+    defer db.free();
+    var dids = try t.upload(@as([]const i32, &ids));
+    defer dids.free();
+    var keys = try t.alloc(streams * block * 8);
+    defer keys.free();
+    try keys.fill8(0);
+    var out = try t.alloc(streams * block * 4);
+    defer out.free();
+    for ([_]bool{ false, true }) |q4| {
+        const m: dft.Markov = if (q4) .{ .w1 = at(d1), .w2 = at(dw), .scales = at(ds), .biases = at(db), .vocab = V } else .{ .w1 = at(d1), .w2 = at(d2), .vocab = V };
+        for (0..block) |i| try t.on.dftMarkovStep(at(dl), V, m, at(dids), at(keys), streams, block, i, t.stream.handle);
+        try t.on.dftMarkovTake(at(keys), at(out), streams * block, t.stream.handle);
+        try t.stream.synchronize();
+        const got = try rig.download(i32, out);
+        defer gpa.free(got);
+        const left = try rig.download(u64, keys);
+        defer gpa.free(left);
+        for (left) |k| try std.testing.expectEqual(@as(u64, 0), k);
+        for (0..streams) |s| {
+            var prev: usize = @intCast(ids[s * block]);
+            for (0..block) |i| {
+                var best: f64 = -std.math.inf(f64);
+                var score_of_got: f64 = 0;
+                for (0..V) |tok| {
+                    var dot: f64 = 0;
+                    for (0..R) |r| {
+                        const wv: f64 = if (q4) blk: {
+                            const code: f64 = @floatFromInt((words[(tok * R + r) / 8] >> @intCast(4 * (r % 8))) & 15);
+                            break :blk bfv(scales[tok * 4 + r / 64]) * code + bfv(biases[tok * 4 + r / 64]);
+                        } else bfv(w2[tok * R + r]);
+                        dot += wv * bfv(w1[prev * R + r]);
+                    }
+                    const sc = bfv(logits[(s * block + i) * V + tok]) + dot;
+                    best = @max(best, sc);
+                    if (tok == got[s * block + i]) score_of_got = sc;
+                }
+                // fp32 sums against fp64: the pick is the best up to rounding
+                try rig.expect(score_of_got >= best - 1e-3, "q4 {} stream {d} step {d}: token {d} scores {d} of best {d}", .{ q4, s, i, got[s * block + i], score_of_got, best });
+                prev = @intCast(got[s * block + i]);
+            }
+        }
+    }
+}

@@ -26,6 +26,10 @@ pub const Config = struct {
     /// a vanilla Markov head (markov_w1[prev] . markov_w2[token], rank `rank`) in the selector's place, and every block
     /// row a draft (sample_from_anchor: row i predicts position pos0 + i + 1, its Markov predecessor the token at pos0 + i).
     dspark: bool = false,
+    /// DSpark's Markov bias over the whole vocabulary, as vLLM's _sample_sequential and llama.cpp's
+    /// build_dspark_markov_head do when the config has no dspark_draft_topk (vLLM dspark/speculator.py 78-80, 157-159);
+    /// false: on each row's `topk` head logits only (vLLM's _sample_sequential_topk; TF_DRAFT_TOPK forces it).
+    full_vocab: bool = false,
 
     /// Drafts one hold yields: every row with DSpark, the rows after the pending one with DFlash2.
     pub fn drafts(c: Config) usize {
@@ -134,19 +138,29 @@ pub const Config = struct {
             .window = 2048,
             .group = 1,
             .rank = if (o.get("markov_rank") != null) try int(o, "markov_rank") else try int(d, "markov_rank"),
-            // vLLM's dspark_draft_topk path: the Markov bias on each row's top-k head logits only
+            // vLLM's dspark_draft_topk path when the config sets it (the Markov bias on each row's top-k head logits only)
             .topk = 16,
             .eps = @floatCast(try num(o, "rms_norm_eps")),
             .theta = @floatCast(try num(rope, "rope_theta")),
             .taps = undefined,
             .n_taps = 0,
             .dspark = true,
+            .full_vocab = true,
+        };
+        if (o.get("dspark_draft_topk")) |v| if (v != .null) {
+            c.topk = try int(o, "dspark_draft_topk");
+            c.full_vocab = false;
         };
         if (rope.get("rope_dim")) |v| if (v != .integer or v.integer != c.head_dim) return error.UnsupportedDraftConfig;
         // the drafts a hold yields: the block (vLLM and llama.cpp draft num_speculative_tokens / n_max rows)
         if (std.c.getenv("TF_DRAFT_BLOCK")) |v| c.block = std.fmt.parseInt(usize, std.mem.span(v), 10) catch c.block;
         if (std.c.getenv("TF_DRAFT_WINDOW")) |v| c.window = std.fmt.parseInt(usize, std.mem.span(v), 10) catch c.window;
-        if (std.c.getenv("TF_DRAFT_TOPK")) |v| c.topk = std.fmt.parseInt(usize, std.mem.span(v), 10) catch c.topk;
+        if (std.c.getenv("TF_DRAFT_TOPK")) |v| {
+            c.topk = std.fmt.parseInt(usize, std.mem.span(v), 10) catch c.topk;
+            c.full_vocab = false;
+        }
+        // the whole-vocabulary kernels take rank 256 (draft.hip markov_step); another rank keeps the top-k walk
+        if (c.rank != 256) c.full_vocab = false;
         try readTaps(&c, d, target);
         if (c.head_dim != 128 and c.head_dim != 256) return error.UnsupportedDraftConfig;
         return c.check(target);
@@ -222,6 +236,7 @@ test "openbmb's DSpark config parses: 256-wide heads, every row a draft, the Mar
     ;
     const c = try Config.parse(gpa, text, target);
     try std.testing.expect(c.dspark);
+    try std.testing.expect(c.full_vocab); // no dspark_draft_topk: the bias over the whole vocabulary
     try std.testing.expectEqual(@as(usize, 256), c.head_dim);
     try std.testing.expectEqual(@as(usize, 256), c.rank);
     try std.testing.expectEqual(@as(usize, 15), c.drafts());

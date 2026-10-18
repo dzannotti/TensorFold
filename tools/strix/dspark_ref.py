@@ -6,7 +6,8 @@ Follows vLLM's qwen3_dflash.py / qwen3_dspark.py and v1/worker/gpu/spec_decode/d
 src/models/dflash.cpp): context K/V = k_proj/v_proj(hidden_norm(fc(taps))), K normed (k_norm) and rotated at its
 position; the block [anchor, mask...] at pos0.. attends non-causally to the context and itself; logits = lm_head(norm(h));
 draft i = argmax(logits_i + markov_w2 . markov_w1[prev]), prev the anchor then draft i-1 (full vocabulary: llama.cpp and
-vLLM's default; restricted to each row's top-k head logits: vLLM's dspark_draft_topk path, what the engine runs).
+vLLM's default and the engine's; restricted to each row's top-k head logits: vLLM's dspark_draft_topk path, the engine's
+with TF_DRAFT_TOPK, whose dump records carry the top-k: k 0 records are the whole-vocabulary chain's).
 The context is the rows the engine's ring keeps (the dump's begin..pos0, each row's last `window` positions)."""
 import json, struct, sys
 import numpy as np
@@ -136,8 +137,8 @@ def main():
             g, u = x @ p('mlp.gate_proj').T, x @ p('mlp.up_proj').T
             h = h + (g / (1 + np.exp(-g)) * u) @ p('mlp.down_proj').T
         logits = rms(h, w['norm.weight'], eps) @ head.T
-        k = top_ids.shape[1]
-        for r in range(B):
+        k = top_ids.shape[1] if top_ids.shape[1] else 16
+        for r in range(B if top_ids.shape[1] else 0):
             ref = np.argsort(-logits[r], kind='stable')[:k]
             stats['rows'] += 1
             stats['top1'] += int(ref[0] == top_ids[r][np.argmax(top_vals[r])])
