@@ -93,6 +93,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.flashnext })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.serve })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.native })).step);
+    b.step("hip-native-host-test", "The HIP engines' admission on stub kernels, no GPU (-Dhip-test-filter narrows it)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.native, .filters = kernel_filters })).step);
     // the GPU programs compile on any host against stub kernels, so `test` catches what only they reach
     test_step.dependOn(&checksExe(b, b.graph.host, .Debug, host).step);
     test_step.dependOn(&server(b, b.graph.host, host, build_options).step);

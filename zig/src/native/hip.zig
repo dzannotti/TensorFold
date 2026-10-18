@@ -86,6 +86,8 @@ const Ready = struct {
 fn ready(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) (Refused || Allocator.Error)!Ready {
     try checkGroup(a, o, problem);
     const native = modelContext(a, io, o.dir);
+    // no HIP kernel scales rope frequencies: a scaled config would run past its native window with wrong positions
+    if (admission.unsupportedRope(a, io, o.dir)) |kind| return refuse(a, problem, "config.json declares \"{s}\" rope scaling, which the HIP engine does not compute: serve the checkpoint without rope_scaling (rope_type \"default\") within its original max_position_embeddings", .{kind});
     const window = admission.contextWindow(o.context, native, F.default_context) catch |err| return switch (err) {
         error.Negative => refuse(a, problem, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
         error.NoNative => refuse(a, problem, "--context 0 asks for the model's window, and its config.json names none: give a token count", .{}),
@@ -328,4 +330,21 @@ test "matrix=on runs only where the matrix-core tiles exist; auto runs everywher
     try std.testing.expect(matrixRefused(on, hip.Caps.of("gfx1030").?) != null);
     const auto: hip.Policy = .{};
     for ([_][]const u8{ "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201" }) |name| try std.testing.expect(matrixRefused(auto, hip.Caps.of(name).?) == null);
+}
+
+test "a config with YaRN (or any rope scaling) is refused before the device is touched" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"qwen3_5","text_config":{"max_position_embeddings":1010000,
+        \\ "rope_parameters":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}}
+    });
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var problem: []const u8 = "";
+    try std.testing.expectError(error.Refused, ready(qwen35.native, a, std.testing.allocator, io, .{ .dir = dir, .model_type = "qwen3_5", .context = 1010000 }, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "\"yarn\" rope scaling") != null);
 }

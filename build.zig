@@ -205,6 +205,13 @@ pub fn build(b: *std.Build) void {
     const warning_run = b.addRunArtifact(warning);
     test_step.dependOn(&warning_run.step);
     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
+    const sampler_stats = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/lanes/sampling_stats_test.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    }) });
+    b.step("test-sampler-stats", "CPU sampler draws vs the exact top_k/top_p/min_p distribution (chi-square, ~1 min)").dependOn(&b.addRunArtifact(sampler_stats).step);
     grammar_build.steps(b, target, xgrammar);
     contract_build.hostTests(b);
 }
