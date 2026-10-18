@@ -232,6 +232,13 @@ struct GguQ<kIQ4_NL> {
 #pragma unroll
         for (int i = 0; i < 4; ++i) u[i] = gg_iq4_lookup((w[i] >> (4 * (p & 1))) & 0x0f0f0f0fu);
     }
+    // the piece's 4-bit indices (a byte each) and its scale: the product looks up kvalues_iq4nl itself (mn is 0)
+    __device__ static void nibbles(const Raw& r, int p, uint32_t (&v)[4], float& s) {
+        s = gg_half(r.d);
+        const uint32_t w[4] = {r.q.x, r.q.y, r.q.z, r.q.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = (w[i] >> (4 * (p & 1))) & 0x0f0f0f0fu;
+    }
     TF_GG_PIECE
 };
 
@@ -257,6 +264,14 @@ struct GguQ<kIQ4_XS> {
         const uint32_t w[4] = {r.q.x, r.q.y, r.q.z, r.q.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) u[i] = gg_iq4_lookup((w[i] >> (4 * (p & 1))) & 0x0f0f0f0fu);
+    }
+    __device__ static void nibbles(const Raw& r, int p, uint32_t (&v)[4], float& s) {
+        uint32_t u[4];
+        float mn;
+        decode(r, p, u, s, mn);
+        const uint32_t w[4] = {r.q.x, r.q.y, r.q.z, r.q.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = (w[i] >> (4 * (p & 1))) & 0x0f0f0f0fu;
     }
     TF_GG_PIECE
 };

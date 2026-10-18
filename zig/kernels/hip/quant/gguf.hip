@@ -156,6 +156,15 @@ __global__ void __launch_bounds__(32 * kGgWaves) gguf_product(Gguf a) {
         xr[mt] = static_cast<const __bf16*>(a.x) + static_cast<long long>(r < a.m ? r : a.m - 1) * a.k;
     }
     constexpr int G = Q::kGroup, PG = G / 16;  // pieces a group
+    // iq4: kvalues_iq4nl of two adjacent indices as a BF16 pair, by their two nibbles (exact signed operands, mn 0)
+    constexpr bool kLut = T == kIQ4_NL || T == kIQ4_XS;
+    __shared__ uint32_t lut[kLut ? 256 : 1];
+    if constexpr (kLut) {
+        constexpr unsigned short kv[16] = {0xc2fe, 0xc2d0, 0xc2a6, 0xc282, 0xc244, 0xc20c, 0xc1b0, 0xc120,
+                                           0x3f80, 0x4150, 0x41c8, 0x4218, 0x4254, 0x428a, 0x42b2, 0x42e2};
+        for (int i = threadIdx.x; i < 256; i += 32 * kGgWaves) lut[i] = kv[i & 15] | static_cast<uint32_t>(kv[i >> 4]) << 16;
+        __syncthreads();
+    }
     const f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
     f32x8 acc[MT];
 #pragma unroll
@@ -169,12 +178,25 @@ __global__ void __launch_bounds__(32 * kGgWaves) gguf_product(Gguf a) {
 #pragma unroll
             for (int q = 0; q < PG; ++q) {
                 uint32_t u[4];
-                Q::piece(blk, p0 + q, u, s, mn);  // a group's pieces share s and mn
                 uint32_t f[8];
-                if constexpr (Q::kSmall) {
-                    gg_pairs128(u, f);
+                if constexpr (kLut) {
+                    typename Q::Raw r;
+                    Q::load(blk, p0 + q, r);
+                    Q::nibbles(r, p0 + q, u, s);
+                    mn = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t t = u[i] | (u[i] >> 4);  // bytes n0 | n1 << 4 and n2 | n3 << 4 at 0 and 16
+                        f[2 * i] = lut[t & 0xffu];
+                        f[2 * i + 1] = lut[(t >> 16) & 0xffu];
+                    }
                 } else {
-                    gg_pairs(u, f);
+                    Q::piece(blk, p0 + q, u, s, mn);  // a group's pieces share s and mn
+                    if constexpr (Q::kSmall) {
+                        gg_pairs128(u, f);
+                    } else {
+                        gg_pairs(u, f);
+                    }
                 }
                 b[q] = __builtin_bit_cast(bf16x16, u32x8{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]});
             }
@@ -193,7 +215,7 @@ __global__ void __launch_bounds__(32 * kGgWaves) gguf_product(Gguf a) {
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     acc[mt][e] = fmaf(d[e], s, acc[mt][e]);
-                    acc[mt][e] = fmaf(sx[e], mn, acc[mt][e]);
+                    if constexpr (!kLut) acc[mt][e] = fmaf(sx[e], mn, acc[mt][e]);
                 }
             }
         }
