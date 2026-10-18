@@ -110,3 +110,13 @@ Columns:
     - Add `exl3` to the qwen3_5 `formats` list in `capabilities --json`.
     - The HIP help/usage still says `--backend {auto,mlx,cuda}`.
     - The `capabilities` env list names CUDA variables, not `TENSORFOLD_HIP_MEMORY_LIMIT_GB` / `TF_POLICY`.
+
+## Added since (2026-10-18)
+
+- **GGUF checkpoints** (qwen3_5 dense family): loaded from the `.gguf` file, with q4_K, q5_K, q6_K, q8_0, q3_K,
+  iq4_xs, iq4_nl and iq3_s kernels. Verified on Unsloth's Qwen3.8-27B UD-Q4_K_XL ([gguf.md](gguf.md)). MoE GGUFs are
+  refused by name.
+- **DSpark drafter** (MiniCPM-V 4.7): the DFlash backbone plus a Markov head over the whole vocabulary, after vLLM's
+  and llama.cpp's implementations. Replies are identical to `draft:false`.
+- **C8:** shared rounds hold the DFlash2 drafter in blocks of 4 or 8, and EXL3 products of 33-128 rows use a 64-row
+  tile with the same bits per row.
