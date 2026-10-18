@@ -68,7 +68,9 @@ A dense tensor of another shape, size or dtype than the shipped projection, and 
 In the Python 0.6.6 engine, these additions cover MLX affine safetensors checkpoints for the dense Qwen family. The
 native engine's per-module readers are named under Backend paths above; for Nemotron, TensorFold's oQ4, oQ6 and oQ8 are
 the measured checkpoints.
-GGUF, AWQ, GPTQ, NVFP, MXFP and arbitrary 8-bit MoE expert formats require their own readers and kernels.
+The HIP engine reads qwen35 GGUF files in place (ggml q4_K, q5_K, q6_K, q8_0, q3_K, iq4_xs, iq4_nl and iq3_s
+projections; see [recipes/gguf.md](recipes/gguf.md)). AWQ, GPTQ, NVFP, MXFP, other GGUF types and arbitrary 8-bit MoE
+expert formats require their own readers and kernels.
 Unsupported formats remain explicit errors.
 
 The new paths are experimental until their hardware qualification is complete.

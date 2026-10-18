@@ -326,6 +326,30 @@ pub const Draft = struct {
                 try d.exl3Rows(h, full.n, parts, rows);
                 weights.quantize(rows, n, k, words, scales, biases);
             },
+            .gguf => |h| {
+                // the head's blocks, rows of them at a time, as ggml's fp32 values (quant.gguf.reference) to bf16
+                const rows = try gpa.alloc(u16, n * k);
+                defer gpa.free(rows);
+                const chunk = 2048;
+                const raw = try gpa.alloc(u8, chunk * @as(usize, h.row_bytes));
+                defer gpa.free(raw);
+                const vals = try gpa.alloc(f64, chunk * k);
+                defer gpa.free(vals);
+                var row: usize = 0;
+                for (parts) |s| {
+                    var r0: usize = s[0];
+                    while (r0 < s[1]) : (r0 += chunk) {
+                        const c = @min(chunk, s[1] - r0);
+                        const bytes = raw[0 .. c * h.row_bytes];
+                        try download(&d.e.driver, h.blocks + r0 * h.row_bytes, bytes);
+                        const host: hip.quant.gguf.Host = .{ .blocks = .{ .dtype = .u8, .rank = 2, .shape = .{ c, h.row_bytes, 1, 1, 1 }, .bytes = bytes }, .type = h.type, .k = k };
+                        try hip.quant.gguf.reference(host, vals[0 .. c * k]);
+                        for (vals[0 .. c * k], rows[row * k ..][0 .. c * k]) |v, *o| o.* = toBf16(@floatCast(v));
+                        row += c;
+                    }
+                }
+                weights.quantize(rows, n, k, words, scales, biases);
+            },
             .dense => |h| {
                 if (!dense) return error.UnsupportedDraftHead;
                 const rows = try gpa.alloc(u16, n * k);

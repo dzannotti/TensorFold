@@ -58,6 +58,7 @@ pub const Config = struct {
         // geometry records a nominal one
         const width: Width = switch (table) {
             .exl3 => .{ .bits = 4, .group = 128 },
+            .gguf => .{ .bits = 4, .group = 256 },
             .dense => if (declared.count() == 0) .{ .bits = 16, .group = 0 } else .{ .bits = 8, .group = 128 },
             .mlx => try table.width(""),
         };

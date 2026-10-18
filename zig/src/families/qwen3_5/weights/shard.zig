@@ -4,6 +4,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const st = @import("core").safetensors;
+const gguf = @import("core").gguf;
+const gguf_names = @import("gguf_names.zig");
 
 pub const Tensor = st.Tensor;
 
@@ -21,6 +23,12 @@ pub const Shard = struct {
         if (len < 8) return error.BadSafetensors;
         var map = try Io.File.MemoryMap.create(io, file, .{ .len = len, .protection = .{ .read = true, .write = false }, .populate = false });
         errdefer map.destroy(io);
+        if (gguf.is(map.memory)) {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            errdefer arena.deinit();
+            const g = try parseGguf(arena.allocator(), map.memory);
+            return .{ .file = file, .map = map, .data = g.data, .names = g.names, .arena = arena };
+        }
         const header_len: usize = @intCast(std.mem.readInt(u64, map.memory[0..8], .little));
         if (header_len > len - 8) return error.BadSafetensors;
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -51,6 +59,39 @@ pub const Shard = struct {
         return .{ .dtype = e.dtype, .rank = e.rank, .shape = e.shape, .bytes = s.map.memory[s.data + e.begin .. s.data + e.end] };
     }
 };
+
+/// A GGUF file's tensors under the MLX names (gguf_names.zig): float ones as their dtype and shape (ggml's dims
+/// reversed), a quantized projection as its rows' blocks, u8 [rows, row bytes], under `<name>.ggml.<type>`.
+fn parseGguf(arena: std.mem.Allocator, bytes: []const u8) !struct { data: usize, names: st.Header } {
+    const f = gguf.parse(arena, bytes) catch return error.BadGguf;
+    if (!std.mem.eql(u8, f.string("general.architecture") orelse "", "qwen35")) return error.UnsupportedGgufArchitecture;
+    const blocks: u64 = @intCast(f.int("qwen35.block_count") orelse return error.BadGguf);
+    const layers = blocks - @as(u64, @intCast(f.int("qwen35.nextn_predict_layers") orelse 0));
+    var out: st.Header = .empty;
+    for (f.tensors) |t| {
+        const name = try gguf_names.mlx(arena, t.name, layers) orelse continue;
+        const projection = std.mem.endsWith(u8, t.name, ".weight") and !std.mem.endsWith(u8, name, ".weight");
+        const dtype: ?st.DType = switch (t.type) {
+            .f32 => .f32,
+            .f16 => .f16,
+            .bf16 => .bf16,
+            else => null,
+        };
+        var e: st.Entry = .{ .dtype = dtype orelse .u8, .rank = @intCast(t.rank), .shape = @splat(1), .begin = @intCast(t.offset), .end = @intCast(t.offset + t.bytes) };
+        if (dtype != null) {
+            for (0..t.rank) |i| e.shape[i] = @intCast(t.dims[t.rank - 1 - i]);
+        } else {
+            e.rank = 2;
+            e.shape[0] = @intCast(t.rows());
+            e.shape[1] = @intCast(t.bytes / t.rows());
+        }
+        const key = if (dtype == null)
+            try std.fmt.allocPrint(arena, "{s}.ggml.{s}", .{ name, gguf.typeName(t.type) })
+        else if (projection) try std.fmt.allocPrint(arena, "{s}.weight", .{name}) else name;
+        try out.put(arena, key, e);
+    }
+    return .{ .data = @intCast(f.data), .names = out };
+}
 
 /// core's `parseHeader` without its refusals of rank and dtype: dimensions past the max rank fold into the last kept one
 /// (ciru's [E, N/16, K/32, 2, 16, 16] codes read as [E, N/16, K/32, 2, 256]); sizes and ranges are still checked.

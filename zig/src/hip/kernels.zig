@@ -15,6 +15,7 @@ pub const Group = enum {
     flashnext,
     draft,
     exl3,
+    gguf,
 };
 pub const group_count = @typeInfo(Group).@"enum".field_names.len;
 

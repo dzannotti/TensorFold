@@ -29,7 +29,9 @@ pub fn tf_gdn_gate(l: *const Launcher, av: C, bv: C, kind: c_int, a_log: CF, dt_
 }
 
 pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: CF, state: F, y: F, batch: c_int, length: c_int, key_heads: c_int, value_heads: c_int, dk: c_int, dv: c_int, s: S, states: F) Error!void {
-    if ((dk != 16 and dk != 128) or dv < 1 or key_heads < 1 or @rem(value_heads, key_heads) != 0 or batch < 1 or length < 1) {
+    // bit 16 of key_heads marks the tiled value-head order (recurrence/gated_delta.hip)
+    const kh = key_heads & 0xffff;
+    if ((dk != 16 and dk != 128) or dv < 1 or kh < 1 or @rem(value_heads, kh) != 0 or batch < 1 or length < 1) {
         return invalid("gated delta");
     }
     var a: Args = .{};

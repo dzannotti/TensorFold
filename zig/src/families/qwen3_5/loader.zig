@@ -13,6 +13,7 @@ test {
     _ = config;
     _ = table;
     _ = @import("weights/shard.zig");
+    _ = @import("weights/gguf_names.zig");
     _ = @import("weights/projection.zig");
     _ = @import("weights/checkpoint_test.zig");
     _ = @import("weights/real_test.zig");
