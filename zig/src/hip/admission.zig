@@ -32,14 +32,14 @@ pub fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative
     return r;
 }
 
-/// The bytes of the checkpoint's safetensors files: what its weights need on the device, near enough to refuse early.
+/// The bytes of the checkpoint's safetensors and GGUF files: what its weights need on the device, near enough to refuse early.
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     var total: u64 = 0;
     var it = d.iterate();
     while (it.next(io) catch null) |e| {
-        if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
+        if (!std.mem.endsWith(u8, e.name, ".safetensors") and !std.mem.endsWith(u8, e.name, ".gguf")) continue;
         const st = d.statFile(io, e.name, .{}) catch continue;
         total += st.size;
     }

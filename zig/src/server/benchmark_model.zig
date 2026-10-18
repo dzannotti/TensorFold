@@ -48,14 +48,14 @@ pub fn describe(a: Allocator, io: std.Io, target: []const u8, dir: []const u8, l
     return out;
 }
 
-/// The bytes of the ``*.safetensors`` files in ``dir``, through a cache snapshot's links; 0 when unreadable.
+/// The bytes of the ``*.safetensors`` and ``*.gguf`` files in ``dir``, through a cache snapshot's links; 0 when unreadable.
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     var it = d.iterate();
     var total: u64 = 0;
     while (it.next(io) catch null) |e| {
-        if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
+        if (!std.mem.endsWith(u8, e.name, ".safetensors") and !std.mem.endsWith(u8, e.name, ".gguf")) continue;
         const st = d.statFile(io, e.name, .{}) catch continue;
         if (st.kind == .file) total +|= st.size;
     }
