@@ -60,6 +60,8 @@ pub const Launcher = struct {
     gdn_gate: Triple,
     gated_delta_tile: [2]Function, // dk 128, 16
     gated_delta_wave: [2]Function,
+    /// dk 128, 32 value rows a block: 8 a wave.
+    gated_delta_rows: Function,
     score_keys: Triple, // by cache kind
     apply_values: Triple,
     causal: Triple,
@@ -125,6 +127,7 @@ pub const Launcher = struct {
         router_tile: [2]Function,
         router_small: [2]Function,
         rms_rows: Function,
+        rms_wide: Function,
         qk_rope: Function,
         add_wide: Function,
         moe_localize: Function,
@@ -191,6 +194,7 @@ pub const Launcher = struct {
             .router_tile = .{ try ops.function("tf_router_tile_f16"), try ops.function("tf_router_tile_bf16") },
             .router_small = .{ try ops.function("tf_router_small_f16"), try ops.function("tf_router_small_bf16") },
             .rms_rows = try ops.function("tf_rms_rows"),
+            .rms_wide = try ops.function("tf_rms_wide"),
             .qk_rope = try ops.function("tf_qk_rope"),
             .add_wide = try ops.function("tf_add_wide"),
             .moe_localize = try ops.function("tf_moe_localize"),
@@ -230,6 +234,7 @@ pub const Launcher = struct {
             try gd.function(ns ++ "16gated_delta_tileILi128ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "16gated_delta_tileILi16ELi8ELi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
         };
+        l.gated_delta_rows = try gd.function("tf_gdn_rows_128_8_4");
         l.gated_delta_wave = .{
             try gd.function(ns ++ "18gated_delta_kernelILi128EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),
             try gd.function(ns ++ "18gated_delta_kernelILi16EEEvPKfS3_S3_S3_S3_PfS4_iiiiS4_"),

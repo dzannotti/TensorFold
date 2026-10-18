@@ -511,3 +511,34 @@ test "the linear attention's prompt conv and DeltaNet gates sit within 1e-5 of f
         try std.testing.expect(@abs(gb[i] - sigmoid(t.value(hb[i]))) < 1e-6);
     }
 }
+
+test "a prompt's wide RMS rows equal the same rows normed one at a time" {
+    const t = try Rig.open(1 << 20);
+    defer t.close();
+    const o = t.ops(&t.on);
+    var rng: rig.Rng = .{ .state = 0x5120 };
+    const rows = 70;
+    const width = 5120;
+    const hx = try gpa.alloc(u16, rows * width);
+    defer gpa.free(hx);
+    for (hx) |*x| x.* = t.bits(rng.unit() * 4);
+    const hw = try gpa.alloc(f32, width);
+    defer gpa.free(hw);
+    for (hw) |*w| w.* = 1 + rng.unit();
+    var x = try t.upload(hx);
+    defer x.free();
+    var w = try t.upload(hw);
+    defer w.free();
+    var all = try t.alloc(rows * width * 2);
+    defer all.free();
+    var one = try t.alloc(rows * width * 2);
+    defer one.free();
+    try o.rms(tensor(x, act(t)), at(w), tensor(all, act(t)), rows, width, 1e-6);
+    for (0..rows) |r| try o.rms(.{ .ptr = at(x) + r * width * 2, .kind = act(t) }, at(w), .{ .ptr = at(one) + r * width * 2, .kind = act(t) }, 1, width, 1e-6);
+    try t.stream.synchronize();
+    const ga = try rig.download(u16, all);
+    defer gpa.free(ga);
+    const go = try rig.download(u16, one);
+    defer gpa.free(go);
+    try std.testing.expectEqualSlices(u16, go, ga);
+}

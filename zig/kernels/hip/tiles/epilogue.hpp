@@ -53,6 +53,19 @@ __device__ inline typename T::elem swiglu(float g, float u, float limit) {
     return narrow_product<T>(g / (1.f + expf(-g)), u);
 }
 
+// F32Out, or the product rounded to T where `out16` is set: a prompt's tile does the cast it would otherwise launch.
+template <typename T>
+struct ActOut {
+    template <class Args>
+    __device__ static void store(const Args& a, int row, int col, float v) {
+        if (a.out16 != nullptr) {
+            static_cast<typename T::elem*>(static_cast<void*>(a.out16))[out_row(a, row) * a.n + col] = narrow<T>(v);
+        } else {
+            a.out[out_row(a, row) * a.n + col] = v;
+        }
+    }
+};
+
 // Stream tile epilogues take a lane's CB column sums for one row (`v`), their column `c` and the paired output width.
 
 // The sum rounded to the activation type where `out16` is set (the decode tails' own rounding), else stored in fp32.

@@ -18,15 +18,15 @@ const invalid = util.invalid;
 pub fn tf_rms(l: *const Launcher, x: C, weight: CF, y: P, kind: c_int, rows: c_int, width: c_int, eps: f32, s: S) Error!void {
     var a: Args = .{};
     try a.add(ad(x));
-    if (width <= 1024) {
-        // a wave a row, rms_kernel's sums
+    if (width <= 1024 or rows >= 64) {
+        // a wave a row, rms_kernel's sums (a prompt's wider rows read twice)
         try a.add(kind);
         try a.add(ad(weight));
         try a.add(ad(y));
         try a.add(rows);
         try a.add(width);
         try a.add(eps);
-        return l.go(l.op.rms_rows, dim(cdiv(rows, 8), 1, 1), dim(256, 1, 1), 0, s, &a);
+        return l.go(if (width <= 1024) l.op.rms_rows else l.op.rms_wide, dim(cdiv(rows, 8), 1, 1), dim(256, 1, 1), 0, s, &a);
     }
     try a.add(ad(weight));
     try a.add(ad(y));

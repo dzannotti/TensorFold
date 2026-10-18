@@ -92,18 +92,29 @@ gated_delta_kernel(const float* __restrict__ q, const float* __restrict__ k, con
     }
 }
 
-// Value rows share a staged tile of k and q, in the wave kernel's order (-ffp-contract=off keeps it).
-template <int DK, int ROWS, int STEPS>
+// lane0_sum's butterfly (xor 16, 8, 4, 2, 1) on DPP and permlanex16 instead of LDS round trips: the same adds.
+__device__ __forceinline__ float wave_sum(float x) {
+    const int u = __float_as_int(x);
+    x = x + __int_as_float(__builtin_amdgcn_permlanex16(u, u, 0x76543210, 0xfedcba98, false, false));
+    x = x + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x168, 0xf, 0xf, false));  // row_xmask:8
+    x = x + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x164, 0xf, 0xf, false));  // row_xmask:4
+    x = x + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x162, 0xf, 0xf, false));  // row_xmask:2
+    x = x + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x161, 0xf, 0xf, false));  // row_xmask:1
+    return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(x)));
+}
+
+// Value rows share a staged tile of k and q, in the wave kernel's order (-ffp-contract=off keeps it); a wave runs RW rows.
+template <int DK, int ROWS, int STEPS, int RW = 1>
 __device__ __forceinline__ void
 gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
                       const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
                       float* __restrict__ y, int length, int key_heads, int value_heads, int dv,
                       float* __restrict__ states, int batch, bool write_back = true) {
     constexpr int SPAN = (DK + 31) / 32;
-    constexpr int WIDTH = 32 * ROWS;
+    constexpr int WIDTH = 32 * (ROWS / RW);
     const int lane = threadIdx.x;
     const int local = threadIdx.y;
-    const int row = blockIdx.x * ROWS + local;
+    const int row0 = blockIdx.x * ROWS + local * RW;
     const int head = blockIdx.y;
     const int key_head = head / (value_heads / key_heads);
     const int tid = local * 32 + lane;
@@ -114,12 +125,15 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
     __shared__ float bs[STEPS];
     __shared__ float vs[STEPS][ROWS];
 
-    float s[4] = {0.f, 0.f, 0.f, 0.f};
-    const size_t state_row = ((static_cast<size_t>(batch) * value_heads + head) * dv + row) * DK;
+    float s[RW][4];
 #pragma unroll
-    for (int i = 0; i < SPAN; ++i) {
-        const int idx = lane + i * 32;
-        if (idx < DK) s[i] = state[state_row + idx];
+    for (int r = 0; r < RW; ++r) {
+        const size_t state_row = ((static_cast<size_t>(batch) * value_heads + head) * dv + row0 + r) * DK;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int idx = lane + i * 32;
+            s[r][i] = i < SPAN && idx < DK ? state[state_row + idx] : 0.f;
+        }
     }
 
     for (int t0 = 0; t0 < length; t0 += STEPS) {
@@ -160,43 +174,72 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
         for (int tt = 0; tt < n; ++tt) {
             const float decay = gs[tt];
             const float step_beta = bs[tt];
-            const float value = vs[tt][local];
-            float remembered = 0.f;
             float held[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int i = 0; i < SPAN; ++i) {
                 const int idx = lane + i * 32;
-                if (idx < DK) {
-                    held[i] = ks[tt][idx];
-                    s[i] = s[i] * decay;
-                    remembered = remembered + s[i] * held[i];
-                }
+                if (idx < DK) held[i] = ks[tt][idx];
             }
-            const float delta = (value - lane0_sum(remembered)) * step_beta;
+            float delta[RW];
 #pragma unroll
-            for (int i = 0; i < SPAN; ++i) {
-                const int idx = lane + i * 32;
-                if (idx < DK) s[i] = s[i] + held[i] * delta;
-            }
-            if (states != nullptr) {
-                const size_t snap =
-                    (((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * dv + row) * DK;
+            for (int r = 0; r < RW; ++r) {
+                float remembered = 0.f;
 #pragma unroll
                 for (int i = 0; i < SPAN; ++i) {
                     const int idx = lane + i * 32;
-                    if (idx < DK) states[snap + idx] = s[i];
+                    if (idx < DK) {
+                        s[r][i] = s[r][i] * decay;
+                        remembered = remembered + s[r][i] * held[i];
+                    }
+                }
+                delta[r] = remembered;
+            }
+#pragma unroll
+            for (int r = 0; r < RW; ++r) delta[r] = (vs[tt][local * RW + r] - wave_sum(delta[r])) * step_beta;
+#pragma unroll
+            for (int r = 0; r < RW; ++r) {
+#pragma unroll
+                for (int i = 0; i < SPAN; ++i) {
+                    const int idx = lane + i * 32;
+                    if (idx < DK) s[r][i] = s[r][i] + held[i] * delta[r];
+                }
+            }
+            if (states != nullptr) {
+#pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    const size_t snap =
+                        (((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * dv + row0 + r) * DK;
+#pragma unroll
+                    for (int i = 0; i < SPAN; ++i) {
+                        const int idx = lane + i * 32;
+                        if (idx < DK) states[snap + idx] = s[r][i];
+                    }
                 }
             }
             if (q == nullptr) continue;
-            float readout = 0.f;
 #pragma unroll
             for (int i = 0; i < SPAN; ++i) {
                 const int idx = lane + i * 32;
-                if (idx < DK) readout = readout + s[i] * qs[tt][idx];
+                if (idx < DK) held[i] = qs[tt][idx];
             }
-            readout = lane0_sum(readout);
-            if (lane == 0) {
-                y[((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * dv + row] = readout;
+            float readout[RW];
+#pragma unroll
+            for (int r = 0; r < RW; ++r) {
+                readout[r] = 0.f;
+#pragma unroll
+                for (int i = 0; i < SPAN; ++i) {
+                    const int idx = lane + i * 32;
+                    if (idx < DK) readout[r] = readout[r] + s[r][i] * held[i];
+                }
+            }
+            float mine = 0.f;
+#pragma unroll
+            for (int r = 0; r < RW; ++r) {
+                const float sum = wave_sum(readout[r]);
+                mine = lane == r ? sum : mine;
+            }
+            if (lane < RW) {
+                y[((static_cast<size_t>(batch) * length + (t0 + tt)) * value_heads + head) * dv + row0 + lane] = mine;
             }
         }
         __syncthreads();
@@ -204,9 +247,13 @@ gated_delta_tile_body(const float* __restrict__ q, const float* __restrict__ k, 
 
     if (!write_back) return;
 #pragma unroll
-    for (int i = 0; i < SPAN; ++i) {
-        const int idx = lane + i * 32;
-        if (idx < DK) state[state_row + idx] = s[i];
+    for (int r = 0; r < RW; ++r) {
+        const size_t state_row = ((static_cast<size_t>(batch) * value_heads + head) * dv + row0 + r) * DK;
+#pragma unroll
+        for (int i = 0; i < SPAN; ++i) {
+            const int idx = lane + i * 32;
+            if (idx < DK) state[state_row + idx] = s[r][i];
+        }
     }
 }
 
@@ -282,6 +329,18 @@ tf_gdn_plan_16(const float* q, const float* k, const float* v, const float* gate
                int key_heads, int value_heads, int dv, PlanArgs plan, int layer) {
     tf::rocm::gated_delta_plan_body<16>(q, k, v, gate, beta, y, key_heads, value_heads, dv, plan, layer);
 }
+
+// A prompt's scan with RW value rows a wave, WAVES waves a block: the tile's sums, fewer waves to hold every row at once.
+#define TF_GDN_ROWS(RW, WAVES)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(32 * WAVES) tf_gdn_rows_128_##RW##_##WAVES(                         \
+        const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,                       \
+        const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,                   \
+        float* __restrict__ y, int length, int key_heads, int value_heads, int dv, float* __restrict__ states) {     \
+        tf::rocm::gated_delta_tile_body<128, RW * WAVES, 16, RW>(q, k, v, gate, beta, state, y, length, key_heads,   \
+                                                                 value_heads, dv, states, blockIdx.z);               \
+    }
+TF_GDN_ROWS(8, 4)
+#undef TF_GDN_ROWS
 
 // The template kernels launches.zig resolves.
 template __global__ void tf::rocm::gated_delta_tile<128, 8, 16>(const float* __restrict__ q,

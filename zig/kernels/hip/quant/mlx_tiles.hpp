@@ -34,7 +34,7 @@ __global__ void __launch_bounds__(32 * WAVES) affine_gemm_kp(Affine a) {
 
 template <int BITS>
 __global__ void __launch_bounds__(256) affine_wmma_gemm(Affine a) {
-    wmma_gemm_tile<MlxDecoder<BITS>, BF16Act, WmmaBF16, F32Out>(a);
+    wmma_gemm_tile<MlxDecoder<BITS>, BF16Act, WmmaBF16, ActOut<WmmaBF16>>(a);
 }
 
 // ---- the decode stream tile ----

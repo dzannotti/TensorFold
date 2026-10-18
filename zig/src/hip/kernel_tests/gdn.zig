@@ -195,3 +195,52 @@ test "a prompt cut on either side of 64 rows gives the same rows and state as on
         try std.testing.expectEqualSlices(u32, @ptrCast(ws), @ptrCast(gs));
     }
 }
+
+/// One launch of a scan kernel `f` (grid x = dv / rows) over the whole of `sh`.
+fn launchScan(t: *Rig, f: @import("../module.zig").Function, rows: usize, waves: usize, sh: Shape, b: [8]DeviceBuffer) !void {
+    const util = @import("../launches/util.zig");
+    var a: util.Args = .{};
+    for (b[0..7]) |x| try a.add(rig.at(x));
+    try a.add(@as(c_int, @intCast(sh.length)));
+    try a.add(@as(c_int, @intCast(sh.key_heads)));
+    try a.add(@as(c_int, @intCast(sh.value_heads)));
+    try a.add(@as(c_int, d));
+    try a.add(@as(u64, 0));
+    try t.on.go(f, util.dim(d / rows, sh.value_heads, 1), util.dim(32, waves, 1), 0, t.stream.handle, &a);
+}
+
+test "the row-blocked scans equal the one-row wave bit for bit at Qwen3.6 27B's shape" {
+    const t = try Rig.open(1 << 30);
+    defer t.close();
+    const sh: Shape = .{ .length = 2048, .key_heads = 16, .value_heads = 48 };
+    const in = try Inputs.make(sh, 0x27b);
+    defer in.free();
+    var bufs: [8]DeviceBuffer = undefined;
+    for ([_][]f32{ in.q, in.k, in.v, in.gate, in.beta, in.state }, 0..) |h, i| bufs[i] = try t.upload(h);
+    bufs[6] = try t.alloc(sh.length * sh.value_heads * d * 4);
+    bufs[7] = bufs[5];
+    defer for (bufs[0..7]) |*b| b.free();
+    const gd = t.on.mods[@backingInt(@import("../kernels.zig").Group.gated_delta)];
+    const Kind = struct { name: [:0]const u8, rows: usize, waves: usize };
+    const kinds = [_]Kind{
+        .{ .name = "wave", .rows = 1, .waves = 1 },
+        .{ .name = "tile", .rows = 8, .waves = 8 },
+        .{ .name = "tf_gdn_rows_128_8_4", .rows = 32, .waves = 4 },
+    };
+    var want: ?[]f32 = null;
+    defer if (want) |w| gpa.free(w);
+    for (kinds) |kd| {
+        const f = if (std.mem.eql(u8, kd.name, "wave")) t.on.gated_delta_wave[0] else if (std.mem.eql(u8, kd.name, "tile")) t.on.gated_delta_tile[0] else try gd.function(kd.name);
+        for (0..3) |_| {
+            try t.stream.synchronize();
+            try bufs[5].upload(0, std.mem.sliceAsBytes(in.state));
+            try launchScan(t, f, kd.rows, kd.waves, sh, bufs);
+        }
+        try t.stream.synchronize();
+        const got = try rig.download(f32, bufs[6]);
+        if (want) |w| {
+            defer gpa.free(got);
+            try std.testing.expectEqualSlices(u32, @ptrCast(w), @ptrCast(got));
+        } else want = got;
+    }
+}

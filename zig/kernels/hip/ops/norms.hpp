@@ -34,7 +34,35 @@ __device__ void rms_rows(const void* x, int kind, const float* weight, void* y, 
     }
 }
 
+// rms_rows for any width: the row read twice from memory instead of held, so a prompt's wide rows fill the GPU.
+__device__ void rms_wide(const void* x, int kind, const float* weight, void* y, int rows, int width, float eps) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    const long long at = static_cast<long long>(row) * width;
+    float sum = 0.f;
+#pragma unroll 8
+    for (int i = lane; i < width; i += 32) {
+        const float v = load(x, kind, at + i);
+        sum += v * v;
+    }
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
+    const float inv = rsqrtf(__shfl(sum, 0, 32) / static_cast<float>(width) + eps);
+#pragma unroll 8
+    for (int i = lane; i < width; i += 32) {
+        float value = load(x, kind, at + i) * inv;
+        if (weight != nullptr) value *= weight[i];
+        store(y, kind, at + i, value);
+    }
+}
+
 }  // namespace
+
+extern "C" __global__ void __launch_bounds__(256) tf_rms_wide(const void* x, int kind, const float* weight, void* y,
+                                                              int rows, int width, float eps) {
+    rms_wide(x, kind, weight, y, rows, width, eps);
+}
 
 extern "C" __global__ void __launch_bounds__(256) tf_rms_rows(const void* x, int kind, const float* weight, void* y,
                                                               int rows, int width, float eps) {
