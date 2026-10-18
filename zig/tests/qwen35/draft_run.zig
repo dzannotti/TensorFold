@@ -221,7 +221,7 @@ fn bench(e: *qwen35.engine.Engine, d: *Draft) !void {
     defer start.deinit();
     var stop = try hip.Event.init(&e.driver, true);
     defer stop.deinit();
-    const ps = [_]struct { name: []const u8, p: qwen35.draft.Linear }{ .{ .name = "gate", .p = d.w.layers[0].gate }, .{ .name = "qkv", .p = d.w.layers[0].qkv }, .{ .name = "down", .p = d.w.layers[0].down }, .{ .name = "head", .p = .{ .q4 = d.head } } };
+    const ps = [_]struct { name: []const u8, p: qwen35.draft.Linear }{ .{ .name = "gate", .p = d.w.layers[0].gate }, .{ .name = "qkv", .p = d.w.layers[0].qkv }, .{ .name = "down", .p = d.w.layers[0].down }, .{ .name = "head", .p = d.head } };
     for (ps) |pp| for ([_]usize{ 1, 8, 16, 32, 64 }) |m| {
         const o: hip.ops.Ops = .{ .l = &e.lib, .bf16 = true, .stream = e.stream.handle, .arena = &arena };
         var best: f32 = std.math.inf(f32);
