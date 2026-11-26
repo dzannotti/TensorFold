@@ -1,0 +1,165 @@
+# Contributing to TensorFold
+
+TensorFold's main line is the Zig engine and server.
+Python 0.6.6 stays available at the `v0.6.6` tag and takes no further changes; Python clients and references under `tools` are development tools.
+Start from `main`, the only branch, and keep one change per pull request.
+Open an issue before a new model family, backend or arithmetic change so we can agree on its gate.
+
+## Coordinate before editing
+
+Check the issue before choosing it. If an issue is taken, offer to pair, split or review instead of opening a competing implementation.
+Claim an issue by opening a draft pull request whose description says `Fixes #<issue>`.
+
+### Contributing with agents
+
+Have the agent load the [contributor skill](docs/recipes/SKILL.md) before it writes any code.
+
+## Build and host tests
+
+Use the exact Zig version in `.zig-version`, currently 0.17.0.
+Metal builds need Xcode's macOS SDK and Metal toolchain: the `.metal` sources need Xcode's Metal compiler. Install full Xcode and its
+Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain`); the Command Line Tools alone fail every kernel compile with
+`unable to find utility "metal"`.
+
+```sh
+zig build native -Dcpu=apple_m1 -Dversion=1.0.0
+zig build test test-golden -Dcpu=apple_m1
+```
+
+`native` writes `zig-out/native/bin/tensorfold-native`, the server.
+On Linux, `zig build native` compiles for the build machine's CPU, so the binary can stop with `Illegal instruction` on a
+machine without the same features (AVX-512, for example). To build for another machine, name its CPU: `-Dcpu=baseline`
+runs on any x86_64, as the release archives do, and `-Dcpu=x86_64_v3` on an x86-64-v3-capable machine (AVX2 class).
+
+Structured output and required tool calls need the release archive's `lib/` or `zig build grammar -Dxgrammar=DIR`; prepare DIR with `git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar` (use the native build's same `--prefix` for grammar).
+To build one stripped server for one GPU (`zig build -Dgpu=spark -Dnvcc=...`, about 69% smaller than the four-target server), see [Build a server for one GPU](RUNBOOK.md#build-a-server-for-one-gpu).
+The `apple_m1` CPU target keeps the macOS binary compatible with M1 through M5.
+`test` runs unit tests; on macOS it also runs available Metal device checks, including GLM MLA and KDA checks.
+Run the full suite on an isolated machine when the local GPU is serving a model.
+`test-golden` compares the frozen server corpus and records known differences separately.
+These results do not substitute for an actual checkpoint/model gate.
+On macOS, `zig build dev-tools` compiles and links every `tf-*` developer tool without running one; run it after changing an API they call.
+
+For the CUDA host-test subset without the macOS Metal family tests:
+
+```sh
+zig build test-cuda-host
+```
+
+This subset does not replace the complete `test` suite.
+
+Native Linux no-GPU CI runs `zig build -Dfixed-cpu test-host --test-timeout 20m`.
+It includes `test` and every configured `test-*` and `check-*` step, including compile-only checks.
+New named checks join automatically, even when a build module registers them last.
+The reviewed exclusions in `zig/build/host_tests.zig` cover the optional xgrammar tests,
+the separately scheduled `check-release-paths` gate, manual large-state timing commands, and temporary failures tracked in #2031.
+An empty named check, a stale exclusion, or an alias that brings excluded work back into the aggregate fails it.
+When a fix lands, remove its temporary exclusion and the matching fixture entry in `tools/zig/host_tests_test.py`.
+This aggregate is only registered for native Linux; other hosts keep their existing `test` and device steps.
+
+HIP is an explicit build opt-in. Add `-Dhip=true` to enable its host tests and named HIP targets:
+
+```sh
+zig build test -Dhip=true
+zig build native-hip -Dhip=true -Dhipcc=/opt/rocm/bin/hipcc -Dhip-arch=gfx1100
+```
+
+The default graph omits HIP. Enabling it does not select another backend or change CUDA, Metal or XPU runtime options.
+The HIP backend uses the same shared core and serving contracts. Device qualification remains specific to its
+checkpoint, compiler, runtime and architecture; a host build does not establish those receipts.
+
+Linux release builds use the CUDA backend and qualified GPU kernel assets.
+Release archives include the native executable, runtime assets and license notices.
+[Packaging](packaging/README.md) lists the flat fatbin set and optional captured CUDA files required by `dist`.
+Compile success alone does not qualify a GPU or checkpoint.
+
+## Exactness and precision
+
+A draft is accepted only when it equals the same engine's plain token.
+Keep shared lane verification, caches and per-stream state in the core; add model operators and weight handling in the family.
+A new family does not add another scheduler beside the engine.
+
+Verify these contracts at the same checkpoint, backend, runtime and settings:
+
+- Drafted output equals `"draft": false` output, token for token.
+- A supported resumed path equals a fresh execution of the full prompt.
+- Each concurrently requested reply equals its solo run, including engines that queue requests.
+- Prompt chunks and decode use the required row arithmetic, with recurrent state, KV and final logits checked at seams.
+- Cancellation, reset and partial acceptance leave the next request's state valid.
+
+A new or changed GPU kernel registers with the [kernel contract](docs/kernel-contract.md), and its pull request posts each backend's `SUMMARY` line. How to bound, profile and measure a speed change is in [docs/optimizing.md](docs/optimizing.md).
+Keep the checkpoint's activation precision and the required accumulation precision.
+A change to reduction order, accumulation order or rounding point must keep every output bit equal to main's: the same token ids and the same logits bits, by default and with any switch on.
+An FP64 reference or an error bound does not make a different result acceptable, and lower-precision formats are not accepted, even opt-in.
+The one exception is a checkpoint's own trained format (for example a KV cache format the checkpoint was trained and published in), checked bit for bit against the serial reference.
+Compare prompt and decode separately on identical input rows.
+
+## Performance receipts
+
+For cache-aware performance receipts, see [observed cache benchmark evidence](docs/cache-benchmarks.md).
+The clients retain server usage and output fingerprints, and verify cold/reused states rather than inferring them.
+Measure before and after on the same machine, using the same checkpoint, public prompt IDs and settings.
+Name the commit/version, GPU, OS, checkpoint revision, runtime libraries and request parameters.
+Record pass, fail and skip counts and explain any unrun platform or feature.
+
+For served decode, the existing standard-library client needs Python 3.11 or newer:
+
+```sh
+python3 tools/bench_openai.py http://127.0.0.1:8080 local-model \
+  --tokens 256 --reps 3 --temperatures 0 --label candidate --output decode.json
+python3 tools/bench_concurrent.py http://127.0.0.1:8080 local-model \
+  --tokens 256 --reps 3 --temperatures 0 --levels 1,4 --alone --serial --output concurrent.json
+```
+
+The server in these commands is the native binary.
+The clients measure requests; Python is not part of native inference or the native build.
+Include ordinary greedy prose and code in the measured prompts.
+For cold prefill, attach exact 2k, 8k, 32k and 64k token arrays, request bodies, timings and cached-token counts.
+Disable supported prefix retention with `--prompt-cache-gib 0` and use fresh KV state for each measurement.
+Record 64k, 128k and the native window separately where the model/platform admits them.
+Compare against the previous release and the applicable standard server, such as `mlx_lm` or `vLLM`.
+When a difference is only a few percent, alternate before/after runs to separate it from temperature and load changes.
+
+Before asking us for a run on our machines, please post main-against-your-branch numbers if your change can reach inference (model and kernel code, the server's prompt and sampling code, build flags): same machine, checkpoint and settings, with token hashes equal on the default path. An opt-in that changes tokens says so and shows its proof.
+Once your numbers are in and there are no requested changes left, we repeat what your files can reach, where we have the hardware and checkpoint to do it. If your numbers show a loss, please fix it or show it's noise first.
+No machine to run on? Say so in the description: we review every PR either way, and we'll work out what we can do. If you have a chip we don't, your numbers are the evidence, so please post them.
+
+Memory receipts include peak physical process footprint and device/pinned allocations where the backend reports them.
+State the hardware RAM class and context; a budget on a larger host is not a measurement on a smaller machine.
+Use a single model process per test machine, the existing GPU lock and admission guard, and record load/cleanup boundaries.
+Never raise a shared machine's limits to get a test through without its owner's authorization.
+
+## Lean code and review
+
+Each module has one job, source files stay at or below 600 lines, and comments/docstrings are single lines of at most 120 columns.
+Measurements and history belong in a receipt or recipe, not source comments.
+The lean checker must add zero problems over the branch's pinned baseline:
+
+```sh
+python3 tools/zig/lean_check.py
+```
+
+Before pushing, run `python3 tools/pr_check.py --base origin/main --pr NUMBER` to check tracked and untracked local changes against the merge base; new lean and source-length findings are errors, and added-text and documentation findings are advisory warnings.
+
+Attach the baseline count and identify inherited findings instead of claiming a nonzero checker exit is clean.
+Write tests that demonstrate a real failure and its correction; keep the failing receipt when changing arithmetic or lifecycle behavior.
+Run the host suite and the device/model checks for every affected platform.
+Coding agents should also load [docs/recipes/SKILL.md](docs/recipes/SKILL.md); agents that support skills can install it as `tensorfold-contributor`.
+We review a candidate, preserve its authorship and run the release gates before landing it.
+
+## Public identity and privacy
+
+Use your approved public Git identity and GitHub noreply address.
+Keep every contributor's authorship through a port or merge; tool co-author trailers do not belong in the history.
+Keep private emails, machine names, local user paths, addresses, keys and confidential data out of source, fixtures and receipts intended for publication.
+Examples use fictional identities and reserved documentation addresses.
+Inspect the complete publication tree, outgoing history and packaged artifacts before uploading them.
+A clean diff or a passing test suite does not replace that review.
+
+## Bug reports and license
+
+Include the native version, model revision, GPU/OS, exact command, startup error and a public request that reproduces the problem.
+A token mismatch report should include both drafted and plain token hashes at the same settings.
+
+TensorFold is Apache-2.0; a contribution follows that license. See [LICENSE](LICENSE), [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Model weights keep their own licenses, and the archive retains the project's required third-party notices.

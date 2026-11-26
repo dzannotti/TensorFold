@@ -1,4 +1,4 @@
-<!-- A small pull request with a complete receipt lands fastest. -->
+<!-- Read CONTRIBUTING.md first. A small pull request with a complete receipt lands fastest. -->
 
 ## What this changes
 

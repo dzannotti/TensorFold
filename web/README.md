@@ -36,7 +36,7 @@ TensorFold Web on 8090), then `npm run build` to refresh `tensorfold_web/ui_dist
 - `ui/`: TypeScript, React and Vite, built to static files shipped inside the Python package.
 - `tests/`: pytest against a stand-in engine (`tensorfold_web/mock_engine.py`) that speaks the same HTTP as TensorFold.
 
-Sources stay at or below 600 lines. HTTP routes, engine control, benchmark modes, learning and reports are split by responsibility.
+Sources follow CONTRIBUTING's 600-line limit. HTTP routes, engine control, benchmark modes, learning and reports are split by responsibility.
 
 The opening screen is a new chat. Saved conversations live in the sidebar. Models contains My models, Discover, Learning and API; its Benchmarks button opens measurements and Compute and clusters opens a drawer. Settings has its own section list, including setup checks and version information. Existing feature links and keyboard shortcuts still work; Cmd-K opens commands and the header button hides the sidebar.
 

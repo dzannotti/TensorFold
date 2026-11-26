@@ -124,8 +124,8 @@ def main():
         ids = (tok.apply_chat_template([{"role": "user", "content": text}], tokenize=True,
                  add_generation_prompt=True, enable_thinking=False) if fixture["kind"] == "chat" else tok.encode(text))
         cases.append((fixture["name"], np.array(ids, np.uint32)))
-    text = (ROOT / "README.md").read_text()
-    cases.append(("public-readme-512", np.array(tok.encode(text)[:512], np.uint32)))
+    text = (ROOT / "CONTRIBUTING.md").read_text()
+    cases.append(("public-contribution-guide-512", np.array(tok.encode(text)[:512], np.uint32)))
     if args.long:  # public, deterministic code: the running Python's own json.decoder and argparse sources
         import inspect
         from json import decoder as json_decoder

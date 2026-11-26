@@ -12,7 +12,7 @@ This skill defines the conditions a contribution must satisfy; it does not appro
 
 Find the TensorFold checkout and its Git root before editing.
 A native checkout has `build.zig`, `.zig-version`, `zig/src/native/` and `docs/recipes/`.
-Read any AGENTS.md in the folders you touch (the app has its own), [RUNBOOK.md](../../RUNBOOK.md) and the [recipe index](README.md).
+Read any AGENTS.md in the folders you touch (the app has its own), [CONTRIBUTING.md](../../CONTRIBUTING.md), [RUNBOOK.md](../../RUNBOOK.md) and the [recipe index](README.md).
 For a GPU change, also read the complete [kernel contract](../kernel-contract.md) before choosing an implementation.
 Target `main`, the only branch, and preserve unrelated changes; a different local TensorFold checkout may be the frozen Python engine.
 
@@ -24,7 +24,7 @@ Before implementation, write a short contract in the working notes or PR draft:
 - The applicable correctness checks, performance metric and agreed acceptance threshold, including cold-prefill requirements.
 - The hardware available, required checks that cannot run there and the evidence needed from another tester.
 
-New families, backends and arithmetic changes need a maintainer-agreed gate.
+New families, backends and arithmetic changes need the maintainer-agreed gate described in CONTRIBUTING.md.
 If that gate is missing, identify the missing decision before presenting the work as ready to land.
 Do not silently lower a threshold, change its workload or replace an unavailable test with an easier one.
 The current `zig/gate.json` may have no entries; that is not permission to invent a release-wide speed target.

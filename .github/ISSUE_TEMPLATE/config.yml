@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Contributing guide
+    url: https://github.com/ashhart/TensorFold/blob/main/CONTRIBUTING.md
+    about: Build, exactness, receipts and the issue-first rule for families, backends and arithmetic.
   - name: Known issues
     url: https://github.com/ashhart/TensorFold/blob/main/docs/known-issues.md
     about: Problems we already know about, and their workarounds.

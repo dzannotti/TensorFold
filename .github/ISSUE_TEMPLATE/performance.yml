@@ -4,7 +4,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Measure before and after on the same machine, checkpoint, prompts and settings.
+        Measure before and after on the same machine, checkpoint, prompts and settings, as CONTRIBUTING.md describes.
         A suspected regression is welcome without a patch. Write "n/a" and why for a field that does not apply.
         Do not paste private paths, hostnames, tokens, keys or confidential prompts. Maintainers may relabel the issue.
   - type: dropdown

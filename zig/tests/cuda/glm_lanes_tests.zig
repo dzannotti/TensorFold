@@ -26,7 +26,7 @@ pub fn openComm(gpu: Gpu, lib: *const cuda.nccl.Library, rank: c_int, world: c_i
 
 const DcKind = struct { kind: []const u8, prompt: []const i32, want: []const i32 };
 
-/// `glm-lanes-cover`: the single-stream contracts on one Engine: drafts, cancel, discard, eos, prompt cache.
+/// `glm-lanes-cover`: CONTRIBUTING's single-stream contracts on one Engine: drafts, cancel, discard, eos, prompt cache.
 pub fn coverCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);

@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Open an issue before a new model family, backend or arithmetic change so we can agree on its gate.
+        CONTRIBUTING.md asks for an issue before a new model family, backend or arithmetic change so we can agree on its gate.
         A proposed gate is not an agreed one: the work is ready to land only after a maintainer's decision.
         Do not paste private paths, hostnames, tokens, keys or confidential prompts. Maintainers may relabel the issue.
   - type: dropdown

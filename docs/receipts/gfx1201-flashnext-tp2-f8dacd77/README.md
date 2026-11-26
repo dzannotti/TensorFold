@@ -18,7 +18,7 @@ No inference implementation changes are included.
 ## Decode
 
 `tools/bench_openai.py … --tokens 256 --reps 3 --temperatures 0` and
-`tools/bench_concurrent.py … --tokens 256 --reps 3 --temperatures 0 --levels 1,4 --alone --serial`.
+`tools/bench_concurrent.py … --tokens 256 --reps 3 --temperatures 0 --levels 1,4 --alone --serial`, as in CONTRIBUTING.md.
 
 | | this run, tp 2 | #2401's receipt, same card count, v1.2.3 |
 |---|---|---|

@@ -72,7 +72,7 @@ The headless launch used `--no-sandbox`. No comparison run established that Chro
 
 ## Next: Phase 2 entry point
 
-First PR candidate (small, reviewable, one change per PR):
+First PR candidate (small, reviewable, per CONTRIBUTING.md "one change per PR"):
 
 1. PR A: fix `owned-group.ts` Linux `comm` bug + test (bug fix, platform-neutral).
 2. PR B: shell discovery in sandbox exec paths (`/bin/zsh` → resolved shell) + test-portability skips for items 4–6.

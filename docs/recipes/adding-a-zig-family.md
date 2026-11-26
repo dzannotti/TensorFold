@@ -57,7 +57,7 @@ its own code is needed, or refuses that feature by name until the block covers i
 
 **The rules a family PR follows.**
 - Settings are read through `zig/src/platform/environment.zig`; policy switches live in `zig/src/core/profile.zig`.
-- Source files stay at or below 600 lines.
+- Source files stay at or below 600 lines ([CONTRIBUTING.md](../../CONTRIBUTING.md#lean-code-and-review)).
 - Each new or changed kernel registers with the [kernel contract](../kernel-contract.md#adding-a-kernel).
 - The served gate is the family's conformance kit profile (`tools/conformance.py`, #2467) once that lands.
 
