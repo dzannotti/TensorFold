@@ -8,21 +8,7 @@ const slice = core.nvfp4_slice;
 const threads = @import("cuda_modelopt_threads.zig");
 const fp8 = @import("cuda_fp8_experts_load.zig");
 
-pub const Cut = struct {
-    from: usize,
-    to: usize,
-
-    pub fn init(total_width: usize, world: usize, rank: usize) !Cut {
-        if (world == 0 or rank >= world or total_width == 0 or total_width % world != 0) return error.UnevenExpertSplit;
-        const part = total_width / world;
-        if (part % 32 != 0) return error.UnevenExpertSplit;
-        return .{ .from = rank * part, .to = (rank + 1) * part };
-    }
-
-    pub fn width(self: Cut) usize {
-        return self.to - self.from;
-    }
-};
+pub const Cut = @import("mxfp8_read.zig").Cut;
 
 /// A rank's routed experts at --tp: `count / world` whole ones from `first`, so every pair keeps one GPU's sums.
 pub const Experts = struct {
@@ -153,20 +139,6 @@ test "expert-parallel ranges give each rank whole experts and cover every expert
     try std.testing.expectEqual(Experts{ .first = 0, .count = 512 }, try Experts.init(512, 1, 0));
     try std.testing.expectError(error.UnevenExpertSplit, Experts.init(512, 2, 2));
     try std.testing.expectError(error.UnevenExpertSplit, Experts.init(511, 2, 0));
-}
-
-test "intermediate-channel cuts cover the source once and preserve 32-input kernel groups" {
-    const a = try Cut.init(640, 2, 0);
-    const b = try Cut.init(640, 2, 1);
-    try std.testing.expectEqual(@as(usize, 0), a.from);
-    try std.testing.expectEqual(@as(usize, 320), a.to);
-    try std.testing.expectEqual(a.to, b.from);
-    try std.testing.expectEqual(@as(usize, 640), b.to);
-    try std.testing.expectEqual(a.width(), b.width());
-    try std.testing.expectError(error.UnevenExpertSplit, Cut.init(640, 0, 0));
-    try std.testing.expectError(error.UnevenExpertSplit, Cut.init(640, 2, 2));
-    try std.testing.expectError(error.UnevenExpertSplit, Cut.init(640, 3, 0));
-    try std.testing.expectError(error.UnevenExpertSplit, Cut.init(640, 32, 0));
 }
 
 pub fn packedBytes(n: usize, k: usize, parts: usize) !usize {
