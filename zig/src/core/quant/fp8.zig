@@ -5,6 +5,7 @@ const convert = @import("convert.zig");
 
 const Tensor = types.Tensor;
 const Why = @import("../modelopt.zig").Why;
+const refuse = @import("../modelopt.zig").refuse;
 
 /// Rows and columns one scale_inv entry covers.
 pub const block = 128;
@@ -97,13 +98,9 @@ fn checked(store: anytype, module: []const u8, tail: []const u8, dtype: types.DT
     const t = try store.get(name);
     const size = std.math.mul(usize, shape[0], shape[1]) catch return error.UnexpectedTensor;
     if (t.is(dtype, shape) and t.bytes.len == size * dtype.size()) return t;
-    var own: Why = .{};
-    const w = why orelse &own;
-    if (t.is(dtype, shape)) {
-        w.set("{s}: {d} bytes, {t} {any} needs {d}", .{ name, t.bytes.len, dtype, shape, size * dtype.size() });
-    } else w.set("{s}: {t} {any}, expected {t} {any}", .{ name, t.dtype, t.shape[0..t.rank], dtype, shape });
-    if (why == null) std.log.err("{s}", .{w.text()});
-    return error.UnexpectedTensor;
+    if (t.is(dtype, shape))
+        return refuse(why, error.UnexpectedTensor, "{s}: {d} bytes, {t} {any} needs {d}", .{ name, t.bytes.len, dtype, shape, size * dtype.size() });
+    return refuse(why, error.UnexpectedTensor, "{s}: {t} {any}, expected {t} {any}", .{ name, t.dtype, t.shape[0..t.rank], dtype, shape });
 }
 
 /// `scale_inv` as f32 into `out`: exact (f32 bit for bit), an f16 NaN stays a NaN; `finite` refuses NaN and infinity.

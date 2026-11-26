@@ -7,11 +7,7 @@ const Why = @import("../modelopt.zig").Why;
 const Tensor = types.Tensor;
 const testing = std.testing;
 
-fn tensor(dtype: types.DType, shape: []const usize, bytes: []const u8) Tensor {
-    var t: Tensor = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .bytes = bytes };
-    @memcpy(t.shape[0..shape.len], shape);
-    return t;
-}
+const tensor = types.view;
 
 /// A store of named tensors, as safetensors maps, Drama 3's shards and the Flash-Next weight store answer `get`.
 const Store = struct {

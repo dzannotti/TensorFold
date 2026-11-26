@@ -74,6 +74,15 @@ pub const Why = struct {
     }
 };
 
+/// `err`, its reason kept in `why`, or logged when the caller passed none.
+pub fn refuse(why: ?*Why, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
+    var own: Why = .{};
+    const w = why orelse &own;
+    w.set(fmt, args);
+    if (why == null) std.log.err("{s}", .{w.text()});
+    return err;
+}
+
 /// config.json's quantization_config (top level, else text_config's) checked as ModelOpt NVFP4.
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *Why) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);

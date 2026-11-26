@@ -28,6 +28,13 @@ pub fn join(buf: []u8, parts: []const []const u8) []const u8 {
     return buf[0..n];
 }
 
+/// A tensor of `dtype` and `shape` over `bytes`, borrowed.
+pub fn view(dtype: DType, shape: []const usize, bytes: []const u8) Tensor {
+    var t: Tensor = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .bytes = bytes };
+    @memcpy(t.shape[0..shape.len], shape);
+    return t;
+}
+
 /// A tensor the loader refuses, logged under its key.
 pub fn refuse(key: []const u8, what: []const u8) error{UnexpectedTensor} {
     std.log.err("{s}: {s}", .{ key, what });
