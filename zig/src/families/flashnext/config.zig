@@ -6,6 +6,8 @@ const rope_config = @import("rope_config");
 pub const Kind = enum { linear_attention, sparse_attention };
 pub const Gate = enum { sigmoid, silu };
 pub const max_layers = 512;
+/// The checkpoint's quantization: MLX affine at one declared width, or ModelOpt mixed precision (FP4-Local).
+pub const Format = union(enum) { mlx: affine.Spec, modelopt };
 pub const Mtp = struct { layers: usize = 0, kinds: [16]Kind = @splat(.sparse_attention), hybrid: bool = false, dedicated_embeddings: bool = false, source_layer: ?usize = null, rope_theta: f64 = 10_000_000 };
 
 pub const Config = struct {
@@ -54,7 +56,7 @@ pub const Config = struct {
     mrope_section: [3]usize,
     eos: [16]u32 = @splat(0),
     eos_count: usize = 0,
-    global_affine: affine.Spec,
+    format: Format,
     /// A widths.Widths set by a tensor reader; widths.quantization reads it, so this file imports no core.
     widths: ?*const anyopaque = null,
 
@@ -64,11 +66,28 @@ pub const Config = struct {
     }
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) !Config {
+        return readAs(gpa, io, directory, false);
+    }
+
+    /// `read`, a ModelOpt checkpoint admitted too (`parseAny`).
+    pub fn readAny(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) !Config {
+        return readAs(gpa, io, directory, true);
+    }
+
+    fn readAs(gpa: std.mem.Allocator, io: std.Io, directory: []const u8, modelopt: bool) !Config {
         const path = try std.fs.path.join(gpa, &.{ directory, "config.json" });
         defer gpa.free(path);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
         defer gpa.free(bytes);
-        return parse(gpa, bytes);
+        return parseAs(gpa, bytes, modelopt);
+    }
+
+    /// The MLX affine width every matrix declares unless overridden; a ModelOpt checkpoint has none.
+    pub fn affineSpec(c: *const Config) !affine.Spec {
+        return switch (c.format) {
+            .mlx => |s| s,
+            .modelopt => error.NotAffineCheckpoint,
+        };
     }
 
     pub fn wide(c: *const Config) !usize {
@@ -100,12 +119,13 @@ pub const Config = struct {
     pub fn declared(c: *const Config, path: []const u8, canonical: *const fn ([]const u8) []const u8) !?affine.Spec {
         const wanted = canonical(path);
         var found = false;
-        var answer: ?affine.Spec = c.global_affine;
+        const global = try c.affineSpec();
+        var answer: ?affine.Spec = global;
         var it = c.quant.iterator();
         while (it.next()) |item| {
             if (!std.mem.eql(u8, canonical(item.key_ptr.*), wanted)) continue;
             const candidate: ?affine.Spec = switch (item.value_ptr.*) {
-                .bool => |enabled| if (enabled) c.global_affine else null,
+                .bool => |enabled| if (enabled) global else null,
                 .object => |value| if (value.count() == 0) null else try spec(value, 4),
                 else => return error.InvalidAffineOverride,
             };
@@ -192,7 +212,22 @@ fn quantBlock(root: std.json.ObjectMap, text: std.json.ObjectMap) !std.json.Obje
     return error.MissingAffineConfig;
 }
 
+/// An MLX affine checkpoint's config; any other quant_method is refused.
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
+    return parseAs(gpa, bytes, false);
+}
+
+/// `parse`, a ModelOpt quantization_config admitted as `.modelopt` (its recipes are the backend's to check).
+pub fn parseAny(gpa: std.mem.Allocator, bytes: []const u8) !Config {
+    return parseAs(gpa, bytes, true);
+}
+
+fn isModelopt(quant: std.json.ObjectMap) bool {
+    const v = quant.get("quant_method") orelse return false;
+    return v == .string and std.mem.eql(u8, v.string, "modelopt");
+}
+
+fn parseAs(gpa: std.mem.Allocator, bytes: []const u8, admit_modelopt: bool) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     errdefer parsed.deinit();
     const root = try object(parsed.value);
@@ -200,7 +235,8 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const tag = root.get("model_type") orelse text.get("model_type") orelse return error.MissingFlashField;
     if (tag != .string or !std.mem.eql(u8, tag.string, "qwen4_exp")) return error.NotFlashNext;
     const quant = try quantBlock(root, text);
-    if (quant.get("quant_method")) |v| if (v != .null and (v != .string or (!std.mem.eql(u8, v.string, "mlx") and !std.mem.eql(u8, v.string, "affine")))) return error.UnsupportedAffineMode;
+    const modelopt = admit_modelopt and isModelopt(quant);
+    if (!modelopt) if (quant.get("quant_method")) |v| if (v != .null and (v != .string or (!std.mem.eql(u8, v.string, "mlx") and !std.mem.eql(u8, v.string, "affine")))) return error.UnsupportedAffineMode;
     const rope = (rope_config.params(text) catch return error.InvalidFlashConfig) orelse std.json.ObjectMap.empty;
     // `--context` sets Metal's YaRN factor, never the config
     if (rope_config.scaled(text, rope)) |key| {
@@ -255,7 +291,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .mtp = try mtpConfig(text),
         .mrope_interleaved = try boolean(rope, "mrope_interleaved", true),
         .mrope_section = .{ 11, 11, 10 },
-        .global_affine = try spec(quant, null),
+        .format = if (modelopt) .modelopt else .{ .mlx = try spec(quant, null) },
     };
     if (c.layers > max_layers or c.heads % c.kv_heads != 0 or c.value_heads % c.key_heads != 0 or c.topk > c.experts) return error.InvalidFlashShape;
     if (c.conv < 2 or c.hc_count == 0 or c.hc_lowrank == 0 or c.index_ratio == 0 or c.index_heads == 0 or c.index_kv_heads == 0 or c.index_heads % c.index_kv_heads != 0 or c.index_dim == 0 or c.index_budget == 0 or c.index_budget % c.index_ratio != 0) return error.InvalidFlashShape;

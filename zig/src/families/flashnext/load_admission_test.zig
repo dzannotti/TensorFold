@@ -26,8 +26,8 @@ test "Flash Next load admits a four-bit group-32 checkpoint without touching any
     defer a.free(bytes);
     var metadata = try config.parse(a, bytes);
     defer metadata.deinit();
-    try std.testing.expectEqual(@as(u8, 4), metadata.global_affine.bits);
-    try std.testing.expectEqual(@as(usize, 32), metadata.global_affine.group);
+    try std.testing.expectEqual(@as(u8, 4), metadata.format.mlx.bits);
+    try std.testing.expectEqual(@as(usize, 32), metadata.format.mlx.group);
     const dir = try fixture(tmp, bytes, checked_index);
     defer a.free(dir);
     try admission.check(a, io, dir);
