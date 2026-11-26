@@ -41,7 +41,12 @@ pub const Arg = extern struct {
     fp16: c_int,
     route: Routing = .{},
     out16: u64 = 0,
+    global: u64 = 0,
+    global_layout: GlobalLayout = .none,
 };
+
+/// quant/mlx.hpp's GlobalLayout: what `Arg.global` holds.
+pub const GlobalLayout = enum(c_int) { none = 0, tensor = 1, expert = 2, expert_pair = 3 };
 
 pub const StreamSides = stream_layout.StreamSides;
 
@@ -49,7 +54,7 @@ pub const StreamSides = stream_layout.StreamSides;
 pub const Side = struct { words: u64, scale: u64, bias: u64, n: c_int, out: u64 };
 
 comptime {
-    std.debug.assert(@sizeOf(GroupTable) == 16 and @sizeOf(Routing) == 32 and @sizeOf(Arg) == 120 and @sizeOf(StreamSides) == 184);
+    std.debug.assert(@sizeOf(GroupTable) == 16 and @sizeOf(Routing) == 32 and @sizeOf(Arg) == 136 and @sizeOf(StreamSides) == 184);
 }
 
 /// Everything a launch needs beside the kernels.

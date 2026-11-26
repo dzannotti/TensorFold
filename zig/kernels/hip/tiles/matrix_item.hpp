@@ -47,7 +47,7 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
             return KpRows{row, row + R * CB + 1, row + R * CB + 1 + R + 1, row + R * CB + 1 + R + 1 + CB + 1};
         };
         // The 8 waves walk the block's columns side by side, CB a lane set a pass, R rows of the item a pass.
-        const int span = CB * (32 / kp_lanes(a.k / a.group));
+        const int span = CB * (32 / kp_lanes(a.k / Dec::fold_k(a)));
         const int end = n0 + kGemmN < a.n ? n0 + kGemmN : a.n;
         for (int colw = n0 + wave * span; colw < end; colw += 8 * span) {
             gemm_kp_wave<Dec, Act, typename Few::Dot, typename Few::Epi, CB, R, true>(a, colw, 0, R, lds);
@@ -56,9 +56,10 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
         return;
     }
     const int words_row = Dec::template row_words<int>(a);
-    const int groups = a.k / a.group;
+    const int fold = Dec::fold_k(a);
+    const int groups = a.k / fold;
     const int stages = a.k / kGemmK;
-    const int per = a.group / kGemmK;
+    const int per = fold / kGemmK;
     const int rows_left = a.m - m0;
     const int line = tid & (kGemmN - 1);
     const int side = __builtin_amdgcn_readfirstlane(tid >> 7);
@@ -78,12 +79,15 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
     uint32_t wreg[2][Dec::kWords];
     u32x4 xreg[4];
     typename Dec::Term term[2];
+    typename Dec::Stage stage[2];
     float run = 0.f;
     auto fetch = [&](int st0) {
         const int st1 = st0 + 1 < stages ? st0 + 1 : stages - 1;
         const int st = st0 < stages ? st0 : stages - 1;
         Dec::template load<true>(wsrc + st * Dec::kWords, wreg[0]);
         Dec::template load<true>(wsrc + st1 * Dec::kWords, wreg[1]);
+        stage[0] = Dec::term_stage(a, col_s, st);
+        stage[1] = Dec::term_stage(a, col_s, st1);
         const int sx_ = xhalf ? st1 : st;
         if (xlive) {
 #pragma unroll
@@ -102,7 +106,7 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
 #pragma unroll
                 for (int h = 0; h < 4; ++h) {
                     const int t = S * 16 + v * 8 + h * 2;
-                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t));
+                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t, stage[J]));
                 }
                 dst[v] = u32x4{d[0], d[1], d[2], d[3]};
             }
@@ -115,7 +119,7 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
         }
         if (side == 0 && st % per == per - 1) {
             sc[(st / per) % 3][line] = Dec::scale_value(a, term[J]);
-            bi[(st / per) % 3][line] = Dec::bias_value(a, term[J]);
+            if constexpr (Dec::kBias) bi[(st / per) % 3][line] = Dec::bias_value(a, term[J]);
         }
     };
     auto sumx = [&](int st, int buf) {
@@ -161,7 +165,9 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
     __syncthreads();
     auto step = [&]<int P>(std::integral_constant<int, P>, int s) {
         constexpr int cur = P;
-        if (s > 0 && (s - 1) % per == per - 1) apply_bias(((s - 1) / per) % 3, ((s - 1) / per) & 1);
+        if constexpr (Dec::kBias) {
+            if (s > 0 && (s - 1) % per == per - 1) apply_bias(((s - 1) / per) % 3, ((s - 1) / per) & 1);
+        }
         if constexpr (P == 1) fetch(s + 1);
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
@@ -183,7 +189,9 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
                 for (int i = 0; i < 8; ++i) acc[mt][i] = Dec::fold_scale(acc[mt][i], d[mt][i], scale);
             }
         }
-        if (sums) sumx(s, cur);
+        if constexpr (Dec::kBias) {
+            if (sums) sumx(s, cur);
+        }
         stash(std::integral_constant<int, P ^ 1>{}, s + 1, cur ^ 1);
         __syncthreads();
     };
@@ -191,7 +199,9 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
         step(std::integral_constant<int, 0>{}, s);
         if (s + 1 < stages) step(std::integral_constant<int, 1>{}, s + 1);
     }
-    if ((stages - 1) % per == per - 1) apply_bias(((stages - 1) / per) % 3, ((stages - 1) / per) & 1);
+    if constexpr (Dec::kBias) {
+        if ((stages - 1) % per == per - 1) apply_bias(((stages - 1) / per) % 3, ((stages - 1) / per) & 1);
+    }
     const int col = n0 + cw + rl;
     if (col >= a.n) return;
 #pragma unroll
@@ -199,7 +209,7 @@ __device__ __forceinline__ void wmma_item_tile(typename Dec::Args& a) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int row = m0 + mt * 16 + 2 * i + rh;
-            if (row < a.m) Epi::store(a, row, col, acc[mt][i]);
+            if (row < a.m) Epi::store(a, row, col, Dec::output(a, col, acc[mt][i]));
         }
     }
 #else

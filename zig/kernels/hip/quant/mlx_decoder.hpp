@@ -24,6 +24,12 @@ struct MlxDecoder {
     // A bias a group: the tiles sum x and fold the bias with it.
     static constexpr bool kBias = true;
 
+    // The prompt tiles fold a dot into the sums every group of K, decode codes with no stage term, apply no global.
+    __device__ static int fold_k(const Args& a) { return a.group; }
+    struct Stage {};
+    __device__ static Stage term_stage(const Args&, long long, int) { return {}; }
+    __device__ static float output(const Args&, int, float v) { return v; }
+
     // ---- the plan: a routed item's expert and rows ----
 
     __device__ static bool take_item(Args& a, int z) { return tf::rocm::take_item(a, z); }
@@ -90,7 +96,7 @@ struct MlxDecoder {
 
     // Codes t and t + 1 of a chunk, in order, as a pair.
     template <typename T>
-    __device__ static typename T::pair pair(const uint32_t (&w)[BITS], int t) {
+    __device__ static typename T::pair pair(const uint32_t (&w)[BITS], int t, Stage) {
         return pair_of<T>(piece_bits<BITS>(w, t), piece_bits<BITS>(w, t + 1));
     }
 
@@ -190,8 +196,8 @@ struct MlxDecoder {
     }
 
     // Pair I of the chunk's codes as the activation type's pair (the codes are below 256, exact in both types).
-    template <typename T, int I>
-    __device__ static typename T::pair stream_pair(const uint32_t (&w)[BITS]) {
+    template <typename T, int I, class Raw>
+    __device__ static typename T::pair stream_pair(const uint32_t (&w)[BITS], const Raw&) {
         constexpr int low = lo<I>();
         constexpr int high = low + gap();
         uint32_t bits;
@@ -217,6 +223,7 @@ struct MlxDecoder {
     struct StreamTerms {
         const unsigned short* scale;
         const unsigned short* bias;
+        long long groups;
         bool half;
 
         struct Raw {
@@ -227,10 +234,15 @@ struct MlxDecoder {
         __device__ explicit StreamTerms(const Args& a)
             : scale(static_cast<const unsigned short*>(a.scale.p)),
               bias(static_cast<const unsigned short*>(a.bias.p)),
+              groups(a.k / a.group),
               half(a.scale.kind == kScaleF16) {}
 
-        __device__ unsigned short scale_raw(long long at) const { return scale[at]; }
-        __device__ unsigned short bias_raw(long long at) const { return bias[at]; }
+        // The first entry of column `col`'s terms; chunk q's are entry q >> gshift past it.
+        __device__ long long row(long long col) const { return col * groups; }
+        __device__ Raw raw(long long base, int q, int gshift) const {
+            const long long at = base + (q >> gshift);
+            return {scale[at], bias[at]};
+        }
 
         __device__ float widen(unsigned short v) const {
             return half ? __half2float(__ushort_as_half(v)) : __uint_as_float(static_cast<uint32_t>(v) << 16);
