@@ -116,8 +116,7 @@ The publishing repository must allow Actions to write packages and make the GHCR
 - `zig build test-golden` checks frozen parity answers and the HTTP security cases.
 
 [CI](../.github/workflows/no-gpu.yml) runs these on Linux and Windows for every pull request, with the root pytest on
-Linux. GPU kernel and served-model checks run on the maintainers' Macs and NVIDIA machines before a change lands;
-[CONTRIBUTING.md](../CONTRIBUTING.md) lists those gates.
+Linux. GPU kernel and served-model checks run on the maintainers' Macs and NVIDIA machines before a change lands.
 
 ## Check exactness yourself
 

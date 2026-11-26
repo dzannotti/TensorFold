@@ -72,8 +72,8 @@ def main():
         ids = (tok.apply_chat_template([{"role": "user", "content": text}], tokenize=True,
                  add_generation_prompt=True) if fixture["kind"] == "chat" else tok.encode(text))
         cases.append((fixture["name"], np.array(ids, np.uint32)))
-    text = (ROOT / "CONTRIBUTING.md").read_text()
-    cases.append(("public-contribution-guide-512", np.array(tok.encode(text)[:512], np.uint32)))
+    text = (ROOT / "README.md").read_text()
+    cases.append(("public-readme-512", np.array(tok.encode(text)[:512], np.uint32)))
     text = (ROOT / "CHANGELOG.md").read_text()
     cases.append(("public-changelog-2048", np.array(tok.encode(text)[:2048], np.uint32)))
     report = dict(mlx=importlib.metadata.version("mlx"), mlx_lm=importlib.metadata.version("mlx-lm"), fixtures=[])

@@ -13,7 +13,7 @@ TensorFold serves language models from a Zig binary on Apple Silicon and NVIDIA 
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.
 
-Building with a coding agent? Have it load the [contributor skill](docs/recipes/SKILL.md) and follow [CONTRIBUTING.md](CONTRIBUTING.md#contributing-with-agents).
+Building with a coding agent? Have it load the [contributor skill](docs/recipes/SKILL.md).
 
 ## Quick start
 
@@ -87,7 +87,6 @@ See [the chat command](docs/chat.md) for its flags and the serve flags it passes
 - [Claude Code](docs/claude-code.md): point it at a local server, name its model, and keep its prompt prefix cacheable.
 - [Evaluating TensorFold](docs/evaluating.md) and [community benchmarks](docs/community-benchmarks.md).
 - [Usable memory profiles](docs/memory-profiling.md): how to record applied budgets, context, cache state and process peaks.
-- [Contributing](CONTRIBUTING.md): ATC and agents, builds, tests and the exactness and performance gates.
 - [Changes](CHANGELOG.md), [1.0.0 release notes](docs/release-notes-1.0.0.md) and [the Zig engine preview](docs/zig-preview.md).
 - TensorFold is Apache-2.0: [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [SECURITY.md](SECURITY.md).
 

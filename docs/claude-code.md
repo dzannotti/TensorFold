@@ -15,7 +15,7 @@ tensorfold serve /path/to/checkpoint --name local-model --context 65536 --host 1
 
 The [API guide](api.md#anthropic-messages) lists the Messages routes, their fields and their refusals. Structured
 output and a required tool call need `libtfgrammar`: the release archives include it under `lib/`, and a source build
-gets it with `zig build grammar -Dxgrammar=DIR` ([clone](../CONTRIBUTING.md#build-and-host-tests)). Without it, a request
+gets it with `zig build grammar -Dxgrammar=DIR`. Without it, a request
 that needs the library is refused with HTTP 400 and names it.
 
 ## Point Claude Code at the server

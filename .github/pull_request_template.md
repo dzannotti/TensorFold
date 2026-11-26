@@ -1,4 +1,4 @@
-<!-- Read CONTRIBUTING.md first. A small pull request with a complete receipt lands fastest. -->
+<!-- A small pull request with a complete receipt lands fastest. -->
 
 ## What this changes
 
@@ -6,7 +6,6 @@
 
 - Issue: <!-- "Fixes #N" when this completes it, "Refs #N" for part of it, or "n/a" and why. A new family, backend or arithmetic change links the issue where its gate was agreed. -->
 - Stacked on: <!-- "main", or the parent pull request and the commits this one adds. -->
-- `atc overlap --json`: <!-- The result against main, and how each conflict was resolved. -->
 
 ## Checks on this head
 

@@ -57,7 +57,7 @@ All checked on 1.0.7.
   native binary needs no `service` command for us (this answers the earlier question).
 - **Receipts:** the M6 receipt for Nemotron (1.0.2, exact, 85 to 108 tok/s with drafts); the Living Weights trials on
   two GB10; KL 0 between drafts on and off on a GB10, worth
-  saying in the README. Bench writes JSON receipts; we follow CONTRIBUTING's format unless Ash prefers another.
+  saying in the README. Bench writes JSON receipts; we keep the existing format unless Ash prefers another.
 - **What works:** `/v1/models`, streamed chat, OpenAI tool calls, Anthropic Messages with `tool_use`, Responses
   without that include; checked with Open WebUI, AnythingLLM, Claude Code and OpenCode.
 
