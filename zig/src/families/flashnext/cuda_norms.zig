@@ -4,15 +4,22 @@ const std = @import("std");
 pub fn offset(comptime layers_n: usize, input: [layers_n]f64) !f32 {
     comptime std.debug.assert(layers_n >= 2 and layers_n % 2 == 0);
     var means = input;
+    return offsetOf(&means);
+}
+
+/// `offset` over a runtime count of layer means, sorted in place; an odd count takes the middle mean.
+pub fn offsetOf(means: []f64) !f32 {
+    if (means.len == 0) return error.InvalidNormConvention;
     var above: usize = 0;
     for (means) |mean| {
         if (!std.math.isFinite(mean)) return error.InvalidNormConvention;
         if (mean > 0.5) above += 1;
     }
-    std.mem.sort(f64, &means, {}, std.sort.asc(f64));
-    const median = (means[layers_n / 2 - 1] + means[layers_n / 2]) / 2;
-    if (above * 10 >= layers_n * 9 and median >= 0.75 and median <= 1.5) return 0;
-    if (above * 10 <= layers_n and median >= -0.5 and median <= 0.25) return 1;
+    std.mem.sort(f64, means, {}, std.sort.asc(f64));
+    const n = means.len;
+    const median = if (n % 2 == 0) (means[n / 2 - 1] + means[n / 2]) / 2 else means[n / 2];
+    if (above * 10 >= n * 9 and median >= 0.75 and median <= 1.5) return 0;
+    if (above * 10 <= n and median >= -0.5 and median <= 0.25) return 1;
     return error.InvalidNormConvention;
 }
 
@@ -24,4 +31,6 @@ test "centered and direct norms have distinct offsets; mixed and nonfinite conve
     try std.testing.expectError(error.InvalidNormConvention, offset(48, mixed));
     mixed[0] = std.math.nan(f64);
     try std.testing.expectError(error.InvalidNormConvention, offset(48, mixed));
+    var odd = [_]f64{ 1.0, 0.9, 1.1 };
+    try std.testing.expectEqual(@as(f32, 0), try offsetOf(&odd));
 }

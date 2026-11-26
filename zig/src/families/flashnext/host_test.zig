@@ -25,8 +25,8 @@ test "pinned public FlashNext config preserves MTP EOS and indexer declarations"
     try std.testing.expectEqualSlices(u32, &.{ 248046, 248044 }, c.eos[0..c.eos_count]);
     try std.testing.expectEqualSlices(usize, &.{ 11, 11, 10 }, &c.mrope_section);
     try std.testing.expect(c.mrope_interleaved);
-    try std.testing.expectEqual(@as(u8, 6), c.global_affine.bits);
-    try std.testing.expectEqual(@as(usize, 32), c.global_affine.group);
+    try std.testing.expectEqual(@as(u8, 6), c.format.mlx.bits);
+    try std.testing.expectEqual(@as(usize, 32), c.format.mlx.group);
 }
 
 test "pinned public MTP and rotary metadata cannot be silently discarded" {
@@ -122,7 +122,7 @@ test "module quantization preserves false true and dictionary-default override s
     try std.testing.expectEqual(@as(u8, 6), (try widths.quantization(&c, "layers.0.inherit")).?.bits);
     try std.testing.expectEqual(@as(usize, 32), (try widths.quantization(&c, "unknown.projection")).?.group);
     try std.testing.expect(widths.launched(.{ .bits = override.bits, .group = @intCast(override.group) }));
-    try std.testing.expect(widths.launched(.{ .bits = c.global_affine.bits, .group = @intCast(c.global_affine.group) }));
+    try std.testing.expect(widths.launched(.{ .bits = c.format.mlx.bits, .group = @intCast(c.format.mlx.group) }));
     try std.testing.expect(!widths.launched(.{ .bits = 7, .group = 64 }) and !widths.launched(.{ .bits = 4, .group = 16 }));
 }
 

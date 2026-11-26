@@ -5,7 +5,8 @@ const lanes = @import("lanes");
 const config = @import("../config.zig");
 const index = @import("../index.zig");
 const plan = @import("plan.zig");
-const Spec = @import("../spec.zig").Spec;
+const modelopt_admit = @import("modelopt_admit.zig");
+const Why = @import("core").modelopt.Why;
 const Engine = @import("engine.zig").Engine;
 const cache = @import("cache.zig");
 const lanes_mod = @import("lanes.zig");
@@ -49,7 +50,7 @@ fn gibs(bytes: u64) f64 {
 
 /// The checkpoint's verdict: its format and tensors, and whether a rank's share and one stream fit `room`.
 pub const Verdict = struct {
-    spec: Spec,
+    format: config.Format,
     weights: u64,
     host: u64,
     /// The longest window one stream may hold beside the weights and scratch.
@@ -59,14 +60,24 @@ pub const Verdict = struct {
 
 /// Admits `c` with the index text `index_json` on rank `rank` of `world` at `window` positions in `room` bytes.
 pub fn admit(a: std.mem.Allocator, gpa: std.mem.Allocator, c: *const config.Config, index_json: []const u8, world: u32, rank: u32, window: u64, room: u64, problem: *[]const u8) Refused!Verdict {
-    const spec = c.global_affine;
-    if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
-    _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
-    const w = plan.weights(c, spec, world) catch |err| return refuse(a, problem, "--tp {d} does not split Flash Next's heads, experts and vocabulary evenly ({s})", .{ world, @errorName(err) });
+    const recipe = switch (c.format) {
+        .mlx => |spec| r: {
+            if (spec.group != 32) return refuse(a, problem, "Flash Next on HIP reads group-32 MLX affine checkpoints; this one has groups of {d}", .{spec.group});
+            _ = index.admit(gpa, index_json, c) catch |err| return refuse(a, problem, "the checkpoint's index lacks a Flash Next tensor ({s})", .{@errorName(err)});
+            break :r plan.mlx(spec);
+        },
+        .modelopt => r: {
+            if (modelopt_admit.mismatch(c)) |field| return refuse(a, problem, "config.json's {s} differs from the Flash Next FP4-Local layout the HIP engine reads", .{field});
+            var why: Why = .{};
+            _ = modelopt_admit.admitIndex(gpa, index_json, c, &why) catch |err| return refuse(a, problem, "the FP4-Local index is refused ({s}): {s}", .{ @errorName(err), why.text() });
+            break :r plan.fp4_local;
+        },
+    };
+    const w = plan.weightsOf(c, recipe, world) catch |err| return refuse(a, problem, "--tp {d} does not split Flash Next's heads, experts and vocabulary evenly ({s})", .{ world, @errorName(err) });
     const token = plan.tokenBytes(c, world, 2) catch return refuse(a, problem, "Flash Next's layer types are unreadable", .{});
     const stream = plan.streamBytes(c, world) catch return refuse(a, problem, "Flash Next's DeltaNet heads do not split over --tp {d}", .{world});
     const most = plan.Fit.window(room, w.device(rank), scratch_bytes, token, stream);
-    return .{ .spec = spec, .weights = w.device(rank), .host = w.host, .most = most, .fits = most >= window };
+    return .{ .format = c.format, .weights = w.device(rank), .host = w.host, .most = most, .fits = most >= window };
 }
 
 fn readIndex(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 {
@@ -94,19 +105,41 @@ fn check(
     o: anytype,
     problem: *[]const u8,
 ) Refused!void {
-    var c = config.Config.read(gpa, io, dir) catch |err| return refuse(a, problem, "{s} is not a Flash Next checkpoint the HIP engine reads ({s})", .{ dir, @errorName(err) });
+    var c = config.Config.readAny(gpa, io, dir) catch |err| return refuse(a, problem, "{s} is not a Flash Next checkpoint the HIP engine reads ({s})", .{ dir, @errorName(err) });
     defer c.deinit();
     const text = readIndex(a, io, dir) catch |err| return refuse(a, problem, "cannot read {s}/model.safetensors.index.json ({s})", .{ dir, @errorName(err) });
     const bytes = cardRoom(gpa, io, dev) catch |err| return refuse(a, problem, "the native HIP engine cannot read the GPU's memory ({s})", .{@errorName(err)});
     const v = admit(a, gpa, &c, text, o.world, o.rank, o.window, bytes, problem) catch |err| return err;
+    try unloaded(a, v, problem);
+    var label: [16]u8 = undefined;
     if (!v.fits) return refuse(
         a,
         problem,
-        "Flash Next {d}-bit on {d} rank(s) holds {d:.2} GiB of weights a rank " ++
+        "Flash Next {s} on {d} rank(s) holds {d:.2} GiB of weights a rank " ++
             "({d:.1} GiB of n-gram tables in host memory) and {d:.1} GiB of scratch, " ++
             "of the {d:.2} GiB this card grants: a {d}-token window does not fit (at most {d}); " ++
             "lower --context, add ranks (--tp), or use a lower-bit checkpoint",
-        .{ v.spec.bits, o.world, gibs(v.weights), gibs(v.host), gibs(scratch_bytes), gibs(bytes), o.window, v.most },
+        .{ formatName(&label, v.format), o.world, gibs(v.weights), gibs(v.host), gibs(scratch_bytes), gibs(bytes), o.window, v.most },
+    );
+}
+
+/// "4-bit" for an MLX checkpoint, "FP4-Local" for the ModelOpt one.
+fn formatName(buf: []u8, f: config.Format) []const u8 {
+    return switch (f) {
+        .mlx => |s| std.fmt.bufPrint(buf, "{d}-bit", .{s.bits}) catch unreachable,
+        .modelopt => "FP4-Local",
+    };
+}
+
+/// FP4-Local is admitted and sized, but no HIP loader reads its weights yet: refused by name, before any upload.
+fn unloaded(a: std.mem.Allocator, v: Verdict, problem: *[]const u8) Refused!void {
+    if (v.format != .modelopt) return;
+    return refuse(
+        a,
+        problem,
+        "Flash Next FP4-Local on HIP needs {d:.2} GiB of weights a rank (its {d:.1} GiB n-gram table read from disk), " ++
+            "but this build does not load FP4-Local weights on HIP yet",
+        .{ gibs(v.weights), gibs(v.host) },
     );
 }
 
@@ -372,4 +405,20 @@ test "admission: on two W7800s the 3-bit checkpoint takes the model's window and
     try std.testing.expect(three.fits);
     try std.testing.expect(!four.fits and four.most >= 65536);
     try std.testing.expect(four.weights > three.weights and four.host > three.host);
+}
+
+test "admission: FP4-Local's n-gram table stays on disk; --ple-on-ssd and the other SSD placements are refused on HIP" {
+    const o: @import("engine_api").Open = .{ .dir = "", .model_type = model_type, .ple_on_ssd = true };
+    try std.testing.expect(o.fsrRefusal("hip") != null);
+}
+
+test "admission: an admitted FP4-Local checkpoint is refused by name until HIP loads its weights" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var problem: []const u8 = "";
+    const v: Verdict = .{ .format = .modelopt, .weights = 76 << 30, .host = 26 << 30, .most = 4096, .fits = true };
+    try std.testing.expectError(error.Refused, unloaded(arena.allocator(), v, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "does not load FP4-Local weights") != null);
+    var label: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("4-bit", formatName(&label, .{ .mlx = try @import("../spec.zig").Spec.init(4, 32) }));
 }

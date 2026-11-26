@@ -1,6 +1,7 @@
 //! Flash Next's tensors as the HIP loader reads them: names, shapes and centred norm storage.
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const norms = @import("../cuda_norms.zig");
 
 /// Every text tensor's prefix (the vision tower's sit outside it).
 pub const root = "language_model.";
@@ -48,6 +49,12 @@ pub const moe = struct {
         "mlp.switch_mlp.up_proj",
         "mlp.switch_mlp.down_proj",
     };
+    /// A ModelOpt checkpoint's routed experts, one module each: `{stem}.mlp.experts.{e}.{part}`.
+    pub const expert_parts = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
+
+    pub fn expert(buf: []u8, layer_stem: []const u8, e: usize, part: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}.mlp.experts.{d}.{s}", .{ layer_stem, e, part });
+    }
 };
 
 /// The Gated DeltaNet block under a layer's stem.
@@ -137,20 +144,11 @@ pub fn shape(c: *const Config, suffix: []const u8) !?Shape {
     return null;
 }
 
-/// Gamma (true) or gamma - 1 stored, from the layers' attention hc norm means: under 8 say zero, a mix is refused.
+/// Gamma (true) or gamma - 1 stored, from the layers' attention hc norm means (cuda_norms' rule): under 8 say zero.
 pub fn normsAroundOne(means: []f64) !bool {
     if (means.len < 8) return false;
-    var above: usize = 0;
-    for (means) |m| {
-        if (m > 0.5) above += 1;
-    }
-    std.mem.sort(f64, means, {}, std.sort.asc(f64));
-    const median = means[means.len / 2];
-    const share = @as(f64, @floatFromInt(above)) / @as(f64, @floatFromInt(means.len));
-    const around_one = share >= 0.9 and 0.75 <= median and median <= 1.5;
-    const around_zero = share <= 0.1 and -0.5 <= median and median <= 0.25;
-    if (!around_one and !around_zero) return error.AmbiguousNormStorage;
-    return around_one;
+    const offset = norms.offsetOf(means) catch return error.AmbiguousNormStorage;
+    return offset == 0;
 }
 
 /// A centred norm's scale from its stored value: 1 + w, w the stored value less one when gamma is stored.

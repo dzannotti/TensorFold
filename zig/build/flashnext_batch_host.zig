@@ -18,7 +18,8 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
     const modelopt_core = @import("h3_host.zig").coreModule(b, b.graph.host);
     const modelopt = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/modelopt_host_test.zig"), .target = b.graph.host, .link_libc = true, .imports = &.{.{ .name = "core", .module = modelopt_core }} });
     const modelopt_run = b.addRunArtifact(b.addTest(.{ .root_module = modelopt }));
-    b.step("test-flashnext-modelopt-host", "The ModelOpt config, MXFP8, NVFP4, PLE and name readers with core alone, no GPU backend").dependOn(&modelopt_run.step);
+    modelopt_run.has_side_effects = true; // TF_FLASHNEXT_FP4LOCAL_DIR is not a cached input
+    b.step("test-flashnext-modelopt-host", "The ModelOpt readers and HIP's FP4-Local admission (TF_FLASHNEXT_FP4LOCAL_DIR: the real checkpoint)").dependOn(&modelopt_run.step);
     all.dependOn(&modelopt_run.step);
     const memory = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/load_memory.zig"), .target = b.graph.host });
     b.step("test-flashnext-memory-host", "Flash Next allocation floor and working-set refusal without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = memory })).step);
