@@ -15,6 +15,9 @@ namespace rocm {
 
 enum ScaleKind : int { kScaleF32 = 0, kScaleBF16 = 1, kScaleF16 = 2 };
 
+// What `Affine::global` holds: no factor, one for the tensor, one an expert, or a gate and an up factor an expert.
+enum GlobalLayout : int { kGlobalNone = 0, kGlobalTensor = 1, kGlobalExpert = 2, kGlobalExpertPair = 3 };
+
 // One (n, k / group) table of scales or biases, row major, in its stored type.
 struct GroupTable {
     const void* p;
@@ -36,6 +39,8 @@ struct Affine {
     int fp16;  // 0 is bf16, 1 is fp16
     Routing route = {};
     __half* out16 = nullptr;  // set: the tile rounds each output to the activation type here instead of writing out
+    const float* global = nullptr;  // the per-tensor fp32 factors a decoder's output applies, as global_layout lays out
+    int global_layout = kGlobalNone;
 };
 
 // A routed block takes item ``z``: its expert's weights and its rows. False when the item has no rows.

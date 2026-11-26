@@ -1,6 +1,13 @@
 #pragma once
 
 // Streaming decode tile for 1 to 8 rows: a lane owns a 32-code chunk of a column; no LDS, lanes fold by shuffle.
+// The fold, the same for every R, CB, block and stream count: chunk q's 16 pairs make one dot2 chain from +0, then
+// acc = fold_scale(acc, d, scale) (and fold_bias) in lane q % lpc, its chunks in the column's rotated round order;
+// lanes add by xor tree, then repair and Dec::output once. lpc follows k alone (launches/affine.zig), so a column's
+// order is fixed by k, lpc and col. StreamTerms::Raw is a chunk's raw terms (MLX: scale and bias of group q >> gshift).
+// A block-scaled decoder (NVFP4, MXFP8) bakes its scales from Raw into exact bf16 weight pairs, folds with scale 1 and no
+// bias, and applies its per-tensor global in output; bf16 folds with scale 1. Pairs it masks enter dot2 as +0, never
+// -0 (gfx1151's dot2 is not IEEE, a -0 lane changes bits); dead lanes past the last chunk fold with scale 0.
 
 #include <type_traits>
 #include <utility>
@@ -47,20 +54,21 @@ constexpr bool stream_pairs_per_group() {
 
 // One column's chunk against RG rows: each code pair is made once and dotted with every row's x.
 template <class Dec, typename T, int RG, int... I>
-__device__ inline void stream_dots(const typename T::pair (&xp)[RG][16], const uint32_t (&w)[Dec::kWords], float (&d)[RG],
+__device__ inline void stream_dots(const typename T::pair (&xp)[RG][16], const uint32_t (&w)[Dec::kWords],
+                                   const typename Dec::StreamTerms::Raw& raw, float (&d)[RG],
                                    std::integer_sequence<int, I...>) {
     (([&] {
-         const typename T::pair q = Dec::template stream_pair<T, I>(w);
+         const typename T::pair q = Dec::template stream_pair<T, I>(w, raw);
 #pragma unroll
          for (int r = 0; r < RG; ++r) d[r] = T::dot(xp[r][I], q, d[r]);
      }()),
      ...);
 }
 
-// One column's 16 code pairs of a chunk, made once for every row of the block.
+// One column's 16 code pairs of a chunk with its stream terms, made once for every row of the block.
 template <class Dec, typename T, int... I>
-__device__ inline void stream_codes(const uint32_t (&w)[Dec::kWords], typename T::pair (&qp)[16],
-                                    std::integer_sequence<int, I...>) {
+__device__ inline void stream_codes(const uint32_t (&w)[Dec::kWords], const typename Dec::StreamTerms::Raw& raw,
+                                    typename T::pair (&qp)[16], std::integer_sequence<int, I...>) {
     if constexpr (Dec::kWords == 4 && Dec::kGapPairs && !std::is_same_v<typename T::elem, __half>) {
         // the byte path below hard-codes the decoder's pairing: pair 4 wd + k is codes 8 wd + k and 8 wd + k + 4
         static_assert(Dec::gap() == 4);
@@ -92,7 +100,7 @@ __device__ inline void stream_codes(const uint32_t (&w)[Dec::kWords], typename T
             qp[4 * wd + 3] = pack(f(o, 1), f(o, 3));
         }
     } else {
-        ((qp[I] = Dec::template stream_pair<T, I>(w)), ...);
+        ((qp[I] = Dec::template stream_pair<T, I>(w, raw)), ...);
     }
 }
 
@@ -116,7 +124,8 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
     const int col0 = (bx * kStreamWaves + (threadIdx.x >> 5)) * per_wave + slot * CH;
     const int nch = a.k >> 5;
     const long long words_row = Dec::template row_words<long long>(a);
-    const long long groups = a.k / a.group;
+    const typename Dec::StreamTerms terms(a);
+    using Raw = typename Dec::StreamTerms::Raw;
     const uint32_t* wp[CB];
     long long sb[CB];
 #pragma unroll
@@ -124,7 +133,7 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         const int cj = PAIR ? c % CH : c;
         const long long col = (col0 + cj < cols ? col0 + cj : cols - 1) + (PAIR && c >= CH ? pair_cols : 0);
         wp[c] = Dec::words(a) + col * words_row;
-        sb[c] = col * groups;
+        sb[c] = terms.row(col);
     }
     const typename Act::elem* xr[R];
 #pragma unroll
@@ -136,30 +145,25 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         for (int c = 0; c < CB; ++c) acc[r][c] = 0.f;
     }
 
-    const typename Dec::StreamTerms terms(a);
-
-    // The loads of one round: every column's chunk and its scale and bias, none waited for before the dots.
-    auto fetch = [&](int base, uint32_t (&w)[CB][Dec::kWords], unsigned short (&sr)[CB], unsigned short (&br)[CB]) {
+    // The loads of one round: every column's chunk and its stream terms, none waited for before the dots.
+    auto fetch = [&](int base, uint32_t (&w)[CB][Dec::kWords], Raw (&raw)[CB]) {
         const int q = base + j < nch ? base + j : nch - 1;
 #pragma unroll
         for (int c = 0; c < CB; ++c) {
             Dec::template load<WIDE>(wp[c] + static_cast<long long>(q) * Dec::kWords, w[c]);
-            const long long at = sb[c] + (q >> gshift);
-            sr[c] = terms.scale_raw(at);
-            br[c] = terms.bias_raw(at);
+            raw[c] = terms.raw(sb[c], q, gshift);
         }
     };
     // The dots of one round. A lane past the row's last chunk read the last one: its scale and bias are zero.
-    auto work = [&](int base, const uint32_t (&w)[CB][Dec::kWords], const unsigned short (&sr)[CB],
-                    const unsigned short (&br)[CB]) {
+    auto work = [&](int base, const uint32_t (&w)[CB][Dec::kWords], const Raw (&raw)[CB]) {
         const bool live = base + j < nch;
         const int q = live ? base + j : nch - 1;
         float sc[CB];
         float bi[CB];
 #pragma unroll
         for (int c = 0; c < CB; ++c) {
-            sc[c] = live ? terms.widen(sr[c]) : 0.f;
-            bi[c] = live ? terms.widen(br[c]) : 0.f;
+            sc[c] = live ? terms.scale_value(raw[c]) : 0.f;
+            bi[c] = live ? terms.bias_value(raw[c]) : 0.f;
         }
         if constexpr (stream_pairs_per_group<Dec, R, CB>()) {
             constexpr int RG = R < 4 ? R : 4;  // rows a pass keeps in registers
@@ -183,9 +187,11 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
                         xn[4 * v + 3] = t.w;
                     }
                     float s = 0.f;
+                    if constexpr (Dec::kBias) {
 #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        s = T::dot(__builtin_bit_cast(pair, xn[i]), __builtin_bit_cast(pair, kOne), s);
+                        for (int i = 0; i < 16; ++i) {
+                            s = T::dot(__builtin_bit_cast(pair, xn[i]), __builtin_bit_cast(pair, kOne), s);
+                        }
                     }
                     sx[r] = s;
                     stream_x_pairs<Dec, T>(xn, xp[r], std::make_integer_sequence<int, 16>{});
@@ -195,11 +201,11 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
                     float d[RG];
 #pragma unroll
                     for (int r = 0; r < RG; ++r) d[r] = 0.f;
-                    stream_dots<Dec, T, RG>(xp, w[c], d, std::make_integer_sequence<int, 16>{});
+                    stream_dots<Dec, T, RG>(xp, w[c], raw[c], d, std::make_integer_sequence<int, 16>{});
 #pragma unroll
                     for (int r = 0; r < RG; ++r) {
                         acc[g * RG + r][c] = Dec::fold_scale(acc[g * RG + r][c], d[r], sc[c]);
-                        acc[g * RG + r][c] = Dec::fold_bias(acc[g * RG + r][c], sx[r], bi[c]);
+                        if constexpr (Dec::kBias) acc[g * RG + r][c] = Dec::fold_bias(acc[g * RG + r][c], sx[r], bi[c]);
                     }
                 }
             }
@@ -208,7 +214,7 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         // every column's code pairs are made once, then each row in turn dots them in the order a row alone takes
         pair qp[CB][16];
 #pragma unroll
-        for (int c = 0; c < CB; ++c) stream_codes<Dec, T>(w[c], qp[c], std::make_integer_sequence<int, 16>{});
+        for (int c = 0; c < CB; ++c) stream_codes<Dec, T>(w[c], raw[c], qp[c], std::make_integer_sequence<int, 16>{});
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (row0 + r >= a.m) break;
@@ -224,9 +230,11 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
                 xn[4 * v + 3] = t.w;
             }
             float sx = 0.f;
+            if constexpr (Dec::kBias) {
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                sx = T::dot(__builtin_bit_cast(pair, xn[i]), __builtin_bit_cast(pair, kOne), sx);
+                for (int i = 0; i < 16; ++i) {
+                    sx = T::dot(__builtin_bit_cast(pair, xn[i]), __builtin_bit_cast(pair, kOne), sx);
+                }
             }
             stream_x_pairs<Dec, T>(xn, xp, std::make_integer_sequence<int, 16>{});
 #pragma unroll
@@ -235,7 +243,7 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
 #pragma unroll
                 for (int i = 0; i < 16; ++i) d = T::dot(xp[i], qp[c][i], d);
                 acc[r][c] = Dec::fold_scale(acc[r][c], d, sc[c]);
-                acc[r][c] = Dec::fold_bias(acc[r][c], sx, bi[c]);
+                if constexpr (Dec::kBias) acc[r][c] = Dec::fold_bias(acc[r][c], sx, bi[c]);
             }
         }
     };
@@ -248,23 +256,23 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
         return ri << lpc_log2;
     };
     uint32_t wa[CB][Dec::kWords];
-    unsigned short sa[CB], ba[CB];
+    Raw ra[CB];
     if constexpr (R == 1) {
         uint32_t wb[CB][Dec::kWords];
-        unsigned short sbb[CB], bbb[CB];
-        fetch(at(0), wa, sa, ba);
+        Raw rb[CB];
+        fetch(at(0), wa, ra);
         for (int r = 0; r < rounds; r += 2) {
-            if (r + 1 < rounds) fetch(at(r + 1), wb, sbb, bbb);
-            work(at(r), wa, sa, ba);
+            if (r + 1 < rounds) fetch(at(r + 1), wb, rb);
+            work(at(r), wa, ra);
             if (r + 1 >= rounds) break;
-            if (r + 2 < rounds) fetch(at(r + 2), wa, sa, ba);
-            work(at(r + 1), wb, sbb, bbb);
+            if (r + 2 < rounds) fetch(at(r + 2), wa, ra);
+            work(at(r + 1), wb, rb);
         }
     } else {
         // several rows: the dots cover the loads' latency, and registers go to the rows' x
         for (int r = 0; r < rounds; ++r) {
-            fetch(at(r), wa, sa, ba);
-            work(at(r), wa, sa, ba);
+            fetch(at(r), wa, ra);
+            work(at(r), wa, ra);
         }
     }
 
@@ -283,13 +291,14 @@ __device__ inline void stream_body(const typename Dec::Args& a, int lpc_log2, in
             for (int d = lpc >> 1; d > 0; d >>= 1) v[c] += __shfl_xor(v[c], d, 32);
         }
         if (j != 0 || row0 + r >= a.m) continue;
+        // a non-finite sum is the decoder's to repair; then its global, once a column
 #pragma unroll
         for (int c = 0; c < CB; ++c) {
             const int col = col0 + c % CH;
-            if (col < cols && !__builtin_isfinite(v[c])) {
-                const int wc = col + (PAIR && c >= CH ? pair_cols : 0);
-                v[c] = Dec::template repair_stream<T>(a, xr[r], wc, v[c]);
-            }
+            if (col >= cols) continue;
+            const int wc = col + (PAIR && c >= CH ? pair_cols : 0);
+            if (!__builtin_isfinite(v[c])) v[c] = Dec::template repair_stream<T>(a, xr[r], wc, v[c]);
+            v[c] = Dec::output(a, wc, v[c]);
         }
 #pragma unroll
         for (int c = 0; c < CH; ++c) {

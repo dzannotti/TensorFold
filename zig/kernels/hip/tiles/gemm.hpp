@@ -60,9 +60,10 @@ __device__ __forceinline__ void gemm_tile(typename Dec::Args& a) {
     const int m0 = by * kGemmM;
     const int n0 = bx * kGemmN;
     const int words_row = Dec::template row_words<int>(a);
-    const int groups = a.k / a.group;
+    const int fold = Dec::fold_k(a);
+    const int groups = a.k / fold;
     const int stages = a.k / kGemmK;
-    const int per = a.group / kGemmK;
+    const int per = fold / kGemmK;
     const int line = tid & (kGemmN - 1);
     const int side = __builtin_amdgcn_readfirstlane(tid >> 7);  // codes 16 * side ..; side 1 also stages x
 
@@ -83,6 +84,7 @@ __device__ __forceinline__ void gemm_tile(typename Dec::Args& a) {
     uint32_t wreg[2][Dec::kWords];
     u32x4 xreg[4];
     typename Dec::Term term[2];
+    typename Dec::Stage stage[2];
     float run = 0.f;
 
     // Every thread issues the same loads, so none waits on a branch. A stage past the last repeats it.
@@ -91,6 +93,8 @@ __device__ __forceinline__ void gemm_tile(typename Dec::Args& a) {
         const int st = st0 < stages ? st0 : stages - 1;
         Dec::template load<true>(wsrc + st * Dec::kWords, wreg[0]);
         Dec::template load<true>(wsrc + st1 * Dec::kWords, wreg[1]);
+        stage[0] = Dec::term_stage(a, col_s, st);
+        stage[1] = Dec::term_stage(a, col_s, st1);
         const int sx_ = xhalf ? st1 : st;
         if (xlive) {
 #pragma unroll
@@ -110,7 +114,7 @@ __device__ __forceinline__ void gemm_tile(typename Dec::Args& a) {
 #pragma unroll
                 for (int h = 0; h < 4; ++h) {
                     const int t = S * 16 + v * 8 + h * 2;
-                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t));
+                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t, stage[J]));
                 }
                 dst[v] = u32x4{d[0], d[1], d[2], d[3]};
             }
@@ -258,7 +262,7 @@ __device__ __forceinline__ void gemm_tile(typename Dec::Args& a) {
 #pragma unroll
         for (int j = 0; j < CT; ++j) {
             const int col = n0 + cbase + kCStride * j;
-            if (col < a.n) Epi::store(a, row, col, acc[r][j]);
+            if (col < a.n) Epi::store(a, row, col, Dec::output(a, col, acc[r][j]));
         }
     }
 }

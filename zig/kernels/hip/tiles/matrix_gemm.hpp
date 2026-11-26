@@ -32,10 +32,11 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
     const int tid = threadIdx.x;
     const int n0 = bx * kGemmN;
     const int words_row = Dec::template row_words<int>(a);
-    const int groups = a.k / a.group;
+    const int fold = Dec::fold_k(a);
+    const int groups = a.k / fold;
     const int stages = a.k / kGemmK;
-    const int per = a.group / kGemmK;
-    const int per_log2 = __builtin_ctz(per);  // groups are 32, 64 or 128 codes: one, two or four stages
+    const int per = fold / kGemmK;
+    const int per_log2 = __builtin_ctz(per);  // folds are 32, 64 or 128 codes: one, two or four stages
     auto group_of = [&](int st) { return st >> per_log2; };
     auto group_start = [&](int st) { return (st & (per - 1)) == 0; };
     auto group_end = [&](int st) { return (st & (per - 1)) == per - 1; };
@@ -58,12 +59,15 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
     uint32_t wreg[2][Dec::kWords];
     u32x4 xreg[4];
     typename Dec::Term term[2];
+    typename Dec::Stage stage[2];
     float run = 0.f;
     auto fetch = [&](int st0) {
         const int st1 = st0 + 1 < stages ? st0 + 1 : stages - 1;
         const int st = st0 < stages ? st0 : stages - 1;
         Dec::template load<true>(wsrc + st * Dec::kWords, wreg[0]);
         Dec::template load<true>(wsrc + st1 * Dec::kWords, wreg[1]);
+        stage[0] = Dec::term_stage(a, col_s, st);
+        stage[1] = Dec::term_stage(a, col_s, st1);
         const int sx_ = xhalf ? st1 : st;
         if (xlive) {
 #pragma unroll
@@ -82,7 +86,7 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
 #pragma unroll
                 for (int h = 0; h < 4; ++h) {
                     const int t = S * 16 + v * 8 + h * 2;
-                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t));
+                    d[h] = __builtin_bit_cast(uint32_t, Dec::template pair<T>(wreg[J], t, stage[J]));
                 }
                 dst[v] = u32x4{d[0], d[1], d[2], d[3]};
             }
@@ -95,7 +99,7 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
         }
         if (side == 0 && group_end(st)) {
             sc[group_of(st) % 3][line] = Dec::scale_value(a, term[J]);
-            bi[group_of(st) % 3][line] = Dec::bias_value(a, term[J]);
+            if constexpr (Dec::kBias) bi[group_of(st) % 3][line] = Dec::bias_value(a, term[J]);
         }
     };
     auto sumx = [&](int st, int buf) {
@@ -153,7 +157,9 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
     __syncthreads();
     auto step = [&]<int P>(std::integral_constant<int, P>, int s) {
         constexpr int cur = P;
-        if (live0 && s > 0 && group_end(s - 1)) apply_bias(group_of(s - 1) % 3, group_of(s - 1) & 1);
+        if constexpr (Dec::kBias) {
+            if (live0 && s > 0 && group_end(s - 1)) apply_bias(group_of(s - 1) % 3, group_of(s - 1) & 1);
+        }
         if constexpr (P == 1) fetch(s + 1);
         if (live0) {
 #pragma unroll
@@ -190,7 +196,9 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
                 }
             }
         }
-        if (sums) sumx(s, cur);
+        if constexpr (Dec::kBias) {
+            if (sums) sumx(s, cur);
+        }
         stash(std::integral_constant<int, P ^ 1>{}, s + 1, cur ^ 1);
         __syncthreads();
     };
@@ -198,7 +206,9 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
         step(std::integral_constant<int, 0>{}, s);
         if (s + 1 < stages) step(std::integral_constant<int, 1>{}, s + 1);
     }
-    if (live0 && group_end(stages - 1)) apply_bias(group_of(stages - 1) % 3, group_of(stages - 1) & 1);
+    if constexpr (Dec::kBias) {
+        if (live0 && group_end(stages - 1)) apply_bias(group_of(stages - 1) % 3, group_of(stages - 1) & 1);
+    }
 #pragma unroll
     for (int mt = 0; mt < 2; ++mt) {
 #pragma unroll
@@ -208,7 +218,7 @@ __device__ __forceinline__ void wmma_gemm_tile(typename Dec::Args& a) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
                 const int col = n0 + wn * 64 + nt * 16 + rl;
-                if (col < a.n) Epi::store(a, row, col, acc[mt][nt][i]);
+                if (col < a.n) Epi::store(a, row, col, Dec::output(a, col, acc[mt][nt][i]));
             }
         }
     }

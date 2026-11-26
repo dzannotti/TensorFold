@@ -20,6 +20,12 @@ struct Bf16Decoder {
     // No bias term: the tile neither sums x nor folds a bias.
     static constexpr bool kBias = false;
 
+    // A fold every group of K, as the launcher sets it; no stage term, no global.
+    __device__ static int fold_k(const Args& a) { return a.group; }
+    struct Stage {};
+    __device__ static Stage term_stage(const Args&, long long, int) { return {}; }
+    __device__ static float output(const Args&, int, float v) { return v; }
+
     // A plain product only: a routed plan's items are not this decoder's.
     __device__ static bool take_item(Args& a, int) { return a.route.items == nullptr; }
 
@@ -45,7 +51,7 @@ struct Bf16Decoder {
 
     // Weights t and t + 1 of a chunk (t even): the word that holds them, as stored.
     template <typename T>
-    __device__ static typename T::pair pair(const uint32_t (&w)[kWords], int t) {
+    __device__ static typename T::pair pair(const uint32_t (&w)[kWords], int t, Stage) {
         static_assert(std::is_same_v<typename T::elem, __bf16>, "BF16 weights take BF16 activations");
         return __builtin_bit_cast(typename T::pair, w[t >> 1]);
     }
