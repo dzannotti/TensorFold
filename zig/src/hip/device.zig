@@ -1,6 +1,7 @@
 //! The GPU a rank serves on and what the run may use there, chosen once by whoever opens an engine.
 
 const std = @import("std");
+const hrx = @import("hrx/api.zig");
 const runtime = @import("runtime.zig");
 const kernels = @import("kernels.zig");
 const Caps = @import("caps.zig").Caps;
@@ -55,6 +56,7 @@ pub const Device = struct {
 
     /// The card's gfx name ("gfx1100", "gfx906:sramecc+:xnack-"), found in its properties record by its prefix.
     pub fn archName(r: *runtime.Runtime, index: c_int, out: []u8) runtime.Error![]const u8 {
+        if (hrx.owns(&r.api)) return hrx.arch(out) orelse error.Invalid;
         const Properties = *const fn (*anyopaque, c_int) callconv(.c) c_int;
         const get = r.lib.lookup(Properties, "hipGetDevicePropertiesR0600") orelse return error.MissingSymbol;
         var props: [16384]u8 align(8) = @splat(0);
