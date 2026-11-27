@@ -1,6 +1,7 @@
 // FP4-Local's NVFP4, MXFP8 and BF16-fold products on the shared tiles, as launches/fp4local.zig resolves them.
 
 #include "quant/fp4local_tiles.hpp"
+#include "quant/gufo_routed.hpp"
 
 namespace tf {
 namespace rocm {

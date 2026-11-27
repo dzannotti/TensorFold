@@ -72,7 +72,8 @@ pub const Kernels = struct {
         const gemv = @backingInt(kernels.Loom.mxfp8_gemv);
         const gu = @backingInt(kernels.Loom.nvfp4_expert_gate_up);
         const dn = @backingInt(kernels.Loom.nvfp4_expert_down);
-        const experts = try nvfp4_experts.Kernels.load(.{ loom[gu], loom[dn] }, .{ manifests[gu], manifests[dn] });
+        var experts = try nvfp4_experts.Kernels.load(.{ loom[gu], loom[dn] }, .{ manifests[gu], manifests[dn] });
+        if (caps.matrix == .wmma11 and std.c.getenv("TF_GUFO_EXPERTS_OFF") == null) experts.f = .{ try m.function("gufo_expert_gate_up"), try m.function("gufo_expert_down") };
         const d0 = @backingInt(kernels.Loom.bf16_gemm_128x128);
         const d1 = @backingInt(kernels.Loom.bf16_gemm_128x256);
         const dense = try bf16_gemm.Kernels.load(.{ loom[d0], loom[d1] }, .{ manifests[d0], manifests[d1] });
