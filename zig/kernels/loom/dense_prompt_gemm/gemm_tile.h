@@ -92,7 +92,7 @@ LOOM_INLINE void stage(Acc& acc, Acc& d, const __bf16* xs, const __bf16* ws, uns
 
 // Staging: a stage is 4 16-byte chunks a row of x (kRows) and of weights (kCols). Slot i < NXS of thread t holds x
 // chunk t + i T, the others weight chunk t + (i - NXS) T (row c / 4, part c % 4), rows clamped to live ones (their
-// sums are never stored). A chunk is fetched two stages ahead into u, held in v, then stored to LDS.
+// sums are never stored). A chunk is fetched one stage ahead into u, then stored to LDS (240 VGPRs: 6 waves a SIMD).
 #define K5_SLOT_DEF(I)                                                                                \
   constexpr bool isx##I = I < G::NXS;                                                                 \
   const unsigned c##I = tid + (isx##I ? I : I - G::NXS) * G::kThreads;                                \
@@ -102,7 +102,7 @@ LOOM_INLINE void stage(Acc& acc, Acc& d, const __bf16* xs, const __bf16* ws, uns
   const unsigned so##I = isx##I ? (x0 + r##I) * (k / 8) + (c##I & 3) : Dec::base(w, w0 + r##I, c##I & 3); \
   const unsigned d0##I = (isx##I ? 0 : 2 * G::kXBuf) + q##I * kPitch + (c##I & 3) * 8;               \
   const unsigned bs##I = isx##I ? G::kXBuf : G::kWBuf;                                                \
-  typename Dec::Raw u##I = Dec::zero(), v##I = u##I;
+  typename Dec::Raw u##I = Dec::zero();
 #define K5_SLOT_FETCH(I, S)                                                                           \
   if constexpr (I < G::NS) {                                                                          \
     if (on##I) {                                                                                      \
@@ -112,10 +112,8 @@ LOOM_INLINE void stage(Acc& acc, Acc& d, const __bf16* xs, const __bf16* ws, uns
   }
 #define K5_SLOT_STORE(I, H)                                                                           \
   if constexpr (I < G::NS) {                                                                          \
-    if (on##I) *(u32x4*)(lds + d0##I + (H) * bs##I) = isx##I ? Dec::chunk(v##I) : Dec::decode(v##I);  \
+    if (on##I) *(u32x4*)(lds + d0##I + (H) * bs##I) = isx##I ? Dec::chunk(u##I) : Dec::decode(u##I);  \
   }
-#define K5_SLOT_SHIFT(I) \
-  if constexpr (I < G::NS) v##I = u##I;
 #define K5_SLOTS(M, ...) M(0 __VA_OPT__(,) __VA_ARGS__) M(1 __VA_OPT__(,) __VA_ARGS__) M(2 __VA_OPT__(,) __VA_ARGS__) \
   M(3 __VA_OPT__(,) __VA_ARGS__) M(4 __VA_OPT__(,) __VA_ARGS__) M(5 __VA_OPT__(,) __VA_ARGS__)
 
@@ -136,15 +134,12 @@ LOOM_INLINE Acc gemm_loop(const typename Dec::Weights& w, const u32x4* x, unsign
   __bf16* const ws = lds + 2 * G::kXBuf;
   K5_SLOTS(K5_SLOT_DEF)
   K5_SLOTS(K5_SLOT_FETCH, 0)
-  K5_SLOTS(K5_SLOT_SHIFT)
   K5_SLOTS(K5_SLOT_STORE, 0)
-  K5_SLOTS(K5_SLOT_FETCH, 1)
-  K5_SLOTS(K5_SLOT_SHIFT)
   lds_barrier();
   for (unsigned s = 0; s < stages; s += PER) {
     [[loom::unroll]] for (unsigned h = 0; h < PER; h++) {
       const unsigned t = s + h;
-      K5_SLOTS(K5_SLOT_FETCH, t + 2 < stages ? t + 2 : stages - 1)
+      K5_SLOTS(K5_SLOT_FETCH, t + 1 < stages ? t + 1 : stages - 1)
       const __bf16* const xb = xs + (h & 1) * G::kXBuf;
       const __bf16* const wb = ws + (h & 1) * G::kWBuf;
       if (FULL || live == 2) {
@@ -157,7 +152,6 @@ LOOM_INLINE Acc gemm_loop(const typename Dec::Weights& w, const u32x4* x, unsign
         if (h == PER - 1) stage<1, NT, false, true>(acc, d, xb, wb, xr, wc, lane);
       }
       K5_SLOTS(K5_SLOT_STORE, (h & 1) ^ 1)
-      K5_SLOTS(K5_SLOT_SHIFT)
       lds_barrier();
     }
   }
@@ -167,7 +161,6 @@ LOOM_INLINE Acc gemm_loop(const typename Dec::Weights& w, const u32x4* x, unsign
 #undef K5_SLOT_DEF
 #undef K5_SLOT_FETCH
 #undef K5_SLOT_STORE
-#undef K5_SLOT_SHIFT
 #undef K5_SLOTS
 
 // One block: rows x0.. (1..kRows live) of x (16-byte units, k / 8 a row) by weight rows w0.. (1..kCols live).
