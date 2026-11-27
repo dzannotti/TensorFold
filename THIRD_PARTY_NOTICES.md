@@ -638,3 +638,10 @@ in `prompt_cases.json` and `mini_cases.json`, which the release's `encoding_erni
 produced through the Hugging Face transformers and tokenizers libraries. `zig/src/families/ernie5_5/prompt.zig` writes
 the text part of that chat encoding in TensorFold's own code, written after reading `encoding_ernie.py` and checked
 against those outputs; no source is copied. `tools/zig/ernie5_5_fixtures.py` rebuilds all of these files.
+
+## gufo prompt kernels
+
+`zig/kernels/hip/flashnext/gufo_attn.hpp` (prompt attention over cohorts of four rows) and
+`zig/kernels/hip/quant/gufo_dense_tile.hpp` (the 256 x 128 dense prompt tile and its grouped raster order) adapt
+`src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp` of gufo at commit `1866ed9`, MIT License,
+Copyright (c) 2026 gufo contributors; each file carries the permission notice and lists its changes.

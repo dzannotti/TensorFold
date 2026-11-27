@@ -21,6 +21,8 @@ const cdiv = util.cdiv;
 
 pub const Fns = struct {
     hc_norm: Function,
+    hc_moe_norm: Function,
+    hc_down_q8: Function,
     hc_gates: Function,
     rms_wide: Function,
     rms_wide_waves: Function,
@@ -35,10 +37,15 @@ pub const Fns = struct {
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_lanes: [2][2]Function, // the same sums from fp16 and bf16 caches, a lane a key and several heads
     sparse_merge: Function,
+    sparse_wmma: ?Function, // gfx11: 12 heads over a bf16 cache at 256 dims, the Loom kernel's sum order
+    gufo_attn: Function,
+    idx_mask: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
             .hc_norm = try m.function("tf_fn_hc_norm"),
+            .hc_moe_norm = try m.function("tf_fn_hc_moe_norm"),
+            .hc_down_q8 = try m.function("tf_fn_hc_down_q8"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .rms_wide_waves = try m.function("tf_fn_rms_wide_waves"),
@@ -56,6 +63,9 @@ pub const Fns = struct {
                 .{ try m.function("tf_fn_sparse_lanes12_f16"), try m.function("tf_fn_sparse_lanes12_bf16") },
             },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
+            .sparse_wmma = m.function("tf_fn_sparse_wmma12_bf16") catch null,
+            .gufo_attn = try m.function("_ZN9gufo_attn25WmmaCausalAttentionKernelILj4ELj16ELb1EEEvPKfS2_PKtS4_PKjjPfjjjm"),
+            .idx_mask = try m.function("tf_fn_idx_mask"),
         };
     }
 };
@@ -81,6 +91,20 @@ pub fn hcNorm(
     s: S,
 ) Error!void {
     return hcNormShares(l, h, branch, inject, h_out, x_out, scale, kind, rows, streams, dims, eps, 0, 0, s);
+}
+
+/// The MoE epilogue over bf16 slot rows `y` (rows, slots, 2560), the 4 streams' writeback and their norm in one launch.
+pub fn hcMoeNorm(l: *const Launcher, h: P, y: C, wts: CF, shared: CF, inject: C, scale: CF, x: P, rows: c_int, slots: c_int, eps: f32, branch: C, xq: P, prior: C, prior_inject: C, hold: bool, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(h), ad(y), ad(wts), ad(shared), ad(inject), ad(scale), ad(x), slots, eps, ad(branch), ad(xq), ad(prior), ad(prior_inject), @as(c_int, @intFromBool(hold)) }) |v| try a.add(v);
+    try l.go(l.fnx.hc_moe_norm, dim(rows, 1, 1), dim(320, 1, 1), 0, s, &a);
+}
+
+/// The down projection on int8 WMMA: Q8_0 rows `wq` (n, k), the norm's tiled Q8 copy `xq`; act (rows, low), inject (rows, 4).
+pub fn hcDownQ8(l: *const Launcher, wq: C, xq: C, act: P, inject: P, rows: c_int, n: c_int, k: c_int, low: c_int, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(wq), ad(xq), ad(act), @as(usize, @intCast(rows)), @as(usize, @intCast(n)), @as(usize, @intCast(k)), ad(inject), low }) |v| try a.add(v);
+    try l.go(l.fnx.hc_down_q8, dim(cdiv(rows, 128), cdiv(n, 64), 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.
@@ -413,6 +437,23 @@ pub fn idxSelect(
     try l.go(l.fnx.idx_select, dim(rows, 1, 1), dim(1024, 1, 1), 0, s, &a);
 }
 
+/// The most mask words a row (tf_fn_idx_mask's LDS): 524,288 visible tokens.
+pub const gufo_mask_words = 4096;
+
+/// Each row's selection as one bit a block (tf_fn_idx_mask), from tf_fn_idx_select's lists.
+pub fn idxMask(l: *const Launcher, ids: CI, id_stride: i64, count: CI, sparse: CI, complete: CI, mask: u64, words: c_uint, ratio: c_int, rows: c_int, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(ids), id_stride, ad(count), ad(sparse), ad(complete), mask, words, ratio }) |v| try a.add(v);
+    try l.go(l.fnx.idx_mask, dim(rows, 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// gufo's prompt attention: `rows` rows from position `start` in groups of four over the union of their masked blocks.
+pub fn gufoAttention(l: *const Launcher, q: CF, k: C, v: C, mask: u64, words: c_uint, out: F, start: c_uint, rows: c_uint, kv_heads: c_int, cap: u64, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(q), @as(u64, 0), ad(k), ad(v), mask, words, ad(out), start, rows, @as(c_uint, 0), cap }) |x| try a.add(x);
+    try l.go(l.fnx.gufo_attn, dim(cdiv(rows, 4), kv_heads, 1), dim(256, 1, 1), 0, s, &a);
+}
+
 /// Attention of each row's heads over its listed keys (or its first count[r] keys) in `parts` parts, then merged.
 pub fn sparseAttention(
     l: *const Launcher,
@@ -509,6 +550,14 @@ pub fn sparseAttentionScalar(
     );
 }
 
+/// Waves a block of tf_fn_sparse_wmma12_bf16 runs, a part each.
+const wmma_parts = 4;
+
+/// Whether the WMMA kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims.
+fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int, rows: c_int) bool {
+    return kernel == .auto and rows >= 4 and std.c.getenv("TF_P1_ATTN_OFF") == null and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
+}
+
 fn sparseWith(
     kernel: enum { auto, scalar },
     l: *const Launcher,
@@ -554,7 +603,11 @@ fn sparseWith(
         parts,
     }) |x| try a.add(x);
     const wide: usize = if (@divExact(heads, kv_heads) <= 6) 0 else 1;
-    if (kernel == .auto and (cache_kind == 1 or cache_kind == 2) and @rem(dims, 8) == 0) {
+    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims, @intCast(rows))) {
+        var c: Args = .{};
+        inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(out), heads, kv_heads, dims, cap, scale }) |x| try c.add(x);
+        return l.go(l.fnx.sparse_wmma.?, dim(kv_heads, rows, 1), dim(32 * wmma_parts, 1, 1), 0, s, &c);
+    } else if (kernel == .auto and (cache_kind == 1 or cache_kind == 2) and @rem(dims, 8) == 0) {
         var c: Args = .{};
         inline for (.{
             ad(q),

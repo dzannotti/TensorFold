@@ -1,4 +1,4 @@
-//! A prompt's sparse attention on the Loom kernels (launches/loom_attention.zig): hipcc's bytes, whole chunks a launch.
+//! A prompt's sparse attention: the Loom indexer (launches/loom_attention.zig), the WMMA core, whole chunks a launch.
 const std = @import("std");
 const hip = @import("hip");
 const model = @import("model.zig");
@@ -8,12 +8,18 @@ const mixers = @import("mixers.zig");
 
 const Ops = hip.ops.Ops;
 
+/// The fewest rows of a launch that take gufo's cohort kernel: below it the per-row kernels are faster.
+const gufo_rows = 64;
+/// tf_fn_idx_mask's most mask words a row.
+const gufo_mask_words = 4096;
+
 /// The most fp32 indexer scores a launch keeps (rows x blocks): past it the rows go in several launches.
 const score_budget = 64 << 20;
 
 /// One stream's `rows` prompt rows from `pos`, ends and blocks from `staged` if given; false where Loom does not fit.
 pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView, cap: usize, q32: u64, iq: u64, att: u64, rows: usize, pos: usize, host: *forward.Host, staged: ?mixers.Rows) !bool {
     const k = &o.l.attn;
+    if (std.c.getenv("TF_P1_ATTN_OFF") != null) return false;
     if (!o.prefill or m.act != .bf16 or !k.takes(d.heads, d.kv_heads, d.head_dim, d.index_heads, d.index_dim)) return false;
     const key_stride = d.index_top * d.index_ratio + d.index_ratio;
     const blocks_max = (pos + rows) / d.index_ratio;
@@ -57,21 +63,45 @@ pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView
             flags = try host.put(o, std.mem.sliceAsBytes(zeros));
             ids = flags;
         }
-        try k.attend(
-            o.l.r,
+        const words = ((pos + r0 + n + d.index_ratio - 1) / d.index_ratio + 31) / 32;
+        if (std.c.getenv("TF_GUFO_ATTN_OFF") == null and n >= gufo_rows and d.kv_heads == 2 and d.index_ratio == 4 and words <= gufo_mask_words) {
+            const mask = try o.arena.of(u32, n * words);
+            try o.l.fn_idx_mask(@ptrFromInt(ids), @intCast(key_stride), @ptrFromInt(count), @ptrFromInt(flags), @ptrFromInt(dev_complete), mask, @intCast(words), @intCast(d.index_ratio), @intCast(n), o.stream);
+            try o.l.fn_gufo_attention(
+                @ptrFromInt(q32 + r0 * d.heads * d.head_dim * 4),
+                @ptrFromInt(kv.k),
+                @ptrFromInt(kv.v),
+                mask,
+                @intCast(words),
+                @ptrFromInt(att + r0 * d.heads * d.head_dim * 4),
+                @intCast(pos + r0),
+                @intCast(n),
+                @intCast(d.kv_heads),
+                @intCast(cap),
+                o.stream,
+            );
+            continue;
+        }
+        // the hipcc twin of Loom's sparse_attend (same bytes, launches/flashnext.zig) runs faster on gfx1151
+        try o.l.fn_sparse_attention(
             @ptrFromInt(q32 + r0 * d.heads * d.head_dim * 4),
             @ptrFromInt(kv.k),
             @ptrFromInt(kv.v),
+            2,
             @ptrFromInt(ids),
             @intCast(key_stride),
             @ptrFromInt(count),
             @ptrFromInt(flags),
+            null,
+            null,
             @ptrFromInt(att + r0 * d.heads * d.head_dim * 4),
             @intCast(n),
             @intCast(d.heads),
             @intCast(d.kv_heads),
+            @intCast(d.head_dim),
             @intCast(cap),
             scale,
+            @intCast(hip.launches.loom_attention.parts),
             o.stream,
         );
     }

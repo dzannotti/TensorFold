@@ -403,6 +403,10 @@ pub const Launcher = struct {
             d.* = kernels.loom_manifests[@backingInt(k)];
         }
         l.hcr = try hc_readout.Kernels.load(hc_mods, hc_docs);
+        if (l.attn.f != null and l.fnx.sparse_wmma == null) {
+            std.log.err("launches: the Loom attention kernels load but tf_fn_sparse_wmma12_bf16 is missing", .{});
+            return error.Invalid;
+        }
         return l;
     }
 
@@ -475,6 +479,8 @@ pub const Launcher = struct {
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
     pub const fn_hc_norm = flashnext.hcNorm;
+    pub const fn_hc_moe_norm = flashnext.hcMoeNorm;
+    pub const fn_hc_down_q8 = flashnext.hcDownQ8;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
     pub const fn_hc_gates = flashnext.hcGates;
     pub const fn_hc_mix = flashnext.hcMix;
@@ -488,6 +494,8 @@ pub const Launcher = struct {
     pub const fn_idx_pool_at = flashnext.idxPoolAt;
     pub const fn_idx_scores = flashnext.idxScores;
     pub const fn_idx_select = flashnext.idxSelect;
+    pub const fn_idx_mask = flashnext.idxMask;
+    pub const fn_gufo_attention = flashnext.gufoAttention;
     pub const fn_sparse_attention = flashnext.sparseAttention;
     pub const fn_sparse_attention_scalar = flashnext.sparseAttentionScalar;
     pub const tf_mamba_conv = mamba.tf_mamba_conv;

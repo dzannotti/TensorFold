@@ -66,6 +66,17 @@ fn run(o: Ops, fmt: fp4.Format, a: fp4.Arg, items: c_int, expert_rows: c_int) Er
     return k.streamGo(o.l.r, fmt, a, .{}, items, o.stream);
 }
 
+/// A prompt's router logits (m, n) fp32 over bf16 rows (n, k) on the bf16 matrix tile: one order at every row count.
+pub fn routerLogits(o: Ops, x: Tensor, rows16: u64, logits: u64, m: usize, n: usize, k: usize) Error!void {
+    if (!o.prefill or o.window or x.kind != .bf16 or m == 0 or k % 128 != 0) return error.BadShape;
+    const w: Weights = .{ .fmt = .bf16, .words = rows16, .n = @intCast(n), .k = @intCast(k) };
+    var a = argOf(w, x, m);
+    a.out = logits;
+    const f = &o.l.fp4;
+    if (f.dense.f != null) return f.dense.go(o.l.r, .t128x128, a, o.stream);
+    return f.tilePromptGo(o.l.r, .bf16, a, 1, 0, o.stream);
+}
+
 /// Up to four decode products of one x that share K and format in one stream launch, bf16 outs; false otherwise.
 pub fn group(o: Ops, x: Tensor, ws: []const Weights, m: usize, outs: []Tensor) Error!bool {
     if (o.prefill or ws.len < 2 or ws.len > 4 or m == 0 or x.kind != .bf16) return false;
@@ -86,12 +97,21 @@ pub fn group(o: Ops, x: Tensor, ws: []const Weights, m: usize, outs: []Tensor) E
     return true;
 }
 
+/// Whether a prompt's routed down `proj` writes bf16 slot rows (Loom's down tile takes it).
+pub fn halfDown(o: Ops, proj: Projection) bool {
+    const w = weightsOf(proj, true) orelse return false;
+    var a = argOf(w, .{ .ptr = 0, .kind = .bf16 }, 1);
+    a.out16 = 1;
+    a.route = .{ .items = 1, .members = 1, .x_div = 1 };
+    return o.prefill and !o.window and w.fmt == .nvfp4 and o.l.fp4.experts.takesDown(a);
+}
+
 /// A routed stack over a plan: out (pairs, n) fp32; `rows` the most an item holds.
 pub fn routed(o: Ops, x: Tensor, w: Weights, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, expert_rows: usize) Error!u64 {
     if (w.fmt != .nvfp4 or x.kind != .bf16 or count == 0) return error.BadShape;
-    const out = try o.arena.of(f32, pairs * w.n);
+    const out = try o.arena.take(pairs * w.n * @as(usize, if (o.half_down) 2 else 4));
     var a = argOf(w, x, rows);
-    a.out = out;
+    if (o.half_down) a.out16 = out else a.out = out;
     a.route = .{ .items = items, .members = members, .x_div = int(x_div) };
     try run(o, .nvfp4, a, int(count), int(expert_rows));
     return out;

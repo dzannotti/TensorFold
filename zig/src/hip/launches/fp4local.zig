@@ -50,10 +50,15 @@ pub const item_rows = 64;
 const rows_of = affine.stream_rows;
 const cbs = affine.stream_cbs;
 
+/// The fewest prompt rows gufo's dense tile takes.
+const gufo_rows = 1024;
+
 pub const Kernels = struct {
     /// stream[format][row tile][columns a lane][pair]: null where the format's chunk words or 16 sums do not fit.
     stream: [3][rows_of.len][cbs.len][2]?Function,
     wmma: [3]Function,
+    /// gufo's 256 x 128 MXFP8 prompt tile (quant/gufo_dense_tile.hpp): plain order, and five row tiles a token tile.
+    gufo: [2]Function,
     item: Function,
     /// The (gate | up) prompt tile with silu(gate) x up in its epilogue: NVFP4 and MXFP8.
     pair: [2]Function,
@@ -72,12 +77,13 @@ pub const Kernels = struct {
         const gemv = @backingInt(kernels.Loom.mxfp8_gemv);
         const gu = @backingInt(kernels.Loom.nvfp4_expert_gate_up);
         const dn = @backingInt(kernels.Loom.nvfp4_expert_down);
-        const experts = try nvfp4_experts.Kernels.load(.{ loom[gu], loom[dn] }, .{ manifests[gu], manifests[dn] });
+        var experts = try nvfp4_experts.Kernels.load(.{ loom[gu], loom[dn] }, .{ manifests[gu], manifests[dn] });
+        if (caps.matrix == .wmma11 and std.c.getenv("TF_GUFO_EXPERTS_OFF") == null) experts.f = .{ try m.function("gufo_expert_gate_up"), try m.function("gufo_expert_down") };
         const d0 = @backingInt(kernels.Loom.bf16_gemm_128x128);
         const d1 = @backingInt(kernels.Loom.bf16_gemm_128x256);
         const dense = try bf16_gemm.Kernels.load(.{ loom[d0], loom[d1] }, .{ manifests[d0], manifests[d1] });
         @setEvalBranchQuota(100_000);
-        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
+        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .gufo = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
@@ -90,6 +96,10 @@ pub const Kernels = struct {
             k.wmma[f] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm9fp4l_wmmaILi{d}EEEvNS0_6AffineE", .{f}));
         }
         k.item = try m.function("_ZN2tf4rocm9fp4l_itemILi0EEEvNS0_6AffineE");
+        k.gufo = .{
+            try m.function("_ZN2tf4rocm4gufo18DenseF16GEMMKernelILi256ELi128ELi2ELi8ELi1ELi1ELb0ELb0ELb0ELb0ELb0ELb0ELb0EEEvNS0_6AffineE"),
+            try m.function("_ZN2tf4rocm4gufo18DenseF16GEMMKernelILi256ELi128ELi2ELi8ELi1ELi5ELb0ELb0ELb0ELb0ELb0ELb0ELb0EEEvNS0_6AffineE"),
+        };
         k.pair = .{ try m.function("_ZN2tf4rocm9fp4l_pairILi0EEEvNS0_6AffineEf"), try m.function("_ZN2tf4rocm9fp4l_pairILi1EEEvNS0_6AffineEf") };
         return k;
     }
@@ -197,7 +207,17 @@ pub const Kernels = struct {
         if (a.m < 1 or a.n < 1 or @rem(a.k, fold(fmt, a)) != 0 or a.x % 16 != 0) return refuse("prompt shape");
         if (fmt == .nvfp4 and k.experts.takesDown(a)) return k.experts.downGo(r, a, items, s);
         if (fmt == .bf16) if (k.dense.pick(a)) |t| return k.dense.go(r, t, a, s);
+        if (fmt == .mxfp8 and items == 1 and a.route.items == 0 and a.m >= gufo_rows and std.c.getenv("TF_GUFO_DENSE_OFF") == null) return k.gufoGo(r, a, s);
         return k.tilePromptGo(r, fmt, a, items, expert_rows, s);
+    }
+
+    /// gufo's tile over a plain MXFP8 product: 256 weight rows x 128 tokens a block, token tiles in groups of 4,096 rows.
+    fn gufoGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream) Error!void {
+        var args: hl.Args = .{};
+        try args.add(a);
+        const row_tiles = util.cdiv(a.n, 256);
+        const grouped = a.k == 6144 and row_tiles % 5 == 0;
+        try go(r, k.gufo[@intFromBool(grouped)], util.dim(util.cdiv(a.m, 128), row_tiles, 1), 256, s, &args);
     }
 
     /// `promptGo` on fp4local.hip's matrix tiles alone: what the Loom prompt kernels are checked against.

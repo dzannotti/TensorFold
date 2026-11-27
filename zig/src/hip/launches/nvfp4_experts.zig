@@ -45,7 +45,7 @@ pub const Kernels = struct {
     /// Whether the routed down product of `a` (2560 by 640, a global an expert, fp32 out) is theirs.
     pub fn takesDown(k: *const Kernels, a: Arg) bool {
         return k.f != null and a.route.items != 0 and a.n == down.n and a.k == down.k and
-            a.global_layout == .expert and a.out != 0 and a.out16 == 0;
+            a.global_layout == .expert and (a.out != 0) != (a.out16 != 0);
     }
 
     /// act = bf16(silu(gate) x up) into a.out16 (pairs, 640) over a plan's `items`; `a.m` the most rows an item holds.
@@ -55,7 +55,7 @@ pub const Kernels = struct {
 
     /// The fp32 down sums into a.out (pairs, 2560) over a plan's `items`.
     pub fn downGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, s: abi.Stream) Error!void {
-        return k.go(r, 1, a, a.out, down.n, 128, items, s);
+        return k.go(r, 1, a, if (a.out16 != 0) a.out16 else a.out, down.n, 128, items, s);
     }
 
     fn go(k: *const Kernels, r: *const runtime.Runtime, which: usize, a: Arg, out: u64, n: c_int, cols: usize, items: c_int, s: abi.Stream) Error!void {
@@ -64,7 +64,7 @@ pub const Kernels = struct {
         var args: hl.Args = .{};
         inline for (.{ a.x, a.words, a.scale.p, a.global, a.route.items, a.route.members, out }) |p| try args.add(p);
         try args.add(a.route.x_div);
-        try args.add(n);
+        try args.add(if (which == 1 and a.out16 != 0) -n else n);
         try args.add(a.k);
         const grid = util.dim(util.cdiv(n, cols), util.cdiv(a.m, 128), items);
         try hl.launch(k.f.?[which], .{ .grid = grid, .block = .{ .x = 256 } }, .{ .r = r, .handle = s }, &args);

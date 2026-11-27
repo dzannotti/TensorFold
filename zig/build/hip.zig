@@ -526,10 +526,10 @@ const headers = [_][]const u8{
     "ops/rope.hpp",               "common/arch.hpp",         "common/dot2.hpp",               "common/vec.hpp",           "common/wmma.hpp",       "quant/act.hpp",
     "quant/mlx.hpp",              "quant/mlx_decoder.hpp",   "quant/mlx_pieces.hpp",          "quant/mlx_tiles.hpp",      "tiles/dot2.hpp",        "tiles/epilogue.hpp",
     "tiles/gemm.hpp",             "tiles/gemm_kp.hpp",       "tiles/matrix_gemm.hpp",         "tiles/matrix_item.hpp",    "tiles/plan.hpp",        "tiles/stream.hpp",
-    "flashnext/streams.hpp",      "flashnext/ngram.hpp",     "flashnext/indexer.hpp",         "flashnext/sparse.hpp",     "ops/nemotron_moe.hpp",  "quant/bf16_decoder.hpp",
+    "flashnext/streams.hpp",      "flashnext/hc_moe.hpp",    "flashnext/hc_q8.hpp",    "flashnext/ngram.hpp",     "flashnext/indexer.hpp",         "flashnext/sparse.hpp",     "ops/nemotron_moe.hpp",  "quant/bf16_decoder.hpp",
     "quant/dense_tiles.hpp",      "tiles/wmma12_gemm.hpp",   "tiles/wmma12_gemm_k32_ref.hpp", "ops/columns.hpp",          "columns_controls.hpp",  "ops/vision.hpp",
     "ops/dense_text.hpp",         "ops/vl_position.hpp",     "flashnext/sparse_lanes.hpp",    "tiles/wmma12_step.hpp",    "inkling2/tile.hpp",     "quant/fp4local_bake.hpp",
-    "quant/mxfp8_decoder.hpp",    "quant/nvfp4_decoder.hpp", "quant/bf16_fold_decoder.hpp",   "quant/fp4local_tiles.hpp", "tiles/matrix_pair.hpp",
+    "quant/mxfp8_decoder.hpp",    "quant/nvfp4_decoder.hpp", "quant/bf16_fold_decoder.hpp",   "quant/fp4local_tiles.hpp", "tiles/matrix_pair.hpp", "flashnext/sparse_wmma.hpp",
 };
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };

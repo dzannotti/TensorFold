@@ -121,11 +121,39 @@ const Loader = struct {
     fn hc(l: *const Loader, base: []const u8, inject: bool) !model.Hc {
         const t = tensors.hc;
         var views: [2]Projection = undefined;
+        const host = if (inject)
+            try mh.stitched(l.a, l.store(), try std.fmt.allocPrint(l.a, "{s}.", .{base}), &.{ t.down, t.inject })
+        else
+            try mh.proj(l.a, l.store(), try l.named(base, t.down));
         return .{
             .scale = try l.scale(try l.named(base, t.norm)),
             .down = if (inject) try l.group(base, &.{ t.down, t.inject }, &views) else try l.proj(try l.named(base, t.down)),
             .up = try l.proj(try l.named(base, t.up)),
+            .down_q8 = switch (host) {
+                .dense => |h| try l.q8(h.weight.bytes),
+                else => 0,
+            },
         };
+    }
+
+    /// bf16 rows as GGML Q8_0 blocks: a f16 scale absmax / 127 and 32 int8 codes a K32 block (gufo's W8A8 weights).
+    fn q8(l: *const Loader, bf16: []const u8) !u64 {
+        const blocks = bf16.len / 64;
+        if (bf16.len % 64 != 0) return 0;
+        const out = try l.a.alloc(u8, blocks * 34);
+        for (0..blocks) |b| {
+            var v: [32]f32 = undefined;
+            var amax: f32 = 0;
+            for (&v, 0..) |*x, e| {
+                x.* = @bitCast(@as(u32, std.mem.readInt(u16, bf16[(b * 32 + e) * 2 ..][0..2], .little)) << 16);
+                amax = @max(amax, @abs(x.*));
+            }
+            const d = amax / 127.0;
+            const id: f32 = if (d != 0) 1.0 / d else 0;
+            std.mem.writeInt(u16, out[b * 34 ..][0..2], @bitCast(@as(f16, @floatCast(d))), .little);
+            for (v, 0..) |x, e| out[b * 34 + 2 + e] = @bitCast(@as(i8, @intFromFloat(@round(x * id))));
+        }
+        return l.tensor(quant.types.view(.u8, &.{out.len}, out));
     }
 
     fn linear(l: *const Loader, base: []const u8) !model.Linear {
@@ -186,6 +214,7 @@ const Loader = struct {
             .top_k = c.topk,
             .rows = c.experts + 1,
             .exact = true,
+            .matrix = true,
             .experts = .{
                 .fused = s.fused,
                 .down = s.down,

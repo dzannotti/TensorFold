@@ -17,17 +17,17 @@ const I = util.I;
 const S = util.S;
 const ad = util.ad;
 
-/// The compiled shapes (README: Geometry): 12 query heads a KV head, 256 dims, 16 parts; indexer 4 heads of 128 dims.
+/// The compiled shapes (README: Geometry): 12 query heads a KV head, 256 dims, 4 parts; indexer 4 heads of 128 dims.
 pub const group = 12;
 pub const dims = 256;
-pub const parts = 16;
+pub const parts = 4;
 pub const index_heads = 4;
 pub const index_dims = 128;
 
 const Kind = enum { attend, scores, select };
 const symbols = [3][:0]const u8{ "sparse_attend", "idx_scores", "idx_select" };
 /// Parameters, buffers and constant bytes of each launch, and its work-items.
-const interfaces = [3][4]u32{ .{ 14, 7, 36, 512 }, .{ 10, 4, 28, 256 }, .{ 10, 6, 24, 256 } };
+const interfaces = [3][4]u32{ .{ 14, 7, 36, 128 }, .{ 10, 4, 28, 256 }, .{ 10, 6, 24, 256 } };
 
 pub const Kernels = struct {
     /// attend, scores, select; null in a build without Loom kernels.

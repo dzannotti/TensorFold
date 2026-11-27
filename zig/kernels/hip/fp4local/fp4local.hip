@@ -1,6 +1,7 @@
 // FP4-Local's NVFP4, MXFP8 and BF16-fold products on the shared tiles, as launches/fp4local.zig resolves them.
 
 #include "quant/fp4local_tiles.hpp"
+#include "quant/gufo_routed.hpp"
 
 namespace tf {
 namespace rocm {
@@ -28,6 +29,8 @@ template __global__ void fp4l_wmma<0>(Affine);
 template __global__ void fp4l_wmma<1>(Affine);
 template __global__ void fp4l_wmma<2>(Affine);
 template __global__ void fp4l_item<0>(Affine);
+template __global__ void gufo::DenseF16GEMMKernel<256, 128, 2, 8, 1>(Affine);
+template __global__ void gufo::DenseF16GEMMKernel<256, 128, 2, 8, 1, 5>(Affine);
 template __global__ void fp4l_pair<0>(Affine, float);
 template __global__ void fp4l_pair<1>(Affine, float);
 

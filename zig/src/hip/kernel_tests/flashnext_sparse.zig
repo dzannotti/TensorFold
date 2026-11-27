@@ -1,4 +1,4 @@
-//! Flash Next's two sparse attention kernels on the same rows: the lanes kernel's parts equal the scalar kernel's bits.
+//! Sparse attention: the lanes kernel's parts equal the scalar kernel's bits where the WMMA kernel does not run.
 const std = @import("std");
 const rig = @import("rig.zig");
 const fx = @import("flashnext.zig");
@@ -20,7 +20,10 @@ test "sparse attention: the lanes kernel gives the scalar kernel's bits at every
         .{ .heads = 6, .kv_heads = 2, .dims = 128, .parts = 16 },
         .{ .heads = 12, .kv_heads = 1, .dims = 128, .parts = 5 },
     };
-    for ([_]c_int{ 2, 1 }) |kind| for (shapes, 0..) |s, i| try same(t, s, kind, 0x5A11 + i);
+    for ([_]c_int{ 2, 1 }) |kind| for (shapes, 0..) |s, i| {
+        const wmma = t.on.fnx.sparse_wmma != null and kind == 2 and s.dims == 256 and s.heads == 12 * s.kv_heads;
+        if (!wmma) try same(t, s, kind, 0x5A11 + i);
+    };
 }
 
 fn same(t: *Rig, s: Shape, kind: c_int, seed: u64) !void {
