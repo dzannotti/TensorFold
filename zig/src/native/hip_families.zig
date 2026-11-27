@@ -50,6 +50,13 @@ pub fn confidenceFloor(comptime F: type, o: api.Open, rdna3_5_alone: bool, fallb
     return if (rdna3_5_alone) F.mtp_confidence_rdna3_5 else fallback;
 }
 
+/// A run's MTP drafts: the flag, else the family's `mtp_drafts_rdna3_5` on one RDNA 3.5 GPU, else `fallback`.
+pub fn draftsDefault(comptime F: type, o: api.Open, rdna3_5_alone: bool, fallback: u8) u8 {
+    if (o.mtp_drafts) |n| return @intCast(n);
+    if (comptime !@hasDecl(F, "mtp_drafts_rdna3_5")) return fallback;
+    return if (rdna3_5_alone) F.mtp_drafts_rdna3_5 else fallback;
+}
+
 /// Most `--mtp-drafts` the family's head takes at `tp` ranks: its `mtp_max_drafts` on one rank, else three.
 pub fn mtpMost(comptime F: type, tp: u32) u32 {
     return if (@hasDecl(F, "mtp_max_drafts") and tp == 1) F.mtp_max_drafts else 3;

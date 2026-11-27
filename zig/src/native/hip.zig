@@ -121,7 +121,7 @@ fn ready(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open
         policy.prefill_step,
         s,
     });
-    if (o.mtp_drafts) |n| policy.mtp.drafts = @intCast(n);
+    policy.mtp.drafts = fam.draftsDefault(F, o, rdna3_5Alone(caps, o.tp), policy.mtp.drafts);
     policy.mtp.confidence = fam.confidenceFloor(F, o, rdna3_5Alone(caps, o.tp), policy.mtp.confidence);
     if (o.keep) |n| policy.slots = @intCast(@min(n, 1 << 16));
     if (matrixRefused(F, policy, caps)) |why| return refuse(a, problem, "matrix=on: {s}; matrix=auto runs the dot2 tiles", .{why});

@@ -23,6 +23,8 @@ pub const default_context: i64 = 32768;
 pub const prefill_step: u32 = 0;
 /// Flash Next's MTP floor on one RDNA 3.5 GPU serving alone, unless `--mtp-confidence` says otherwise.
 pub const mtp_confidence_rdna3_5: f64 = 0.8;
+/// Flash Next's MTP drafts on one RDNA 3.5 GPU alone unless `--mtp-drafts`; the timed depth rule cuts under it.
+pub const mtp_drafts_rdna3_5: u8 = 7;
 /// Device bytes a rank keeps for the forward's scratch until the engine counts its own.
 pub const scratch_bytes: u64 = 2 << 30;
 
@@ -267,6 +269,19 @@ test promptCacheBytes {
     try std.testing.expectEqual(@as(u64, 12 * g), promptCacheBytes(12.0, true, 16 * g, 16 * g));
 }
 
+/// The lone windows and the head step timed for the depth rule; untimed, it drafts by the first draft's rate alone.
+fn timeCosts(gpa: std.mem.Allocator, fx: *lanes_mod.Fx) void {
+    @import("costs.zig").measure(gpa, fx, &fx.costs) catch |err| {
+        std.log.warn("flashnext: lane costs not timed ({t}); drafts follow the first draft's rate", .{err});
+        fx.costs = .{};
+        return;
+    };
+    var line: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line);
+    for (fx.costs.window[0..fx.costs.windows]) |x| w.print(" {d}:{d:.2}", .{ x.width, x.ms }) catch {};
+    std.log.info("flashnext: lane costs (rows:ms){s}; head step {d:.2} ms", .{ w.buffered(), fx.costs.step_ms });
+}
+
 /// Rank 0's lanes over `p.e` for `streams` streams, with the server's startup line.
 fn lanesOf(gpa: std.mem.Allocator, dev: hip.Device, o: anytype, p: Prepared, streams: usize) !*Owned {
     const own = try gpa.create(Owned);
@@ -275,6 +290,7 @@ fn lanesOf(gpa: std.mem.Allocator, dev: hip.Device, o: anytype, p: Prepared, str
     errdefer fx.deinit();
     // the first stream's caches at load: a first prompt otherwise waits on allocating and clearing them
     try p.e.makeFirstSlot();
+    if (o.world == 1) timeCosts(gpa, fx);
     // kept prompt states live in host memory: --prompt-cache-gib, else 16 GiB (on shared pages, what the streams leave)
     fx.keepPrompts(promptCacheBytes(o.cache_gib, p.shared, p.room, p.per * streams));
     var why: [96]u8 = undefined;
