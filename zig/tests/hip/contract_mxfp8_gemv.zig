@@ -1,4 +1,4 @@
-//! The Loom MXFP8 GEMV under the HIP contract: byte-equal to fp4l_stream (MXFP8) at the checkpoint's shapes, rows 1-8.
+//! The Loom MXFP8 GEMV (rows 1-8) and skinny tile (1-64) under the HIP contract: fp4l_stream's bytes (MXFP8).
 const std = @import("std");
 const hip = @import("hip");
 const core = @import("core");
@@ -11,9 +11,31 @@ const rows = contract.rows;
 const fp8 = core.quant.fp8;
 const fp4 = hip.launches.fp4local;
 const gemv = hip.launches.mxfp8_gemv;
+const skinny = hip.launches.skinny;
 const Arg = fp4.Arg;
 
-pub const Reg = struct { name: []const u8, out: gemv.Out, served: []const c.Shape };
+/// The Loom kernel a registration checks.
+pub const Which = enum { gemv, skinny };
+
+pub const Reg = struct { name: []const u8, out: gemv.Out, served: []const c.Shape, which: Which = .gemv };
+
+/// The skinny tile's served row counts: each row fragment's edges (all of 1-64 run in `identity`).
+const skinny_rows = [_]usize{ 1, 9, 16, 17, 24, 32, 33, 48, 49, 64 };
+
+/// Every product of the skinny table with output `out` at skinny_rows.
+fn servedSkinny(comptime out: gemv.Out) []const c.Shape {
+    @setEvalBranchQuota(100_000);
+    comptime var list: []const c.Shape = &.{};
+    inline for (skinny.table, 0..) |e, i| {
+        const seen = for (skinny.table[0..i]) |f| {
+            if (f.n == e.n and f.v.k == e.v.k and f.out == e.out) break true;
+        } else false;
+        if (e.out == out and !seen) for (skinny_rows) |m| {
+            list = list ++ [_]c.Shape{.{ .rows = m, .n = e.n, .k = e.v.k }};
+        };
+    }
+    return list;
+}
 
 /// Rows 1 to 8 of every product the table takes the stream tile's place at with output `out`.
 fn served(comptime out: gemv.Out) []const c.Shape {
@@ -33,12 +55,12 @@ fn served(comptime out: gemv.Out) []const c.Shape {
     return list;
 }
 
-/// The stitched row groups' cuts (qkv | z | b | a, q | k | v | index), else four sides cut at multiples of 8.
-fn cutsOf(n: usize) [3]usize {
+/// The stitched row groups' cuts (qkv | z | b | a, q | k | v | index), else four sides cut at multiples of 8 (16).
+fn cutsOf(which: Which, n: usize) [3]usize {
     return switch (n) {
         16480 => .{ 10240, 16384, 16432 },
         13952 => .{ 12288, 12800, 13312 },
-        else => .{ n / 32 * 8, n / 16 * 8, 3 * n / 32 * 8 },
+        else => if (which == .skinny) .{ n / 64 * 16, n / 32 * 16, 3 * n / 64 * 16 } else .{ n / 32 * 8, n / 16 * 8, 3 * n / 32 * 8 },
     };
 }
 
@@ -47,7 +69,11 @@ pub const registrations = [_]Reg{
     .{ .name = name ++ " (fp32 out)", .out = .f32, .served = served(.f32) },
     .{ .name = name ++ " (bf16 out)", .out = .bf16, .served = served(.bf16) },
     .{ .name = name ++ " (4 bf16 sides)", .out = .sides, .served = served(.sides) },
+    .{ .name = sk_name ++ " (fp32 out)", .out = .f32, .served = servedSkinny(.f32), .which = .skinny },
+    .{ .name = sk_name ++ " (bf16 out)", .out = .bf16, .served = servedSkinny(.bf16), .which = .skinny },
+    .{ .name = sk_name ++ " (4 bf16 sides)", .out = .sides, .served = servedSkinny(.sides), .which = .skinny },
 };
+const sk_name = "loom skinny_mxfp8";
 
 /// fp4l_stream's depth: 16 dot2s a chunk (3 each: gfx1151's dot2 is not IEEE), a fold a chunk, the lane tree.
 fn depth(s: c.Shape) usize {
@@ -98,10 +124,21 @@ pub const Case = struct {
     const vt = g.hooks(Case);
 
     /// A variant of the table for k, m rows and `out`: the table's own for a served n, else any of that k (edges in n).
-    fn entry(n: usize, k: usize, m: usize, out: gemv.Out) ?usize {
+    fn entry(which: Which, n: usize, k: usize, m: usize, out: gemv.Out) ?usize {
+        if (which == .skinny) return skinnyEntry(n, k, m, out);
         var any: ?usize = null;
         for (gemv.table, 0..) |e, i| {
             if (e.v.k != k or e.out != out or e.v.rows < m) continue;
+            if (e.n == n) return i;
+            any = any orelse i;
+        }
+        return any;
+    }
+
+    fn skinnyEntry(n: usize, k: usize, m: usize, out: gemv.Out) ?usize {
+        var any: ?usize = null;
+        for (skinny.table, 0..) |e, i| {
+            if (e.v.k != k or e.out != out or e.v.f != (m + 15) / 16) continue;
             if (e.n == n) return i;
             any = any orelse i;
         }
@@ -112,8 +149,9 @@ pub const Case = struct {
         const m = shape.rows;
         const n = shape.n;
         const k = shape.k;
-        if (m == 0 or m > 8 or n == 0 or (self.reg.out == .sides and n < 32)) return false;
-        self.at = entry(n, k, m, self.reg.out) orelse return false;
+        const most: usize = if (self.reg.which == .skinny) skinny.max_rows else 8;
+        if (m == 0 or m > most or n == 0 or (self.reg.out == .sides and n < (if (self.reg.which == .skinny) @as(usize, 64) else 32))) return false;
+        self.at = entry(self.reg.which, n, k, m, self.reg.out) orelse return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
@@ -139,7 +177,7 @@ pub const Case = struct {
         self.arg.words = try self.rig.input(codes);
         self.arg.scale.p = try self.rig.input(es);
         self.arg.x = try self.rig.input(std.mem.sliceAsBytes(self.x));
-        self.cuts = if (self.reg.out == .sides) cutsOf(n) else .{ n, n, n };
+        self.cuts = if (self.reg.out == .sides) cutsOf(self.reg.which, n) else .{ n, n, n };
         const elem: usize = if (self.reg.out == .f32) 4 else 2;
         for (0..4) |s| {
             const width = self.side(s);
@@ -173,7 +211,12 @@ pub const Case = struct {
             .f32, .bf16 => {
                 var arg = a;
                 if (self.reg.out == .f32) arg.out = out[0] else arg.out16 = out[0];
-                if (tile) try f.tileGo(r, .mxfp8, arg, .{}, 1, s) else try f.gemv.go(r, self.at, a.m, a.n, a.words, a.scale.p, a.x, out[0], self.reg.out == .bf16, s);
+                const half = self.reg.out == .bf16;
+                if (tile) {
+                    try f.tileGo(r, .mxfp8, arg, .{}, 1, s);
+                } else if (self.reg.which == .skinny) {
+                    try f.skinny.go(r, self.at, a.m, a.n, a.words, a.scale.p, a.x, out[0], half, s);
+                } else try f.gemv.go(r, self.at, a.m, a.n, a.words, a.scale.p, a.x, out[0], half, s);
             },
             .sides => {
                 var sides: fp4.StreamSides = .{ .count = 4, .out_half = 1 };
@@ -193,7 +236,9 @@ pub const Case = struct {
                     try f.tileGo(r, .mxfp8, arg, sides, 1, s);
                 } else {
                     const cuts: [3]c_int = .{ @intCast(self.cuts[0]), @intCast(self.cuts[1]), @intCast(self.cuts[2]) };
-                    try f.gemv.goSides(r, self.at, a.m, a.n, cuts, a.words, a.scale.p, a.x, out, s);
+                    if (self.reg.which == .skinny) {
+                        try f.skinny.goSides(r, self.at, a.m, a.n, cuts, a.words, a.scale.p, a.x, out, s);
+                    } else try f.gemv.goSides(r, self.at, a.m, a.n, cuts, a.words, a.scale.p, a.x, out, s);
                 }
             },
         }
@@ -280,7 +325,7 @@ pub fn identity(a: std.mem.Allocator, x: *Case) !bool {
     var bad: ?usize = null;
     for (1..full) |m| {
         x.arg.m = @intCast(m);
-        x.at = Case.entry(s.n, s.k, m, x.reg.out).?;
+        x.at = Case.entry(x.reg.which, s.n, s.k, m, x.reg.out).?;
         try x.launch(x.base, false);
         for (0..4) |i| {
             const len = m * x.side(i) * elem;

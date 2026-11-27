@@ -12,6 +12,7 @@ const stream_pick = @import("stream_pick.zig");
 const stream_layout = @import("stream_layout.zig");
 const util = @import("util.zig");
 const mxfp8_gemv = @import("mxfp8_gemv.zig");
+const skinny = @import("skinny.zig");
 const nvfp4_experts = @import("nvfp4_experts.zig");
 const bf16_gemm = @import("bf16_gemm.zig");
 const kernels = @import("../kernels.zig");
@@ -62,6 +63,8 @@ pub const Kernels = struct {
     matrix: bool,
     /// The Loom MXFP8 GEMV: the stream tile's bytes, at the shapes it is faster; empty in a build without Loom.
     gemv: mxfp8_gemv.Kernels,
+    /// The Loom skinny MXFP8 tile: the stream tile's bytes for 1-64 rows, weights read once; empty without Loom.
+    skinny: skinny.Kernels,
     /// The Loom NVFP4 grouped-expert prompt kernels: the routed prompt tiles' bytes; empty without Loom.
     experts: nvfp4_experts.Kernels,
     /// The Loom dense bf16 prompt GEMMs: fp4l_wmma's BF16 bytes, at the shapes they are faster; empty without Loom.
@@ -76,8 +79,9 @@ pub const Kernels = struct {
         const d0 = @backingInt(kernels.Loom.bf16_gemm_128x128);
         const d1 = @backingInt(kernels.Loom.bf16_gemm_128x256);
         const dense = try bf16_gemm.Kernels.load(.{ loom[d0], loom[d1] }, .{ manifests[d0], manifests[d1] });
+        const sk = @backingInt(kernels.Loom.skinny_mxfp8);
         @setEvalBranchQuota(100_000);
-        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
+        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .skinny = try skinny.Kernels.load(loom[sk], manifests[sk]), .experts = experts, .dense = dense };
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
@@ -124,13 +128,21 @@ pub const Kernels = struct {
     pub fn streamGo(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, sides_in: StreamSides, items: c_int, s: abi.Stream) Error!void {
         const plain = sides_in.pair_cols == 0 and items == 1 and a.route.items == 0;
         if (fmt == .mxfp8 and plain) {
-            if (sides_in.count == 0) if (k.gemv.pick(a.n, a.k, a.m, if (a.out16 != 0) .bf16 else .f32)) |at| {
-                const half = a.out16 != 0;
-                return k.gemv.go(r, at, a.m, a.n, a.words, a.scale.p, a.x, if (half) a.out16 else a.out, half, s);
-            };
-            if (stitched(sides_in, a.k)) |st| if (k.gemv.pick(st.n, a.k, a.m, .sides)) |at| {
-                return k.gemv.goSides(r, at, a.m, st.n, st.cuts, st.words, st.scale, a.x, st.out, s);
-            };
+            const half = a.out16 != 0;
+            if (sides_in.count == 0) {
+                const out: mxfp8_gemv.Out = if (half) .bf16 else .f32;
+                if (k.gemv.pick(a.n, a.k, a.m, out)) |at|
+                    return k.gemv.go(r, at, a.m, a.n, a.words, a.scale.p, a.x, if (half) a.out16 else a.out, half, s);
+                if (k.skinny.pick(a.n, a.k, a.m, out)) |at|
+                    return k.skinny.go(r, at, a.m, a.n, a.words, a.scale.p, a.x, if (half) a.out16 else a.out, half, s);
+            }
+            if (stitched(sides_in, a.k)) |st| {
+                if (k.gemv.pick(st.n, a.k, a.m, .sides)) |at|
+                    return k.gemv.goSides(r, at, a.m, st.n, st.cuts, st.words, st.scale, a.x, st.out, s);
+                const even = @rem(st.cuts[0], 16) == 0 and @rem(st.cuts[1], 16) == 0 and @rem(st.cuts[2], 16) == 0;
+                if (even) if (k.skinny.pick(st.n, a.k, a.m, .sides)) |at|
+                    return k.skinny.goSides(r, at, a.m, st.n, st.cuts, st.words, st.scale, a.x, st.out, s);
+            }
         }
         return k.tileGo(r, fmt, a, sides_in, items, s);
     }
