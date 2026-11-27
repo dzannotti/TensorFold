@@ -483,11 +483,13 @@ pub const Fx = struct {
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const f = of(ptr);
         states.settle(f);
+        f.e.beginKeeps();
         for (windows, paths) |w, path| {
             const lane = f.lanes.get(w.stream) orelse return error.UnknownStream;
             for (path, 0..) |r, j| if (r != j) return error.TreesNotBuilt;
             if (lane.pending != null) try f.mark(lane, path.len);
         }
+        try f.e.endKeeps();
     }
 
     /// The head absorbs each stream's kept rows (residual streams and the token after each), then chains its drafts.

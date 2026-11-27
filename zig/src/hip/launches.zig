@@ -59,6 +59,8 @@ pub const hc_readout = @import("launches/hc_readout.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
+pub const LaneArgs = plan.LaneArgs;
+pub const LaneFront = plan.LaneFront;
 pub const PlanRef = plan.PlanRef;
 /// Rows of one slot a block of the shared-row score kernels takes.
 pub const score_rows = plan.score_rows;
@@ -163,6 +165,9 @@ pub const Launcher = struct {
         gather: Function,
         gdn: [2]Function, // dk 128, 16
         gdn_replay: [2]Function, // dk 128, 16
+        lane_front: Function,
+        lane_chain: Function,
+        lane_roll: Function,
         page_write: Function,
         page_gather: Function,
     };
@@ -268,6 +273,9 @@ pub const Launcher = struct {
             .gather = try pl.function("tf_plan_gather"),
             .gdn = .{ try gd.function("tf_gdn_plan_128"), try gd.function("tf_gdn_plan_16") },
             .gdn_replay = .{ try gd.function("tf_gdn_replay_128"), try gd.function("tf_gdn_replay_16") },
+            .lane_front = try gd.function("tf_gdn_lanes_front"),
+            .lane_chain = try gd.function("tf_gdn_lanes_chain"),
+            .lane_roll = try gd.function("tf_gdn_lanes_roll"),
             .page_write = try pl.function("tf_page_write"),
             .page_gather = try pl.function("tf_page_gather"),
         };
@@ -462,6 +470,9 @@ pub const Launcher = struct {
     pub const planGatedDelta = plan.planGatedDelta;
     pub const planKeep = plan.planKeep;
     pub const planGdnReplay = plan.planGdnReplay;
+    pub const laneFront = plan.laneFront;
+    pub const laneChain = plan.laneChain;
+    pub const laneRoll = plan.laneRoll;
     pub const pagesWrite = plan.pagesWrite;
     pub const pagesGather = plan.pagesGather;
     pub const planGather = plan.planGather;

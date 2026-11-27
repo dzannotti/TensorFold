@@ -181,6 +181,7 @@ fn restore(
     try s.synchronize();
     if (saved.at + 1 > c.layout.cap) return error.SnapshotTooLong;
     try copyIn(x, c, saved.at, ratio, saved.main, gpa);
+    c.late = .{};
     if (head) |h| try copyIn(x, h, saved.at, ratio, saved.head, gpa);
     c.len = saved.at;
     c.pooled = saved.pooled;
