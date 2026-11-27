@@ -403,6 +403,10 @@ pub const Launcher = struct {
             d.* = kernels.loom_manifests[@backingInt(k)];
         }
         l.hcr = try hc_readout.Kernels.load(hc_mods, hc_docs);
+        if (l.attn.f != null and l.fnx.sparse_wmma == null) {
+            std.log.err("launches: the Loom attention kernels load but tf_fn_sparse_wmma12_bf16 is missing", .{});
+            return error.Invalid;
+        }
         return l;
     }
 

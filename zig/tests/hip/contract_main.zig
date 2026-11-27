@@ -385,6 +385,10 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     var sparse = sparse_k.SparseLanes.init(a, &r, s, &l);
     defer sparse.deinit();
     try kernels.append(a, sparse.kernel());
+    var sparse_wmma = sparse_k.SparseLanes.init(a, &r, s, &l);
+    defer sparse_wmma.deinit();
+    sparse_wmma.wmma = true;
+    if (l.fnx.sparse_wmma != null) try kernels.append(a, sparse_wmma.kernel());
     var idx_scores: [2]idx_k.IdxScores = undefined;
     for (&idx_scores, std.enums.values(idx_k.Fault)) |*x, fault| x.* = .init(a, &r, s, &l, fault);
     defer for (&idx_scores) |*x| x.deinit();

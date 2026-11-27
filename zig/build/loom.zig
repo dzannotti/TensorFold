@@ -10,7 +10,7 @@ pub const version = std.mem.trim(u8, @embedFile("../../.loom-version"), " \t\r\n
 pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 = null, inputs: []const []const u8 };
 
 const k4_headers: []const []const u8 = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h" };
-const sa_headers: []const []const u8 = &.{ "lanes_asm.h", "exp_exact.h" };
+const sa_headers: []const []const u8 = &.{ "wmma_tile.h", "exp_exact.h" };
 const dg_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h" };
 const hc_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h" };
 
@@ -37,7 +37,7 @@ const Checks = struct { dir: []const u8, cxx: ?[]const u8 = null, inputs: []cons
 const checks = [_]Checks{
     .{ .dir = "mxfp8_gemv", .inputs = &.{ "gen.py", "gen_epilogue.py" } },
     .{ .dir = "nvfp4_grouped_expert", .cxx = "checks.cxx", .inputs = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h", "gate_up.cxx", "down.cxx" } },
-    .{ .dir = "sparse_attention", .cxx = "checks.cxx", .inputs = &.{ "lanes_asm.h", "exp_exact.h", "oracle.h", "attend.cxx", "scores.cxx", "select.cxx" } },
+    .{ .dir = "sparse_attention", .cxx = "checks.cxx", .inputs = &.{ "wmma_tile.h", "exp_exact.h", "oracle.h", "attend.cxx", "scores.cxx", "select.cxx" } },
     .{ .dir = "dense_prompt_gemm", .cxx = "checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "bf16_gemm.cxx" } },
     .{ .dir = "gdn_prompt", .cxx = "checks.cxx", .inputs = &.{ "recur.h", "oracle.h", "gdn_recur.cxx" } },
     .{ .dir = "dense_prompt_gemm", .cxx = "hc_checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h", "hc_norm.cxx", "hc_readout.cxx" } },
