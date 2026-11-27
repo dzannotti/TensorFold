@@ -19,16 +19,21 @@ const shared_copy_rows = 4;
 pub const shared_chain_drafts = 3;
 
 /// The lane core's facts of a loaded model: `drafting` names a head that drafts, `drafts` its capped chains.
+fn ltEnv(name: [*:0]const u8, default: u32) u32 {
+    const raw = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(u32, std.mem.span(raw), 10) catch default;
+}
+
 pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) lanes.Model {
     return .{
         .exact_width = exact_width,
-        .first_copy_rows = shared_copy_rows,
+        .first_copy_rows = ltEnv("LT_COPY_ROWS", shared_copy_rows),
         .gpu_tokens = false,
         .mtp = drafting,
         .speculate = drafting,
         .speculate_early = false,
         .drafts = drafts,
-        .shared_mtp_cap = shared_chain_drafts,
+        .shared_mtp_cap = ltEnv("LT_SHARED_CAP", shared_chain_drafts),
         .hidden_rows = true,
         .batch_rows = @intCast(exact_width * streams),
         .max_streams = @intCast(streams),

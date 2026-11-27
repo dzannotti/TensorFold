@@ -1,6 +1,7 @@
 // FP4-Local's NVFP4, MXFP8 and BF16-fold products on the shared tiles, as launches/fp4local.zig resolves them.
 
 #include "quant/fp4local_tiles.hpp"
+#include "quant/qmmf_tiles.hpp"
 
 namespace tf {
 namespace rocm {
@@ -23,6 +24,26 @@ TF_FP4L_ROWS(TF_FP4L_STREAM, 1, 4)
 TF_FP4L_ROWS(TF_FP4L_PAIR, 1, 2)
 TF_FP4L_ROWS(TF_FP4L_PAIR, 1, 4)
 TF_FP4L_ROWS(TF_FP4L_STREAM, 2, 2)
+TF_FP4L_STREAM(0, 8, 2)
+TF_FP4L_STREAM(1, 8, 2)
+TF_FP4L_STREAM(2, 8, 2)
+TF_FP4L_PAIR(0, 8, 2)
+TF_FP4L_PAIR(1, 8, 2)
+TF_FP4L_STREAM(0, 16, 2)
+TF_FP4L_STREAM(1, 16, 2)
+TF_FP4L_STREAM(2, 16, 2)
+TF_FP4L_STREAM(0, 24, 2)
+TF_FP4L_STREAM(1, 24, 2)
+TF_FP4L_STREAM(2, 24, 2)
+TF_FP4L_STREAM(0, 32, 2)
+TF_FP4L_STREAM(1, 32, 2)
+TF_FP4L_STREAM(2, 32, 2)
+TF_FP4L_PAIR(0, 16, 2)
+TF_FP4L_PAIR(1, 16, 2)
+TF_FP4L_PAIR(0, 24, 2)
+TF_FP4L_PAIR(1, 24, 2)
+TF_FP4L_PAIR(0, 32, 2)
+TF_FP4L_PAIR(1, 32, 2)
 
 template __global__ void fp4l_wmma<0>(Affine);
 template __global__ void fp4l_wmma<1>(Affine);
@@ -33,3 +54,6 @@ template __global__ void fp4l_pair<1>(Affine, float);
 
 }  // namespace rocm
 }  // namespace tf
+// lt rev 3
+// lt rev 4
+// lt rev 5
