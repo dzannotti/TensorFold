@@ -41,4 +41,7 @@ test {
     _ = @import("hip/state_test.zig");
     _ = @import("hip/fused_prep_test.zig");
     _ = @import("hip/mtp_drafts_test.zig");
+    _ = @import("hip/load_modelopt.zig");
+    @import("std").testing.refAllDecls(@import("hip/load_experts.zig"));
+    @import("std").testing.refAllDecls(@import("hip/tables_nvfp4.zig").Rows);
 }

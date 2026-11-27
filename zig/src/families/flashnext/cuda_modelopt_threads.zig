@@ -6,23 +6,14 @@ const experts = @import("cuda_modelopt_experts.zig");
 const ex = cuda.experts.Nvfp4Experts;
 const nvfp4 = @import("nvfp4_read.zig");
 
-pub const default_threads = 8;
+pub const default_threads = nvfp4.default_threads;
 pub const max_threads = nvfp4.max_threads;
 
 /// Pinned bytes a load stages at most, a whole number of experts' words at a time.
 pub const staging_bytes: usize = 192 << 20;
 
-/// TF_FLASHNEXT_LOAD_THREADS: unset, 8; otherwise 1 (loadShape's one-expert loop) to 32 threads, anything else refused.
-pub fn parseThreads(v: ?[]const u8) !usize {
-    const s = v orelse return default_threads;
-    const n = std.fmt.parseInt(usize, s, 10) catch return error.BadLoadThreads;
-    if (n == 0 or n > max_threads) return error.BadLoadThreads;
-    return n;
-}
-
-pub fn configured() !usize {
-    return parseThreads(if (std.c.getenv("TF_FLASHNEXT_LOAD_THREADS")) |v| std.mem.span(v) else null);
-}
+pub const parseThreads = nvfp4.parseThreads;
+pub const configured = nvfp4.configured;
 
 pub const View = nvfp4.View;
 

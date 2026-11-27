@@ -240,7 +240,7 @@ const Loader = struct {
 };
 
 /// An fp32 tensor's values copied out (its bytes may sit at any alignment).
-fn floats(a: Allocator, t: Tensor) ![]f32 {
+pub fn floats(a: Allocator, t: Tensor) ![]f32 {
     const v = try a.alloc(f32, t.bytes.len / 4);
     @memcpy(std.mem.sliceAsBytes(v), t.bytes);
     return v;
@@ -272,7 +272,7 @@ fn join(a: Allocator, x: Tensor, y: Tensor) !Tensor {
 }
 
 /// Whether the centred norms are stored as gamma, from every layer's attention hc norm mean (tensors.normsAroundOne).
-fn aroundOne(a: Allocator, t: *const Tables, layers: usize) !bool {
+pub fn aroundOne(a: Allocator, t: anytype, layers: usize, exported: bool) !bool {
     const means = try a.alloc(f64, layers);
     for (means, 0..) |*m, i| {
         var buf: [128]u8 = undefined;
@@ -281,7 +281,9 @@ fn aroundOne(a: Allocator, t: *const Tables, layers: usize) !bool {
             "{s}.{s}.{s}",
             .{ try tensors.layer(&buf, i), tensors.hc.attn, tensors.hc.norm },
         );
-        const v = try floats(a, try quant.convert.float32(a, try t.get(k)));
+        var spelled: [256]u8 = undefined;
+        const name = if (exported) try @import("../names_modelopt.zig").exported(k, &spelled) else k;
+        const v = try floats(a, try quant.convert.float32(a, try t.get(name)));
         var sum: f64 = 0;
         for (v) |x| sum += x;
         m.* = sum / @as(f64, @floatFromInt(v.len));
@@ -292,7 +294,7 @@ fn aroundOne(a: Allocator, t: *const Tables, layers: usize) !bool {
 /// The draft head's rows: the family's draft vocabulary (ascending ids) of the output head.
 pub const draft_ids = @import("../proposal_table.zig").text;
 
-fn draftSpans(a: Allocator) ![]Span {
+pub fn draftSpans(a: Allocator) ![]Span {
     const logical = try draftIds(a);
     defer a.free(logical);
     var list: std.ArrayList(Span) = .empty;
@@ -391,16 +393,17 @@ test "the MTP head's HIP names follow the index's root, so oMLX's top-level mtp.
     try std.testing.expectEqualStrings("mtp.hyper_connection_mixer", om.mixer);
 }
 
-/// One rank's weights (`rank` null: the whole model) from `ck`; rank 0 also holds the MTP head under `mtp_root`.
+/// One rank's weights (`rank` null: the whole model) from `ck`, the MTP head on rank 0; FP4-Local via load_modelopt.
 pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *core.checkpoint.Checkpoint, c: *const config.Config, rank: ?Rank, act: model.Kind, mtp_root: []const u8) !Weights {
     try @import("../readout_fused.zig").refuse("HIP", @import("../readout_fused.zig").requested());
     try @import("../fused_split.zig").refuse("HIP", try @import("../fused_split.zig").on());
+    if (c.format == .modelopt) return @import("load_modelopt.zig").load(gpa, d, ck, c, rank, act, mtp_root);
     var w: Weights = .{ .gpa = gpa };
     errdefer w.deinit();
     const tables: Tables = .{ .ck = ck, .cfg = c };
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const l: Loader = .{ .a = arena.allocator(), .t = &tables, .up = .{ .r = d, .buffers = &w.buffers, .gpa = gpa }, .rank = rank, .around_one = try aroundOne(arena.allocator(), &tables, c.layers), .mtp_root = mtp_root };
+    const l: Loader = .{ .a = arena.allocator(), .t = &tables, .up = .{ .r = d, .buffers = &w.buffers, .gpa = gpa }, .rank = rank, .around_one = try aroundOne(arena.allocator(), &tables, c.layers, false), .mtp_root = mtp_root };
     const world_n: usize = if (rank) |r| r.world else 1;
     const dims = try model.Dims.of(c, world_n);
     const head = try l.proj(tensors.lm_head);

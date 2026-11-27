@@ -19,6 +19,19 @@ pub fn resolve(weight_map: std.json.ObjectMap, requested: []const u8, buf: []u8)
     return error.MissingTensor;
 }
 
+/// `requested`'s exported spelling (in `buf`), or `requested` when no alias names its prefix: a stem, unchecked.
+pub fn exported(requested: []const u8, buf: []u8) ![]const u8 {
+    var dotted: [512]u8 = undefined;
+    const stem = try std.fmt.bufPrint(&dotted, "{s}.", .{requested});
+    inline for (aliases) |pair| {
+        if (std.mem.startsWith(u8, stem, pair[0])) {
+            const out = try std.fmt.bufPrint(buf, "{s}{s}", .{ pair[1], stem[pair[0].len..] });
+            return out[0 .. out.len - 1];
+        }
+    }
+    return requested;
+}
+
 test "canonical checkpoint aliases preserve exact stored namespace and prefer a direct key" {
     const a = std.testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, a,
@@ -32,4 +45,7 @@ test "canonical checkpoint aliases preserve exact stored namespace and prefer a 
     try std.testing.expectEqualStrings("mtp.x", try resolve(wm, "language_model.mtp.x", &buf));
     try std.testing.expectEqualStrings("language_model.model.direct", try resolve(wm, "language_model.model.direct", &buf));
     try std.testing.expectError(error.MissingTensor, resolve(wm, "language_model.model.missing", &buf));
+    try std.testing.expectEqualStrings("model.language_model.layers.3", try exported("language_model.model.layers.3", &buf));
+    try std.testing.expectEqualStrings("lm_head", try exported("language_model.lm_head", &buf));
+    try std.testing.expectEqualStrings("mtp", try exported("mtp", &buf));
 }

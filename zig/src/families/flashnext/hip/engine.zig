@@ -127,7 +127,7 @@ pub const Engine = struct {
         if (o.world > 1) e.comm = try (o.group orelse return error.NoGroup).open();
         errdefer if (e.comm) |c| c.close();
         _ = try steps.done(.{ 0, 0 }, .first);
-        e.cfg = try config.Config.read(gpa, io, dir);
+        e.cfg = try config.Config.readAny(gpa, io, dir);
         errdefer e.cfg.deinit();
         e.ck = try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
         errdefer e.ck.close();
@@ -136,8 +136,14 @@ pub const Engine = struct {
         const rank: ?core.quant.Rank = if (o.world > 1) .{ .rank = o.rank, .world = o.world } else null;
         // the index drives both the MTP head's root (oMLX keeps it outside language_model) and the shard spelling
         const map = try weightMapOf(e.keep.allocator(), io, dir);
+        const began = std.Io.Clock.awake.now(io).toNanoseconds();
         e.weights = try loader.load(gpa, &e.driver, &e.ck, &e.cfg, rank, e.act, index.mtpRoot(map));
         errdefer e.weights.deinit();
+        std.log.info("Flash Next weights: {d:.2} GiB on the device in {d} buffers, loaded in {d:.1} s", .{
+            @as(f64, @floatFromInt(hip.usage(false).device)) / (1 << 30),
+            e.weights.buffers.items.len,
+            @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - began)) / 1e9,
+        });
         e.weights.model.tp = e.comm;
         const spelling = index.ngramSpelling(map);
         e.tables = try tables.Tables.init(e.keep.allocator(), &e.ck, io, &e.cfg, e.weights.model.ple.layer, spelling);

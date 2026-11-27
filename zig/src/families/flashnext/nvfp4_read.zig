@@ -4,6 +4,19 @@ const core = @import("core");
 const slice = core.nvfp4_slice;
 
 pub const max_threads = 32;
+pub const default_threads = 8;
+
+/// TF_FLASHNEXT_LOAD_THREADS: unset, 8; otherwise 1 (loadShape's one-expert loop) to 32 threads, anything else refused.
+pub fn parseThreads(v: ?[]const u8) !usize {
+    const s = v orelse return default_threads;
+    const n = std.fmt.parseInt(usize, s, 10) catch return error.BadLoadThreads;
+    if (n == 0 or n > max_threads) return error.BadLoadThreads;
+    return n;
+}
+
+pub fn configured() !usize {
+    return parseThreads(@import("sys").environment.rawText("TF_FLASHNEXT_LOAD_THREADS"));
+}
 
 /// A projection's borrowed planes: FP4 codes, plain E4M3 scales or the CSF planes, the global and its bytes.
 pub const View = struct { codes: []const u8, scales: []const u8 = &.{}, fixed: []const u8 = &.{}, exceptions: []const u8 = &.{}, global: f32, global_bytes: []const u8 = &.{} };

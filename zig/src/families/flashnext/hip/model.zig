@@ -96,6 +96,8 @@ pub const Linear = struct {
     a_log: u64,
     dt_bias: u64,
     norm: u64,
+    /// qkv | z | b | a stitched along N as FP4-Local stores them (the parts above view its rows); null for MLX.
+    inputs: ?Projection = null,
 };
 
 pub const Sparse = struct {
@@ -109,6 +111,8 @@ pub const Sparse = struct {
     k_norm: u64,
     iq_norm: u64,
     ik_norm: u64,
+    /// q | k | v | index stitched along N as FP4-Local stores them (the parts above view its rows); null for MLX.
+    inputs: ?Projection = null,
 };
 
 pub const Mixer = union(enum) { linear: Linear, sparse: Sparse };

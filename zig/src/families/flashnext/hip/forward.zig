@@ -162,7 +162,7 @@ pub const Inputs = struct {
 pub fn stage(m: *const model.Model, host: *Host, segs: []const Seg, window: bool) !Staged {
     const d = m.dims;
     const t = host.tables;
-    if (d.ple_dim / t.rows.dims != ngram.heads) return error.UnsupportedNgramHeads;
+    if (d.ple_dim / t.dims() != ngram.heads) return error.UnsupportedNgramHeads;
     var rows: usize = 0;
     for (segs) |g| rows += g.tokens.len;
     const n16 = rows * ngram.heads;
@@ -263,22 +263,29 @@ fn ple(
     const t = host.tables;
     const mark = o.arena.mark();
     defer o.arena.release(mark);
-    const emb = try take(o, m.act, rows * d.ple_dim);
     const first = row0 * ngram.heads;
-    try o.l.tf_embed_rows(
-        @ptrFromInt(in.words + first * t.wordBytes()),
-        @ptrFromInt(in.scales + first * t.tableBytes()),
-        @ptrFromInt(in.biases + first * t.tableBytes()),
-        @backingInt(Kind.bf16),
-        @ptrFromInt(in.local),
-        @intCast(rows * ngram.heads),
-        t.rows.bits,
-        @intCast(t.rows.group),
-        @intCast(t.rows.dims),
-        @ptrFromInt(emb.ptr),
-        @backingInt(m.act),
-        o.stream,
-    );
+    // FP4-Local's rows arrive decoded: the staged bf16 rows are the embedding (token-major, heads in turn)
+    const emb: Tensor = switch (t.store) {
+        .nvfp4 => if (m.act == .bf16) .{ .ptr = in.words + first * t.wordBytes(), .kind = .bf16 } else return error.UnsupportedNgramHeads,
+        .mlx => |r| e: {
+            const e = try take(o, m.act, rows * d.ple_dim);
+            try o.l.tf_embed_rows(
+                @ptrFromInt(in.words + first * t.wordBytes()),
+                @ptrFromInt(in.scales + first * t.tableBytes()),
+                @ptrFromInt(in.biases + first * t.tableBytes()),
+                @backingInt(Kind.bf16),
+                @ptrFromInt(in.local),
+                @intCast(rows * ngram.heads),
+                r.bits,
+                @intCast(r.group),
+                @intCast(r.dims),
+                @ptrFromInt(e.ptr),
+                @backingInt(m.act),
+                o.stream,
+            );
+            break :e e;
+        },
+    };
     const kv = try o.project(emb, m.ple.kv, rows, false);
     const gated = try take(o, m.act, rows * d.wide());
     const tail = c.layout.tail_rows * d.wide() * m.act.size();
