@@ -1,0 +1,112 @@
+//! FP4-Local's contract entry: gates 1-4, then bit identity across decode rows and prompt row counts and cuts.
+const std = @import("std");
+const hip = @import("hip");
+const core = @import("core");
+const Profile = @import("contract_entry.zig").Profile;
+const k_ = @import("contract_fp4local.zig");
+
+const g = core.contract.gates;
+
+pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
+    var r = try hip.Runtime.open();
+    defer r.close();
+    var ctx = try hip.Context.init(&r, 0);
+    defer ctx.deinit();
+    var s = try hip.Stream.init(&r);
+    defer s.deinit();
+    var l = try hip.Launcher.load(&r, .{}, hip.kernels.images);
+    defer l.unload();
+    var t: g.Tally = .{};
+    if (!l.fp4.matrix) {
+        std.debug.print("N/A  hip fp4l_*: FP4-Local runs on gfx11's matrix cores only\n", .{});
+        return t;
+    }
+    var cases: [k_.registrations.len]k_.Case = undefined;
+    for (&cases, k_.registrations) |*x, reg| x.* = .init(a, &r, s, &l, reg);
+    defer for (&cases) |*x| x.deinit();
+    var kernels: std.ArrayList(g.Kernel) = .empty;
+    defer kernels.deinit(a);
+    for (&cases) |*x| try kernels.append(a, x.kernel());
+    try g.runAll(a, kernels.items, 0x6b63, &t);
+    for (&cases) |*x| {
+        const ok = if (x.reg.routed) try shuffled(a, x) else try identity(a, x);
+        t.kernels += 1;
+        if (ok) t.passed += 1 else t.failed += 1;
+    }
+    return t;
+}
+
+/// A routed plan's pairs come out the same bytes under another plan of them: items in another order, one item split.
+fn shuffled(a: std.mem.Allocator, x: *k_.Case) !bool {
+    const served = x.reg.served[0];
+    if (!try x.prepare(served, .random, 0x5f)) return false;
+    try x.run();
+    const total = served.rows * x.rowBytes();
+    const want = try a.dupe(u8, try x.rig.bytes(x.outOf(x.arg), total));
+    defer a.free(want);
+    const m: i32 = @intCast(served.rows);
+    const half = @divTrunc(m + 1, 2);
+    const cut = @divTrunc(half, 3);
+    const items = [_]i32{ 0, half, m - half, 1, cut, half - cut, 1, 0, cut };
+    var arg = x.arg;
+    arg.route.items = try x.rig.input(std.mem.sliceAsBytes(&items));
+    retarget(x, &arg, 0);
+    x.items = 3;
+    try x.launchWith(arg);
+    x.items = 2;
+    const same = std.mem.eql(u8, try x.rig.bytes(scratchOf(x), total), want);
+    const say = "{s} shuffled {s}: items reordered and split, {d} pairs at {d}x{d}\n";
+    std.debug.print(say, .{ if (same) "PASS" else "FAIL", x.reg.name, served.rows, served.n, served.k });
+    return same;
+}
+
+/// Where a check's launch writes: the case's scratch, `at` bytes on.
+fn retarget(x: *k_.Case, arg: *k_.Arg, at: usize) void {
+    if (x.reg.tile == .pair) arg.out16 = x.base16 + at else arg.out = x.base + at;
+}
+
+fn scratchOf(x: *const k_.Case) u64 {
+    return if (x.reg.tile == .pair) x.base16 else x.base;
+}
+
+/// The rows of a launch of fewer rows (and of later cuts, for the prompt tile) equal the full launch's bytes.
+fn identity(a: std.mem.Allocator, x: *k_.Case) !bool {
+    const prompt = x.reg.tile != .stream;
+    const served = x.reg.served[0];
+    const full: usize = if (prompt) 256 else 8;
+    if (!try x.prepare(.{ .rows = full, .n = served.n, .k = served.k }, .random, 0x1d)) return false;
+    try x.run();
+    const n = served.n;
+    const row = x.rowBytes();
+    const want = try a.dupe(u8, try x.rig.bytes(x.outOf(x.arg), full * row));
+    defer a.free(want);
+    const counts: []const usize = if (prompt) &.{ 1, 7, 16, 64, 127, 128, 129, 200 } else &.{ 1, 2, 3, 4, 5, 6, 7 };
+    var bad: ?usize = null;
+    for (counts) |m| {
+        var arg = x.arg;
+        arg.m = @intCast(m);
+        retarget(x, &arg, 0);
+        try x.launchWith(arg);
+        if (!std.mem.eql(u8, try x.rig.bytes(scratchOf(x), m * row), want[0 .. m * row])) bad = bad orelse m;
+    }
+    // a prompt cut at 1, 7, 64, 128 and 129 rows: each piece's rows from its own launch
+    if (prompt) for ([_]usize{ 1, 7, 64, 128, 129 }) |cut| {
+        var at: usize = 0;
+        while (at < full) : (at += cut) {
+            const m = @min(cut, full - at);
+            var arg = x.arg;
+            arg.m = @intCast(m);
+            arg.x += at * served.k * 2;
+            retarget(x, &arg, at * row);
+            try x.launchWith(arg);
+        }
+        if (!std.mem.eql(u8, try x.rig.bytes(scratchOf(x), full * row), want)) bad = bad orelse 1000 + cut;
+    };
+    const what = if (prompt) "row counts 1-200 and cuts 1, 7, 64, 128, 129 of 256 rows" else "row counts 1-7 of 8";
+    if (bad) |m| {
+        std.debug.print("FAIL identity {s}: {s}: first differing case {d}\n", .{ x.reg.name, what, m });
+        return false;
+    }
+    std.debug.print("PASS identity {s}: {s} byte-equal at {d}x{d}\n", .{ x.reg.name, what, n, served.k });
+    return true;
+}

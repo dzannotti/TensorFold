@@ -49,6 +49,7 @@ const dense_text = @import("launches/dense_text.zig");
 pub const draft = @import("launches/draft.zig");
 pub const exl3 = @import("launches/exl3.zig");
 pub const dsv41 = @import("launches/dsv41.zig");
+pub const fp4local = @import("launches/fp4local.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -120,6 +121,8 @@ pub const Launcher = struct {
     exl3: exl3.Fns,
     /// DeepSeek-V4.1's indexer top-512 (deepseek_v41/topk512.hip).
     dsv41: dsv41.Fns,
+    /// FP4-Local's NVFP4, MXFP8 and BF16-fold products (fp4local/fp4local.hip).
+    fp4: fp4local.Kernels,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -361,6 +364,7 @@ pub const Launcher = struct {
         l.dense = try dense.Kernels.load(tiles, chip.act == .bf16, chip.matrix == .wmma12, choices.products.matrix);
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
+        l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip);
         return l;
     }
 

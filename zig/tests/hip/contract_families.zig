@@ -3,6 +3,7 @@ pub const Profile = @import("contract_entry.zig").Profile;
 pub const Entry = @import("contract_entry.zig").Entry;
 
 pub const entries = [_]Entry{
+    .{ .group = .fp4local, .run = @import("contract_fp4local_entry.zig").run },
     .{ .group = .glm_ocr, .run = @import("contract_glm_ocr.zig").run },
     .{ .group = .inkling2, .run = @import("contract_inkling2.zig").run },
     .{ .group = .joint_schema, .run = @import("contract_joint_schema.zig").run },

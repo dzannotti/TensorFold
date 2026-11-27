@@ -147,6 +147,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const dense_tune_run = b.addRunArtifact(b.addTest(.{ .root_module = dense_tune_module }));
     dense_tune_run.has_side_effects = true; // timings: run every time, never from the cache
     b.step("hip-dense-tune", "Time the dot2 and WMMA BF16 dense tiles at Qwen3-8B's shapes (-Dhip-arch)").dependOn(&dense_tune_run.step);
+    const fp4l_module = b.createModule(.{ .root_source_file = b.path("zig/src/hip/fp4local_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    fp4l_module.addIncludePath(.{ .cwd_relative = hip_include });
+    fp4l_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
+    fp4l_module.addImport("hip_kernels", objects);
+    fp4l_module.addImport("core", coreModule(b, target));
+    const fp4l_bench = b.addTest(.{ .name = "tf-hip-fp4local-bench", .root_module = fp4l_module });
+    const fp4l_run = b.addRunArtifact(fp4l_bench);
+    fp4l_run.has_side_effects = true;
+    b.step("hip-fp4local-bench-build", "Build and install FP4-Local's product timings (-Dhip-arch, no run)").dependOn(&b.addInstallArtifact(fp4l_bench, .{}).step);
+    b.step("hip-fp4local-bench", "Time FP4-Local's products at the checkpoint's shapes: roofline share and energy (-Dhip-arch)").dependOn(&fp4l_run.step);
     const stub_kernels = b.createModule(.{ .root_source_file = b.addWriteFiles().add("kernels.zig", stub) });
     const host = engineModules(b, b.graph.host, .Debug, stub_kernels, null);
     b.step("test-environment-hip-host", "Named HIP budget refusals without GPU work").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.hip, .filters = &.{ "HIP environment:", "a carve-out needs the card" } })).step);
@@ -505,17 +515,19 @@ const groups = [_]Source{
     .{ .path = "decode/plan_rows.hip" },
     .{ .path = "inkling2/attention.hip", .strict = true },
     .{ .path = "deepseek_v41/topk512.hip" },
+    .{ .path = "fp4local/fp4local.hip" },
 };
 /// What the group sources include, so an edit to one rebuilds them.
 const headers = [_][]const u8{
-    "attention/attention_fa.hip", "attention/prefill.hpp", "decode/pages.hpp",              "decode/plan.hpp",       "ops/attention.hpp",    "ops/common.hpp",
-    "ops/draw.hpp",               "ops/tp.hpp",            "ops/elementwise.hpp",           "ops/linear.hpp",        "ops/moe.hpp",          "ops/norms.hpp",
-    "ops/rope.hpp",               "common/arch.hpp",       "common/dot2.hpp",               "common/vec.hpp",        "common/wmma.hpp",      "quant/act.hpp",
-    "quant/mlx.hpp",              "quant/mlx_decoder.hpp", "quant/mlx_pieces.hpp",          "quant/mlx_tiles.hpp",   "tiles/dot2.hpp",       "tiles/epilogue.hpp",
-    "tiles/gemm.hpp",             "tiles/gemm_kp.hpp",     "tiles/matrix_gemm.hpp",         "tiles/matrix_item.hpp", "tiles/plan.hpp",       "tiles/stream.hpp",
-    "flashnext/streams.hpp",      "flashnext/ngram.hpp",   "flashnext/indexer.hpp",         "flashnext/sparse.hpp",  "ops/nemotron_moe.hpp", "quant/bf16_decoder.hpp",
-    "quant/dense_tiles.hpp",      "tiles/wmma12_gemm.hpp", "tiles/wmma12_gemm_k32_ref.hpp", "ops/columns.hpp",       "columns_controls.hpp", "ops/vision.hpp",
-    "ops/dense_text.hpp",         "ops/vl_position.hpp",   "flashnext/sparse_lanes.hpp",    "tiles/wmma12_step.hpp", "inkling2/tile.hpp",
+    "attention/attention_fa.hip", "attention/prefill.hpp",   "decode/pages.hpp",              "decode/plan.hpp",          "ops/attention.hpp",     "ops/common.hpp",
+    "ops/draw.hpp",               "ops/tp.hpp",              "ops/elementwise.hpp",           "ops/linear.hpp",           "ops/moe.hpp",           "ops/norms.hpp",
+    "ops/rope.hpp",               "common/arch.hpp",         "common/dot2.hpp",               "common/vec.hpp",           "common/wmma.hpp",       "quant/act.hpp",
+    "quant/mlx.hpp",              "quant/mlx_decoder.hpp",   "quant/mlx_pieces.hpp",          "quant/mlx_tiles.hpp",      "tiles/dot2.hpp",        "tiles/epilogue.hpp",
+    "tiles/gemm.hpp",             "tiles/gemm_kp.hpp",       "tiles/matrix_gemm.hpp",         "tiles/matrix_item.hpp",    "tiles/plan.hpp",        "tiles/stream.hpp",
+    "flashnext/streams.hpp",      "flashnext/ngram.hpp",     "flashnext/indexer.hpp",         "flashnext/sparse.hpp",     "ops/nemotron_moe.hpp",  "quant/bf16_decoder.hpp",
+    "quant/dense_tiles.hpp",      "tiles/wmma12_gemm.hpp",   "tiles/wmma12_gemm_k32_ref.hpp", "ops/columns.hpp",          "columns_controls.hpp",  "ops/vision.hpp",
+    "ops/dense_text.hpp",         "ops/vl_position.hpp",     "flashnext/sparse_lanes.hpp",    "tiles/wmma12_step.hpp",    "inkling2/tile.hpp",     "quant/fp4local_bake.hpp",
+    "quant/mxfp8_decoder.hpp",    "quant/nvfp4_decoder.hpp", "quant/bf16_fold_decoder.hpp",   "quant/fp4local_tiles.hpp", "tiles/matrix_pair.hpp",
 };
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
