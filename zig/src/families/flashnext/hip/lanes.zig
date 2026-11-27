@@ -44,6 +44,7 @@ pub const Lane = struct {
     /// The residual streams of the last forward's rows: the head's input.
     streams: hip.DeviceBuffer,
     held: [max_depth]u32 = undefined,
+    held_p: [max_depth]f32 = undefined,
     held_n: usize = 0,
     /// The prompt pass: the row it reached and the cuts where the prompt cache keeps a state (null once it is in).
     fill: ?Fill = null,
@@ -161,6 +162,7 @@ pub const Fx = struct {
             .keep = keepFn,
             .draft = draftFn,
             .tree = heldFn,
+            .probabilities = probabilitiesFn,
             .release = releaseFn,
         } };
     }
@@ -495,6 +497,17 @@ pub const Fx = struct {
         const f = of(ptr);
         states.settle(f);
         try draft_batch.draft(f, requests);
+    }
+
+    fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
+        const lane = of(ptr).lanes.get(s) orelse return error.UnknownStream;
+        if (out.len > lane.held_n) return false;
+        var chance: f64 = 1;
+        for (out, lane.held_p[0..out.len]) |*o, p| {
+            chance *= p;
+            o.* = chance;
+        }
+        return true;
     }
 
     fn heldFn(ptr: *anyopaque, s: *lanes.Stream, _: std.mem.Allocator) anyerror!?lanes.stream.Held {
