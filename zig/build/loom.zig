@@ -6,13 +6,14 @@ pub const Options = struct { compile: ?[]const u8, target: []const u8 };
 /// The hrx-loom release the sources are written and checked against; another one is refused.
 pub const version = std.mem.trim(u8, @embedFile("../../.loom-version"), " \t\r\n");
 
-/// A Loom code object from zig/kernels/loom/`dir`: gen.py writes its module, or loom-import-cxx makes it of `cxx`.
-pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 = null, inputs: []const []const u8 };
+/// A Loom code object from zig/kernels/loom/`dir` (gen.py's module, or loom-import-cxx's of `cxx`; `every`: all exports).
+pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 = null, inputs: []const []const u8, every: bool = false };
 
 const k4_headers: []const []const u8 = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h" };
 const sa_headers: []const []const u8 = &.{ "lanes_asm.h", "exp_exact.h" };
 const dg_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h" };
 const hc_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h" };
+const sk_headers: []const []const u8 = &.{ "mxfp8_cols.h", "skinny_tile.h", "skinny_out.h" };
 
 /// The kernels in zig/src/hip/kernels.zig's Loom order.
 pub const kernels = [_]Kernel{
@@ -29,6 +30,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "hc_down_wide", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
     .{ .name = "hc_down_narrow", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
     .{ .name = "hc_up_mix", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
+    .{ .name = "skinny_mxfp8", .dir = "skinny_gemm", .cxx = "skinny_mxfp8.cxx", .inputs = sk_headers, .every = true },
 };
 
 /// A directory's loom-test module: gen_tests.py's output (with gen.py's module as its library), or C++ checks.
@@ -41,6 +43,7 @@ const checks = [_]Checks{
     .{ .dir = "dense_prompt_gemm", .cxx = "checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "bf16_gemm.cxx" } },
     .{ .dir = "gdn_prompt", .cxx = "checks.cxx", .inputs = &.{ "recur.h", "oracle.h", "gdn_recur.cxx" } },
     .{ .dir = "dense_prompt_gemm", .cxx = "hc_checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h", "hc_norm.cxx", "hc_readout.cxx" } },
+    .{ .dir = "skinny_gemm", .cxx = "checks.cxx", .inputs = &.{ "mxfp8_cols.h", "skinny_tile.h", "skinny_out.h", "skinny_mxfp8.cxx" } },
 };
 
 /// The images' declarations of a build without Loom kernels.
@@ -160,7 +163,7 @@ fn compile(b: *std.Build, t: Tools, k: Kernel) Image {
     const module = b.fmt("{s}.loom", .{k.name});
     if (k.cxx) |src| {
         run.addFileArg(import(b, t, k.dir, src, k.inputs, module));
-        run.addArg(b.fmt("--root=@{s}", .{k.name}));
+        if (!k.every) run.addArg(b.fmt("--root=@{s}", .{k.name}));
     } else run.addFileArg(generate(b, t, k.dir, "gen.py", k.inputs, module));
     run.addArgs(&.{ b.fmt("--target={s}", .{t.target}), "--format=amdgpu-hsaco", "--artifact-manifest=details" });
     const hsaco = run.addPrefixedOutputFileArg("--output=", b.fmt("{s}.hsaco", .{k.name}));
