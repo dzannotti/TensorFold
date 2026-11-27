@@ -1,7 +1,7 @@
 //! Gate 5's records of the Loom kernels (zig/kernels/loom): gfx1151 only, -Dloom-target's chip.
 const Record = @import("hip_records.zig").Record;
 
-pub const records = [35]Record{
+pub const records = [36]Record{
     .{
         .launch = .{ .name = "Loom mxfp8 gemv r1 k2560 l16 s1 c1 w4 g5 p1 x4", .symbol = "mxfp8_gemv_r1_k2560_l16_s1_c1_w4_g5_p1_x4", .image = "loom_mxfp8_gemv", .threads = 128 },
         .usage = .{
@@ -314,6 +314,15 @@ pub const records = [35]Record{
             .{ .vgprs = 0, .served = false },
             .{ .vgprs = 0, .served = false },
             .{ .vgprs = 240, .sgprs = 30, .lds = 61440, .private = 0, .bound = 512, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
+    .{
+        .launch = .{ .name = "Loom gdn recur", .symbol = "gdn_recur", .image = "loom_gdn_recur", .threads = 128 },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 216, .sgprs = 102, .lds = 10304, .private = 0, .bound = 128, .wave = 32 },
             .{ .vgprs = 0, .served = false },
         },
     },

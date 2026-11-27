@@ -1,4 +1,4 @@
-//! Flash Next's Loom prompt attention and indexer under the HIP contract: byte-equal to the hipcc kernels they replace.
+//! Flash Next's Loom prompt attention, indexer and DeltaNet under the HIP contract: the bytes of the hipcc kernels.
 const std = @import("std");
 const hip = @import("hip");
 const core = @import("core");
@@ -6,6 +6,7 @@ const rig_ = @import("contract_rig.zig");
 const Profile = @import("contract_entry.zig").Profile;
 const sparse_k = @import("contract_sparse_lanes.zig");
 const idx_k = @import("contract_idx_scores.zig");
+const gdn_k = @import("contract_loom_gdn.zig");
 
 const contract = core.contract;
 const c = contract.spec;
@@ -173,5 +174,12 @@ pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
     defer select.deinit();
     const kernels = [_]g.Kernel{ attend.kernel(), scores.kernel(), select.kernel() };
     try g.runAll(a, &kernels, 0x5a77, &t);
+    if (l.gdn_loom.f == null) return t;
+    var y = gdn_k.Recur.init(a, &r, s, &l, .y);
+    defer y.deinit();
+    var st = gdn_k.Recur.init(a, &r, s, &l, .state);
+    defer st.deinit();
+    const recur = [_]g.Kernel{ y.kernel(), st.kernel() };
+    try g.runAll(a, &recur, 0x6764, &t);
     return t;
 }
