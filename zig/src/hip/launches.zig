@@ -52,6 +52,7 @@ pub const dsv41 = @import("launches/dsv41.zig");
 pub const fp4local = @import("launches/fp4local.zig");
 pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
 pub const nvfp4_experts = @import("launches/nvfp4_experts.zig");
+pub const loom_attention = @import("launches/loom_attention.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -127,6 +128,8 @@ pub const Launcher = struct {
     dsv41: dsv41.Fns,
     /// FP4-Local's NVFP4, MXFP8 and BF16-fold products (fp4local/fp4local.hip).
     fp4: fp4local.Kernels,
+    /// Flash Next's Loom sparse prompt attention and indexer; empty in a build without Loom.
+    attn: loom_attention.Kernels,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -375,6 +378,14 @@ pub const Launcher = struct {
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip, l.loom, kernels.loom_manifests);
+        const sa = [3]kernels.Loom{ .sparse_attend, .idx_scores, .idx_select };
+        var sa_mods: [3]?Module = undefined;
+        var sa_docs: [3][]const u8 = undefined;
+        for (sa, &sa_mods, &sa_docs) |k, *m, *d| {
+            m.* = l.loom[@backingInt(k)];
+            d.* = kernels.loom_manifests[@backingInt(k)];
+        }
+        l.attn = try loom_attention.Kernels.load(sa_mods, sa_docs);
         return l;
     }
 

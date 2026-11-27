@@ -72,6 +72,8 @@ pub const SparseLanes = struct {
     out: u64 = 0,
     base: u64 = 0, // the replaced kernel's output
     msg: [200]u8 = undefined,
+    /// The Loom kernel (launches/loom_attention.zig) against this lanes kernel: bf16, 12 heads a KV head.
+    loom: bool = false,
 
     pub fn init(a: std.mem.Allocator, rt: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher) SparseLanes {
         return .{ .rig = .{ .a = a, .r = rt, .s = s }, .l = l.*, .k = kit.act(), .arena = .init(a) };
@@ -83,8 +85,19 @@ pub const SparseLanes = struct {
     }
 
     pub fn kernel(self: *SparseLanes) g.Kernel {
-        return .{ .spec = spec(self.k), .ctx = self, .vt = &vt };
+        if (!self.loom) return .{ .spec = spec(self.k), .ctx = self, .vt = &vt };
+        var sp = spec(self.k);
+        sp.name = "loom sparse_attend";
+        sp.replaces = names[1];
+        sp.served = &loom_served;
+        return .{ .spec = sp, .ctx = self, .vt = &vt };
     }
+
+    /// Prompt slices and whole chunks of 5 to 256 rows over 1k to 16k keys.
+    const loom_served = [_]c.Shape{
+        .{ .rows = 64, .n = 24, .k = 4096 },  .{ .rows = 256, .n = 24, .k = 16384 }, .{ .rows = 5, .n = 24, .k = 1024 },
+        .{ .rows = 129, .n = 24, .k = 8192 }, .{ .rows = 200, .n = 12, .k = 4096 },
+    };
 
     const vt = g.hooks(SparseLanes);
 
@@ -129,6 +142,7 @@ pub const SparseLanes = struct {
     /// Random: values in [-1, 1) exact in the kind. Stress: q = 0 and integer values, so every weight is 1.
     pub fn prepare(self: *SparseLanes, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         const group: usize = if (shape.n % 12 == 0) 12 else 6;
+        if (self.loom and (group != 12 or self.k != .bf16)) return false;
         if (shape.rows < 1 or shape.n % group != 0 or shape.k < 12 * shape.rows + 64 or shape.k > 20000) return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
@@ -182,6 +196,11 @@ pub const SparseLanes = struct {
     pub fn run(self: *SparseLanes) !void {
         const s = self.shape;
         const d = self.dev;
+        if (self.loom) {
+            const kv: c_int = @intCast(s.n / self.group);
+            try self.l.attn.attend(self.l.r, @ptrFromInt(d[0]), @ptrFromInt(d[1]), @ptrFromInt(d[2]), @ptrFromInt(d[3]), stride, @ptrFromInt(d[4]), @ptrFromInt(d[5]), @ptrFromInt(self.out), @intCast(s.rows), @intCast(s.n), kv, @intCast(s.k), scale, self.rig.s.handle);
+            return self.rig.s.synchronize();
+        }
         try self.l.fn_sparse_attention(
             @ptrFromInt(d[0]),
             @ptrFromInt(d[1]),
@@ -206,11 +225,13 @@ pub const SparseLanes = struct {
         try self.rig.s.synchronize();
     }
 
-    /// The scalar kernel's output on the same inputs.
+    /// The scalar kernel's output on the same inputs (the lanes kernel's, for the Loom kernel).
     pub fn replaced(self: *SparseLanes) ![]const u8 {
         const s = self.shape;
         const d = self.dev;
-        try self.l.fn_sparse_attention_scalar(
+        const call = if (self.loom) &hip.Launcher.fn_sparse_attention else &hip.Launcher.fn_sparse_attention_scalar;
+        try call(
+            &self.l,
             @ptrFromInt(d[0]),
             @ptrFromInt(d[1]),
             @ptrFromInt(d[2]),
