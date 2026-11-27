@@ -71,7 +71,7 @@ pub const Fx = struct {
     ones: hip.DeviceBuffer,
     draft_ids: []u32,
     drafts: u32,
-    /// Lone windows and the head step timed at load (costs.zig); none under tensor parallelism.
+    /// Windows, shared rows and the head step timed at load (costs.zig); none under tensor parallelism.
     costs: @import("costs.zig").Costs = .{},
     /// The kept prompt states (null: no reuse), and the slot the next one takes on every rank.
     store: ?pc.Store = null,
@@ -167,7 +167,7 @@ pub const Fx = struct {
 
     pub fn facts(f: *const Fx) lanes.Model {
         const m = facts_mod.factsFor(cache.max_window, f.streams, f.e.weights.model.mtp != null and f.drafts > 0, f.drafts);
-        return facts_mod.timed(m, f.costs.window[0..f.costs.windows], f.costs.step_ms);
+        return facts_mod.timed(m, f.costs.window[0..f.costs.windows], f.costs.shared[0..f.costs.shareds], f.costs.step_ms);
     }
 
     /// Kept row `i`'s side buffer (forward.Mark): its part of the window snapshots, free while a prompt fills, or null.

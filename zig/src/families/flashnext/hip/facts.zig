@@ -16,7 +16,7 @@ pub fn capDrafts(asked: u8) u32 {
 const shared_copy_rows = 4;
 
 /// Most head drafts a stream chains in a shared round; a lone stream chains the policy's drafts.
-pub const shared_chain_drafts = 3;
+pub const shared_chain_drafts = 7;
 
 /// The lane core's facts of a loaded model: `drafting` names a head that drafts, `drafts` its capped chains.
 pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) lanes.Model {
@@ -36,12 +36,13 @@ pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) l
     };
 }
 
-/// `m` with its lone windows' and head step's timed costs: a lone stream's depth rule weighs drafts by time.
-pub fn timed(m: lanes.Model, windows: []const lanes.config.Cost, step_ms: f64) lanes.Model {
+/// `m` with its timed costs: lone windows by width, shared rounds by total rows, and the head step.
+pub fn timed(m: lanes.Model, windows: []const lanes.config.Cost, rows: []const lanes.config.Cost, step_ms: f64) lanes.Model {
     var out = m;
     out.window_costs = windows;
-    // shared rounds are untimed: a lone window's ms would price every stream's extra rows as one stream's
+    // shared rounds take their own timed rows: a lone window's ms would price every stream's rows as one stream's
     out.window_costs_lone = true;
+    out.shared_costs = rows;
     out.mtp_step_ms = step_ms;
     return out;
 }
@@ -49,7 +50,7 @@ pub fn timed(m: lanes.Model, windows: []const lanes.config.Cost, step_ms: f64) l
 test "timed windows give the depth rule its forward costs; untimed it keeps the fallback by first-draft rate" {
     const a = std.testing.allocator;
     const windows = [_]lanes.config.Cost{ .{ .width = 1, .ms = 40 }, .{ .width = 2, .ms = 45 }, .{ .width = 3, .ms = 50 } };
-    var cfg = try lanes.Config.init(a, timed(factsFor(cache.max_window, 1, true, 7), &windows, 1.5), cache.max_window, cache.max_window - 1);
+    var cfg = try lanes.Config.init(a, timed(factsFor(cache.max_window, 1, true, 7), &windows, &.{}, 1.5), cache.max_window, cache.max_window - 1);
     defer cfg.deinit(a);
     try std.testing.expect(!cfg.family_costs.empty());
     try std.testing.expectEqual(@as(f64, 1.5), cfg.mtp_step_ms);

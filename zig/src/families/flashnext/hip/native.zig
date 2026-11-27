@@ -269,7 +269,7 @@ test promptCacheBytes {
     try std.testing.expectEqual(@as(u64, 12 * g), promptCacheBytes(12.0, true, 16 * g, 16 * g));
 }
 
-/// The lone windows and the head step timed for the depth rule; untimed, it drafts by the first draft's rate alone.
+/// The windows, shared rows and head step timed for the depth rule; untimed, it drafts by the first draft's rate alone.
 fn timeCosts(gpa: std.mem.Allocator, fx: *lanes_mod.Fx) void {
     @import("costs.zig").measure(gpa, fx, &fx.costs) catch |err| {
         std.log.warn("flashnext: lane costs not timed ({t}); drafts follow the first draft's rate", .{err});
@@ -279,6 +279,8 @@ fn timeCosts(gpa: std.mem.Allocator, fx: *lanes_mod.Fx) void {
     var line: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line);
     for (fx.costs.window[0..fx.costs.windows]) |x| w.print(" {d}:{d:.2}", .{ x.width, x.ms }) catch {};
+    w.writeAll("; shared rows") catch {};
+    for (fx.costs.shared[0..fx.costs.shareds]) |x| w.print(" {d}:{d:.2}", .{ x.width, x.ms }) catch {};
     std.log.info("flashnext: lane costs (rows:ms){s}; head step {d:.2} ms", .{ w.buffered(), fx.costs.step_ms });
 }
 
