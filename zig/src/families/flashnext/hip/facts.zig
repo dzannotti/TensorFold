@@ -18,6 +18,12 @@ const shared_copy_rows = 4;
 /// Most head drafts a stream chains in a shared round; a lone stream chains the policy's drafts.
 pub const shared_chain_drafts = 3;
 
+/// CUDA's draft policy (cuda_lanes.zig facts): the head's chances size each chain and its stop rule cuts it; LT_DPROB=0 keeps the lane core's rate-priced depth and the shared cap.
+pub fn headChances() bool {
+    const raw = std.c.getenv("LT_DPROB") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
 /// The lane core's facts of a loaded model: `drafting` names a head that drafts, `drafts` its capped chains.
 pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) lanes.Model {
     return .{
@@ -28,11 +34,12 @@ pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) l
         .speculate = drafting,
         .speculate_early = false,
         .drafts = drafts,
-        .shared_mtp_cap = shared_chain_drafts,
+        .shared_mtp_cap = if (headChances()) 0 else shared_chain_drafts,
         .hidden_rows = true,
         .batch_rows = @intCast(exact_width * streams),
         .max_streams = @intCast(streams),
         .draft_streams = drafting,
+        .draft_probabilities = drafting and headChances(),
     };
 }
 
@@ -85,4 +92,12 @@ test "the facts cap shared chains at three, and the default policy asks the lane
     defer deep.deinit(a);
     try std.testing.expectEqual(@as(u32, 7), deep.most_drafts);
     try std.testing.expectEqual(@as(u32, 3), deep.shared_mtp_cap);
+}
+
+test "a drafting head gives the lane core its chances and no shared cap, as CUDA's" {
+    if (!headChances()) return error.SkipZigTest;
+    const facts = factsFor(cache.max_window, 5, true, 7);
+    try std.testing.expect(facts.draft_probabilities);
+    try std.testing.expectEqual(@as(u32, 0), facts.shared_mtp_cap);
+    try std.testing.expect(!factsFor(cache.max_window, 5, false, 0).draft_probabilities);
 }

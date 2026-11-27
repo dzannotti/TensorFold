@@ -77,6 +77,7 @@ fn serial(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
             const t = stop.take(d, prob[0]);
             if (!t.propose) break;
             lane.held[d] = tok[0];
+            lane.held_p[d] = prob[0];
             chained = d + 1;
             if (d + 1 == depth or !t.more) break;
             const step = [_]forward.Seg{.{ .c = hc, .tokens = &tok, .pos = lane.caches.len + d }};
@@ -183,6 +184,7 @@ fn batched(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
         const s = &slots[si];
         const t = s.stop.take(0, probs[si]);
         s.lane.held[0] = toks[si];
+        s.lane.held_p[0] = probs[si];
         s.chained = 1;
         if (1 < s.depth and t.more) {
             active[next] = si;
@@ -233,6 +235,7 @@ fn batched(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
             const t = s.stop.take(step, probs[a]);
             if (!t.propose) continue;
             s.lane.held[step] = toks[a];
+            s.lane.held_p[step] = probs[a];
             s.chained = step + 1;
             if (step + 1 < s.depth and t.more) {
                 active[next] = si;
