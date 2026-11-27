@@ -2,6 +2,7 @@
 const std = @import("std");
 const hip = @import("hip.zig");
 const limits = @import("../src/core/contract/limits.zig");
+const loom = @import("loom.zig");
 
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
@@ -14,6 +15,7 @@ pub const Options = struct {
     test_step: *std.Build.Step,
     lighton_gpu: *std.Build.Module,
     lighton_host: *std.Build.Module,
+    loom: loom.Options,
 };
 
 /// hip-kernel-contract (gates 1-5 on this GPU), hip-kernel-contract-objects and hip-kernel-contract-limits (no GPU).
@@ -73,6 +75,7 @@ pub fn steps(b: *std.Build, o: Options) void {
         _ = all.addCopyDirectory(hip.objectFiles(b, o.hipcc, t.name).getDirectory(), t.name, .{});
         const ctl = hip.compile(b, o.hipcc, t.name, source, "contract_controls.hsaco");
         _ = all.addCopyFile(ctl, b.fmt("{s}/contract_controls.hsaco", .{t.name}));
+        loom.objects(b, all, o.loom, t.name);
     }
     const to: std.Build.Step.InstallDir.Options = .{
         .source_dir = all.getDirectory(),
@@ -87,6 +90,7 @@ pub fn steps(b: *std.Build, o: Options) void {
     audit.addDirectoryArg(all.getDirectory());
     const fits = "Every registered HIP launch against each served chip's code objects";
     b.step("hip-kernel-contract-limits", fits).dependOn(&audit.step);
+    loom.testStep(b, o.loom, o.arch);
     // the runner compiles on any host against stub kernels, so `test` catches what only it reaches
     const host_runner = runner(b, b.graph.host, .Debug, o.host, o.lighton_host, controls(b, "", null));
     o.test_step.dependOn(&host_runner.step);

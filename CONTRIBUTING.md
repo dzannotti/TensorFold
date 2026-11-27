@@ -64,6 +64,9 @@ zig build test -Dhip=true
 zig build native-hip -Dhip=true -Dhipcc=/opt/rocm/bin/hipcc -Dhip-arch=gfx1100
 ```
 
+Add `-Dloom-compile=<venv>/bin/loom-compile` (hrx-loom at the version in `.loom-version`) to build the Loom kernels
+under `zig/kernels/loom` too; `zig build loom-test` runs their own checks. Without it they are absent and hipcc's serve.
+
 The default graph omits HIP. Enabling it does not select another backend or change CUDA, Metal or XPU runtime options.
 The HIP backend uses the same shared core and serving contracts. Device qualification remains specific to its
 checkpoint, compiler, runtime and architecture; a host build does not establish those receipts.

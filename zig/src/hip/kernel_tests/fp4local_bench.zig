@@ -26,6 +26,7 @@ const cases = [_]Case{
     .{ .name = "mxfp8 q", .fmt = .mxfp8, .n = 12288, .k = 2560 },
     .{ .name = "mxfp8 out", .fmt = .mxfp8, .n = 2560, .k = 6144 },
     .{ .name = "mxfp8 index", .fmt = .mxfp8, .n = 640, .k = 2560 },
+    .{ .name = "mxfp8 shared gate|up", .fmt = .mxfp8, .n = 1280, .k = 2560 },
     .{ .name = "mxfp8 shared down", .fmt = .mxfp8, .n = 2560, .k = 640 },
     .{ .name = "nvfp4 gate|up routed", .fmt = .nvfp4, .n = 1280, .k = 2560, .kind = .routed },
     .{ .name = "nvfp4 gate|up swiglu", .fmt = .nvfp4, .n = 1280, .k = 2560, .kind = .pair },
@@ -227,66 +228,73 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
             }
             const expert_rows: c_int = @intCast((m * top_k + experts - 1) / experts);
             const launch = struct {
-                fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool) !void {
+                fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool, tile: bool) !void {
                     var arg = arg0;
                     const s = r.stream.handle;
+                    const stream = if (tile) &fp4.Kernels.tileGo else &fp4.Kernels.streamGo;
                     if (pr and c.kind == .pair) return k.pairGo(r.on.r, c.fmt, arg, it, 0, s);
                     if (pr) return k.promptGo(r.on.r, c.fmt, arg, it, er, s);
                     if (c.kind == .pair) return k.streamGo(r.on.r, c.fmt, arg, .{ .pair_cols = @intCast(c.n / 2) }, it, s);
                     if (c.sides.len > 0) {
-                        var sides: fp4.StreamSides = .{ .count = @intCast(c.sides.len) };
+                        var sides: fp4.StreamSides = .{ .count = @intCast(c.sides.len), .out_half = 1 };
                         var row: usize = 0;
                         for (c.sides, 0..) |n, i| {
                             sides.words[i] = arg.words + row * c.k;
                             sides.scale[i] = arg.scale.p + row * c.k / 32;
-                            sides.out[i] = arg.out + row * 4 * @as(usize, @intCast(arg.m));
+                            sides.out[i] = arg.out + row * 2 * @as(usize, @intCast(arg.m));
                             sides.n[i] = @intCast(n);
                             row += n;
                         }
                         arg.n = @intCast(c.sides[0]);
-                        return k.streamGo(r.on.r, c.fmt, arg, sides, it, s);
+                        return stream(k, r.on.r, c.fmt, arg, sides, it, s);
                     }
-                    return k.streamGo(r.on.r, c.fmt, arg, .{}, it, s);
+                    return stream(k, r.on.r, c.fmt, arg, .{}, it, s);
                 }
             }.go;
-            for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
-            try t.stream.synchronize();
-            try start.record(t.stream);
-            for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
-            try end.record(t.stream);
-            try end.synchronize();
-            const probe = @as(f64, try Event.elapsedMs(start, end));
-            // enough launches for ~0.3 s of power samples a batch
-            const reps = @max(1, @as(usize, @intFromFloat(300.0 / @max(probe, 0.001))));
-            var us: [batches]f64 = undefined;
-            var sampler: Sampler = .{};
-            const th = try std.Thread.spawn(.{}, Sampler.loop, .{&sampler});
-            for (&us) |*u| {
+            // MXFP8 decode twice where the build has the Loom GEMV: as served, then on fp4l_stream alone
+            const both = cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null;
+            for (0..if (both) 2 else 1) |pass| {
+                const tile = pass == 1;
+                const who: []const u8 = if (!both) "" else if (tile) " [hipcc]" else " [served]";
+                for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt, tile);
+                try t.stream.synchronize();
                 try start.record(t.stream);
-                for (0..reps) |_| for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
+                for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt, tile);
                 try end.record(t.stream);
                 try end.synchronize();
-                u.* = @as(f64, try Event.elapsedMs(start, end)) * 1000 / @as(f64, @floatFromInt(plans * reps));
-            }
-            sampler.stop.store(true, .release);
-            th.join();
-            std.mem.sort(f64, &us, {}, std.sort.asc(f64));
-            const mid = us[batches / 2];
-            const watts = if (sampler.count > 0) sampler.sum / @as(f64, @floatFromInt(sampler.count)) else 0;
-            // bytes a launch must read: the experts its plan touches (or the matrix), x once, out once
-            const out_bytes = pairs * (if (cs.kind == .pair) cs.n else cs.n * 4);
-            const bytes = @as(f64, @floatFromInt(touched * one)) / @as(f64, @floatFromInt(plans)) + @as(f64, @floatFromInt(m * cs.k * 2 + out_bytes));
-            const flops = 2.0 * @as(f64, @floatFromInt(pairs * cs.n * cs.k));
-            const gbs = bytes / mid / 1e3;
-            const tfs = flops / mid / 1e6;
-            if (prompt) {
-                std.debug.print("FP4L prompt {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.1} us {d:>6.2} TFLOPS {d:>5.1}% of {d:.1}  {d:>5.1} W {d:>6.1} J/PFLOP (noise {d:.1}%)\n", .{
-                    cs.name, m, cs.n, cs.k, mid, tfs, tfs / matrix * 100, matrix, watts, watts / tfs * 1e3, (us[batches - 1] / us[0] - 1) * 100,
-                });
-            } else {
-                std.debug.print("FP4L decode {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.2} us {d:>6.1} GB/s {d:>5.1}% of {d:.0}  {d:>5.1} W {d:>6.3} J/GB (noise {d:.1}%)\n", .{
-                    cs.name, m, cs.n, cs.k, mid, gbs, gbs / bandwidth * 100, bandwidth, watts, watts / gbs, (us[batches - 1] / us[0] - 1) * 100,
-                });
+                const probe = @as(f64, try Event.elapsedMs(start, end));
+                // enough launches for ~0.3 s of power samples a batch
+                const reps = @max(1, @as(usize, @intFromFloat(300.0 / @max(probe, 0.001))));
+                var us: [batches]f64 = undefined;
+                var sampler: Sampler = .{};
+                const th = try std.Thread.spawn(.{}, Sampler.loop, .{&sampler});
+                for (&us) |*u| {
+                    try start.record(t.stream);
+                    for (0..reps) |_| for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt, tile);
+                    try end.record(t.stream);
+                    try end.synchronize();
+                    u.* = @as(f64, try Event.elapsedMs(start, end)) * 1000 / @as(f64, @floatFromInt(plans * reps));
+                }
+                sampler.stop.store(true, .release);
+                th.join();
+                std.mem.sort(f64, &us, {}, std.sort.asc(f64));
+                const mid = us[batches / 2];
+                const watts = if (sampler.count > 0) sampler.sum / @as(f64, @floatFromInt(sampler.count)) else 0;
+                // bytes a launch must read: the experts its plan touches (or the matrix), x once, out once
+                const out_bytes = pairs * (if (cs.kind == .pair or cs.sides.len > 0) cs.n * 2 else cs.n * 4);
+                const bytes = @as(f64, @floatFromInt(touched * one)) / @as(f64, @floatFromInt(plans)) + @as(f64, @floatFromInt(m * cs.k * 2 + out_bytes));
+                const flops = 2.0 * @as(f64, @floatFromInt(pairs * cs.n * cs.k));
+                const gbs = bytes / mid / 1e3;
+                const tfs = flops / mid / 1e6;
+                if (prompt) {
+                    std.debug.print("FP4L prompt {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.1} us {d:>6.2} TFLOPS {d:>5.1}% of {d:.1}  {d:>5.1} W {d:>6.1} J/PFLOP (noise {d:.1}%)\n", .{
+                        cs.name, m, cs.n, cs.k, mid, tfs, tfs / matrix * 100, matrix, watts, watts / tfs * 1e3, (us[batches - 1] / us[0] - 1) * 100,
+                    });
+                } else {
+                    std.debug.print("FP4L decode {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.2} us {d:>6.1} GB/s {d:>5.1}% of {d:.0}  {d:>5.1} W {d:>6.3} J/GB (noise {d:.1}%){s}\n", .{
+                        cs.name, m, cs.n, cs.k, mid, gbs, gbs / bandwidth * 100, bandwidth, watts, watts / gbs, (us[batches - 1] / us[0] - 1) * 100, who,
+                    });
+                }
             }
         }
     };

@@ -33,7 +33,7 @@ fn resolveHipcc(b: *std.Build, given: ?[]const u8) []const u8 {
     return names[0];
 }
 /// HIP's options as given, declared whether or not -Dhip=true builds anything with them.
-pub const Options = struct { hipcc: ?[]const u8, hip_include: ?[]const u8, hip_arch: ?[]const u8, device_lib: ?[]const u8, relax_branches: bool };
+pub const Options = struct { hipcc: ?[]const u8, hip_include: ?[]const u8, hip_arch: ?[]const u8, device_lib: ?[]const u8, relax_branches: bool, loom: @import("loom.zig").Options };
 pub fn options(b: *std.Build) Options {
     return .{
         .hipcc = b.option([]const u8, "hipcc", "HIP compiler for model-free tests"),
@@ -41,6 +41,7 @@ pub fn options(b: *std.Build) Options {
         .hip_arch = b.option([]const u8, "hip-arch", "Exact GPU architecture for the probe code object"),
         .device_lib = b.option([]const u8, "hip-device-lib", "ROCm device bitcode directory (default <rocm>/lib/llvm/amdgcn/bitcode; Arch: <rocm>/amdgcn/bitcode)"),
         .relax_branches = b.option(bool, "hip-relax-branches", "Relax gfx1100 branches earlier (-amdgpu-s-branch-bits=15), for clang 21 (#1521)") orelse false,
+        .loom = @import("loom.zig").options(b),
     };
 }
 /// The Qwen3.5 / 3.6 checkpoint loader tests: part of `test` on every build, HIP or not.
@@ -120,7 +121,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     b.step("hip-affine-test", "Run exact affine golden GPU regression").dependOn(&b.addRunArtifact(affine_test).step);
     const device_lib = o.device_lib;
     @import("dots_mocr.zig").columnObjects(b, .{ .name = hipcc, .resolved = hipcc_resolved, .device_lib = device_lib, .relax_branches = o.relax_branches });
-    const objects = kernelObjects(b, hipcc, hipcc_resolved, device_lib, o.relax_branches, hip_arch);
+    const objects = kernelObjects(b, hipcc, hipcc_resolved, device_lib, o.relax_branches, hip_arch, o.loom);
     const kernel_module = b.createModule(.{ .root_source_file = b.path("zig/src/hip/kernel_tests.zig"), .target = target, .link_libc = true });
     kernel_module.addIncludePath(.{ .cwd_relative = hip_include });
     kernel_module.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
@@ -313,6 +314,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .lighton_gpu = gpu.lighton,
         .lighton_host = host.lighton,
         .test_step = test_step,
+        .loom = o.loom,
     });
 }
 /// `tf-qwen35-test`: the model checks on a real checkpoint and GPU.
@@ -531,9 +533,9 @@ const headers = [_][]const u8{
 };
 /// The flags of the kernels' first build: no contraction, wave32 on RDNA, C++20.
 const flags = [_][]const u8{ "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1", "-DHIPBLAS_V2", "-fPIC", "-DCUDA_HAS_FP16=1", "-DHIP_ENABLE_WARP_SYNC_BUILTINS=1", "-std=c++20", "-fno-gpu-rdc", "-mno-wavefrontsize64", "-ffp-contract=off" };
-const stub = std.fmt.comptimePrint("pub const arch = \"\";\npub const images: [{d}][]align(8) const u8 = @splat(&.{{}});\n", .{groups.len});
-/// One code object a group for `arch`, built with the caps table's instruction switches, as the `hip_kernels` module.
-pub fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, relax_branches: bool, arch: []const u8) *std.Build.Module {
+const stub = std.fmt.comptimePrint("pub const arch = \"\";\npub const images: [{d}][]align(8) const u8 = @splat(&.{{}});\n", .{groups.len}) ++ @import("loom.zig").stub;
+/// One code object a group for `arch` (the caps table's instruction switches) and the Loom images, as `hip_kernels`.
+pub fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u8, device_lib: ?[]const u8, relax_branches: bool, arch: []const u8, loom: @import("loom.zig").Options) *std.Build.Module {
     const files = objectFiles(b, .{ .name = hipcc, .resolved = hipcc_resolved, .device_lib = device_lib, .relax_branches = relax_branches }, arch);
     var decls: []const u8 = "";
     var refs: []const u8 = "";
@@ -541,11 +543,10 @@ pub fn kernelObjects(b: *std.Build, hipcc: []const u8, hipcc_resolved: []const u
         decls = b.fmt("{s}const g{d} align(8) = @embedFile(\"group{d}.hsaco\").*;\n", .{ decls, i, i });
         refs = b.fmt("{s}&g{d}, ", .{ refs, i });
     }
-    return b.createModule(.{ .root_source_file = files.add("kernels.zig", b.fmt("pub const arch = \"{s}\";\n{s}pub const images = [_][]align(8) const u8{{ {s}}};\n", .{ arch, decls, refs })) });
+    return b.createModule(.{ .root_source_file = files.add("kernels.zig", b.fmt("pub const arch = \"{s}\";\n{s}pub const images = [_][]align(8) const u8{{ {s}}};\n{s}", .{ arch, decls, refs, @import("loom.zig").decls(b, files, loom, arch) })) });
 }
 /// The HIP compiler as the build found it, the device bitcode it links, and whether gfx1100 relaxes branches earlier.
 pub const Hipcc = struct { name: []const u8, resolved: []const u8, device_lib: ?[]const u8, relax_branches: bool = false };
-
 /// The groups' code objects for `arch` in one directory, group0.hsaco onward.
 pub fn objectFiles(b: *std.Build, cc: Hipcc, arch: []const u8) *std.Build.Step.WriteFile {
     const files = b.addWriteFiles();

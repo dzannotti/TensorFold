@@ -16,16 +16,23 @@ fn isControl(r: records.Record) bool {
     return std.mem.startsWith(u8, r.launch.name, "control");
 }
 
-/// The embedded code object a record names, built for this binary's -Dhip-arch.
+/// The Loom kernel a record's image names (loom_<kernel>), or null for a hipcc group.
+fn loomOf(name: []const u8) ?hip.kernels.Loom {
+    if (!std.mem.startsWith(u8, name, "loom_")) return null;
+    return std.meta.stringToEnum(hip.kernels.Loom, name["loom_".len..]);
+}
+
+/// The embedded code object a record names, built for this binary's -Dhip-arch (empty: a Loom kernel not built).
 fn image(name: []const u8) ![]align(8) const u8 {
     if (std.mem.eql(u8, name, "contract_controls")) return &controls.bytes;
+    if (loomOf(name)) |k| return hip.kernels.loom_images[@backingInt(k)];
     const group = std.meta.stringToEnum(hip.kernels.Group, name) orelse return error.UnknownImage;
     return hip.kernels.images[@backingInt(group)];
 }
 
 /// The file of a record's code object for one chip in a `hip-kernel-contract-objects` directory.
 fn file(a: std.mem.Allocator, dir: []const u8, chip: []const u8, name: []const u8) ![]u8 {
-    if (std.mem.eql(u8, name, "contract_controls")) {
+    if (std.mem.eql(u8, name, "contract_controls") or loomOf(name) != null) {
         return std.fmt.allocPrint(a, "{s}/{s}/{s}.hsaco", .{ dir, chip, name });
     }
     const group = std.meta.stringToEnum(hip.kernels.Group, name) orelse return error.UnknownImage;
@@ -89,6 +96,10 @@ pub fn liveOf(a: std.mem.Allocator, r: *const hip.Runtime, ctx: hip.Context, arc
             continue;
         }
         const bytes = try image(rec.launch.image);
+        if (bytes.len == 0 and loomOf(rec.launch.image) != null) {
+            std.debug.print("N/A  limits live {s}: built without -Dloom-compile\n", .{rec.launch.name});
+            continue;
+        }
         const listed = try hsaco.kernels(a, bytes);
         defer a.free(listed);
         const meta = (hsaco.find(listed, rec.launch.symbolOn(at)) orelse return error.SymbolNotInImage).usage;
@@ -131,6 +142,12 @@ pub fn objects(a: std.mem.Allocator, io: std.Io, dir: []const u8) !usize {
             }
             const path = try file(a, dir, t.name, rec.launch.image);
             defer a.free(path);
+            const absent = if (std.Io.Dir.cwd().access(io, path, .{})) |_| false else |e| e == error.FileNotFound;
+            if (absent and loomOf(rec.launch.image) != null) {
+                std.debug.print("N/A  limits {s} {s}: built without -Dloom-compile\n", .{ t.name, rec.launch.name });
+                try line.appendSlice(a, ".{ .vgprs = 0, .served = false }, ");
+                continue;
+            }
             const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 28)) catch |err| {
                 const say = "FAIL limits {s}: {s}: {t} (build hip-kernel-contract-objects)\n";
                 std.debug.print(say, .{ rec.launch.name, path, err });

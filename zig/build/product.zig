@@ -185,7 +185,7 @@ fn hipServer(b: *std.Build, o: Options, build_options: *std.Build.Step.Options, 
     const hipcc = o.hip_options.hipcc orelse "hipcc";
     const hipcc_resolved = b.findProgram(.{ .names = &.{hipcc} }) orelse hipcc;
     const hip_include = o.hip_options.hip_include orelse b.pathResolve(&.{ std.fs.path.dirname(hipcc_resolved) orelse "/opt/rocm/bin", "..", "include" });
-    const objects = hip_build.kernelObjects(b, hipcc, hipcc_resolved, o.hip_options.device_lib, o.hip_options.relax_branches, arch);
+    const objects = hip_build.kernelObjects(b, hipcc, hipcc_resolved, o.hip_options.device_lib, o.hip_options.relax_branches, arch, o.hip_options.loom);
     const e = hip_build.engineModules(b, o.target, o.optimize, objects, hip_include);
     return hip_build.server(b, o.target, e, build_options);
 }
