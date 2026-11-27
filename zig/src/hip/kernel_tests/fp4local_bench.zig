@@ -16,8 +16,11 @@ const top_k = 10;
 const experts = 512;
 
 const Kind = enum { plain, routed, pair };
-const Case = struct { name: []const u8, fmt: fp4.Format, n: usize, k: usize, kind: Kind = .plain };
+/// `sides`: a group's products of one x in one launch (n is their sum), as a DeltaNet or attention layer runs them.
+const Case = struct { name: []const u8, fmt: fp4.Format, n: usize, k: usize, kind: Kind = .plain, sides: []const usize = &.{} };
 const cases = [_]Case{
+    .{ .name = "mxfp8 qkv|z|b|a", .fmt = .mxfp8, .n = 16480, .k = 2560, .sides = &.{ 10240, 6144, 48, 48 } },
+    .{ .name = "mxfp8 q|k|v|index", .fmt = .mxfp8, .n = 13952, .k = 2560, .sides = &.{ 12288, 512, 512, 640 } },
     .{ .name = "mxfp8 qkv", .fmt = .mxfp8, .n = 10240, .k = 2560 },
     .{ .name = "mxfp8 z", .fmt = .mxfp8, .n = 6144, .k = 2560 },
     .{ .name = "mxfp8 q", .fmt = .mxfp8, .n = 12288, .k = 2560 },
@@ -132,7 +135,6 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
     var end = try Event.init(&t.r, true);
     defer end.deinit();
     for (cases) |cs| for ([_]bool{ false, true }) |prompt| {
-        if (cs.kind == .pair and prompt) continue;
         const routed = cs.kind != .plain;
         const one = weightBytes(cs.fmt, cs.n, cs.k);
         const stack: usize = if (routed) experts else 1;
@@ -172,11 +174,7 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
         defer gb.free();
         const rows_list: []const usize = if (prompt) &.{prompt_rows} else &decode_rows;
         for (rows_list) |m| {
-            const pl: ?Plan = if (routed) try plan(&rng, m) else null;
-            defer if (pl) |p| {
-                gpa.free(p.items);
-                gpa.free(p.members);
-            };
+            const kn = t.on.fp4;
             const pairs = if (routed) m * top_k else m;
             const hx = try gpa.alloc(u16, m * cs.k);
             defer gpa.free(hx);
@@ -185,70 +183,101 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
             defer x.free();
             var y = try t.alloc(pairs * cs.n * 4);
             defer y.free();
-            var items_b = try t.upload(if (pl) |p| p.items else &[_]i32{0});
-            defer items_b.free();
-            var members_b = try t.upload(if (pl) |p| p.members else &[_]i32{0});
-            defer members_b.free();
-            var a: fp4.Arg = .{ .x = at(x), .words = at(w), .scale = .{ .p = at(sc), .kind = 0 }, .bias = .{ .p = 0, .kind = 0 }, .out = at(y), .m = @intCast(m), .n = @intCast(cs.n), .k = @intCast(cs.k), .bits = 0, .group = if (cs.fmt == .bf16) fp4.bf16Fold(@intCast(cs.k)) else 128, .fp16 = 0 };
+            var base: fp4.Arg = .{ .x = at(x), .words = at(w), .scale = .{ .p = at(sc), .kind = 0 }, .bias = .{ .p = 0, .kind = 0 }, .out = at(y), .m = @intCast(m), .n = @intCast(cs.n), .k = @intCast(cs.k), .bits = 0, .group = if (cs.fmt == .bf16) fp4.bf16Fold(@intCast(cs.k)) else 128, .fp16 = 0 };
             if (cs.fmt == .nvfp4) {
-                a.global = at(gb);
-                a.global_layout = if (cs.n == 1280) .expert_pair else .expert;
+                base.global = at(gb);
+                base.global_layout = if (cs.n == 1280) .expert_pair else .expert;
             }
-            var items: c_int = 1;
-            if (pl) |p| {
-                a.route = .{ .items = at(items_b), .members = at(members_b), .x_div = top_k };
-                a.m = @intCast(p.most);
-                items = @intCast(p.count);
+            // a routed decode reads a few experts: fresh plans rotate past the caches, as weight copies do for the rest
+            var touched: usize = 0;
+            const plans: usize = if (!routed) copies else if (prompt) 1 else @max(1, read_target / (m * top_k * one));
+            const args = try gpa.alloc(fp4.Arg, plans);
+            defer gpa.free(args);
+            const its = try gpa.alloc(c_int, plans);
+            defer gpa.free(its);
+            var bufs: std.ArrayList(@TypeOf(x)) = .empty;
+            defer {
+                for (bufs.items) |*b| b.free();
+                bufs.deinit(gpa);
+            }
+            for (args, its, 0..) |*a, *it, c| {
+                a.* = base;
+                it.* = 1;
+                if (routed) {
+                    const p = try plan(&rng, m);
+                    defer {
+                        gpa.free(p.items);
+                        gpa.free(p.members);
+                    }
+                    try bufs.append(gpa, try t.upload(p.items));
+                    try bufs.append(gpa, try t.upload(p.members));
+                    a.route = .{ .items = at(bufs.items[bufs.items.len - 2]), .members = at(bufs.items[bufs.items.len - 1]), .x_div = top_k };
+                    a.m = @intCast(p.most);
+                    it.* = @intCast(p.count);
+                    touched += p.count;
+                } else {
+                    a.words += c * words_one;
+                    a.scale.p += c * scales_one;
+                    touched += 1;
+                }
+                if (cs.kind == .pair) {
+                    a.out16 = a.out;
+                    a.out = 0;
+                }
             }
             const expert_rows: c_int = @intCast((m * top_k + experts - 1) / experts);
             const launch = struct {
-                fn go(r: *Rig, c: Case, arg0: fp4.Arg, copy: usize, stride_w: usize, stride_s: usize, its: c_int, er: c_int, pr: bool) !void {
+                fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool) !void {
                     var arg = arg0;
-                    arg.words += copy * stride_w;
-                    arg.scale.p += copy * stride_s;
-                    const k = &r.on.fp4;
-                    if (pr) return k.promptGo(r.on.r, c.fmt, arg, its, er, r.stream.handle);
-                    if (c.kind == .pair) {
-                        arg.out16 = arg.out;
-                        arg.out = 0;
-                        return k.streamGo(r.on.r, c.fmt, arg, .{ .pair_cols = @intCast(c.n / 2) }, its, r.stream.handle);
+                    const s = r.stream.handle;
+                    if (pr and c.kind == .pair) return k.pairGo(r.on.r, c.fmt, arg, it, 0, s);
+                    if (pr) return k.promptGo(r.on.r, c.fmt, arg, it, er, s);
+                    if (c.kind == .pair) return k.streamGo(r.on.r, c.fmt, arg, .{ .pair_cols = @intCast(c.n / 2) }, it, s);
+                    if (c.sides.len > 0) {
+                        var sides: fp4.StreamSides = .{ .count = @intCast(c.sides.len) };
+                        var row: usize = 0;
+                        for (c.sides, 0..) |n, i| {
+                            sides.words[i] = arg.words + row * c.k;
+                            sides.scale[i] = arg.scale.p + row * c.k / 32;
+                            sides.out[i] = arg.out + row * 4 * @as(usize, @intCast(arg.m));
+                            sides.n[i] = @intCast(n);
+                            row += n;
+                        }
+                        arg.n = @intCast(c.sides[0]);
+                        return k.streamGo(r.on.r, c.fmt, arg, sides, it, s);
                     }
-                    return k.streamGo(r.on.r, c.fmt, arg, .{}, its, r.stream.handle);
+                    return k.streamGo(r.on.r, c.fmt, arg, .{}, it, s);
                 }
             }.go;
-            const sw = words_one * stack;
-            const ss = scales_one * stack;
-            for (0..copies) |c| try launch(t, cs, a, c, sw, ss, items, expert_rows, prompt);
+            for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
             try t.stream.synchronize();
-            // enough launches for ~0.3 s of power samples a batch
-            var reps: usize = 1;
             try start.record(t.stream);
-            for (0..copies) |c| try launch(t, cs, a, c, sw, ss, items, expert_rows, prompt);
+            for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
             try end.record(t.stream);
             try end.synchronize();
             const probe = @as(f64, try Event.elapsedMs(start, end));
-            reps = @max(1, @as(usize, @intFromFloat(300.0 / @max(probe, 0.001))));
+            // enough launches for ~0.3 s of power samples a batch
+            const reps = @max(1, @as(usize, @intFromFloat(300.0 / @max(probe, 0.001))));
             var us: [batches]f64 = undefined;
             var sampler: Sampler = .{};
             const th = try std.Thread.spawn(.{}, Sampler.loop, .{&sampler});
             for (&us) |*u| {
                 try start.record(t.stream);
-                for (0..reps) |_| for (0..copies) |c| try launch(t, cs, a, c, sw, ss, items, expert_rows, prompt);
+                for (0..reps) |_| for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt);
                 try end.record(t.stream);
                 try end.synchronize();
-                u.* = @as(f64, try Event.elapsedMs(start, end)) * 1000 / @as(f64, @floatFromInt(copies * reps));
+                u.* = @as(f64, try Event.elapsedMs(start, end)) * 1000 / @as(f64, @floatFromInt(plans * reps));
             }
             sampler.stop.store(true, .release);
             th.join();
             std.mem.sort(f64, &us, {}, std.sort.asc(f64));
             const mid = us[batches / 2];
             const watts = if (sampler.count > 0) sampler.sum / @as(f64, @floatFromInt(sampler.count)) else 0;
-            // bytes a launch must read: the experts the plan touches (or the matrix), x once, out once
-            const touched: usize = if (pl) |p| p.count else 1;
-            const out_bytes = pairs * (if (cs.kind == .pair) cs.n else cs.n * 2);
-            const bytes = touched * one + m * cs.k * 2 + out_bytes;
+            // bytes a launch must read: the experts its plan touches (or the matrix), x once, out once
+            const out_bytes = pairs * (if (cs.kind == .pair) cs.n else cs.n * 4);
+            const bytes = @as(f64, @floatFromInt(touched * one)) / @as(f64, @floatFromInt(plans)) + @as(f64, @floatFromInt(m * cs.k * 2 + out_bytes));
             const flops = 2.0 * @as(f64, @floatFromInt(pairs * cs.n * cs.k));
-            const gbs = @as(f64, @floatFromInt(bytes)) / mid / 1e3;
+            const gbs = bytes / mid / 1e3;
             const tfs = flops / mid / 1e6;
             if (prompt) {
                 std.debug.print("FP4L prompt {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.1} us {d:>6.2} TFLOPS {d:>5.1}% of {d:.1}  {d:>5.1} W {d:>6.1} J/PFLOP (noise {d:.1}%)\n", .{

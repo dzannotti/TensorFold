@@ -61,7 +61,7 @@ pub const Kernels = struct {
         @setEvalBranchQuota(100_000);
         var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11 };
         inline for (0..3) |f| {
-            const words = (Format.chunkWords(@enumFromInt(f)));
+            const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
                 const fits = cb * rows <= 16 and cb * words <= affine.stream_code_words and !(pair == 1 and f == 2);
                 if (fits) k.stream[f][ri][ci][pair] = try m.function(std.fmt.comptimePrint(
@@ -81,17 +81,24 @@ pub const Kernels = struct {
         try hl.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, .{ .r = r, .handle = s }, args);
     }
 
+    /// Lanes a column (log2) from K alone, so its sum order is fixed: the most, up to 32, that split the chunks evenly.
+    pub fn lanes(kk: c_int) u5 {
+        const chunks = kk >> 5;
+        var l: u5 = 0;
+        while (l < 5 and @rem(chunks, @as(c_int, 2) << l) == 0) l += 1;
+        return l;
+    }
+
     /// The decode tile's choice: its function, lanes a column (log2) and outputs a block.
     pub const Pick = struct { f: Function, lpc_log2: u5, per_block: c_int, rows: c_int };
 
     /// The stream tile for `a` (m rows, total_n outputs over `items`); `pair`: outputs are silu(gate) x up.
     pub fn pickStream(k: *const Kernels, fmt: Format, a: Arg, total_n: c_int, items: c_int, pair: bool) ?Pick {
         if (a.m < 1 or a.k < 32 or @rem(a.k, 32) != 0) return null;
-        var lpc_log2: u5 = 0;
-        while ((@as(c_int, 1) << lpc_log2) < (a.k >> 5) and lpc_log2 < 5) lpc_log2 += 1;
+        const lpc_log2 = lanes(a.k);
         const t = stream_pick.pick(k.caps.generation, a.m, lpc_log2, fmt.chunkWords(), total_n, items, pair);
         const ri = stream_pick.rowTile(a.m);
-        const f = k.stream[@intFromEnum(fmt)][ri][t.at][@intFromBool(pair)] orelse return null;
+        const f = k.stream[@backingInt(fmt)][ri][t.at][@intFromBool(pair)] orelse return null;
         return .{ .f = f, .lpc_log2 = lpc_log2, .per_block = t.per_block, .rows = rows_of[ri] };
     }
 
@@ -131,7 +138,7 @@ pub const Kernels = struct {
         const small = fmt == .nvfp4 and a.route.items != 0 and expert_rows <= item_rows;
         const rows: usize = if (small) item_rows else 128;
         const grid = util.dim(util.cdiv(a.n, 128), util.cdiv(a.m, rows), items);
-        try go(r, if (small) k.item else k.wmma[@intFromEnum(fmt)], grid, 256, s, &args);
+        try go(r, if (small) k.item else k.wmma[@backingInt(fmt)], grid, 256, s, &args);
     }
 
     /// silu(gate) x up of a (gate | up) stack into a.out16 (pairs, n / 2): promptGo's sums, then moe_act's bytes.
@@ -142,7 +149,7 @@ pub const Kernels = struct {
         try args.add(a);
         try args.add(limit);
         const grid = util.dim(util.cdiv(@divExact(a.n, 2), 64), util.cdiv(a.m, 128), items);
-        try go(r, k.pair[@intFromEnum(fmt)], grid, 256, s, &args);
+        try go(r, k.pair[@backingInt(fmt)], grid, 256, s, &args);
     }
 
     /// The inputs a prompt output's fold covers.
@@ -155,6 +162,13 @@ pub const Kernels = struct {
         return error.Invalid;
     }
 };
+
+test "a column's lanes split K's chunks evenly, at most 32" {
+    try std.testing.expectEqual(@as(u5, 4), Kernels.lanes(2560));
+    try std.testing.expectEqual(@as(u5, 5), Kernels.lanes(6144));
+    try std.testing.expectEqual(@as(u5, 2), Kernels.lanes(640));
+    try std.testing.expectEqual(@as(u5, 1), Kernels.lanes(320));
+}
 
 test "the BF16 fold is 128 where K takes it, else 64 or 32" {
     try std.testing.expectEqual(@as(c_int, 128), bf16Fold(2560));
