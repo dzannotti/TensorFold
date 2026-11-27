@@ -31,6 +31,20 @@ pub fn weightsOf(proj: Projection, stack: bool) ?Weights {
     };
 }
 
+fn ltWmma(m: c_int) bool {
+    const std = @import("std");
+    const raw = std.c.getenv("LT_WMMA") orelse return false;
+    const from = std.fmt.parseInt(c_int, std.mem.span(raw), 10) catch return false;
+    return from > 0 and m >= from;
+}
+
+fn ltQmmf(m: c_int) bool {
+    const std = @import("std");
+    const raw = std.c.getenv("LT_QMMF") orelse return false;
+    const from = std.fmt.parseInt(c_int, std.mem.span(raw), 10) catch return false;
+    return from > 0 and m >= from;
+}
+
 fn argOf(w: Weights, x: Tensor, m: usize) fp4.Arg {
     return .{
         .x = x.ptr,
@@ -63,11 +77,14 @@ pub fn project(o: Ops, x: Tensor, w: Weights, m: usize, f32_out: bool) Error!Ten
 fn run(o: Ops, fmt: fp4.Format, a: fp4.Arg, items: c_int, expert_rows: c_int) Error!void {
     const k = &o.l.fp4;
     if (o.prefill) return k.promptGo(o.l.r, fmt, a, items, expert_rows, o.stream);
+    if (items == 1 and try k.qmmfGo(o.l.r, fmt, a, o.stream)) return;
+    if (a.route.items == 0 and ltWmma(a.m)) return k.promptGo(o.l.r, fmt, a, items, expert_rows, o.stream);
     return k.streamGo(o.l.r, fmt, a, .{}, items, o.stream);
 }
 
 /// Up to four decode products of one x that share K and format in one stream launch, bf16 outs; false otherwise.
 pub fn group(o: Ops, x: Tensor, ws: []const Weights, m: usize, outs: []Tensor) Error!bool {
+    if (ltWmma(int(m))) return false;
     if (o.prefill or ws.len < 2 or ws.len > 4 or m == 0 or x.kind != .bf16) return false;
     for (ws) |w| if (w.fmt != ws[0].fmt or w.k != ws[0].k or w.layout != .none) return false;
     var sides: fp4.StreamSides = .{ .count = @intCast(ws.len), .out_half = 1 };
@@ -82,6 +99,17 @@ pub fn group(o: Ops, x: Tensor, ws: []const Weights, m: usize, outs: []Tensor) E
     }
     var a = argOf(ws[0], x, m);
     a.n = int(widest);
+    if (fp4.Kernels.qmmfTakes(ws[0].fmt, int(m))) {
+        if (fp4.Kernels.stitched(sides, a.k)) |st| {
+            if (try o.l.fp4.qmmfSt(o.l.r, ws[0].fmt, a, st, o.stream)) return true;
+        }
+        for (ws, outs[0..ws.len]) |w, out| {
+            var one = argOf(w, x, m);
+            one.out16 = out.ptr;
+            try run(o, w.fmt, one, 1, 0);
+        }
+        return true;
+    }
     try o.l.fp4.streamGo(o.l.r, ws[0].fmt, a, sides, 1, o.stream);
     return true;
 }

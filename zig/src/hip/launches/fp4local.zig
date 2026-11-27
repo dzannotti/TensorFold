@@ -47,7 +47,11 @@ pub const decode_rows = 8;
 /// A routed prompt whose items average at most this many rows takes the 64-row item tile (NVFP4 only).
 pub const item_rows = 64;
 
-const rows_of = affine.stream_rows;
+const rows_of = [_]u8{ 1, 2, 4, 8, 16, 24, 32 };
+fn ltEnv(name: [*:0]const u8, default: c_int) c_int {
+    const raw = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(c_int, std.mem.span(raw), 10) catch default;
+}
 const cbs = affine.stream_cbs;
 
 pub const Kernels = struct {
@@ -57,6 +61,7 @@ pub const Kernels = struct {
     item: Function,
     /// The (gate | up) prompt tile with silu(gate) x up in its epilogue: NVFP4 and MXFP8.
     pair: [2]Function,
+    qmmf: [2][3]?Function = @splat(@splat(null)),
     caps: Caps,
     /// gfx11: the matrix tiles run; elsewhere every prompt is refused.
     matrix: bool,
@@ -81,7 +86,7 @@ pub const Kernels = struct {
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
-                const fits = cb * rows <= 16 and cb * words <= affine.stream_code_words and !(pair == 1 and f == 2);
+                const fits = (cb * rows <= 16 or cb == 2) and cb * words <= affine.stream_code_words and !(pair == 1 and f == 2);
                 if (fits) k.stream[f][ri][ci][pair] = try m.function(std.fmt.comptimePrint(
                     "_ZN2tf4rocm11fp4l_streamILi{d}ELi{d}ELi{d}ELb{d}EEEvNS0_6AffineENS0_11StreamSidesEi",
                     .{ f, rows, cb, pair },
@@ -89,6 +94,9 @@ pub const Kernels = struct {
             };
             k.wmma[f] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm9fp4l_wmmaILi{d}EEEvNS0_6AffineE", .{f}));
         }
+        inline for (.{ "mx", "bf" }, 0..) |fm, fi| inline for (.{ "16", "32", "64" }, 0..) |bm, bi| {
+            k.qmmf[fi][bi] = m.function("tf_qmmf_" ++ fm ++ "_" ++ bm) catch null;
+        };
         k.item = try m.function("_ZN2tf4rocm9fp4l_itemILi0EEEvNS0_6AffineE");
         k.pair = .{ try m.function("_ZN2tf4rocm9fp4l_pairILi0EEEvNS0_6AffineEf"), try m.function("_ZN2tf4rocm9fp4l_pairILi1EEEvNS0_6AffineEf") };
         return k;
@@ -115,9 +123,65 @@ pub const Kernels = struct {
         if (a.m < 1 or a.k < 32 or @rem(a.k, 32) != 0) return null;
         const lpc_log2 = lanes(a.k);
         const t = stream_pick.pick(k.caps.generation, a.m, lpc_log2, fmt.chunkWords(), total_n, items, pair);
+        const big = ltEnv("LT_R8", 0);
+        if (a.m > 4 and big != 0) {
+            var bi: usize = 3;
+            while (bi < 6 and rows_of[bi] < a.m and rows_of[bi + 1] <= big) bi += 1;
+            const f8 = k.stream[@backingInt(fmt)][bi][0][@intFromBool(pair)] orelse return null;
+            return .{ .f = f8, .lpc_log2 = lpc_log2, .per_block = affine.stream_waves * (@as(c_int, 32) >> lpc_log2) * @divExact(@as(c_int, 2), @as(c_int, if (pair) 2 else 1)), .rows = rows_of[bi] };
+        }
         const ri = stream_pick.rowTile(a.m);
         const f = k.stream[@backingInt(fmt)][ri][t.at][@intFromBool(pair)] orelse return null;
         return .{ .f = f, .lpc_log2 = lpc_log2, .per_block = t.per_block, .rows = rows_of[ri] };
+    }
+
+    pub fn qmmfTakes(fmt: Format, m: c_int) bool {
+        const from = ltEnv("LT_QMMF", 0);
+        if (from <= 0 or m < from or fmt == .nvfp4) return false;
+        if ((ltEnv("LT_QMMF_FMT", 3) & @as(c_int, if (fmt == .mxfp8) 1 else 2)) == 0) return false;
+        return m <= ltEnv("LT_QMMF_TO", 1 << 20);
+    }
+
+    /// LT probe: the qmmf column tile for a plain MXFP8 or bf16 product; false when it does not take it.
+    pub fn qmmfGo(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, s: abi.Stream) Error!bool {
+        if (!qmmfTakes(fmt, a.m)) return false;
+        return k.qmmfRaw(r, fmt, a, s);
+    }
+
+    pub const QmmfSides = extern struct { out: [4]u64 = @splat(0), cuts: [3]c_int = @splat(0), count: c_int = 0 };
+
+    pub fn qmmfRaw(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, s: abi.Stream) Error!bool {
+        return k.qmmfSt(r, fmt, a, null, s);
+    }
+
+    pub fn qmmfSt(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a0: Arg, st: ?Stitched, s: abi.Stream) Error!bool {
+        var a = a0;
+        var qs: QmmfSides = .{};
+        if (st) |g| {
+            a.words = g.words;
+            a.scale.p = g.scale;
+            a.n = g.n;
+            qs = .{ .out = g.out, .cuts = g.cuts, .count = 1 };
+        }
+        if (fmt == .nvfp4 or a.route.items != 0 or @rem(a.k, 32) != 0) return false;
+        const bi: usize = if (a.m <= 16) 0 else if (a.m <= 32 or ltEnv("LT_QMMF_64", 0) == 0) 1 else 2;
+        const blocks: c_int = @divTrunc(a.n + 15, 16);
+        const kts: c_int = a.k >> 4;
+        if (@rem(kts, 4) != 0) return false;
+        var sk: c_int = 1;
+        const cap = ltEnv("LT_QMMF_SK", 8);
+        const want = ltEnv("LT_QMMF_WAVES", 4096);
+        while (sk < cap and blocks * sk < want and @rem(kts, sk * 8) == 0 and @divTrunc(kts, sk * 2) >= 8) sk *= 2;
+        const f = k.qmmf[if (fmt == .mxfp8) 0 else 1][bi] orelse return false;
+        const cg: c_int = @divExact(8, sk);
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(sk);
+        try args.add(qs);
+        const rows: c_int = if (bi == 0) 16 else if (bi == 1) 32 else 64;
+        if (ltEnv("LT_QMMF_DBG", 0) != 0) std.debug.print("LT qmmf m{d} n{d} k{d} sk{d} cg{d} gx{d} gy{d}\n", .{ a.m, a.n, a.k, sk, cg, @divTrunc(blocks + cg - 1, cg), @divTrunc(a.m + rows - 1, rows) });
+        try go(r, f, .{ .x = @intCast(@divTrunc(blocks + cg - 1, cg)), .y = @intCast(@divTrunc(a.m + rows - 1, rows)), .z = 1 }, 256, s, &args);
+        return true;
     }
 
     /// The stream tile over `a` (or a plan's `items`, or `sides`): fp32 `a.out`, or the activation type in `a.out16`.

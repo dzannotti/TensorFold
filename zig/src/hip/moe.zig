@@ -79,7 +79,11 @@ pub fn tileFor(o: Ops, rows: usize) usize {
 pub fn tileOf(rows: usize, window: bool, prefill: bool, prompt_from: usize) usize {
     // decode and the MTP draft head keep BLOCK_FROM: a card's start is gated on the prompt pass
     const from = if (prefill) prompt_from else BLOCK_FROM;
-    return if (rows < from or window) LANE_ROWS else BLOCK_ROWS;
+    if (rows < from or window) {
+        if (std.c.getenv("LT_LANE")) |raw| return std.fmt.parseInt(usize, std.mem.span(raw), 10) catch LANE_ROWS;
+        return LANE_ROWS;
+    }
+    return BLOCK_ROWS;
 }
 
 /// The stacked shared expert's tile: it holds every row, so a prompt pass never cuts it below the GEMM tile.

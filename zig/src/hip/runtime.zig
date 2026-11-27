@@ -72,7 +72,10 @@ pub const Runtime = struct {
 };
 
 pub fn check(result: abi.Result) Error!void {
-    if (result != 0) return error.HipFailed;
+    if (result != 0) {
+        std.debug.print("LT hip result {d}\n", .{result});
+        return error.HipFailed;
+    }
 }
 
 test "complete runtime refuses absent library" {

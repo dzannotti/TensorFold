@@ -10,7 +10,7 @@ const Event = @import("../stream.zig").Event;
 const bandwidth = 241.0; // GB/s, measured read ceiling
 const matrix = 55.5; // TFLOPS, measured bf16 WMMA ceiling
 const read_target = 768 << 20;
-const batches = 7;
+const batches = 3;
 const prompt_rows = 4096;
 const top_k = 10;
 const experts = 512;
@@ -37,7 +37,7 @@ const cases = [_]Case{
     .{ .name = "bf16 hc up", .fmt = .bf16, .n = 10240, .k = 320 },
     .{ .name = "bf16 router", .fmt = .bf16, .n = 512, .k = 2560 },
 };
-const decode_rows = [_]usize{ 1, 2, 4, 8 };
+const decode_rows = [_]usize{ 1, 8, 16, 20, 32, 48, 64 };
 
 /// Weight bytes of one (n, k) projection in its format.
 fn weightBytes(fmt: fp4.Format, n: usize, k: usize) usize {
@@ -137,6 +137,8 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
     var end = try Event.init(&t.r, true);
     defer end.deinit();
     for (cases) |cs| for ([_]bool{ false, true }) |prompt| {
+        if (std.c.getenv("LT_BENCH") != null and (prompt or cs.fmt == .nvfp4)) continue;
+        if (std.c.getenv("LT_CASE")) |want| if (std.mem.indexOf(u8, cs.name, std.mem.span(want)) == null) continue;
         const routed = cs.kind != .plain;
         const one = weightBytes(cs.fmt, cs.n, cs.k);
         const stack: usize = if (routed) experts else 1;
@@ -229,9 +231,28 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
             }
             const expert_rows: c_int = @intCast((m * top_k + experts - 1) / experts);
             const launch = struct {
-                fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool, tile: bool) !void {
+                fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool, mode: usize) !void {
                     var arg = arg0;
                     const s = r.stream.handle;
+                    const tile = mode == 1;
+                    if (mode == 2) {
+                        if (c.sides.len == 0) {
+                            if (!try k.qmmfRaw(r.on.r, c.fmt, arg, s)) return error.SkipZigTest;
+                            return;
+                        }
+                        var sides: fp4.StreamSides = .{ .count = @intCast(c.sides.len), .out_half = 1 };
+                        var row: usize = 0;
+                        for (c.sides, 0..) |n, i| {
+                            sides.words[i] = arg.words + row * c.k;
+                            sides.scale[i] = arg.scale.p + row * c.k / 32;
+                            sides.out[i] = arg.out + row * 2 * @as(usize, @intCast(arg.m));
+                            sides.n[i] = @intCast(n);
+                            row += n;
+                        }
+                        const st = fp4.Kernels.stitched(sides, arg.k) orelse return error.SkipZigTest;
+                        if (!try k.qmmfSt(r.on.r, c.fmt, arg, st, s)) return error.SkipZigTest;
+                        return;
+                    }
                     const stream = if (tile) &fp4.Kernels.tileGo else &fp4.Kernels.streamGo;
                     if (pr and c.kind == .pair) {
                         if (!tile and k.experts.takesGateUp(arg, 0)) return k.experts.gateUpGo(r.on.r, arg, it, s);
@@ -258,9 +279,11 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
             // twice where a Loom kernel may serve it: as served, then on the hipcc tiles alone
             const both = (cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null) or (cs.fmt == .nvfp4 and prompt and kn.experts.f != null) or
                 (cs.fmt == .bf16 and prompt and kn.dense.f != null);
-            for (0..if (both) 2 else 1) |pass| {
-                const tile = pass == 1;
-                const who: []const u8 = if (!both) "" else if (tile) " [hipcc]" else " [served]";
+            const qm = !prompt and cs.fmt != .nvfp4 and std.c.getenv("LT_BENCH") != null;
+            for (0..3) |tile| {
+                if (tile == 1 and !both) continue;
+                if (tile == 2 and !qm) continue;
+                const who: []const u8 = if (tile == 2) " [qmmf]" else if (tile == 1) " [hipcc]" else " [served]";
                 for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt, tile);
                 try t.stream.synchronize();
                 try start.record(t.stream);
