@@ -42,10 +42,10 @@ theirs. It depends on K and the column alone, never on m, F, NT, the block or th
 
 Weights are the WMMA A operand (a lane's 16 codes of one column), x rows the B operand (padding rows enter as +0), so
 an accumulator lane holds one row by 8 columns: elements 0-3 are columns 0-7 of the fragment, 4-7 columns 8-15. A block
-has one wave a column lane and NT column fragments a wave; a wave's fragments are 2 T groups of 8
-columns apart, so all share one rotation, and a wave's x fragments of a chunk serve all of them. Elements 4-7 (rotation
-+ 1) keep the first chunk's chain and fold it last. The block's scales are staged once into LDS as multipliers; the
-lane tree runs through LDS one fragment at a time.
+has one wave a column lane and NT column fragments a wave. Block p of a tile takes the groups of 8 columns p + T j
+(j = 0..2 NT - 1), so all its columns share rotation p; fragment nt holds groups j = 2 nt (rows 0-7) and 2 nt + 1
+(rows 8-15), and a wave's x fragments of a chunk serve all of them. The block's scales are staged once into LDS as
+multipliers; the lane tree runs through LDS one fragment at a time. Weights of chunk t + 1 load while chunk t computes.
 
 ## Test and benchmark
 

@@ -56,13 +56,13 @@ LOOM_INLINE Place place(const Sides& s, unsigned b) {
   const unsigned base = side == 0 ? 0 : side == 1 ? s.c1 : side == 2 ? s.c2 : s.c3;
   const unsigned width = side == 0 ? w0 : side == 1 ? w1 : side == 2 ? w2 : w3;
   const unsigned local = b - start, tile = local / G::T, p = local % G::T;
-  return {side, base, width, tile * G::kTile + 2 * p, (2 * p) % G::T};
+  return {side, base, width, tile * G::kTile + p, (p + G::T) % G::T};  // the mod keeps Loom's LDS index in range
 }
 
-// Fragment nt's column c (0..15), side-local: groups group0 + 2 T nt and the next one (one rotation a wave).
+// Fragment nt's column c (0..15), side-local: groups group0 + T (2 nt) and + T (2 nt + 1), one rotation a block.
 template <class G>
 LOOM_INLINE unsigned local_col(const Place& pl, unsigned nt, unsigned c) {
-  return 8 * (pl.group0 + 2 * G::T * nt) + c;
+  return 8 * (pl.group0 + G::T * (2 * nt + (c >> 3))) + (c & 7);
 }
 
 // The block's e8m0 bytes as multipliers at sc[((q NT + nt) 2 + h) 8 + e], column 2 e + h of fragment nt.
@@ -86,9 +86,9 @@ LOOM_INLINE void stage_scales(const Args& a, const Place& pl, float* sc, unsigne
     const unsigned c = pl.base + local_col<G>(pl, J, lane & 15); \
     col##J = c < a.n ? c : a.n - 1;                              \
   }
-#define SK_ACC(I, J) f32x8 v##I##J = zero8; f32x4 k##I##J = zero4;
+#define SK_ACC(I, J) f32x8 v##I##J = zero8;
 #define SK_RAW(J) u32x4 cw0##J = zw, cw1##J = zw, nw0##J = zw, nw1##J = zw;
-#define SK_XRAW(I) u32x8 cx0##I = zx, cx1##I = zx, nx0##I = zx, nx1##I = zx;
+#define SK_XRAW(I) u32x8 cx0##I = zx, cx1##I = zx;
 #define SK_FETCH_W(J)                                                 \
   if constexpr (G::NT > J) {                                          \
     const u32x4* src = (const u32x4*)(a.w + col##J * G::K + 32 * nq); \
@@ -100,12 +100,11 @@ LOOM_INLINE void stage_scales(const Args& a, const Place& pl, float* sc, unsigne
     const unsigned row = 16 * I + (lane & 15);                       \
     if (row < a.m) {                                                 \
       const u32x8* src = (const u32x8*)(a.x + row * G::K + 32 * nq); \
-      nx0##I = src[0];                                               \
-      nx1##I = src[1];                                               \
+      cx0##I = src[0];                                               \
+      cx1##I = src[1];                                               \
     }                                                                \
   }
 #define SK_SHIFT_W(J) cw0##J = nw0##J; cw1##J = nw1##J;
-#define SK_SHIFT_X(I) cx0##I = nx0##I; cx1##I = nx1##I;
 #define SK_DEC(J)                                                         \
   bf16x16 a0##J = zb, a1##J = zb;                                         \
   f32x4 s0##J = zero4, s1##J = zero4;                                     \
@@ -122,23 +121,10 @@ LOOM_INLINE void stage_scales(const Args& a, const Place& pl, float* sc, unsigne
     const bf16x16 b1 = fr::attach<fr::role::rhs>(__builtin_bit_cast(bf16x16, cx1##I), sh);              \
     f32x8 d = loom::vector::mma(a0##J, b0, init);                                                        \
     d = loom::vector::mma(a1##J, b1, fr::attach<fr::role::init>(d, sh));                                 \
-    if (t == 0 && G::T > 1) {                                                                            \
-      [[loom::unroll]] for (unsigned e = 0; e < 4; e++) v##I##J[e] = loom::scalar::fmaf(d[e], s0##J[e], 0.0f); \
-      k##I##J = {d[4], d[5], d[6], d[7]};                                                                \
-    } else {                                                                                             \
-      [[loom::unroll]] for (unsigned e = 0; e < 4; e++) {                                                \
-        v##I##J[e] = loom::scalar::fmaf(d[e], s0##J[e], v##I##J[e]);                                     \
-        v##I##J[4 + e] = loom::scalar::fmaf(d[4 + e], s1##J[e], v##I##J[4 + e]);                         \
-      }                                                                                                  \
+    [[loom::unroll]] for (unsigned e = 0; e < 4; e++) {                                                  \
+      v##I##J[e] = loom::scalar::fmaf(d[e], s0##J[e], v##I##J[e]);                                       \
+      v##I##J[4 + e] = loom::scalar::fmaf(d[4 + e], s1##J[e], v##I##J[4 + e]);                           \
     }                                                                                                    \
-  }
-#define SK_KEEP_S(J)    \
-  f32x4 r1##J = zero4;  \
-  if constexpr (G::NT > J) r1##J = ((const f32x4*)(sc + ((q0 * G::NT + J) * 2 + h) * 8))[1];
-#define SK_KEEP(I, J)                                                                                       \
-  if constexpr (G::F > I && G::NT > J) {                                                                    \
-    [[loom::unroll]] for (unsigned e = 0; e < 4; e++)                                                       \
-      v##I##J[4 + e] = loom::scalar::fmaf(k##I##J[e], r1##J[e], v##I##J[4 + e]);                            \
   }
 // The xor tree across waves (levels off = W/2 .. 1: v_w + v_(w + off)), then wave 0 repairs and stores.
 #define SK_FIN(I, J)                                                                                        \
@@ -168,7 +154,7 @@ LOOM_INLINE void stage_scales(const Args& a, const Place& pl, float* sc, unsigne
   }
 
 // One block: scales staged, chunks q = tau L + wave from the tile's rotation (chunk t + 1 fetched while t computes),
-// elements 4-7 (rotation + 1) folding chunk rot last, then the tree and the stores.
+// then the tree and the stores.
 template <class G>
 LOOM_INLINE void skinny(const Args& a, const Sides& s, const Outs& out, float* sc, float* red) {
   const fr::shape<int, int> sh{16, 16};
@@ -188,26 +174,22 @@ LOOM_INLINE void skinny(const Args& a, const Sides& s, const Outs& out, float* s
   {
     const unsigned nq = pl.rot * G::L + wave;
     SK_I(SK_FETCH_W)
-    SK_I(SK_FETCH_X)
   }
   stage_scales<G>(a, pl, sc, tid);
   lds_barrier();
   [[loom::unroll]] for (unsigned t = 0; t < G::T; t++) {
     const unsigned q = ((pl.rot + t) % G::T) * G::L + wave;
     SK_I(SK_SHIFT_W)
-    SK_I(SK_SHIFT_X)
+    {
+      const unsigned nq = q;
+      SK_I(SK_FETCH_X)
+    }
     if (t + 1 < G::T) {
       const unsigned nq = ((pl.rot + t + 1) % G::T) * G::L + wave;
       SK_I(SK_FETCH_W)
-      SK_I(SK_FETCH_X)
     }
     SK_I(SK_DEC)
     SK_IJ(SK_MMA)
-  }
-  if constexpr (G::T > 1) {
-    const unsigned q0 = pl.rot * G::L + wave;
-    SK_I(SK_KEEP_S)
-    SK_IJ(SK_KEEP)
   }
   SK_IJ(SK_FIN)
 }
@@ -221,11 +203,8 @@ LOOM_INLINE void skinny(const Args& a, const Sides& s, const Outs& out, float* s
 #undef SK_FETCH_W
 #undef SK_FETCH_X
 #undef SK_SHIFT_W
-#undef SK_SHIFT_X
 #undef SK_DEC
 #undef SK_MMA
-#undef SK_KEEP_S
-#undef SK_KEEP
 #undef SK_FIN
 
 }  // namespace sk
