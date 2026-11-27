@@ -9,6 +9,7 @@ const loader = @import("load.zig");
 const tables = @import("tables.zig");
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
+const ahead = @import("ahead.zig");
 const head_mod = @import("head.zig");
 const mixers = @import("mixers.zig");
 const index = @import("../index.zig");
@@ -69,6 +70,8 @@ pub const Engine = struct {
     weights: loader.Weights,
     tables: tables.Tables,
     host: forward.Host,
+    /// The next prompt chunk's inputs, staged while the one before it runs.
+    ahead: ahead.Ahead,
     qk: [2]hip.DeviceBuffer,
     arena: hip.Arena,
     drawer: serve.draw.Drawer,
@@ -166,7 +169,9 @@ pub const Engine = struct {
             .staging = try hip.HostBuffer.alloc(&e.driver, staging_bytes),
             .tables = &e.tables,
         };
-        errdefer e.host.staging.free();
+        errdefer e.host.deinit();
+        e.ahead = try ahead.Ahead.init(gpa, &e.driver, &e.weights.model, &e.tables, o.chunk);
+        errdefer e.ahead.deinit(gpa);
         e.eos = e.tables.hasher.ref.eos;
         e.narrowed = null;
         // every weight is on the device now: only the n-gram rows a gather reads stay resident
@@ -227,7 +232,8 @@ pub const Engine = struct {
         if (e.votes) |*v| v.deinit();
         e.drawer.deinit();
         e.arena.deinit();
-        e.host.staging.free();
+        e.host.deinit();
+        e.ahead.deinit(e.gpa);
         e.tables.deinit(e.keep.allocator());
         for (&e.qk) |*b| b.free();
         e.weights.deinit();
@@ -415,10 +421,15 @@ pub const Engine = struct {
         e.host.used = 0;
         e.arena.reset();
         const segs = [_]forward.Seg{.{ .c = c, .tokens = tokens, .pos = c.len, .marks = marks }};
-        const staged = try forward.stage(&e.weights.model, &e.host, &segs, false);
+        const staged = e.ahead.take(c, tokens) orelse try forward.stage(&e.weights.model, &e.host, &segs, false);
         const out = try forward.run(e.ops(&e.arena), &e.weights.model, &e.host, &segs, false, staged);
         c.len += tokens.len;
         return out;
+    }
+
+    /// The prompt chunk `tokens` after the one in flight on `c` staged now, while that one runs (same bytes).
+    pub fn stageAhead(e: *Engine, c: *cache.Caches, tokens: []const u32) !void {
+        try e.ahead.stage(&e.weights.model, c, tokens);
     }
 
     /// The graph choice for a round of windows `segs`, from its shape's history; every rank makes it in the same order.

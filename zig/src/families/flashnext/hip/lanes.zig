@@ -344,6 +344,10 @@ pub const Fx = struct {
         fill.next = taken;
         const live = fill.next < fill.count and to == fill.stops[fill.next];
         if (live) fill.next += 1;
+        if (!last) {
+            const next_stop = if (fill.next < fill.count) fill.stops[fill.next] else prompt.len;
+            try e.stageAhead(&lane.caches, prompt[to..@min(next_stop, to + chunk)]);
+        }
         f.keeps = .{ .lane = lane, .s = s, .marks = held, .n = n_marks, .live = if (live) to else null, .last = last, .from = fill.from, .kept0 = fill.kept0 };
         if (!last or f.link != null) states.settle(f); // the other ranks take each keep in step order
         if (!last) return false;
