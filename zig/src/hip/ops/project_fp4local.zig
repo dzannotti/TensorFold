@@ -97,14 +97,17 @@ pub fn routed(o: Ops, x: Tensor, w: Weights, items: u64, count: usize, members: 
     return out;
 }
 
-/// The routed (gate | up) stack with silu(gate) x up as the stream tile's epilogue; null on a prompt span.
+/// silu(gate) x up of a routed (gate | up) stack in one launch: the stream tile in decode, Loom's on a prompt, or null.
 pub fn routedAct(o: Ops, x: Tensor, w: Weights, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
-    if (o.prefill or w.fmt != .nvfp4 or x.kind != .bf16 or w.n % 2 != 0 or count == 0) return null;
-    const out = try o.arena.take(pairs * (w.n / 2) * 2);
+    if (w.fmt != .nvfp4 or x.kind != .bf16 or w.n % 2 != 0 or count == 0) return null;
     var a = argOf(w, x, rows);
-    a.out16 = out;
     a.route = .{ .items = items, .members = members, .x_div = int(x_div) };
-    try o.l.fp4.streamGo(o.l.r, .nvfp4, a, .{ .pair_cols = int(w.n / 2), .limit = limit }, int(count), o.stream);
+    if (o.prefill and !o.l.fp4.experts.takesGateUp(a, limit)) return null;
+    const out = try o.arena.take(pairs * (w.n / 2) * 2);
+    a.out16 = out;
+    if (o.prefill) {
+        try o.l.fp4.experts.gateUpGo(o.l.r, a, int(count), o.stream);
+    } else try o.l.fp4.streamGo(o.l.r, .nvfp4, a, .{ .pair_cols = int(w.n / 2), .limit = limit }, int(count), o.stream);
     return .{ .ptr = out, .kind = .bf16 };
 }
 

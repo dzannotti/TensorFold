@@ -33,8 +33,8 @@ pub const arch: []const u8 = objects.arch;
 /// The objects in `Group` order; empty in a build without hipcc.
 pub const images: [group_count][]align(8) const u8 = objects.images;
 
-/// The Loom kernels (zig/kernels/loom), one code object each, in zig/build/loom.zig's `sources` order.
-pub const Loom = enum { mxfp8_gemv };
+/// The Loom kernels (zig/kernels/loom), one code object each, in zig/build/loom.zig's `kernels` order.
+pub const Loom = enum { mxfp8_gemv, nvfp4_expert_gate_up, nvfp4_expert_down };
 pub const loom_count = @typeInfo(Loom).@"enum".field_names.len;
 
 /// The architecture the Loom objects were built for (-Dloom-target); empty in a build without -Dloom-compile.

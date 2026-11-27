@@ -6,11 +6,25 @@ pub const Options = struct { compile: ?[]const u8, target: []const u8 };
 /// The hrx-loom release the sources are written and checked against; another one is refused.
 pub const version = std.mem.trim(u8, @embedFile("../../.loom-version"), " \t\r\n");
 
-/// A kernel's directory under zig/kernels/loom: gen.py writes <name>.loom, gen_tests.py its loom-test module.
-pub const Kernel = struct { name: []const u8 };
+/// A Loom code object from zig/kernels/loom/`dir`: gen.py writes its module, or loom-import-cxx makes it of `cxx`.
+pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 = null, inputs: []const []const u8 };
+
+const k4_headers: []const []const u8 = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h" };
 
 /// The kernels in zig/src/hip/kernels.zig's Loom order.
-pub const kernels = [_]Kernel{.{ .name = "mxfp8_gemv" }};
+pub const kernels = [_]Kernel{
+    .{ .name = "mxfp8_gemv", .dir = "mxfp8_gemv", .inputs = &.{"gen_epilogue.py"} },
+    .{ .name = "nvfp4_expert_gate_up", .dir = "nvfp4_grouped_expert", .cxx = "gate_up.cxx", .inputs = k4_headers },
+    .{ .name = "nvfp4_expert_down", .dir = "nvfp4_grouped_expert", .cxx = "down.cxx", .inputs = k4_headers },
+};
+
+/// A directory's loom-test module: gen_tests.py's output (with gen.py's module as its library), or C++ checks.
+const Checks = struct { dir: []const u8, cxx: ?[]const u8 = null, inputs: []const []const u8 };
+
+const checks = [_]Checks{
+    .{ .dir = "mxfp8_gemv", .inputs = &.{ "gen.py", "gen_epilogue.py" } },
+    .{ .dir = "nvfp4_grouped_expert", .cxx = "checks.cxx", .inputs = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h", "gate_up.cxx", "down.cxx" } },
+};
 
 /// The images' declarations of a build without Loom kernels.
 pub const stub = std.fmt.comptimePrint(
@@ -34,8 +48,8 @@ pub fn arch(target: []const u8) ?[]const u8 {
     return target[prefix.len..];
 }
 
-/// The hrx-loom install a build uses: its loom-compile and loom-test, and the Python beside them that runs gen.py.
-const Tools = struct { compile: []const u8, test_tool: []const u8, python: []const u8, target: []const u8 };
+/// The hrx-loom install a build uses: loom-compile, loom-test, loom-import-cxx, and the Python that runs gen.py.
+const Tools = struct { compile: []const u8, test_tool: []const u8, import: []const u8, python: []const u8, target: []const u8 };
 
 /// The install for `hip_arch`, its version checked; null without -Dloom-compile or for another architecture.
 fn tools(b: *std.Build, o: Options, hip_arch: []const u8) ?Tools {
@@ -51,6 +65,7 @@ fn tools(b: *std.Build, o: Options, hip_arch: []const u8) ?Tools {
     return .{
         .compile = resolved,
         .test_tool = b.pathJoin(&.{ bin, "loom-test" }),
+        .import = b.pathJoin(&.{ bin, "loom-import-cxx" }),
         .python = b.pathJoin(&.{ bin, "python3" }),
         .target = o.target,
     };
@@ -85,10 +100,14 @@ pub fn objects(b: *std.Build, dir: *std.Build.Step.WriteFile, o: Options, name: 
 pub fn testStep(b: *std.Build, o: Options, hip_arch: []const u8) void {
     const step = b.step("loom-test", "Every Loom kernel's loom-test cases on this GPU (-Dloom-compile, -Dhip-arch)");
     const t = tools(b, o, hip_arch) orelse return;
-    for (kernels) |k| {
+    for (checks) |c| {
         const run = b.addSystemCommand(&.{t.test_tool});
-        run.addFileArg(generate(b, t, k, "gen_tests.py", "tests.loom"));
-        run.addPrefixedFileArg("--library=", generate(b, t, k, "gen.py", b.fmt("{s}.loom", .{k.name})));
+        if (c.cxx) |src| {
+            run.addFileArg(import(b, t, c.dir, src, c.inputs, "checks.loom"));
+        } else {
+            run.addFileArg(generate(b, t, c.dir, "gen_tests.py", c.inputs, "tests.loom"));
+            run.addPrefixedFileArg("--library=", generate(b, t, c.dir, "gen.py", c.inputs, b.fmt("{s}.loom", .{c.dir})));
+        }
         run.addArgs(&.{ "--device=amdgpu", b.fmt("--target={s}", .{t.target}) });
         run.has_side_effects = true;
         step.dependOn(&run.step);
@@ -97,18 +116,35 @@ pub fn testStep(b: *std.Build, o: Options, hip_arch: []const u8) void {
 
 pub const Image = struct { hsaco: std.Build.LazyPath, manifest: std.Build.LazyPath };
 
-/// A kernel's generated module (`script` writes it to stdout), regenerated when its generators change.
-fn generate(b: *std.Build, t: Tools, k: Kernel, script: []const u8, out: []const u8) std.Build.LazyPath {
+fn source(b: *std.Build, dir: []const u8, file: []const u8) std.Build.LazyPath {
+    return b.path(b.fmt("zig/kernels/loom/{s}/{s}", .{ dir, file }));
+}
+
+/// A generated module (`script` writes it to stdout), regenerated when it or `inputs` change.
+fn generate(b: *std.Build, t: Tools, dir: []const u8, script: []const u8, inputs: []const []const u8, out: []const u8) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{t.python});
-    run.addFileArg(b.path(b.fmt("zig/kernels/loom/{s}/{s}", .{ k.name, script })));
-    for ([_][]const u8{ "gen.py", "gen_epilogue.py" }) |f| run.addFileInput(b.path(b.fmt("zig/kernels/loom/{s}/{s}", .{ k.name, f })));
+    run.addFileArg(source(b, dir, script));
+    for (inputs) |f| run.addFileInput(source(b, dir, f));
     return run.captureStdOut(.{ .basename = out });
+}
+
+/// The module loom-import-cxx makes of C++ source `cxx`, its includes found in `dir` (`inputs`).
+fn import(b: *std.Build, t: Tools, dir: []const u8, cxx: []const u8, inputs: []const []const u8, out: []const u8) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{t.import});
+    run.addPrefixedDirectoryArg("--I=", b.path(b.fmt("zig/kernels/loom/{s}", .{dir})));
+    run.addFileArg(source(b, dir, cxx));
+    for (inputs) |f| run.addFileInput(source(b, dir, f));
+    return run.addPrefixedOutputFileArg("--output=", out);
 }
 
 /// A kernel's code object and its artifact manifest (details: each function's interface and workgroup size).
 fn compile(b: *std.Build, t: Tools, k: Kernel) Image {
     const run = b.addSystemCommand(&.{t.compile});
-    run.addFileArg(generate(b, t, k, "gen.py", b.fmt("{s}.loom", .{k.name})));
+    const module = b.fmt("{s}.loom", .{k.name});
+    if (k.cxx) |src| {
+        run.addFileArg(import(b, t, k.dir, src, k.inputs, module));
+        run.addArg(b.fmt("--root=@{s}", .{k.name}));
+    } else run.addFileArg(generate(b, t, k.dir, "gen.py", k.inputs, module));
     run.addArgs(&.{ b.fmt("--target={s}", .{t.target}), "--format=amdgpu-hsaco", "--artifact-manifest=details" });
     const hsaco = run.addPrefixedOutputFileArg("--output=", b.fmt("{s}.hsaco", .{k.name}));
     const manifest = run.addPrefixedOutputFileArg("--emit-artifact-manifest=", b.fmt("{s}.manifest.json", .{k.name}));
