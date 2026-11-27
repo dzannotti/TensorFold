@@ -15,9 +15,6 @@ const take = forward.take;
 /// Rows one window holds at most: the pending token and its drafts.
 pub const window_rows = cache.max_window;
 
-/// Slots a window's plan runs: the window, then an empty slot that stops its wave writing the state back.
-const slots = 2;
-
 /// Whether this model's shapes are the plan kernels': key dim 128, eight value rows a wave, gated heads.
 pub fn supported(d: model.Dims, layers: usize) bool {
     if (d.key_dim != 128) return false;
@@ -26,8 +23,10 @@ pub fn supported(d: model.Dims, layers: usize) bool {
     return layers > 0;
 }
 
-/// The plan's words in four-byte units: a slot's first row, its rows, its kept rows, its descriptor pointer.
+/// The plan's words in four-byte units over `slots` slots (a round's streams and an empty last one): each slot's first
+/// row and rows, a kept-row array a slot (each stream's keep its own), the descriptor pointers and a layer's snapshots.
 pub const Layout = struct {
+    slots: usize,
     first: usize,
     count: usize,
     keep: usize,
@@ -35,12 +34,13 @@ pub const Layout = struct {
     snaps: usize,
     words: usize,
 
-    pub fn of(layers: usize) Layout {
+    pub fn of(layers: usize, slots: usize) Layout {
         var l: Layout = undefined;
+        l.slots = slots;
         l.first = 0;
         l.count = slots;
         l.keep = 2 * slots;
-        l.ptr = std.mem.alignForward(usize, 3 * slots, 4); // eight-byte pointers start on an even word
+        l.ptr = std.mem.alignForward(usize, l.keep + slots * slots, 4); // eight-byte pointers start on an even word
         l.snaps = l.ptr + 2 * slots;
         l.words = l.snaps + 4 * layers;
         return l;
@@ -52,21 +52,23 @@ pub const Layout = struct {
     }
 
     /// Where the descriptors start (eight-byte aligned).
-    fn start(layers: usize) usize {
-        return std.mem.alignForward(usize, of(layers).words, 2);
+    fn start(layers: usize, slots: usize) usize {
+        return std.mem.alignForward(usize, of(layers, slots).words, 2);
     }
 
     /// Every word of the plan: its control words, then a descriptor a slot.
-    pub fn total(layers: usize) usize {
-        return start(layers) + slots * desc(layers);
+    pub fn total(layers: usize, slots: usize) usize {
+        return start(layers, slots) + slots * desc(layers);
     }
 };
 
-/// One stream's window plan: the round's words, its descriptors, and the rows its keep reads again.
+/// A round's window plan over every stream in it: the words, a descriptor a stream, and the rows each keep reads again.
 pub const Plan = struct {
     r: *const hip.Runtime,
     layers: usize,
-    /// Rows the buffers hold at most: a window.
+    /// Streams a round holds at most, and the slots the words lay out: one more, the empty slot.
+    streams: usize,
+    /// Rows the buffers hold at most: a window a stream.
     room: usize,
     key_heads: usize,
     value_heads: usize,
@@ -79,37 +81,42 @@ pub const Plan = struct {
     /// The words and descriptors, and the device copy a round and a keep read.
     host: hip.HostBuffer,
     dev: hip.DeviceBuffer,
-    /// A layer's k, v, gate and beta over the window's rows, section-major: what a keep replays from.
+    /// A layer's k, v, gate and beta over the round's rows, section-major: what a keep replays from.
     kept: hip.DeviceBuffer,
-    /// A layer's conv input rows over the window, section-major: where a keep takes its conv tail.
+    /// A layer's conv input rows over the round, section-major: where a keep takes its conv tail.
     samples: hip.DeviceBuffer,
-    /// Rows the window last ran.
+    /// The last round's rows, streams, and each stream's cache slot and rows.
     rows: usize = 0,
+    n: usize = 0,
+    ids: [forward.max_segs]u32 = undefined,
+    counts: [forward.max_segs]usize = undefined,
 
-    pub fn init(d: *const hip.Runtime, dims: model.Dims) !Plan {
+    pub fn init(d: *const hip.Runtime, dims: model.Dims, streams: usize) !Plan {
         if (!supported(dims, dims.layers)) return error.UnsupportedPlan;
-        var host = try hip.HostBuffer.alloc(d, 4 * Layout.total(dims.layers));
+        const n = @min(@max(streams, 1), forward.max_segs);
+        var host = try hip.HostBuffer.alloc(d, 4 * Layout.total(dims.layers, n + 1));
         errdefer host.free();
         var dev = try hip.DeviceBuffer.alloc(d, host.bytes.len);
         errdefer dev.free();
-        const width = dims.key_heads * dims.key_dim + dims.value_heads * dims.value_dim + 2 * dims.value_heads;
-        var kept = try hip.DeviceBuffer.alloc(d, 4 * window_rows * width * dims.layers);
+        const room = n * window_rows;
+        var kept = try hip.DeviceBuffer.alloc(d, 4 * room * width(dims) * dims.layers);
         errdefer kept.free();
-        var samples = try hip.DeviceBuffer.alloc(d, 4 * window_rows * dims.convWidth() * dims.layers);
+        var samples = try hip.DeviceBuffer.alloc(d, 4 * room * dims.convWidth() * dims.layers);
         errdefer samples.free();
         @memset(host.bytes, 0);
         return .{
             .r = d,
             .layers = dims.layers,
-            .room = window_rows,
+            .streams = n,
+            .room = room,
             .key_heads = dims.key_heads,
             .value_heads = dims.value_heads,
             .key_dim = dims.key_dim,
             .value_dim = dims.value_dim,
             .conv = dims.conv,
             .channels = dims.convWidth(),
-            .kept_stride = 4 * window_rows * width,
-            .samples_stride = 4 * window_rows * dims.convWidth(),
+            .kept_stride = 4 * room * width(dims),
+            .samples_stride = 4 * room * dims.convWidth(),
             .host = host,
             .dev = dev,
             .kept = kept,
@@ -124,28 +131,34 @@ pub const Plan = struct {
         p.host.free();
     }
 
-    /// Device bytes a stream's plan takes, whether or not one is made: the admission counts it the same either way.
-    pub fn bytes(dims: model.Dims) usize {
-        const width = dims.key_heads * dims.key_dim + dims.value_heads * dims.value_dim + 2 * dims.value_heads;
-        const words = 4 * Layout.total(dims.layers);
-        return words + 4 * window_rows * width * dims.layers + 4 * window_rows * dims.convWidth() * dims.layers;
+    /// A row's kept values: k, v, gate and beta.
+    fn width(dims: model.Dims) usize {
+        return dims.key_heads * dims.key_dim + dims.value_heads * dims.value_dim + 2 * dims.value_heads;
+    }
+
+    /// Device bytes the plan for `streams` streams takes, whether or not one is made: the admission counts it either way.
+    pub fn bytes(dims: model.Dims, streams: usize) usize {
+        const n = @min(@max(streams, 1), forward.max_segs);
+        const room = n * window_rows;
+        return 4 * Layout.total(dims.layers, n + 1) + 4 * room * width(dims) * dims.layers +
+            4 * room * dims.convWidth() * dims.layers;
     }
 
     pub fn layout(p: *const Plan) Layout {
-        return Layout.of(p.layers);
+        return Layout.of(p.layers, p.streams + 1);
     }
 
     /// A slot's descriptor words: [0] cached positions, [1] the last kept final row (0: none), then a layer's pair.
     fn descriptor(p: *Plan, slot: usize) []u64 {
-        const at = Layout.start(p.layers) + slot * Layout.desc(p.layers);
+        const at = Layout.start(p.layers, p.streams + 1) + slot * Layout.desc(p.layers);
         return p.host.slice(u64)[at / 2 ..][0 .. Layout.desc(p.layers) / 2];
     }
 
     fn descAt(p: *const Plan, slot: usize) u64 {
-        return p.dev.base() + 4 * (Layout.start(p.layers) + slot * Layout.desc(p.layers));
+        return p.dev.base() + 4 * (Layout.start(p.layers, p.streams + 1) + slot * Layout.desc(p.layers));
     }
 
-    /// Linear layer `layer`'s section-major k, v, gate and beta over the window's row `at`.
+    /// Linear layer `layer`'s section-major k, v, gate and beta over the round's row `at`.
     pub fn keptOf(p: *const Plan, layer: usize, at: usize) struct { k: u64, v: u64, gate: u64, beta: u64 } {
         const kw = p.key_heads * p.key_dim;
         const vw = p.value_heads * p.value_dim;
@@ -157,68 +170,88 @@ pub const Plan = struct {
         return .{ .k = k, .v = v, .gate = gate, .beta = gate + 4 * rows * p.value_heads };
     }
 
-    /// The conv samples of layer `layer` (the window's `channels` a row).
+    /// The conv samples of layer `layer` (the round's `channels` a row).
     pub fn samplesOf(p: *const Plan, layer: usize) u64 {
         return p.samples.base() + layer * p.samples_stride;
     }
 
-    /// The kept rows a round and a keep read.
-    pub fn keepWords(p: *const Plan) u64 {
-        return p.dev.base() + 4 * p.layout().keep;
+    /// Slot `slot`'s kept-row array, the one its keep reads.
+    fn keepWords(p: *const Plan, slot: usize) u64 {
+        return p.dev.base() + 4 * (p.layout().keep + slot * p.layout().slots);
     }
 
-    /// The window's words and descriptor for caches `c` over `n` rows, on the host: the copy goes up with `send`.
-    pub fn fill(p: *Plan, c: *const cache.Caches, n: usize) !void {
-        if (n == 0 or n > p.room) return error.TooManyRows;
+    /// The round's words and a descriptor a stream of `segs`, on the host: the copy goes up with `send`.
+    pub fn fill(p: *Plan, segs: []const forward.Seg) !void {
+        if (segs.len == 0 or segs.len > p.streams) return error.TooManyStreams;
+        var rows: usize = 0;
+        for (segs) |g| rows += g.tokens.len;
+        if (rows > p.room) return error.TooManyRows;
+        for (segs) |g| if (g.tokens.len == 0 or g.tokens.len > window_rows) return error.TooManyRows;
         const l = p.layout();
         const w = p.host.slice(u32);
         const ptr = p.host.slice(u64);
-        const desc = p.descriptor(0);
+        const c0 = segs[0].c;
         for (0..p.layers) |i| {
-            // a sparse layer keeps its descriptor pair, conv samples and replay inputs zero: the kernels skip it
-            desc[2 + 2 * i ..][0..2].* = if (c.linear[i]) .{ c.linearAt(i).conv, c.linearAt(i).state } else .{ 0, 0 };
-            ptr[l.snaps / 2 + 2 * i] = if (c.linear[i]) p.samplesOf(i) else 0;
-            ptr[l.snaps / 2 + 2 * i + 1] = if (c.linear[i]) p.kept.base() + i * p.kept_stride else 0;
+            // a sparse layer keeps its conv samples and replay inputs zero: the kernels skip it
+            ptr[l.snaps / 2 + 2 * i] = if (c0.linear[i]) p.samplesOf(i) else 0;
+            ptr[l.snaps / 2 + 2 * i + 1] = if (c0.linear[i]) p.kept.base() + i * p.kept_stride else 0;
         }
-        // a round keeps no final row: a keep takes the conv tail and the state alone
-        desc[0] = 0;
-        desc[1] = 0;
-        @memset(p.descriptor(1), 0);
-        w[l.first] = 0;
-        w[l.count] = @intCast(n);
-        w[l.keep] = std.math.maxInt(u32);
-        ptr[l.ptr / 2] = p.descAt(0);
+        // every keep array starts with nothing kept: a stream's keep writes its own slot of its own array
+        @memset(w[l.keep..][0 .. l.slots * l.slots], std.math.maxInt(u32));
+        var at: usize = 0;
+        for (segs, 0..) |g, s| {
+            const desc = p.descriptor(s);
+            for (0..p.layers) |i| {
+                desc[2 + 2 * i ..][0..2].* = if (g.c.linear[i]) .{ g.c.linearAt(i).conv, g.c.linearAt(i).state } else .{ 0, 0 };
+            }
+            // a round keeps no final row: a keep takes the conv tail and the state alone
+            desc[0] = 0;
+            desc[1] = 0;
+            w[l.first + s] = @intCast(at);
+            w[l.count + s] = @intCast(g.tokens.len);
+            ptr[l.ptr / 2 + s] = p.descAt(s);
+            p.ids[s] = g.c.id;
+            p.counts[s] = g.tokens.len;
+            at += g.tokens.len;
+        }
         // the empty slot runs nothing and keeps nothing: the kernels stop at its zero row count
-        w[l.first + 1] = 0;
-        w[l.count + 1] = 0;
-        w[l.keep + 1] = std.math.maxInt(u32);
-        ptr[l.ptr / 2 + 1] = p.descAt(1);
-        p.rows = n;
+        const empty = segs.len;
+        @memset(p.descriptor(empty), 0);
+        w[l.first + empty] = @intCast(at);
+        w[l.count + empty] = 0;
+        ptr[l.ptr / 2 + empty] = p.descAt(empty);
+        p.rows = rows;
+        p.n = segs.len;
     }
 
-    /// The words up to the device: a graph holds the copy, so its every replay sends the window's own words.
+    /// The words up to the device: a graph holds the copy, so its every replay sends the round's own words.
     pub fn send(p: *Plan, s: hip.abi.Stream) !void {
-        try hip.raw.upload(p.dev, 0, p.host.bytes, s);
+        try hip.raw.upload(p.dev, 0, p.host.bytes[0 .. 4 * Layout.total(p.layers, p.streams + 1)], s);
     }
 
-    /// The window's first `n` rows kept: the conv tail from their samples, the state replayed through them.
-    pub fn keep(p: *Plan, o: Ops, n: usize) !void {
+    /// Cache slot `id`'s first `n` rows of the last round kept: the conv tail from their samples, the state replayed.
+    pub fn keep(p: *Plan, o: Ops, id: u32, n: usize) !void {
+        const s = for (p.ids[0..p.n], 0..) |x, i| {
+            if (x == id) break i;
+        } else return error.KeepNotInRound;
         // a window of one row left the state and its conv tail as the round wrote them
-        if (p.rows <= 1 or n == 0) return;
-        p.host.slice(u32)[p.layout().keep] = @bitCast(@as(i32, @intCast(n)));
-        try p.send(o.stream);
+        if (p.counts[s] <= 1 or n == 0) return;
+        const l = p.layout();
+        const words = p.host.slice(u32)[l.keep + s * l.slots ..][0..l.slots];
+        words[s] = @bitCast(@as(i32, @intCast(n)));
+        try hip.raw.upload(p.dev, 4 * (l.keep + s * l.slots), std.mem.sliceAsBytes(words), o.stream);
         try pops.keep(o, p.ref(), .{
-            .keep = p.keepWords(),
+            .keep = p.keepWords(s),
             .hidden = 0,
             .hidden_words = 0,
             .channels = p.channels,
             .taps = p.conv - 1,
             .layers = p.layers,
         });
-        try pops.gdnReplay(o, p.keepWords(), p.ref(), p.key_heads, p.value_heads, p.key_dim, p.value_dim, p.layers);
+        try pops.gdnReplay(o, p.keepWords(s), p.ref(), p.key_heads, p.value_heads, p.key_dim, p.value_dim, p.layers);
     }
 
-    /// The words as launches take them: the window's rows from its first.
+    /// The words as launches take them: every stream's rows from its first, and the empty slot.
     pub fn ref(p: *const Plan) pops.Plan {
         const l = p.layout();
         const at = p.dev.base();
@@ -230,127 +263,74 @@ pub const Plan = struct {
                 .snaps = at + 4 * l.snaps,
             },
             .rows = p.rows,
-            .slots = slots,
+            .slots = p.n + 1,
         };
     }
 };
 
-/// Every cache slot's window plan: a slot's keep reads its own rows, which the next round over it has not yet written.
-pub const Slots = struct {
-    gpa: std.mem.Allocator,
-    plans: []Plan,
-
-    pub fn init(gpa: std.mem.Allocator, d: *const hip.Runtime, dims: model.Dims, streams: usize) !Slots {
-        const plans = try gpa.alloc(Plan, @max(streams, 1));
-        var made: usize = 0;
-        errdefer {
-            for (plans[0..made]) |*p| p.deinit();
-            gpa.free(plans);
-        }
-        for (plans) |*p| {
-            p.* = try Plan.init(d, dims);
-            made += 1;
-        }
-        return .{ .gpa = gpa, .plans = plans };
-    }
-
-    pub fn deinit(s: *Slots) void {
-        for (s.plans) |*p| p.deinit();
-        s.gpa.free(s.plans);
-    }
-
-    /// Cache slot `id`'s plan (null: a slot this rank never leased, so nothing can round or keep it).
-    pub fn planFor(s: *Slots, id: u32) ?*Plan {
-        if (id >= s.plans.len) return null;
-        return &s.plans[id];
-    }
-
-    /// Device bytes the slots take.
-    pub fn bytes(dims: model.Dims, streams: usize) usize {
-        return Plan.bytes(dims) * @max(streams, 1);
-    }
-};
-
-/// A window's rows through the linear attention from its plan: a stream one conv split and delta rule, the norm after.
+/// A round's rows through the linear attention from its plan: one conv split and delta rule over every stream, the norm after.
 pub fn linear(
     o: Ops,
     m: *const model.Model,
     l: model.Linear,
-    segs: []const forward.Seg,
     index: usize,
     qkv: Tensor,
     z: Tensor,
     a: Tensor,
     b: Tensor,
     rows: usize,
-    s: *Slots,
+    p: *const Plan,
 ) !Tensor {
+    if (rows != p.rows) return error.CachesNotPlanned;
     const d = m.dims;
     const ch = d.convWidth();
     const kw = d.key_heads * d.key_dim;
     const vw = d.value_heads * d.value_dim;
     const y = try o.arena.of(f32, rows * vw);
-    var off: usize = 0;
-    for (segs) |g| {
-        const p = s.planFor(g.c.id) orelse return error.CachesNotPlanned;
-        const n = g.tokens.len;
-        const qn = try o.arena.of(f32, n * kw);
-        const kept = p.keptOf(index, 0);
-        try pops.convSplit(
-            o,
-            forward.at(qkv, off * ch),
-            l.conv,
-            qn,
-            kept.k,
-            kept.v,
-            p.ref(),
-            index,
-            ch,
-            d.conv,
-            kw,
-            vw,
-            .{ .q = m.qk.q, .k = m.qk.k, .eps = m.qk.eps },
-            .{
-                .a = forward.at(a, off * d.value_heads),
-                .b = forward.at(b, off * d.value_heads),
-                .a_log = l.a_log,
-                .dt_bias = l.dt_bias,
-                .gate = kept.gate,
-                .beta = kept.beta,
-                .count = n * d.value_heads,
-                .heads = d.value_heads,
-            },
-        );
-        try pops.gatedDelta(
-            o,
-            qn,
-            kept.k,
-            kept.v,
-            kept.gate,
-            kept.beta,
-            y + off * vw * 4,
-            p.ref(),
-            index,
-            d.key_heads,
-            d.value_heads,
-            d.key_dim,
-            d.value_dim,
-        );
-        off += n;
-    }
+    const qn = try o.arena.of(f32, rows * kw);
+    const kept = p.keptOf(index, 0);
+    try pops.convSplit(
+        o,
+        qkv,
+        l.conv,
+        qn,
+        kept.k,
+        kept.v,
+        p.ref(),
+        index,
+        ch,
+        d.conv,
+        kw,
+        vw,
+        .{ .q = m.qk.q, .k = m.qk.k, .eps = m.qk.eps },
+        .{
+            .a = a,
+            .b = b,
+            .a_log = l.a_log,
+            .dt_bias = l.dt_bias,
+            .gate = kept.gate,
+            .beta = kept.beta,
+            .count = rows * d.value_heads,
+            .heads = d.value_heads,
+        },
+    );
+    try pops.gatedDelta(o, qn, kept.k, kept.v, kept.gate, kept.beta, y, p.ref(), index, d.key_heads, d.value_heads, d.key_dim, d.value_dim);
     const out = try take(o, m.act, rows * vw);
     try o.gnormOut(y, l.norm, z, out, rows * d.value_heads, d.value_dim, d.eps, d.gate);
     return o.project(out, l.out, rows, l.out.partial);
 }
 
-test "the words keep every slot's arrays and put the pointers on even words" {
-    const l = Layout.of(48);
-    try std.testing.expect(l.ptr % 2 == 0);
-    try std.testing.expect(l.snaps == l.ptr + 2 * slots);
-    try std.testing.expect(l.words == l.snaps + 4 * 48);
-    try std.testing.expect(Layout.start(48) % 2 == 0);
+test "the words keep a keep array a slot and put the pointers on even words" {
+    for ([_]usize{ 2, 4, 6, 65 }) |slots| {
+        const l = Layout.of(48, slots);
+        try std.testing.expect(l.ptr % 2 == 0);
+        try std.testing.expect(l.ptr >= l.keep + slots * slots);
+        try std.testing.expect(l.snaps == l.ptr + 2 * slots);
+        try std.testing.expect(l.words == l.snaps + 4 * 48);
+        try std.testing.expect(Layout.start(48, slots) % 2 == 0);
+        try std.testing.expectEqual(Layout.start(48, slots) + slots * Layout.desc(48), Layout.total(48, slots));
+    }
     try std.testing.expectEqual(@as(usize, 2 * (2 + 2 * 48)), Layout.desc(48));
-    try std.testing.expectEqual(Layout.start(48) + slots * Layout.desc(48), Layout.total(48));
 }
 
 test "the plan path is the default: Flash Next's shapes take it, the shapes its kernels cannot take stay per-row" {
@@ -385,6 +365,7 @@ test "one layer's kept sections sit one after another over the window's rows" {
     var p: Plan = undefined;
     p.rows = 4;
     p.room = window_rows;
+    p.streams = 1;
     p.key_heads = 16;
     p.key_dim = 128;
     p.value_heads = vh;
