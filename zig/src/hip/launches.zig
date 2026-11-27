@@ -54,6 +54,7 @@ pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
 pub const nvfp4_experts = @import("launches/nvfp4_experts.zig");
 pub const bf16_gemm = @import("launches/bf16_gemm.zig");
 pub const loom_attention = @import("launches/loom_attention.zig");
+pub const loom_gdn = @import("launches/loom_gdn.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -131,6 +132,8 @@ pub const Launcher = struct {
     fp4: fp4local.Kernels,
     /// Flash Next's Loom sparse prompt attention and indexer; empty in a build without Loom.
     attn: loom_attention.Kernels,
+    /// The Loom prompt DeltaNet recurrence; empty in a build without Loom.
+    gdn_loom: loom_gdn.Kernels,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -387,6 +390,8 @@ pub const Launcher = struct {
             d.* = kernels.loom_manifests[@backingInt(k)];
         }
         l.attn = try loom_attention.Kernels.load(sa_mods, sa_docs);
+        const gr = @backingInt(kernels.Loom.gdn_recur);
+        l.gdn_loom = try loom_gdn.Kernels.load(l.loom[gr], kernels.loom_manifests[gr]);
         return l;
     }
 

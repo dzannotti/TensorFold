@@ -23,6 +23,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "idx_select", .dir = "sparse_attention", .cxx = "select.cxx", .inputs = sa_headers },
     .{ .name = "bf16_gemm_128x128", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
     .{ .name = "bf16_gemm_128x256", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
+    .{ .name = "gdn_recur", .dir = "gdn_prompt", .cxx = "gdn_recur.cxx", .inputs = &.{"recur.h"} },
 };
 
 /// A directory's loom-test module: gen_tests.py's output (with gen.py's module as its library), or C++ checks.
@@ -33,6 +34,7 @@ const checks = [_]Checks{
     .{ .dir = "nvfp4_grouped_expert", .cxx = "checks.cxx", .inputs = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h", "gate_up.cxx", "down.cxx" } },
     .{ .dir = "sparse_attention", .cxx = "checks.cxx", .inputs = &.{ "lanes_asm.h", "exp_exact.h", "oracle.h", "attend.cxx", "scores.cxx", "select.cxx" } },
     .{ .dir = "dense_prompt_gemm", .cxx = "checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "bf16_gemm.cxx" } },
+    .{ .dir = "gdn_prompt", .cxx = "checks.cxx", .inputs = &.{ "recur.h", "oracle.h", "gdn_recur.cxx" } },
 };
 
 /// The images' declarations of a build without Loom kernels.

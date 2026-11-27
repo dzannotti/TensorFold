@@ -35,6 +35,8 @@ pub fn tf_gated_delta(l: *const Launcher, q: CF, k: CF, v: CF, gate: CF, beta: C
     if ((dk != 16 and dk != 128) or dv < 1 or key_heads < 1 or @rem(value_heads, key_heads) != 0 or batch < 1 or length < 1) {
         return invalid("gated delta");
     }
+    // a prompt's rows on the Loom kernel at any count: tf_gdn_prompt_128's bytes, which the tile and wave also give
+    if (l.gdn_loom.takes(batch, dk, dv, states != null)) return l.gdn_loom.run(l.r, q, k, v, gate, beta, state, y, length, key_heads, value_heads, s);
     var a: Args = .{};
     try a.add(ad(q));
     try a.add(ad(k));
