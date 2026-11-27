@@ -54,6 +54,8 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_Q27_GEMM` | Exactly `narrow`; default the 128x128 tiles |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | A finite GiB amount; the HIP admission's floor (0.5, or 2 on shared memory) and the memory's size still bound it |
 | `TENSORFOLD_HIP_MEMORY_LIMIT_GB` | A positive finite GiB amount whose byte count fits a 64-bit size |
+| `TENSORFOLD_GPU` | Exactly `hip` or `hrx`; unset or blank `hip`. `hrx` drives the HIP families through AMD HRX's native runtime instead of a HIP library ([HRX](hip-hrx.md)) |
+| `TENSORFOLD_HRX` | Path of the libhrx shared library `TENSORFOLD_GPU=hrx` opens; unset `libhrx.so.0` on the library path |
 | `TF_DSPINE_WINDOW` | Qwen3.8-27B on CUDA with a DSpine `--drafter`: whole row count 16 through 8192 that narrows the drafter's sliding window; it must be at least the block (16) and at most the checkpoint's own `sliding_window`, else the drafter is refused when it opens; unset or blank keeps the checkpoint's (8192 for tencent/Qwen3.8-27B-DSpine-b16) |
 | `TF_DRAFT_NODES` | Whole native-size nonnegative count, capped by the drafter's window; zero disables trees |
 | `TF_QMMF_HALF_BELOW` | Whole native-size nonnegative block count; zero disables half tiles; default 96, or two blocks per SM with `TF_QMMF_HALF_BN=1` |
