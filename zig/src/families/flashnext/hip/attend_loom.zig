@@ -1,4 +1,4 @@
-//! A prompt's sparse attention on the Loom kernels (launches/loom_attention.zig): hipcc's bytes, whole chunks a launch.
+//! A prompt's sparse attention: the Loom indexer (launches/loom_attention.zig), the WMMA core, whole chunks a launch.
 const std = @import("std");
 const hip = @import("hip");
 const model = @import("model.zig");
@@ -57,21 +57,26 @@ pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView
             flags = try host.put(o, std.mem.sliceAsBytes(zeros));
             ids = flags;
         }
-        try k.attend(
-            o.l.r,
+        // the hipcc twin of Loom's sparse_attend (same bytes, launches/flashnext.zig) runs faster on gfx1151
+        try o.l.fn_sparse_attention(
             @ptrFromInt(q32 + r0 * d.heads * d.head_dim * 4),
             @ptrFromInt(kv.k),
             @ptrFromInt(kv.v),
+            2,
             @ptrFromInt(ids),
             @intCast(key_stride),
             @ptrFromInt(count),
             @ptrFromInt(flags),
+            null,
+            null,
             @ptrFromInt(att + r0 * d.heads * d.head_dim * 4),
             @intCast(n),
             @intCast(d.heads),
             @intCast(d.kv_heads),
+            @intCast(d.head_dim),
             @intCast(cap),
             scale,
+            @intCast(hip.launches.loom_attention.parts),
             o.stream,
         );
     }
