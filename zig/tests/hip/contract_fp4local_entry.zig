@@ -1,4 +1,4 @@
-//! FP4-Local's contract entry: gates 1-4, bit identity across decode rows and prompt rows and cuts, then the Loom GEMV.
+//! FP4-Local's contract entry: gates 1-4, bit identity across decode and prompt rows and cuts, then the Loom kernels.
 const std = @import("std");
 const hip = @import("hip");
 const core = @import("core");
@@ -36,7 +36,28 @@ pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
     }
     try loom(a, &r, s, &l, &t);
     try experts(a, &r, s, &l, &t);
+    try dense(a, &r, s, &l, &t);
     return t;
+}
+
+/// The Loom dense bf16 GEMMs against fp4l_wmma's bytes, when the build has them.
+fn dense(a: std.mem.Allocator, r: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher, t: *g.Tally) !void {
+    if (l.fp4.dense.f == null) {
+        std.debug.print("N/A  loom bf16_gemm_*: built without -Dloom-compile, fp4l_wmma serves BF16 prompts\n", .{});
+        return;
+    }
+    var cases: [k_.dense_registrations.len]k_.Case = undefined;
+    for (&cases, k_.dense_registrations) |*x, reg| x.* = .init(a, r, s, l, reg);
+    defer for (&cases) |*x| x.deinit();
+    var kernels: std.ArrayList(g.Kernel) = .empty;
+    defer kernels.deinit(a);
+    for (&cases) |*x| try kernels.append(a, x.kernel());
+    try g.runAll(a, kernels.items, 0x6466, t);
+    for (&cases) |*x| {
+        const ok = try identity(a, x);
+        t.kernels += 1;
+        if (ok) t.passed += 1 else t.failed += 1;
+    }
 }
 
 /// The Loom grouped-expert kernels against fp4l_wmma's and fp4l_pair's bytes, when the build has them.

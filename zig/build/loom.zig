@@ -11,6 +11,7 @@ pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 
 
 const k4_headers: []const []const u8 = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h" };
 const sa_headers: []const []const u8 = &.{ "lanes_asm.h", "exp_exact.h" };
+const dg_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h" };
 
 /// The kernels in zig/src/hip/kernels.zig's Loom order.
 pub const kernels = [_]Kernel{
@@ -20,6 +21,8 @@ pub const kernels = [_]Kernel{
     .{ .name = "sparse_attend", .dir = "sparse_attention", .cxx = "attend.cxx", .inputs = sa_headers },
     .{ .name = "idx_scores", .dir = "sparse_attention", .cxx = "scores.cxx", .inputs = sa_headers },
     .{ .name = "idx_select", .dir = "sparse_attention", .cxx = "select.cxx", .inputs = sa_headers },
+    .{ .name = "bf16_gemm_128x128", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
+    .{ .name = "bf16_gemm_128x256", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
 };
 
 /// A directory's loom-test module: gen_tests.py's output (with gen.py's module as its library), or C++ checks.
@@ -29,6 +32,7 @@ const checks = [_]Checks{
     .{ .dir = "mxfp8_gemv", .inputs = &.{ "gen.py", "gen_epilogue.py" } },
     .{ .dir = "nvfp4_grouped_expert", .cxx = "checks.cxx", .inputs = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h", "gate_up.cxx", "down.cxx" } },
     .{ .dir = "sparse_attention", .cxx = "checks.cxx", .inputs = &.{ "lanes_asm.h", "exp_exact.h", "oracle.h", "attend.cxx", "scores.cxx", "select.cxx" } },
+    .{ .dir = "dense_prompt_gemm", .cxx = "checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "bf16_gemm.cxx" } },
 };
 
 /// The images' declarations of a build without Loom kernels.

@@ -13,6 +13,7 @@ const stream_layout = @import("stream_layout.zig");
 const util = @import("util.zig");
 const mxfp8_gemv = @import("mxfp8_gemv.zig");
 const nvfp4_experts = @import("nvfp4_experts.zig");
+const bf16_gemm = @import("bf16_gemm.zig");
 const kernels = @import("../kernels.zig");
 
 const Error = runtime.Error;
@@ -63,6 +64,8 @@ pub const Kernels = struct {
     gemv: mxfp8_gemv.Kernels,
     /// The Loom NVFP4 grouped-expert prompt kernels: the routed prompt tiles' bytes; empty without Loom.
     experts: nvfp4_experts.Kernels,
+    /// The Loom dense bf16 prompt GEMMs: fp4l_wmma's BF16 bytes, at the shapes they are faster; empty without Loom.
+    dense: bf16_gemm.Kernels,
 
     /// fp4local.hip's kernels in `m`, and the Loom kernels in `loom` the build has (`manifests` check them).
     pub fn load(m: Module, caps: Caps, loom: [kernels.loom_count]?Module, manifests: [kernels.loom_count][]const u8) Error!Kernels {
@@ -70,8 +73,11 @@ pub const Kernels = struct {
         const gu = @backingInt(kernels.Loom.nvfp4_expert_gate_up);
         const dn = @backingInt(kernels.Loom.nvfp4_expert_down);
         const experts = try nvfp4_experts.Kernels.load(.{ loom[gu], loom[dn] }, .{ manifests[gu], manifests[dn] });
+        const d0 = @backingInt(kernels.Loom.bf16_gemm_128x128);
+        const d1 = @backingInt(kernels.Loom.bf16_gemm_128x256);
+        const dense = try bf16_gemm.Kernels.load(.{ loom[d0], loom[d1] }, .{ manifests[d0], manifests[d1] });
         @setEvalBranchQuota(100_000);
-        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts };
+        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
@@ -190,10 +196,11 @@ pub const Kernels = struct {
         if (!k.matrix) return refuse("the FP4-Local prompt tile needs gfx11's matrix cores");
         if (a.m < 1 or a.n < 1 or @rem(a.k, fold(fmt, a)) != 0 or a.x % 16 != 0) return refuse("prompt shape");
         if (fmt == .nvfp4 and k.experts.takesDown(a)) return k.experts.downGo(r, a, items, s);
+        if (fmt == .bf16) if (k.dense.pick(a)) |t| return k.dense.go(r, t, a, s);
         return k.tilePromptGo(r, fmt, a, items, expert_rows, s);
     }
 
-    /// `promptGo` on fp4local.hip's matrix tiles alone: what the Loom grouped-expert kernels are checked against.
+    /// `promptGo` on fp4local.hip's matrix tiles alone: what the Loom prompt kernels are checked against.
     pub fn tilePromptGo(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, items: c_int, expert_rows: c_int, s: abi.Stream) Error!void {
         var args: hl.Args = .{};
         try args.add(a);
