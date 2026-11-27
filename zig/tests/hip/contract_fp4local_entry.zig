@@ -1,9 +1,10 @@
-//! FP4-Local's contract entry: gates 1-4, then bit identity across decode rows and prompt row counts and cuts.
+//! FP4-Local's contract entry: gates 1-4, bit identity across decode rows and prompt rows and cuts, then the Loom GEMV.
 const std = @import("std");
 const hip = @import("hip");
 const core = @import("core");
 const Profile = @import("contract_entry.zig").Profile;
 const k_ = @import("contract_fp4local.zig");
+const gemv_ = @import("contract_mxfp8_gemv.zig");
 
 const g = core.contract.gates;
 
@@ -33,7 +34,28 @@ pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
         t.kernels += 1;
         if (ok) t.passed += 1 else t.failed += 1;
     }
+    try loom(a, &r, s, &l, &t);
     return t;
+}
+
+/// The Loom MXFP8 GEMV against fp4l_stream's bytes, when the build has it (-Dloom-compile).
+fn loom(a: std.mem.Allocator, r: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher, t: *g.Tally) !void {
+    if (l.fp4.gemv.f == null) {
+        std.debug.print("N/A  loom mxfp8_gemv: built without -Dloom-compile, fp4l_stream serves MXFP8 decode\n", .{});
+        return;
+    }
+    var cases: [gemv_.registrations.len]gemv_.Case = undefined;
+    for (&cases, gemv_.registrations) |*x, reg| x.* = .init(a, r, s, l, reg);
+    defer for (&cases) |*x| x.deinit();
+    var kernels: std.ArrayList(g.Kernel) = .empty;
+    defer kernels.deinit(a);
+    for (&cases) |*x| try kernels.append(a, x.kernel());
+    try g.runAll(a, kernels.items, 0x6c6d, t);
+    for (&cases) |*x| {
+        const ok = try gemv_.identity(a, x);
+        t.kernels += 1;
+        if (ok) t.passed += 1 else t.failed += 1;
+    }
 }
 
 /// A routed plan's pairs come out the same bytes under another plan of them: items in another order, one item split.

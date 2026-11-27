@@ -11,6 +11,7 @@ const affine = @import("affine.zig");
 const stream_pick = @import("stream_pick.zig");
 const stream_layout = @import("stream_layout.zig");
 const util = @import("util.zig");
+const mxfp8_gemv = @import("mxfp8_gemv.zig");
 
 const Error = runtime.Error;
 pub const Arg = affine.Arg;
@@ -56,10 +57,13 @@ pub const Kernels = struct {
     caps: Caps,
     /// gfx11: the matrix tiles run; elsewhere every prompt is refused.
     matrix: bool,
+    /// The Loom MXFP8 GEMV: the stream tile's bytes, at the shapes it is faster; empty in a build without Loom.
+    gemv: mxfp8_gemv.Kernels,
 
-    pub fn load(m: Module, caps: Caps) Error!Kernels {
+    /// fp4local.hip's kernels in `m`, and the Loom GEMV's in `loom` when the build has them (`manifest` checks them).
+    pub fn load(m: Module, caps: Caps, loom: ?Module, manifest: []const u8) Error!Kernels {
         @setEvalBranchQuota(100_000);
-        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11 };
+        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom, manifest) };
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
@@ -104,6 +108,50 @@ pub const Kernels = struct {
 
     /// The stream tile over `a` (or a plan's `items`, or `sides`): fp32 `a.out`, or the activation type in `a.out16`.
     pub fn streamGo(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, sides_in: StreamSides, items: c_int, s: abi.Stream) Error!void {
+        const plain = sides_in.pair_cols == 0 and items == 1 and a.route.items == 0;
+        if (fmt == .mxfp8 and plain) {
+            if (sides_in.count == 0) if (k.gemv.pick(a.n, a.k, a.m, if (a.out16 != 0) .bf16 else .f32)) |at| {
+                const half = a.out16 != 0;
+                return k.gemv.go(r, at, a.m, a.n, a.words, a.scale.p, a.x, if (half) a.out16 else a.out, half, s);
+            };
+            if (stitched(sides_in, a.k)) |st| if (k.gemv.pick(st.n, a.k, a.m, .sides)) |at| {
+                return k.gemv.goSides(r, at, a.m, st.n, st.cuts, st.words, st.scale, a.x, st.out, s);
+            };
+        }
+        return k.tileGo(r, fmt, a, sides_in, items, s);
+    }
+
+    /// A group of sides as one product: its planes, n, the column cuts between sides and their outputs in that order.
+    pub const Stitched = struct { words: u64, scale: u64, n: c_int, cuts: [3]c_int, out: [4]u64 };
+
+    /// A bf16 group whose MXFP8 sides follow one another in memory, each starting at a multiple of 8 rows, or null.
+    pub fn stitched(sides: StreamSides, kk: c_int) ?Stitched {
+        const count: usize = @intCast(@max(sides.count, 0));
+        if (count < 2 or count > 4 or sides.out_half == 0 or kk < 32) return null;
+        const k: u64 = @intCast(kk);
+        var order: [4]usize = .{ 0, 1, 2, 3 };
+        std.mem.sort(usize, order[0..count], sides, struct {
+            fn less(s: StreamSides, a: usize, b: usize) bool {
+                return s.words[a] < s.words[b];
+            }
+        }.less);
+        const first = order[0];
+        var st: Stitched = .{ .words = sides.words[first], .scale = sides.scale[first], .n = 0, .cuts = undefined, .out = @splat(sides.out[first]) };
+        for (0..4) |i| {
+            if (i < count) {
+                const s = order[i];
+                const rows: u64 = @intCast(st.n);
+                if (sides.n[s] < 1 or @rem(st.n, 8) != 0 or sides.words[s] != st.words + rows * k or sides.scale[s] != st.scale + rows * (k / 32)) return null;
+                st.out[i] = sides.out[s];
+                st.n += sides.n[s];
+            }
+            if (i < 3) st.cuts[i] = st.n;
+        }
+        return st;
+    }
+
+    /// `streamGo` on fp4local.hip's stream tile alone: the kernel the Loom GEMV's bytes are checked against.
+    pub fn tileGo(k: *const Kernels, r: *const runtime.Runtime, fmt: Format, a: Arg, sides_in: StreamSides, items: c_int, s: abi.Stream) Error!void {
         const pair = sides_in.pair_cols > 0;
         var total: c_int = if (pair) sides_in.pair_cols else a.n;
         if (sides_in.count > 0) {
@@ -174,4 +222,27 @@ test "the BF16 fold is 128 where K takes it, else 64 or 32" {
     try std.testing.expectEqual(@as(c_int, 128), bf16Fold(2560));
     try std.testing.expectEqual(@as(c_int, 64), bf16Fold(320));
     try std.testing.expectEqual(@as(c_int, 32), bf16Fold(96));
+}
+
+test "a group of stitched MXFP8 rows is one product in memory order; a gap or fp32 outputs are not" {
+    const k: u64 = 2560;
+    var g: StreamSides = .{ .count = 4, .out_half = 1 };
+    const n = [_]c_int{ 10240, 6144, 48, 48 };
+    const at = [_]u64{ 0, 10240, 16432, 16384 };
+    for (0..4) |i| {
+        g.n[i] = n[i];
+        g.words[i] = 0x1000 + at[i] * k;
+        g.scale[i] = 0x9000 + at[i] * (k / 32);
+        g.out[i] = 0x100 * (i + 1);
+    }
+    const st = Kernels.stitched(g, 2560).?;
+    try std.testing.expectEqual(@as(c_int, 16480), st.n);
+    try std.testing.expectEqual([3]c_int{ 10240, 16384, 16432 }, st.cuts);
+    try std.testing.expectEqual([4]u64{ 0x100, 0x200, 0x400, 0x300 }, st.out);
+    var gap = g;
+    gap.words[3] += k;
+    try std.testing.expect(Kernels.stitched(gap, 2560) == null);
+    var wide = g;
+    wide.out_half = 0;
+    try std.testing.expect(Kernels.stitched(wide, 2560) == null);
 }

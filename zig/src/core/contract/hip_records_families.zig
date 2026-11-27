@@ -8,6 +8,7 @@ pub const records = .{
     @import("hip_records_inkling2.zig").records,
     @import("hip_records_joint.zig").records,
     @import("hip_records_lighton_ocr.zig").records,
+    @import("hip_records_loom.zig").records,
     @import("hip_records_qwen_vision.zig").records,
     @import("hip_records_relu2_widths.zig").records,
 };
@@ -36,6 +37,7 @@ test "HIP record counts stay pinned in their owning files" {
         @import("hip_records_item.zig").records.len,
         @import("hip_records_joint.zig").records.len,
         @import("hip_records_lighton_ocr.zig").records.len,
+        @import("hip_records_loom.zig").records.len,
         @import("hip_records_pair.zig").records.len,
         @import("hip_records_prompt.zig").records.len,
         @import("hip_records_qwen3.zig").records.len,

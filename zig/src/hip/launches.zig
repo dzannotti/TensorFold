@@ -50,6 +50,7 @@ pub const draft = @import("launches/draft.zig");
 pub const exl3 = @import("launches/exl3.zig");
 pub const dsv41 = @import("launches/dsv41.zig");
 pub const fp4local = @import("launches/fp4local.zig");
+pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -65,6 +66,8 @@ pub const stream_pick = @import("launches/stream_pick.zig");
 pub const Launcher = struct {
     r: *const runtime.Runtime,
     mods: [kernels.group_count]Module,
+    /// The Loom objects built for this device; null in a build without them (zig/build/loom.zig).
+    loom: [kernels.loom_count]?Module,
     rms: Triple,
     columns: columns.Functions,
     vision: vision.Functions,
@@ -213,6 +216,12 @@ pub const Launcher = struct {
         for (images, 0..) |img, i| {
             l.mods[i] = try Module.load(r, img);
             loaded += 1;
+        }
+        l.loom = @splat(null);
+        errdefer for (&l.loom) |*m| if (m.*) |*x| x.unload();
+        const loom_here = std.mem.eql(u8, kernels.loom_arch, kernels.arch);
+        for (&l.loom, kernels.loom_images) |*m, img| {
+            if (loom_here and img.len > 0) m.* = try Module.load(r, img);
         }
         const ops = l.mods[@backingInt(kernels.Group.ops)];
         const act = l.mods[@backingInt(kernels.Group.act)];
@@ -364,12 +373,14 @@ pub const Launcher = struct {
         l.dense = try dense.Kernels.load(tiles, chip.act == .bf16, chip.matrix == .wmma12, choices.products.matrix);
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
-        l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip);
+        const gemv = @backingInt(kernels.Loom.mxfp8_gemv);
+        l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip, l.loom[gemv], kernels.loom_manifests[gemv]);
         return l;
     }
 
     pub fn unload(l: *Launcher) void {
         for (&l.mods) |*m| m.unload();
+        for (&l.loom) |*m| if (m.*) |*x| x.unload();
     }
 
     pub const tf_rms = norms.tf_rms;

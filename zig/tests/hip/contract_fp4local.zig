@@ -243,7 +243,7 @@ pub const Case = struct {
         const r = self.l.r;
         const s = self.rig.s.handle;
         switch (tile) {
-            .stream => try f.streamGo(r, self.reg.fmt, arg, .{}, self.items, s),
+            .stream => try f.tileGo(r, self.reg.fmt, arg, .{}, self.items, s),
             .wmma => try f.promptGo(r, self.reg.fmt, arg, self.items, 1 << 20, s),
             .item => try f.promptGo(r, self.reg.fmt, arg, self.items, 1, s),
             .pair => try f.pairGo(r, self.reg.fmt, arg, self.items, 0, s),

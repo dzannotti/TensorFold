@@ -85,12 +85,14 @@ struct Mxfp8Decoder {
         a.scale.p = sides.scale[s];
     }
 
+    // Decode folds as the Loom GEMV does (zig/kernels/loom/mxfp8_gemv): weights e4m3 x 2^-8, the block's 2^(e - 119)
+    // in the fold; outputs equal its bytes.
     template <typename T, int I, class Raw>
-    __device__ static typename T::pair stream_pair(const uint32_t (&w)[kWords], const Raw& raw) {
-        return __builtin_bit_cast(typename T::pair, mxfp8_pair(w[I >> 1], (I & 1) * 2, mxfp8_multiplier(raw.e)));
+    __device__ static typename T::pair stream_pair(const uint32_t (&w)[kWords], const Raw&) {
+        return __builtin_bit_cast(typename T::pair, mxfp8_pair(w[I >> 1], (I & 1) * 2, 1.f));
     }
 
-    // A chunk's raw term is its e8m0 byte; the scale is in the weights, so a live chunk folds with 1.
+    // A chunk's raw term is its e8m0 byte: a live chunk folds with its block's multiplier.
     struct StreamTerms {
         const uint8_t* e;
         long long chunks;
@@ -100,7 +102,7 @@ struct Mxfp8Decoder {
         __device__ explicit StreamTerms(const Args& a) : e(static_cast<const uint8_t*>(a.scale.p)), chunks(a.k >> 5) {}
         __device__ long long row(long long col) const { return col * chunks; }
         __device__ Raw raw(long long base, int q, int) const { return {e[base + q]}; }
-        __device__ float scale_value(Raw) const { return 1.f; }
+        __device__ float scale_value(Raw r) const { return mxfp8_multiplier(r.e); }
         __device__ float bias_value(Raw) const { return 0.f; }
     };
 
