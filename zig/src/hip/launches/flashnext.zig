@@ -37,6 +37,8 @@ pub const Fns = struct {
     sparse_lanes: [2][2]Function, // the same sums from fp16 and bf16 caches, a lane a key and several heads
     sparse_merge: Function,
     sparse_wmma: ?Function, // gfx11: 12 heads over a bf16 cache at 256 dims, the Loom kernel's sum order
+    gufo_attn: Function,
+    idx_mask: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -60,6 +62,8 @@ pub const Fns = struct {
             },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
             .sparse_wmma = m.function("tf_fn_sparse_wmma12_bf16") catch null,
+            .gufo_attn = try m.function("_ZN9gufo_attn25WmmaCausalAttentionKernelILj4ELj16ELb1EEEvPKfS2_PKtS4_PKjjPfjjjm"),
+            .idx_mask = try m.function("tf_fn_idx_mask"),
         };
     }
 };
@@ -424,6 +428,23 @@ pub fn idxSelect(
     try l.go(l.fnx.idx_select, dim(rows, 1, 1), dim(1024, 1, 1), 0, s, &a);
 }
 
+/// The most mask words a row (tf_fn_idx_mask's LDS): 524,288 visible tokens.
+pub const gufo_mask_words = 4096;
+
+/// Each row's selection as one bit a block (tf_fn_idx_mask), from tf_fn_idx_select's lists.
+pub fn idxMask(l: *const Launcher, ids: CI, id_stride: i64, count: CI, sparse: CI, complete: CI, mask: u64, words: c_uint, ratio: c_int, rows: c_int, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(ids), id_stride, ad(count), ad(sparse), ad(complete), mask, words, ratio }) |v| try a.add(v);
+    try l.go(l.fnx.idx_mask, dim(rows, 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// gufo's prompt attention: `rows` rows from position `start` in groups of four over the union of their masked blocks.
+pub fn gufoAttention(l: *const Launcher, q: CF, k: C, v: C, mask: u64, words: c_uint, out: F, start: c_uint, rows: c_uint, kv_heads: c_int, cap: u64, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(q), @as(u64, 0), ad(k), ad(v), mask, words, ad(out), start, rows, @as(c_uint, 0), cap }) |x| try a.add(x);
+    try l.go(l.fnx.gufo_attn, dim(cdiv(rows, 4), kv_heads, 1), dim(256, 1, 1), 0, s, &a);
+}
+
 /// Attention of each row's heads over its listed keys (or its first count[r] keys) in `parts` parts, then merged.
 pub fn sparseAttention(
     l: *const Launcher,
@@ -524,8 +545,8 @@ pub fn sparseAttentionScalar(
 const wmma_parts = 4;
 
 /// Whether the WMMA kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims.
-fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int) bool {
-    return kernel == .auto and std.c.getenv("TF_P1_ATTN_OFF") == null and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
+fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int, rows: c_int) bool {
+    return kernel == .auto and rows >= 4 and std.c.getenv("TF_P1_ATTN_OFF") == null and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
 }
 
 fn sparseWith(
@@ -573,7 +594,7 @@ fn sparseWith(
         parts,
     }) |x| try a.add(x);
     const wide: usize = if (@divExact(heads, kv_heads) <= 6) 0 else 1;
-    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims)) {
+    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims, @intCast(rows))) {
         var c: Args = .{};
         inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(out), heads, kv_heads, dims, cap, scale }) |x| try c.add(x);
         return l.go(l.fnx.sparse_wmma.?, dim(kv_heads, rows, 1), dim(32 * wmma_parts, 1, 1), 0, s, &c);

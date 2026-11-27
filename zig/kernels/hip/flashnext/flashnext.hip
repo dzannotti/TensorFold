@@ -7,3 +7,4 @@
 #include "sparse.hpp"
 #include "sparse_lanes.hpp"
 #include "sparse_wmma.hpp"
+#include "gufo_attn.hpp"
