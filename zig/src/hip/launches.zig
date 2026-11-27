@@ -54,6 +54,7 @@ pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
 pub const nvfp4_experts = @import("launches/nvfp4_experts.zig");
 pub const bf16_gemm = @import("launches/bf16_gemm.zig");
 pub const loom_attention = @import("launches/loom_attention.zig");
+pub const hc_readout = @import("launches/hc_readout.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -131,6 +132,8 @@ pub const Launcher = struct {
     fp4: fp4local.Kernels,
     /// Flash Next's Loom sparse prompt attention and indexer; empty in a build without Loom.
     attn: loom_attention.Kernels,
+    /// Flash Next's Loom hyper-connection read-out on prompts; empty in a build without Loom.
+    hcr: hc_readout.Kernels,
 
     const PlanFns = struct {
         kv_write: Function,
@@ -387,6 +390,14 @@ pub const Launcher = struct {
             d.* = kernels.loom_manifests[@backingInt(k)];
         }
         l.attn = try loom_attention.Kernels.load(sa_mods, sa_docs);
+        const hc = [4]kernels.Loom{ .hc_norm, .hc_down_wide, .hc_down_narrow, .hc_up_mix };
+        var hc_mods: [4]?Module = undefined;
+        var hc_docs: [4][]const u8 = undefined;
+        for (hc, &hc_mods, &hc_docs) |k, *m, *d| {
+            m.* = l.loom[@backingInt(k)];
+            d.* = kernels.loom_manifests[@backingInt(k)];
+        }
+        l.hcr = try hc_readout.Kernels.load(hc_mods, hc_docs);
         return l;
     }
 

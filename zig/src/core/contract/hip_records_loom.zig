@@ -1,7 +1,7 @@
 //! Gate 5's records of the Loom kernels (zig/kernels/loom): gfx1151 only, -Dloom-target's chip.
 const Record = @import("hip_records.zig").Record;
 
-pub const records = [35]Record{
+pub const records = [39]Record{
     .{
         .launch = .{ .name = "Loom mxfp8 gemv r1 k2560 l16 s1 c1 w4 g5 p1 x4", .symbol = "mxfp8_gemv_r1_k2560_l16_s1_c1_w4_g5_p1_x4", .image = "loom_mxfp8_gemv", .threads = 128 },
         .usage = .{
@@ -314,6 +314,42 @@ pub const records = [35]Record{
             .{ .vgprs = 0, .served = false },
             .{ .vgprs = 0, .served = false },
             .{ .vgprs = 240, .sgprs = 30, .lds = 61440, .private = 0, .bound = 512, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
+    .{
+        .launch = .{ .name = "Loom hc norm", .symbol = "hc_norm", .image = "loom_hc_norm", .threads = 256 },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 92, .sgprs = 24, .lds = 16896, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
+    .{
+        .launch = .{ .name = "Loom hc down wide", .symbol = "hc_down_wide", .image = "loom_hc_down_wide", .threads = 512 },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 252, .sgprs = 32, .lds = 65536, .private = 0, .bound = 512, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
+    .{
+        .launch = .{ .name = "Loom hc down narrow", .symbol = "hc_down_narrow", .image = "loom_hc_down_narrow", .threads = 256 },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 256, .sgprs = 34, .lds = 40960, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
+    .{
+        .launch = .{ .name = "Loom hc up mix", .symbol = "hc_up_mix", .image = "loom_hc_up_mix", .threads = 512 },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 226, .sgprs = 30, .lds = 65536, .private = 0, .bound = 512, .wave = 32 },
             .{ .vgprs = 0, .served = false },
         },
     },

@@ -68,6 +68,7 @@ pub const Out = struct { mixed: Tensor, streams: Tensor };
 
 /// A hyper-connection's read of the normed streams `x`: the block input, and the inject gates when `inject` is set.
 pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize, inject: ?Tensor) !Tensor {
+    if (try readout(o, m, hc, x, rows, inject)) |mixed| return mixed;
     const d = m.dims;
     const z = try o.project(x, hc.down, rows, true);
     const act = try take(o, m.act, rows * d.low);
@@ -97,6 +98,34 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
     return mixed;
 }
 
+/// The bf16 [n][k] rows of a BF16-fold projection (FP4-Local's hyper-connection weights), or null.
+fn bf16Rows(p: hip.ops.Projection) ?u64 {
+    return switch (p.handle) {
+        .dense => |h| if (h.fold and h.dtype == .bf16) h.weight else null,
+        else => null,
+    };
+}
+
+/// A prompt's streams take the Loom read-out (launches/hc_readout.zig): hipcc's bytes, its gates and mix fused.
+fn fused(o: Ops, m: *const model.Model) bool {
+    const d = m.dims;
+    return o.prefill and m.act == .bf16 and o.l.hcr.takes(d.streams, d.hidden, d.low, d.low);
+}
+
+/// hcPre on the Loom read-out: the down with the gates, the up with the mix; null where it does not take `hc`.
+fn readout(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize, inject: ?Tensor) !?Tensor {
+    const d = m.dims;
+    if (!fused(o, m) or !o.l.hcr.takes(d.streams, d.hidden, d.low, hc.down.n)) return null;
+    if (hc.down.k != d.wide() or hc.up.n != d.wide() or hc.up.k != d.low or (inject != null) != (hc.down.n > d.low)) return null;
+    const down = bf16Rows(hc.down) orelse return null;
+    const up = bf16Rows(hc.up) orelse return null;
+    const act = try take(o, m.act, rows * d.low);
+    try o.l.hcr.down(o.l.r, x.ptr, down, act.ptr, if (inject) |i| i.ptr else null, rows, hc.down.n, d.low, o.stream);
+    const mixed = try take(o, m.act, rows * d.hidden);
+    try o.l.hcr.upMix(o.l.r, act.ptr, up, x.ptr, mixed.ptr, rows, d.low, o.stream);
+    return mixed;
+}
+
 /// A block's output into the streams, then their norm: a tp rank's fp32 share is gathered and summed in the kernel.
 pub fn hcBranch(o: Ops, m: *const model.Model, h: Tensor, branch: Tensor, inject: Tensor, x: Tensor, scale: u64, rows: usize) !void {
     if (branch.kind != .f32) return hcNorm(o, m, h, branch, inject, x, scale, rows);
@@ -120,6 +149,11 @@ pub fn hcNorm(
     rows: usize,
 ) !void {
     const d = m.dims;
+    if (fused(o, m) and (branch == null or inject != null)) {
+        const b: ?u64 = if (branch) |t| t.ptr else null;
+        const i: ?u64 = if (inject) |t| t.ptr else null;
+        return o.l.hcr.norm(o.l.r, h.ptr, b, if (b != null) i else null, scale, x.ptr, rows, d.eps, o.stream);
+    }
     try o.l.fn_hc_norm(
         @ptrFromInt(h.ptr),
         if (branch) |b| @ptrFromInt(b.ptr) else null,
