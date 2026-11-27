@@ -66,7 +66,11 @@ GPU, serving alone:
 - The lane core's depth rule weighs each round's chain by time. The lanes time a lone window of every width (one to
   eight rows) and the head step at load, on a scratch stream, and log them (`flashnext: lane costs`); the rounds served
   then refine them. Untimed (under `--tp`), the rule falls back to one or two drafts by the first draft's rate.
-- `--mtp-drafts` defaults to 7 (the window's most) and caps the rule's depth; `--mtp-confidence` stays 0.8.
+- `--mtp-drafts` defaults to 7 (the window's most) and caps the rule's depth.
+- A chain stops as on CUDA: while the product of its drafts' probabilities stays at or above 0.4. `--mtp-confidence
+  c` instead keeps a draft after the first only at or above `c`. Against the earlier per-draft floor of 0.8, which kept
+  the first draft under it, the product rule gave 49.3 / 45.9 tok/s at one stream (3.2 / 2.7 tokens per round),
+  104.8 / 104.0 at three and 135.9 / 137.1 at five (prose / code), token hashes unchanged.
 
 Measured on one Strix Halo host (`bench_streams` decode, greedy, 256 tokens, median of 3, `--context 65536
 --prompt-cache-gib 0`), every setting's token hashes equal to plain decoding's:
