@@ -95,6 +95,7 @@ pub const Ops = struct {
     pub const moeTail = moe.moeTail;
     pub const moeRouter = moe.moeRouter;
     pub const moeRouterRows = moe.moeRouterRows;
+    pub const routerLogits = @import("project_fp4local.zig").routerLogits;
     pub const moeSelect = moe.moeSelect;
     pub const moeRoute = moe.moeRoute;
     pub const moeAct = moe.moeAct;

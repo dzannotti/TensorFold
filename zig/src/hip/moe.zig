@@ -38,6 +38,8 @@ pub const Routed = struct {
     remap: u64 = 0,
     /// Plan the rows' own pairs, not a power-of-two bucket's (no graph replays the launches at other row counts).
     exact: bool = false,
+    /// A prompt's logits on the bf16 matrix tile over `rows16` (CUDA's bf16 mma router), every row count alike.
+    matrix: bool = false,
 
     /// Routed experts, the shared one not counted.
     pub fn count(r: Routed) usize {
@@ -123,7 +125,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     const wts = try o.arena.of(f32, size * slots);
     const items = try o.arena.of(i32, cap * 3);
     const members = try o.arena.of(i32, size * slots);
-    try o.moeRouterRows(x, r.rows32, r.rows16, logits, rows, ex.dims, r.rows);
+    try router(o, r, x, logits, rows);
     const count: usize = cap;
     var tile: usize = undefined;
     if (r.remap != 0) {
@@ -163,6 +165,12 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     return .{ .ptr = out, .kind = kind };
 }
 
+fn router(o: Ops, r: Routed, x: Tensor, logits: u64, rows: usize) ops.Error!void {
+    const d = r.experts.dims;
+    if (r.matrix and r.rows16 != 0 and o.prefill and !o.window) return o.routerLogits(x, r.rows16, logits, rows, r.rows, d);
+    try o.moeRouterRows(x, r.rows32, r.rows16, logits, rows, d, r.rows);
+}
+
 /// down(silu(gate) * up) of `x`'s rows at the shared expert's own widths: (rows, dims) fp32, as the combine reads it.
 fn sharedRun(o: Ops, sh: Shared, x: Tensor, rows: usize, kind: Kind, limit: f32) ops.Error!u64 {
     const width = sh.gate_up.n / 2;
@@ -185,7 +193,7 @@ pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pa
     const wts = try o.arena.of(f32, size * slots);
     const items = try o.arena.of(i32, cap * 3);
     const members = try o.arena.of(i32, size * slots);
-    try o.moeRouterRows(x, r.rows32, r.rows16, logits, rows, r.experts.dims, r.rows);
+    try router(o, r, x, logits, rows);
     const p = try expertParts(o, kind, r, x, rows, logits, pick, wts, items, members, cap);
     return .{ .y = p.y, .wts = wts, .slots = slots };
 }

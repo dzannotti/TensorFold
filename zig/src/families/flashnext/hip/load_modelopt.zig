@@ -186,6 +186,7 @@ const Loader = struct {
             .top_k = c.topk,
             .rows = c.experts + 1,
             .exact = true,
+            .matrix = true,
             .experts = .{
                 .fused = s.fused,
                 .down = s.down,
