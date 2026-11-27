@@ -4,7 +4,6 @@
 // `sparse_attend` writes each part's o, m and l for `sparse_merge` (merge.cxx). ABI, sum order, geometry: README.md.
 #include <loomcxx/kernel.h>
 
-#include "exp_exact.h"
 #include "wmma_tile.h"
 
 constexpr unsigned kBlockParts = 4, kWaves = 2 * kBlockParts;
@@ -28,7 +27,7 @@ void sparse_attend(const float* q, const __bf16* k, const __bf16* v, const int* 
   const int n = count[r];
   const Rows rows = {(const unsigned short*)k, (const unsigned short*)v, ids + (long long)r * id_stride,
                      (long long)g * cap, sparse[r] != 0};
-  stage_q(qp, q + ((long long)r * heads + g * kGroup) * kDims, scale, tid, 32 * kWaves);
+  stage_q(qp, q + ((long long)r * heads + g * kGroup) * kDims, tid, 32 * kWaves);
   lds_barrier();
 
   Part st = start();
@@ -47,7 +46,7 @@ void sparse_attend(const float* q, const __bf16* k, const __bf16* v, const int* 
     put8(mine, lane, x);
     lds_barrier();
     const f32x8 y = get8(other, lane);
-    const Probs pr = softmax(st.m, st.l, side ? y + x : x + y, tn, col, half);
+    const Probs pr = softmax(st.m, st.l, (side ? y + x : x + y) * scale, tn, col, half);
     lds_barrier();
     st = values_half(st, vw, pr, (unsigned short*)mine, col, half);
   }
