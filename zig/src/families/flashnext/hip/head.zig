@@ -5,6 +5,7 @@ const model = @import("model.zig");
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
 const mixers = @import("mixers.zig");
+const head_kv = @import("head_kv.zig");
 
 const Ops = hip.ops.Ops;
 const Tensor = hip.ops.Tensor;
@@ -83,6 +84,11 @@ pub fn run(
     try forward.hcNorm(o, m, h, e, .{ .ptr = ones.base(), .kind = m.act }, x, l.ahc.scale, rows);
     const inject = try take(o, m.act, rows * d.streams);
     const mixed = try forward.hcPre(o, m, l.ahc, x, rows, inject);
+    if (prompt and std.c.getenv("TF_HEAD_FULL") == null) {
+        try head_kv.store(o, m, d, l.mixer.sparse, segs, mixed, rows, dev_pos);
+        for (segs) |g| g.c.pooled = (g.pos + g.tokens.len) / d.index_ratio;
+        return .{ .mixed = mixed, .streams = h };
+    }
     const branch = try mixers.sparse(o, m, d, l.mixer.sparse, segs, 0, mixed, rows, dev_pos, host, null);
     try forward.hcNorm(o, m, h, branch, inject, x, l.mhc.scale, rows);
     const mixed2 = try forward.hcPre(o, m, l.mhc, x, rows, inject);
