@@ -86,6 +86,9 @@ pub const valid = [_]Case{
     .{ .name = "TF_Q27_POCKET_OFF", .raw = "all", .n = 0 },
     .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .raw = "1", .n = 4607182418800017408 },
     .{ .name = "TENSORFOLD_HIP_MEMORY_LIMIT_GB", .raw = "2", .n = 4611686018427387904 },
+    .{ .name = "TENSORFOLD_GPU", .raw = "hip", .n = 0 },
+    .{ .name = "TENSORFOLD_GPU", .raw = "hrx", .n = 1 },
+    .{ .name = "TENSORFOLD_HRX", .raw = "/opt/hrx/lib/libhrx.so.0", .n = 0 },
 
     .{ .name = "TF_MTP_DRAFTS", .raw = "4294967295", .n = std.math.maxInt(u32) },
     .{ .name = "TF_DSPINE_WINDOW", .raw = "16", .n = 16 },
