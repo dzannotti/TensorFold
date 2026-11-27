@@ -3,6 +3,8 @@ const std = @import("std");
 const Rule = @import("environment.zig").Rule;
 
 pub const rules = [_]Rule{
+    .{ .name = "TENSORFOLD_GPU", .scope = .cuda, .kind = .word, .words = &.{ "hip", "hrx" }, .forms = "hip (the HIP runtime library) or hrx (the native HRX driver); unset or blank: hip" },
+    .{ .name = "TENSORFOLD_HRX", .scope = .cuda, .kind = .path, .forms = "the libhrx shared library the native HRX driver opens (unset: libhrx.so.0 on the library path)" },
     .{ .name = "TF_LOAD_PREFETCH", .scope = .common, .kind = .size, .max = 16, .blank_default = false, .forms = "a whole reader-thread count from 0 to 16 (unset: the caller's default)" },
     .{ .name = "TENSORFOLD_PREFILL_SHARE", .scope = .common, .kind = .positive_real, .max = 1, .forms = "a finite share from 0.01 to 1 (unset or exactly empty uses the caller default; startup enforces the lower bound)" },
     .{ .name = "TENSORFOLD_PREFILL_BUDGET", .scope = .common, .kind = .u32, .trim = " \t", .first_digit = true, .forms = "a whole row budget from 0 to 4294967295 (0 disables the budget)" },
