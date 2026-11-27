@@ -5,6 +5,7 @@ const model = @import("model.zig");
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
 const gdn = @import("gdn_replay.zig");
+const attend_loom = @import("attend_loom.zig");
 
 const Ops = hip.ops.Ops;
 const Tensor = hip.ops.Tensor;
@@ -444,6 +445,7 @@ fn attend(
     staged: ?Rows,
     graphed: bool,
 ) !void {
+    if (staged == null and !graphed and try attend_loom.attend(o, m, d, kv, cap, q32, iq, att, rows, pos, host)) return;
     const hd = d.head_dim;
     const di = d.index_dim;
     const kind = @backingInt(m.act);

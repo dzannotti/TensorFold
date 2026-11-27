@@ -65,6 +65,9 @@ pub const IdxScores = struct {
     keys: []f64 = &.{},
     dev: [3]u64 = @splat(0),
     out: u64 = 0,
+    base: u64 = 0,
+    /// The Loom kernel (launches/loom_attention.zig) against tf_fn_idx_scores (bf16 keys).
+    loom: bool = false,
 
     pub fn init(a: std.mem.Allocator, rt: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher, f: Fault) IdxScores {
         return .{ .rig = .{ .a = a, .r = rt, .s = s }, .l = l, .k = kit.act(), .fault = f, .arena = .init(a) };
@@ -80,6 +83,10 @@ pub const IdxScores = struct {
         var s = spec(self.k);
         const control = self.fault.name();
         if (control) |name| s.name = name;
+        if (self.loom) {
+            s.name = "loom idx_scores";
+            s.replaces = "hip tf_fn_idx_scores (bf16 keys)";
+        }
         return .{ .spec = s, .ctx = self, .vt = &vt, .control = if (control != null) .shapes else null };
     }
 
@@ -88,6 +95,7 @@ pub const IdxScores = struct {
     /// Random: values in [-1, 1) exact in the kind. Stress: small integers, so every sum is exact.
     pub fn prepare(self: *IdxScores, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         if (shape.k != dims or shape.rows < 1 or shape.n <= top or shape.n > 40000) return false;
+        if (self.loom and self.k != .bf16) return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
@@ -113,10 +121,22 @@ pub const IdxScores = struct {
             try self.rig.input(std.mem.sliceAsBytes(complete)),
         };
         self.out = try self.rig.output(shape.rows * shape.n * 4);
+        self.base = try self.rig.scratch(shape.rows * shape.n * 4);
         return true;
     }
 
     pub fn run(self: *IdxScores) !void {
+        const s = self.shape;
+        const d = self.dev;
+        if (self.loom) {
+            try self.l.attn.scores(self.l.r, @ptrFromInt(d[0]), @ptrFromInt(d[1]), @ptrFromInt(d[2]), @ptrFromInt(self.out), @intCast(s.rows), @intCast(s.n), @intCast(s.n), top, self.rig.s.handle);
+            return self.rig.s.synchronize();
+        }
+        return self.hipcc(self.out);
+    }
+
+    /// tf_fn_idx_scores into `out`: the run, and the Loom kernel's baseline.
+    fn hipcc(self: *IdxScores, out: u64) !void {
         const s = self.shape;
         const d = self.dev;
         const run_heads: c_int = if (self.fault == .one_head_short) heads - 1 else heads;
@@ -124,7 +144,7 @@ pub const IdxScores = struct {
             @ptrFromInt(d[0]),
             @ptrFromInt(d[1]),
             @ptrFromInt(d[2]),
-            @ptrFromInt(self.out),
+            @ptrFromInt(out),
             @backingInt(self.k),
             @intCast(s.rows),
             run_heads,
@@ -135,6 +155,12 @@ pub const IdxScores = struct {
             self.rig.s.handle,
         );
         try self.rig.s.synchronize();
+    }
+
+    /// tf_fn_idx_scores's bytes on the same inputs.
+    pub fn replaced(self: *IdxScores) ![]const u8 {
+        try self.hipcc(self.base);
+        return self.rig.bytes(self.base, self.count() * 4);
     }
 
     pub fn count(self: *IdxScores) usize {
