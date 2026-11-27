@@ -38,7 +38,7 @@ pub fn linear(
     }
     const qkv, const z, const a, const b = outs;
     // a window on the plan path: every row of it through the stream's plan, no state snapshot a row
-    if (window) if (m.gdn) |s| return gdn.linear(o, m, l, segs, index, qkv, z, a, b, rows, s);
+    if (window) if (m.gdn) |p| return gdn.linear(o, m, l, index, qkv, z, a, b, rows, p);
     const q = try o.arena.of(f32, rows * kw);
     const k = try o.arena.of(f32, rows * kw);
     const v = try o.arena.of(f32, rows * vw);

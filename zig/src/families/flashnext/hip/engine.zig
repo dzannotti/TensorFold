@@ -87,8 +87,8 @@ pub const Engine = struct {
     stopped: bool,
     /// The chunk the options asked for when the engine took their fallback (null: it took what they asked).
     narrowed: ?usize = null,
-    /// The cache slots' DeltaNet plans (null: a window keeps its state a row, from the snapshots).
-    gdn: ?*gdn.Slots = null,
+    /// The rounds' DeltaNet plan (null: a window keeps its state a row, from the snapshots).
+    gdn: ?*gdn.Plan = null,
 
     /// `load`, this rank's failure heard by the other ranks at the step they wait at.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: Options) !*Engine {
@@ -191,11 +191,11 @@ pub const Engine = struct {
         // a window runs from the plan where its shapes are the plan kernels': else a snapshot a row stays
         e.gdn = null;
         if (gdn.supported(e.weights.model.dims, e.cfg.layers)) {
-            const slots = try gpa.create(gdn.Slots);
-            errdefer gpa.destroy(slots);
-            slots.* = try gdn.Slots.init(gpa, &e.driver, e.weights.model.dims, @max(o.want, 1));
-            e.gdn = slots;
-            e.weights.model.gdn = slots;
+            const plan = try gpa.create(gdn.Plan);
+            errdefer gpa.destroy(plan);
+            plan.* = try gdn.Plan.init(&e.driver, e.weights.model.dims, o.want);
+            e.gdn = plan;
+            e.weights.model.gdn = plan;
         }
         errdefer if (e.gdn) |p| {
             p.deinit();
@@ -285,7 +285,7 @@ pub const Engine = struct {
         const pool = try hip.admission.budget(e.gpa, e.io, e.ctx);
         const room = pool.room(hip.usage(false).device);
         const slots: u64 = if (gdn.supported(e.weights.model.dims, e.cfg.layers))
-            @intCast(gdn.Slots.bytes(e.weights.model.dims, @max(e.o.want, 1)))
+            @intCast(gdn.Plan.bytes(e.weights.model.dims, e.o.want))
         else
             0;
         const asked = e.o.chunk;
@@ -367,10 +367,9 @@ pub const Engine = struct {
         if (kept == 0 or kept > tokens.len) return error.BadKeep;
         const l = c.layout;
         const s = e.stream.handle;
-        const plan = if (e.weights.model.gdn) |p| p.planFor(c.id) else null;
         // a plan leaves the state where its window began, so a keep always runs; a one-row window wrote it back
-        if (plan) |p| {
-            try p.keep(e.ops(&e.arena), kept);
+        if (e.weights.model.gdn) |p| {
+            try p.keep(e.ops(&e.arena), c.id, kept);
         } else if (kept < tokens.len) {
             for (c.linear, 0..) |linear, i| {
                 if (!linear) continue;
@@ -447,11 +446,8 @@ pub const Engine = struct {
         e.host.used = 0;
         e.arena.reset();
         const staged = try forward.stage(&e.weights.model, &e.host, segs, true);
-        // a window's plan words are written here, outside the graph its round may replay, which copies them up
-        if (e.weights.model.gdn) |s| for (segs) |g| {
-            const p = s.planFor(g.c.id) orelse return error.CachesNotPlanned;
-            try p.fill(g.c, g.tokens.len);
-        };
+        // the round's plan words are written here, outside the graph its round may replay, which copies them up
+        if (e.weights.model.gdn) |p| try p.fill(segs);
         const began = nowNs(e.io);
         defer e.graphs.submit_ns += @intCast(nowNs(e.io) - began);
         e.graphs.rounds += 1;

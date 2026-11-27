@@ -433,6 +433,12 @@ pub const Fx = struct {
                 try f.msg.appendSlice(f.gpa, tokens[i][0..n]);
             }
         }
+        // the DeltaNet plan is one a round: a stream's window still pending keeps all its rows now, as its next step would
+        var it = f.lanes.valueIterator();
+        while (it.next()) |l| if (l.*.pending) |p| {
+            if (std.c.getenv("TF_GDN_LOG") != null) std.debug.print("gdn flush id={d} rows={d}\n", .{ l.*.caches.id, p.rows });
+            try f.mark(l.*, p.rows);
+        };
         const pick = try e.choose(segs[0..windows.len]);
         if (f.link != null) {
             f.msg.items[2] = @backingInt(pick);
