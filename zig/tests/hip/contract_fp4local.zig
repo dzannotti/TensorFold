@@ -14,13 +14,36 @@ const fp4 = hip.launches.fp4local;
 const Format = fp4.Format;
 pub const Arg = fp4.Arg;
 
-pub const Tile = enum { stream, wmma, item, pair };
+pub const Tile = enum {
+    stream,
+    wmma,
+    item,
+    pair,
+    /// The Loom grouped-expert kernels (launches/nvfp4_experts.zig): gate|up with SwiGLU, and down.
+    loom_gate_up,
+    loom_down,
+
+    /// The tile writes silu(gate) x up activations (pairs, n / 2) in bf16.
+    pub fn act(t: Tile) bool {
+        return t == .pair or t == .loom_gate_up;
+    }
+};
 
 /// One registration: a format on a tile at the served shapes; routed runs a two-expert plan with per-expert globals.
 pub const Reg = struct { name: []const u8, fmt: Format, tile: Tile, routed: bool = false, served: []const c.Shape };
 
 const dn = "hip fp4l_stream";
 const pn = "hip fp4l_wmma";
+/// The Loom grouped-expert kernels at Flash Next's routed shapes, where the build has them (-Dloom-compile).
+pub const loom_registrations = [_]Reg{
+    .{ .name = "loom nvfp4_expert_gate_up (NVFP4 routed plan, bf16 act)", .fmt = .nvfp4, .tile = .loom_gate_up, .routed = true, .served = &.{
+        .{ .rows = 160, .n = 1280, .k = 2560 }, .{ .rows = 64, .n = 1280, .k = 2560 }, .{ .rows = 7, .n = 1280, .k = 2560 }, .{ .rows = 300, .n = 1280, .k = 2560 },
+    } },
+    .{ .name = "loom nvfp4_expert_down (NVFP4 routed plan, fp32 out)", .fmt = .nvfp4, .tile = .loom_down, .routed = true, .served = &.{
+        .{ .rows = 90, .n = 2560, .k = 640 }, .{ .rows = 40, .n = 2560, .k = 640 }, .{ .rows = 7, .n = 2560, .k = 640 }, .{ .rows = 300, .n = 2560, .k = 640 },
+    } },
+};
+
 pub const registrations = [_]Reg{
     // MXFP8 decode: DeltaNet qkv / z / a, out; attention q, k, index, o; shared expert gate|up and down
     .{ .name = dn ++ " (MXFP8, fp32 out)", .fmt = .mxfp8, .tile = .stream, .served = &.{
@@ -102,7 +125,7 @@ pub const Case = struct {
 
     pub fn kernel(self: *Case) g.Kernel {
         const prompt = self.reg.tile != .stream;
-        const pair = self.reg.tile == .pair;
+        const pair = self.reg.tile.act();
         return .{
             .spec = .{
                 .name = self.reg.name,
@@ -110,7 +133,7 @@ pub const Case = struct {
                 .depth = if (prompt) depthPrompt else depthStream,
                 .ops = if (self.reg.fmt == .nvfp4) 1 else 0,
                 .out = if (pair) .bf16 else .f32,
-                .replaces = if (self.reg.tile == .item) "fp4l_wmma" else if (pair) "fp4l_wmma then moe_act" else null,
+                .replaces = if (self.reg.tile == .item or self.reg.tile == .loom_down) "fp4l_wmma" else if (pair) "fp4l_wmma then moe_act" else null,
                 .served = self.reg.served,
                 .tiles = if (prompt)
                     .{ .{ .size = if (self.reg.tile == .item) 64 else 128 }, .{ .size = 128 }, .{} }
@@ -133,6 +156,9 @@ pub const Case = struct {
         if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k % 32 != 0) return false;
         if (self.reg.tile != .stream and shape.k % self.fold(shape.k) != 0) return false;
         if (self.reg.fmt == .nvfp4 and self.reg.routed and shape.n % 2 != 0) return false;
+        const ex = hip.launches.nvfp4_experts;
+        if (self.reg.tile == .loom_gate_up and (shape.n != 2 * ex.gate_up.n or shape.k != ex.gate_up.k)) return false;
+        if (self.reg.tile == .loom_down and (shape.n != ex.down.n or shape.k != ex.down.k)) return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
@@ -155,6 +181,7 @@ pub const Case = struct {
                 const words = try a.alloc(u32, stacks * n * k / 8);
                 const scales = try a.alloc(u8, stacks * n * k / 16);
                 const globals = try a.alloc(f32, stacks * 2);
+                const per_expert = self.reg.tile == .loom_down;
                 for (globals) |*v| v.* = if (stress) 1 else 0x1p-6 * (1 + rng.float(f32));
                 for (scales) |*s| s.* = if (stress) 0x38 else @intCast(0x20 + rng.uintLessThan(u8, 0x30));
                 @memset(words, 0);
@@ -164,13 +191,13 @@ pub const Case = struct {
                     words[row * k / 8 + i / 8] |= @as(u32, code) << @intCast(4 * p + 16 * (i % 2));
                     const e = row / n;
                     const col = row % n;
-                    const gl = globals[2 * e + @intFromBool(self.reg.routed and col >= n / 2)];
+                    const gl = if (per_expert) globals[e] else globals[2 * e + @intFromBool(self.reg.routed and col >= n / 2)];
                     self.w[row * k + i] = nvfp4.e2m1(code) * fp8.e4m3(scales[row * (k / 16) + i / 16]) * @as(f64, gl);
                 };
                 arg.words = try self.rig.input(std.mem.sliceAsBytes(words));
                 arg.scale.p = try self.rig.input(scales);
                 arg.global = try self.rig.input(std.mem.sliceAsBytes(globals));
-                arg.global_layout = if (self.reg.routed) .expert_pair else .tensor;
+                arg.global_layout = if (per_expert) .expert else if (self.reg.routed) .expert_pair else .tensor;
                 arg.bits = 4;
             },
             .mxfp8 => {
@@ -215,7 +242,7 @@ pub const Case = struct {
             self.items = 2;
         } else @memset(self.expert_of, 0);
         arg.x = try self.rig.input(std.mem.sliceAsBytes(self.x));
-        if (self.reg.tile == .pair) {
+        if (self.reg.tile.act()) {
             if (n % 2 != 0 or k % 128 != 0) return false;
             arg.out16 = try self.rig.output(m * n);
             self.base16 = try self.rig.scratch(m * n);
@@ -244,9 +271,11 @@ pub const Case = struct {
         const s = self.rig.s.handle;
         switch (tile) {
             .stream => try f.tileGo(r, self.reg.fmt, arg, .{}, self.items, s),
-            .wmma => try f.promptGo(r, self.reg.fmt, arg, self.items, 1 << 20, s),
-            .item => try f.promptGo(r, self.reg.fmt, arg, self.items, 1, s),
+            .wmma => try f.tilePromptGo(r, self.reg.fmt, arg, self.items, 1 << 20, s),
+            .item => try f.tilePromptGo(r, self.reg.fmt, arg, self.items, 1, s),
             .pair => try f.pairGo(r, self.reg.fmt, arg, self.items, 0, s),
+            .loom_gate_up => try f.experts.gateUpGo(r, arg, self.items, s),
+            .loom_down => try f.experts.downGo(r, arg, self.items, s),
         }
         try self.rig.s.synchronize();
     }
@@ -266,7 +295,7 @@ pub const Case = struct {
         plain.out = self.base;
         plain.out16 = 0;
         try self.launch(.wmma, plain);
-        if (self.reg.tile != .pair) return self.rig.bytes(self.base, self.count() * 4);
+        if (!self.reg.tile.act()) return self.rig.bytes(self.base, self.count() * 4);
         const width = self.shape.n / 2;
         try self.l.tf_moe_act(@ptrFromInt(self.base), @ptrFromInt(self.base16), 2, @intCast(self.shape.rows), @intCast(width), 0, self.rig.s.handle);
         return self.rig.bytes(self.base16, self.count() * 2);
@@ -274,17 +303,17 @@ pub const Case = struct {
 
     /// Outputs: (rows, n) sums, or the pair tile's (rows, n / 2) activations.
     pub fn count(self: *Case) usize {
-        return self.shape.rows * if (self.reg.tile == .pair) self.shape.n / 2 else self.shape.n;
+        return self.shape.rows * if (self.reg.tile.act()) self.shape.n / 2 else self.shape.n;
     }
 
     /// Bytes of a row's outputs.
     pub fn rowBytes(self: *const Case) usize {
-        return if (self.reg.tile == .pair) self.shape.n else self.shape.n * 4;
+        return if (self.reg.tile.act()) self.shape.n else self.shape.n * 4;
     }
 
     /// The output buffer of a launch (fp32 out, or the pair tile's act).
     pub fn outOf(self: *const Case, arg: Arg) u64 {
-        return if (self.reg.tile == .pair) arg.out16 else arg.out;
+        return if (self.reg.tile.act()) arg.out16 else arg.out;
     }
 
     fn terms(self: *Case, p: usize, j: usize, t: []f64) void {
@@ -295,7 +324,7 @@ pub const Case = struct {
 
     pub fn reference(self: *Case, want: []f64, mag: []f64) !void {
         const t = try self.arena.allocator().alloc(f64, self.shape.k);
-        if (self.reg.tile == .pair) {
+        if (self.reg.tile.act()) {
             const width = self.shape.n / 2;
             for (0..self.shape.rows) |p| for (0..width) |f| {
                 var gu: [2]f64 = undefined;

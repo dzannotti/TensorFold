@@ -51,6 +51,7 @@ pub const exl3 = @import("launches/exl3.zig");
 pub const dsv41 = @import("launches/dsv41.zig");
 pub const fp4local = @import("launches/fp4local.zig");
 pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
+pub const nvfp4_experts = @import("launches/nvfp4_experts.zig");
 
 pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
@@ -373,8 +374,7 @@ pub const Launcher = struct {
         l.dense = try dense.Kernels.load(tiles, chip.act == .bf16, chip.matrix == .wmma12, choices.products.matrix);
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
-        const gemv = @backingInt(kernels.Loom.mxfp8_gemv);
-        l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip, l.loom[gemv], kernels.loom_manifests[gemv]);
+        l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip, l.loom, kernels.loom_manifests);
         return l;
     }
 

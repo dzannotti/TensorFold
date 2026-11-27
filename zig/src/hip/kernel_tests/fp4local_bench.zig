@@ -232,8 +232,11 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
                     var arg = arg0;
                     const s = r.stream.handle;
                     const stream = if (tile) &fp4.Kernels.tileGo else &fp4.Kernels.streamGo;
-                    if (pr and c.kind == .pair) return k.pairGo(r.on.r, c.fmt, arg, it, 0, s);
-                    if (pr) return k.promptGo(r.on.r, c.fmt, arg, it, er, s);
+                    if (pr and c.kind == .pair) {
+                        if (!tile and k.experts.takesGateUp(arg, 0)) return k.experts.gateUpGo(r.on.r, arg, it, s);
+                        return k.pairGo(r.on.r, c.fmt, arg, it, 0, s);
+                    }
+                    if (pr) return if (tile) k.tilePromptGo(r.on.r, c.fmt, arg, it, er, s) else k.promptGo(r.on.r, c.fmt, arg, it, er, s);
                     if (c.kind == .pair) return k.streamGo(r.on.r, c.fmt, arg, .{ .pair_cols = @intCast(c.n / 2) }, it, s);
                     if (c.sides.len > 0) {
                         var sides: fp4.StreamSides = .{ .count = @intCast(c.sides.len), .out_half = 1 };
@@ -251,8 +254,8 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
                     return stream(k, r.on.r, c.fmt, arg, .{}, it, s);
                 }
             }.go;
-            // MXFP8 decode twice where the build has the Loom GEMV: as served, then on fp4l_stream alone
-            const both = cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null;
+            // twice where a Loom kernel may serve it: as served, then on the hipcc tiles alone
+            const both = (cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null) or (cs.fmt == .nvfp4 and prompt and kn.experts.f != null);
             for (0..if (both) 2 else 1) |pass| {
                 const tile = pass == 1;
                 const who: []const u8 = if (!both) "" else if (tile) " [hipcc]" else " [served]";
@@ -287,8 +290,8 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
                 const gbs = bytes / mid / 1e3;
                 const tfs = flops / mid / 1e6;
                 if (prompt) {
-                    std.debug.print("FP4L prompt {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.1} us {d:>6.2} TFLOPS {d:>5.1}% of {d:.1}  {d:>5.1} W {d:>6.1} J/PFLOP (noise {d:.1}%)\n", .{
-                        cs.name, m, cs.n, cs.k, mid, tfs, tfs / matrix * 100, matrix, watts, watts / tfs * 1e3, (us[batches - 1] / us[0] - 1) * 100,
+                    std.debug.print("FP4L prompt {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.1} us {d:>6.2} TFLOPS {d:>5.1}% of {d:.1}  {d:>5.1} W {d:>6.1} J/PFLOP (noise {d:.1}%){s}\n", .{
+                        cs.name, m, cs.n, cs.k, mid, tfs, tfs / matrix * 100, matrix, watts, watts / tfs * 1e3, (us[batches - 1] / us[0] - 1) * 100, who,
                     });
                 } else {
                     std.debug.print("FP4L decode {s:<22} m{d:>5} n{d:>6} k{d:>5}: {d:>9.2} us {d:>6.1} GB/s {d:>5.1}% of {d:.0}  {d:>5.1} W {d:>6.3} J/GB (noise {d:.1}%){s}\n", .{

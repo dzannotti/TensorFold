@@ -35,7 +35,28 @@ pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
         if (ok) t.passed += 1 else t.failed += 1;
     }
     try loom(a, &r, s, &l, &t);
+    try experts(a, &r, s, &l, &t);
     return t;
+}
+
+/// The Loom grouped-expert kernels against fp4l_wmma's and fp4l_pair's bytes, when the build has them.
+fn experts(a: std.mem.Allocator, r: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher, t: *g.Tally) !void {
+    if (l.fp4.experts.f == null) {
+        std.debug.print("N/A  loom nvfp4_expert_*: built without -Dloom-compile, the matrix tiles serve routed prompts\n", .{});
+        return;
+    }
+    var cases: [k_.loom_registrations.len]k_.Case = undefined;
+    for (&cases, k_.loom_registrations) |*x, reg| x.* = .init(a, r, s, l, reg);
+    defer for (&cases) |*x| x.deinit();
+    var kernels: std.ArrayList(g.Kernel) = .empty;
+    defer kernels.deinit(a);
+    for (&cases) |*x| try kernels.append(a, x.kernel());
+    try g.runAll(a, kernels.items, 0x6b34, t);
+    for (&cases) |*x| {
+        const ok = try shuffled(a, x);
+        t.kernels += 1;
+        if (ok) t.passed += 1 else t.failed += 1;
+    }
 }
 
 /// The Loom MXFP8 GEMV against fp4l_stream's bytes, when the build has it (-Dloom-compile).
@@ -84,11 +105,11 @@ fn shuffled(a: std.mem.Allocator, x: *k_.Case) !bool {
 
 /// Where a check's launch writes: the case's scratch, `at` bytes on.
 fn retarget(x: *k_.Case, arg: *k_.Arg, at: usize) void {
-    if (x.reg.tile == .pair) arg.out16 = x.base16 + at else arg.out = x.base + at;
+    if (x.reg.tile.act()) arg.out16 = x.base16 + at else arg.out = x.base + at;
 }
 
 fn scratchOf(x: *const k_.Case) u64 {
-    return if (x.reg.tile == .pair) x.base16 else x.base;
+    return if (x.reg.tile.act()) x.base16 else x.base;
 }
 
 /// The rows of a launch of fewer rows (and of later cuts, for the prompt tile) equal the full launch's bytes.
