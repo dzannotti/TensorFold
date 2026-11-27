@@ -56,7 +56,7 @@ pub const loom_registrations = [_]Reg{
 pub const dense_registrations = [_]Reg{
     .{ .name = "loom bf16_gemm_128x128 (BF16, fp32 out)", .fmt = .bf16, .tile = .loom_bf16_128x128, .served = &.{
         .{ .rows = 300, .n = 324, .k = 10240 }, .{ .rows = 129, .n = 10240, .k = 320 }, .{ .rows = 1, .n = 320, .k = 10240 },
-        .{ .rows = 200, .n = 10240, .k = 320 },
+        .{ .rows = 200, .n = 10240, .k = 320 }, .{ .rows = 300, .n = 513, .k = 2560 },  .{ .rows = 1, .n = 513, .k = 2560 },
     } },
     .{ .name = "loom bf16_gemm_128x256 (BF16, fp32 out)", .fmt = .bf16, .tile = .loom_bf16_128x256, .served = &.{
         .{ .rows = 300, .n = 324, .k = 10240 }, .{ .rows = 129, .n = 320, .k = 10240 }, .{ .rows = 7, .n = 324, .k = 10240 },
@@ -101,7 +101,7 @@ pub const registrations = [_]Reg{
     } },
     .{ .name = pn ++ " (BF16, fp32 out)", .fmt = .bf16, .tile = .wmma, .served = &.{
         .{ .rows = 128, .n = 320, .k = 10240 }, .{ .rows = 65, .n = 10240, .k = 320 }, .{ .rows = 33, .n = 512, .k = 2560 },
-        .{ .rows = 20, .n = 4, .k = 10240 },
+        .{ .rows = 20, .n = 4, .k = 10240 },    .{ .rows = 130, .n = 513, .k = 2560 },
     } },
 };
 
