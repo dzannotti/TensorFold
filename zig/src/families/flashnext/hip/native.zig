@@ -110,7 +110,7 @@ fn check(
     const text = readIndex(a, io, dir) catch |err| return refuse(a, problem, "cannot read {s}/model.safetensors.index.json ({s})", .{ dir, @errorName(err) });
     const bytes = cardRoom(gpa, io, dev) catch |err| return refuse(a, problem, "the native HIP engine cannot read the GPU's memory ({s})", .{@errorName(err)});
     const v = admit(a, gpa, &c, text, o.world, o.rank, o.window, bytes, problem) catch |err| return err;
-    try unloaded(a, v, problem);
+    try oneRank(a, v, o.world, problem);
     var label: [16]u8 = undefined;
     if (!v.fits) return refuse(
         a,
@@ -131,15 +131,15 @@ fn formatName(buf: []u8, f: config.Format) []const u8 {
     };
 }
 
-/// FP4-Local is admitted and sized, but no HIP loader reads its weights yet: refused by name, before any upload.
-fn unloaded(a: std.mem.Allocator, v: Verdict, problem: *[]const u8) Refused!void {
-    if (v.format != .modelopt) return;
+/// FP4-Local loads on one rank (its baked planes are not cut): more ranks are refused by name, before any upload.
+fn oneRank(a: std.mem.Allocator, v: Verdict, world: u32, problem: *[]const u8) Refused!void {
+    if (v.format != .modelopt or world == 1) return;
     return refuse(
         a,
         problem,
-        "Flash Next FP4-Local on HIP needs {d:.2} GiB of weights a rank (its {d:.1} GiB n-gram table read from disk), " ++
-            "but this build does not load FP4-Local weights on HIP yet",
-        .{ gibs(v.weights), gibs(v.host) },
+        "Flash Next FP4-Local on HIP loads on one rank ({d:.2} GiB of weights, its {d:.1} GiB n-gram table read from disk); " ++
+            "--tp {d} is refused",
+        .{ gibs(v.weights), gibs(v.host), world },
     );
 }
 
@@ -412,13 +412,14 @@ test "admission: FP4-Local's n-gram table stays on disk; --ple-on-ssd and the ot
     try std.testing.expect(o.fsrRefusal("hip") != null);
 }
 
-test "admission: an admitted FP4-Local checkpoint is refused by name until HIP loads its weights" {
+test "admission: FP4-Local loads on one rank, and --tp over it is refused by name" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var problem: []const u8 = "";
     const v: Verdict = .{ .format = .modelopt, .weights = 76 << 30, .host = 26 << 30, .most = 4096, .fits = true };
-    try std.testing.expectError(error.Refused, unloaded(arena.allocator(), v, &problem));
-    try std.testing.expect(std.mem.indexOf(u8, problem, "does not load FP4-Local weights") != null);
+    try oneRank(arena.allocator(), v, 1, &problem);
+    try std.testing.expectError(error.Refused, oneRank(arena.allocator(), v, 2, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "--tp 2 is refused") != null);
     var label: [16]u8 = undefined;
     try std.testing.expectEqualStrings("4-bit", formatName(&label, .{ .mlx = try @import("../spec.zig").Spec.init(4, 32) }));
 }

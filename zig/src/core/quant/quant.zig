@@ -21,6 +21,8 @@ pub const gptq = @import("gptq.zig");
 pub const nvfp4_format = @import("nvfp4_format.zig");
 pub const mxfp8_format = @import("mxfp8_format.zig");
 pub const fp4local_decode = @import("fp4local_decode.zig");
+/// The two baked layouts as formats (host, device, handle); the loader bakes them, `read` never offers them.
+pub const fp4local_matrix = @import("fp4local_matrix.zig");
 pub const widen = @import("widen.zig");
 
 const Allocator = std.mem.Allocator;
@@ -43,6 +45,8 @@ pub fn Module(comptime f: Format) type {
         .mlx => mlx,
         .dense => dense,
         .bf16 => bf16,
+        .nvfp4 => fp4local_matrix.nvfp4,
+        .mxfp8 => fp4local_matrix.mxfp8,
     };
 }
 
@@ -70,12 +74,14 @@ pub const Config = union(Format) {
     mlx: mlx.Config,
     dense: dense.Config,
     bf16: bf16.Config,
+    nvfp4: void,
+    mxfp8: void,
 
     /// The tensor's MLX width (the table's own, else the global one).
     pub fn width(c: Config, key: []const u8) error{UnsupportedQuantization}!mlx.Width {
         return switch (c) {
             .mlx => |q| q.width(key),
-            .dense, .bf16 => error.UnsupportedQuantization,
+            .dense, .bf16, .nvfp4, .mxfp8 => error.UnsupportedQuantization,
         };
     }
 };
@@ -93,6 +99,8 @@ pub const Host = union(Format) {
     mlx: mlx.Host,
     dense: dense.Host,
     bf16: bf16.Host,
+    nvfp4: fp4local_matrix.nvfp4.Host,
+    mxfp8: fp4local_matrix.mxfp8.Host,
 
     /// Output rows N.
     pub fn rows(h: Host) usize {
@@ -165,6 +173,8 @@ pub const Device = union(Format) {
     mlx: mlx.Device,
     dense: dense.Device,
     bf16: bf16.Device,
+    nvfp4: fp4local_matrix.nvfp4.Device,
+    mxfp8: fp4local_matrix.mxfp8.Device,
 };
 
 pub fn upload(u: Uploader, h: Host) !Device {
@@ -178,6 +188,8 @@ pub const Handle = union(Format) {
     mlx: mlx.Matrix,
     dense: dense.Matrix,
     bf16: bf16.Matrix,
+    nvfp4: fp4local_matrix.nvfp4.Matrix,
+    mxfp8: fp4local_matrix.mxfp8.Matrix,
 };
 
 /// One product (N, K): the format's handle and its shape. A stack is one expert's shape at the stack's addresses.
@@ -242,5 +254,6 @@ test {
     _ = nvfp4_format;
     _ = mxfp8_format;
     _ = fp4local_decode;
+    _ = fp4local_matrix;
     _ = widen;
 }

@@ -5,6 +5,7 @@ test {
     _ = @import("nvfp4_read.zig");
     _ = @import("ple_host.zig");
     _ = @import("names_modelopt.zig");
+    _ = @import("modelopt_host.zig");
     _ = @import("hip/modelopt_admit.zig");
     _ = @import("hip/plan.zig");
     _ = @import("hip/tensors.zig");

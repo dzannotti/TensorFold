@@ -1,5 +1,6 @@
 //! The products on a projection of any format, dispatched on its tag; `affine*` are the MLX affine path behind them.
 
+const std = @import("std");
 const t = @import("types.zig");
 const quant = @import("core").quant;
 const launches = @import("../launches.zig");
@@ -41,6 +42,10 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
             },
             .bf16 => {
                 if (m == 0 or x.kind != .bf16) return error.BadShape;
+                if (o.l.dense.refusal(o.l.dense.serve, x.ptr, h.weight, int(m), int(proj.n), int(proj.k))) |why| {
+                    std.log.err("no HIP tile takes the bf16 dense projection ({d} x {d}): {s}", .{ proj.n, proj.k, why });
+                    return error.BadShape;
+                }
                 const kind: t.Kind = if (f32_out) .f32 else .bf16;
                 const out: Tensor = .{ .ptr = try o.arena.take(m * proj.n * kind.size()), .kind = kind };
                 try denseGemm(o, o.l.dense.serve, x, h.weight, out, m, proj.n, proj.k);
@@ -58,7 +63,14 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
             b.project(x.ptr, h.weight, out.ptr, m, proj.n, proj.k) catch |err| return if (err == error.Invalid) error.BadShape else error.HipFailed;
             return out;
         },
+        .nvfp4, .mxfp8 => return noKernels(proj),
     }
+}
+
+/// FP4-Local's NVFP4 and MXFP8 projections are loaded, but no kernel reads them yet: refused here, nothing runs.
+fn noKernels(proj: Projection) Error {
+    std.log.err("no FP4-Local kernels yet: the {t} projection ({d} x {d}) has no HIP product", .{ proj.format(), proj.n, proj.k });
+    return error.NoFp4LocalKernels;
 }
 
 /// silu(gate) x up into `act` (m, n / 2) from an interleaved gate/up BF16 projection (n, k), in the WMMA epilogue.
@@ -66,6 +78,7 @@ pub fn projectSilu(o: Ops, x: Tensor, proj: Projection, m: usize, act: Tensor) E
     const h = switch (proj.handle) {
         .dense => |d| d,
         .mlx, .bf16 => return error.BadShape,
+        .nvfp4, .mxfp8 => return noKernels(proj),
     };
     if (h.dtype != .bf16 or m == 0 or x.kind != .bf16 or act.kind != .bf16) return error.BadShape;
     if (o.l.dense.siluRefusal(x.ptr, h.weight, act.ptr, int(m), int(proj.n), int(proj.k)) != null) return error.BadShape;
@@ -78,7 +91,7 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
     if (ps.len > ws.len) return false;
     for (ps, ws[0..ps.len]) |pr, *w| switch (pr.handle) {
         .mlx => |h| w.* = affineOf(pr, h),
-        .dense, .bf16 => return false,
+        .dense, .bf16, .nvfp4, .mxfp8 => return false,
     };
     return affineGroup(o, x, ws[0..ps.len], m, outs);
 }
@@ -88,6 +101,7 @@ pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: 
     switch (proj.handle) {
         .mlx => |h| return affineRoutedAct(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, limit),
         .dense, .bf16 => return null,
+        .nvfp4, .mxfp8 => return noKernels(proj),
     }
 }
 
@@ -95,7 +109,7 @@ pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: 
 pub fn projectRelu2(o: Ops, x: Tensor, proj: Projection, m: usize, out: Tensor) Error!bool {
     const h = switch (proj.handle) {
         .mlx => |h| h,
-        .dense, .bf16 => return false,
+        .dense, .bf16, .nvfp4, .mxfp8 => return false,
     };
     const w = affineOf(proj, h);
     try w.check();
@@ -136,7 +150,7 @@ pub fn projectRoutedRelu2(
 ) Error!bool {
     const h = switch (proj.handle) {
         .mlx => |h| h,
-        .dense, .bf16 => return false,
+        .dense, .bf16, .nvfp4, .mxfp8 => return false,
     };
     const w = affineOf(proj, h);
     try w.check();
@@ -174,11 +188,11 @@ pub fn projectRoutedPlainRelu2(
 ) Error!bool {
     const ha = switch (routed.handle) {
         .mlx => |h| h,
-        .dense, .bf16 => return false,
+        .dense, .bf16, .nvfp4, .mxfp8 => return false,
     };
     const hb = switch (plain.handle) {
         .mlx => |h| h,
-        .dense, .bf16 => return false,
+        .dense, .bf16, .nvfp4, .mxfp8 => return false,
     };
     const wa = affineOf(routed, ha);
     const wb = affineOf(plain, hb);
@@ -226,6 +240,7 @@ pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usi
     switch (proj.handle) {
         .mlx => |h| return affineRouted(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, expert_rows),
         .dense, .bf16 => return error.BadShape,
+        .nvfp4, .mxfp8 => return noKernels(proj),
     }
 }
 
@@ -235,6 +250,7 @@ pub fn embedRows(o: Ops, table: Projection, ids: u64, n: usize, out: Tensor) Err
         .mlx => |h| return embedAffine(o, affineOf(table, h), ids, n, out),
         .dense => |h| try o.l.tf_embed_dense(p(h.weight), @backingInt(try kindOf(h.dtype)), @ptrFromInt(ids), int(n), int(table.k), p(out.ptr), @backingInt(out.kind), o.stream),
         .bf16 => |h| try o.l.tf_embed_dense(p(h.weight), @backingInt(t.Kind.bf16), @ptrFromInt(ids), int(n), int(table.k), p(out.ptr), @backingInt(out.kind), o.stream),
+        .nvfp4, .mxfp8 => return noKernels(table),
     }
 }
 
@@ -378,7 +394,6 @@ pub fn affineRouted(o: Ops, x: Tensor, w: Affine, items: u64, count: usize, memb
 }
 
 test "a routed prompt without its average rows per expert refuses, instead of guessing the 64-row tile" {
-    const std = @import("std");
     var arena = @import("../arena.zig").Arena.counting();
     const o: Ops = .{ .l = undefined, .bf16 = true, .stream = null, .arena = &arena, .prefill = true };
     const x = Tensor{ .ptr = 0, .kind = .bf16 };
