@@ -1,4 +1,4 @@
-//! Flash Next's sparse attention on the lanes kernel under the contract on HIP: bytes equal to the scalar kernel's.
+//! Sparse attention under the HIP contract: lanes == scalar bytes, WMMA held to fp64, Loom == WMMA bytes.
 const std = @import("std");
 const hip = @import("hip");
 const core = @import("core");
@@ -26,6 +26,27 @@ const names = [2][]const u8{
 };
 const rule = "a NaN a row did not select never reaches it; a selected value reaches its dim, a selected key the head";
 const why = "the scalar kernel's fp32 sums in its order: a row's keys in 32-key tiles, a dim at a time";
+
+const wmma_name = "hip tf_fn_sparse_wmma12_bf16";
+const wmma_why = "CUDA's math on WMMA: bf16 q, one score chain, bf16 p into PV, 4 parts of 32-key tiles merged in order, bf16 out";
+
+/// The WMMA kernel's prompt and decode shapes: 12 query heads a kv head.
+const wmma_served = [_]c.Shape{
+    .{ .rows = 64, .n = 24, .k = 1024 }, .{ .rows = 16, .n = 12, .k = 4096 }, .{ .rows = 1, .n = 24, .k = 4096 },
+    .{ .rows = 2, .n = 24, .k = 4096 },  .{ .rows = 3, .n = 24, .k = 4096 },  .{ .rows = 4, .n = 24, .k = 4096 },
+};
+
+/// The lanes kernel's bf16 shapes where the WMMA kernel takes the 12-head ones: a tp-4 rank's 6 heads.
+const lanes_beside_wmma = [_]c.Shape{.{ .rows = 17, .n = 6, .k = 1024 }};
+
+pub fn wmmaSpec() c.Spec {
+    var sp = spec(.bf16);
+    sp.name = wmma_name;
+    sp.replaces = null;
+    sp.served = &wmma_served;
+    sp.sums = .{ .f16 = 0, .bf16 = 0, .why = wmma_why, .exact = false };
+    return sp;
+}
 
 pub fn spec(k: kit.Kind) c.Spec {
     return .{
@@ -72,8 +93,10 @@ pub const SparseLanes = struct {
     out: u64 = 0,
     base: u64 = 0, // the replaced kernel's output
     msg: [200]u8 = undefined,
-    /// The Loom kernel (launches/loom_attention.zig) against this lanes kernel: bf16, 12 heads a KV head.
+    /// The Loom kernel (launches/loom_attention.zig) against the WMMA kernel: bf16, 12 heads a KV head.
     loom: bool = false,
+    /// The WMMA kernel alone, held to fp64 (gfx11 builds).
+    wmma: bool = false,
 
     pub fn init(a: std.mem.Allocator, rt: *const hip.Runtime, s: hip.Stream, l: *const hip.Launcher) SparseLanes {
         return .{ .rig = .{ .a = a, .r = rt, .s = s }, .l = l.*, .k = kit.act(), .arena = .init(a) };
@@ -85,10 +108,15 @@ pub const SparseLanes = struct {
     }
 
     pub fn kernel(self: *SparseLanes) g.Kernel {
-        if (!self.loom) return .{ .spec = spec(self.k), .ctx = self, .vt = &vt };
+        if (self.wmma) return .{ .spec = wmmaSpec(), .ctx = self, .vt = &vt };
+        if (!self.loom) {
+            var sp = spec(self.k);
+            if (self.k == .bf16 and self.l.fnx.sparse_wmma != null) sp.served = &lanes_beside_wmma;
+            return .{ .spec = sp, .ctx = self, .vt = &vt };
+        }
         var sp = spec(self.k);
         sp.name = "loom sparse_attend";
-        sp.replaces = names[1];
+        sp.replaces = wmma_name;
         sp.served = &loom_served;
         return .{ .spec = sp, .ctx = self, .vt = &vt };
     }
@@ -142,7 +170,9 @@ pub const SparseLanes = struct {
     /// Random: values in [-1, 1) exact in the kind. Stress: q = 0 and integer values, so every weight is 1.
     pub fn prepare(self: *SparseLanes, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         const group: usize = if (shape.n % 12 == 0) 12 else 6;
-        if (self.loom and (group != 12 or self.k != .bf16)) return false;
+        if ((self.loom or self.wmma) and (group != 12 or self.k != .bf16)) return false;
+        const takes_wmma = self.l.fnx.sparse_wmma != null and group == 12 and self.k == .bf16;
+        if (!self.loom and !self.wmma and takes_wmma) return false;
         if (shape.rows < 1 or shape.n % group != 0 or shape.k < 12 * shape.rows + 64 or shape.k > 20000) return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
@@ -225,7 +255,7 @@ pub const SparseLanes = struct {
         try self.rig.s.synchronize();
     }
 
-    /// The scalar kernel's output on the same inputs (the lanes kernel's, for the Loom kernel).
+    /// The scalar kernel's output on the same inputs (the WMMA kernel's, for the Loom kernel).
     pub fn replaced(self: *SparseLanes) ![]const u8 {
         const s = self.shape;
         const d = self.dev;
