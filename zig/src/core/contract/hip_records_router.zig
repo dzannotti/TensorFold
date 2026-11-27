@@ -27,8 +27,41 @@ const plan: Record = .{
     },
 };
 
-/// The same launch in bf16, whose weights are the wider activation's rows; then the route plan the picks feed.
-pub const records = [3]Record{
+/// The wide plan's span counts: 1,024 experts' counts.
+const wide_count: Record = .{
+    .launch = .{ .name = "moe route tf_moe_route_count", .symbol = "tf_moe_route_count", .image = "ops", .threads = 256, .dynamic = 1024 * 4 },
+    .usage = .{
+        .{ .vgprs = 7, .sgprs = 16, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 7, .sgprs = 18, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 7, .sgprs = 16, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 7, .sgprs = 15, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+    },
+};
+
+/// The wide plan's one-block scan: 1,024 experts' counts, starts and ends, then the scan of two ints a thread.
+const wide_scan: Record = .{
+    .launch = .{ .name = "moe route tf_moe_route_scan", .symbol = "tf_moe_route_scan", .image = "ops", .threads = 1024, .dynamic = 3 * 1024 * 4 + 2 * 1024 * 4 },
+    .usage = .{
+        .{ .vgprs = 62, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+        .{ .vgprs = 62, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+        .{ .vgprs = 62, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+        .{ .vgprs = 62, .sgprs = 27, .lds = 0, .private = 0, .bound = 1024, .wave = 32 },
+    },
+};
+
+/// The wide plan's span scatter: a span's picks in static LDS.
+const wide_scatter: Record = .{
+    .launch = .{ .name = "moe route tf_moe_route_scatter", .symbol = "tf_moe_route_scatter", .image = "ops", .threads = 256 },
+    .usage = .{
+        .{ .vgprs = 14, .sgprs = 17, .lds = 2048, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 14, .sgprs = 18, .lds = 2048, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 14, .sgprs = 17, .lds = 2048, .private = 0, .bound = 256, .wave = 32 },
+        .{ .vgprs = 14, .sgprs = 17, .lds = 2048, .private = 0, .bound = 256, .wave = 32 },
+    },
+};
+
+/// The same launch in bf16, whose weights are the wider activation's rows; then the route plans the picks feed.
+pub const records = [6]Record{
     routeTile("router tf_router_bf16_f16", "tf_router_bf16_f16"),
     .{
         .launch = .{ .name = "router tf_router_bf16", .symbol = "tf_router_bf16", .image = "decode", .threads = 128 },
@@ -40,4 +73,7 @@ pub const records = [3]Record{
         },
     },
     plan,
+    wide_count,
+    wide_scan,
+    wide_scatter,
 };
