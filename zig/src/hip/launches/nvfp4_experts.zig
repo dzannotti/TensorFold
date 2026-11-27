@@ -66,7 +66,7 @@ pub const Kernels = struct {
         try args.add(a.route.x_div);
         try args.add(n);
         try args.add(a.k);
-        const grid = util.dim(util.cdiv(n, cols), util.cdiv(a.m, 128), items);
+        const grid = util.dim(util.cdiv(n, cols), util.cdiv(a.m, 16), items);
         try hl.launch(k.f.?[which], .{ .grid = grid, .block = .{ .x = 256 } }, .{ .r = r, .handle = s }, &args);
     }
 };

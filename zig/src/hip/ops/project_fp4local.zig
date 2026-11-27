@@ -10,6 +10,18 @@ const Projection = quant.Projection;
 const dev = quant.fp4local_device;
 const int = t.int;
 
+pub var t2: bool = false;
+var t2_from_cache: usize = 0;
+
+pub fn t2From() usize {
+    if (t2_from_cache == 0) {
+        const std = @import("std");
+        t2_from_cache = std.math.maxInt(usize);
+        if (std.c.getenv("TF_T2_FROM")) |v| t2_from_cache = @max(1, std.fmt.parseInt(usize, std.mem.span(v), 10) catch std.math.maxInt(usize));
+    }
+    return t2_from_cache;
+}
+
 /// The FP4-Local formats' common argument: the format, and the product's planes.
 pub const Weights = struct { fmt: fp4.Format, words: u64, scale: u64 = 0, global: u64 = 0, layout: fp4.GlobalLayout = .none, n: u32, k: u32 };
 
@@ -93,6 +105,10 @@ pub fn routed(o: Ops, x: Tensor, w: Weights, items: u64, count: usize, members: 
     var a = argOf(w, x, rows);
     a.out = out;
     a.route = .{ .items = items, .members = members, .x_div = int(x_div) };
+    if (t2 and !o.prefill and o.l.fp4.experts.takesDown(a)) {
+        try o.l.fp4.experts.downGo(o.l.r, a, int(count), o.stream);
+        return out;
+    }
     try run(o, .nvfp4, a, int(count), int(expert_rows));
     return out;
 }
@@ -105,7 +121,7 @@ pub fn routedAct(o: Ops, x: Tensor, w: Weights, items: u64, count: usize, member
     if (o.prefill and !o.l.fp4.experts.takesGateUp(a, limit)) return null;
     const out = try o.arena.take(pairs * (w.n / 2) * 2);
     a.out16 = out;
-    if (o.prefill) {
+    if (o.prefill or (t2 and o.l.fp4.experts.takesGateUp(a, limit))) {
         try o.l.fp4.experts.gateUpGo(o.l.r, a, int(count), o.stream);
     } else try o.l.fp4.streamGo(o.l.r, .nvfp4, a, .{ .pair_cols = int(w.n / 2), .limit = limit }, int(count), o.stream);
     return .{ .ptr = out, .kind = .bf16 };

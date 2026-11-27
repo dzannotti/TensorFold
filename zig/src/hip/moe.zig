@@ -197,18 +197,22 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
     const pairs = rows * slots;
     var count: usize = cap;
     var tile: usize = undefined;
+    const fp4l = @import("ops/project_fp4local.zig");
+    const t2 = !o.prefill and rows >= fp4l.t2From();
+    fp4l.t2 = t2;
+    defer fp4l.t2 = false;
     if (rows == 1) {
         try o.moeSelect(logits, pick, wts, .{ .items = items, .members = members }, cap, 1, r.count(), r.top_k);
         tile = 1;
         count = slots;
     } else {
         try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
-        tile = tileFor(o, rows);
+        tile = if (t2) BLOCK_ROWS else tileFor(o, rows);
         // the stacked shared expert is the last id; beside the stack its items are zeroed below, so it keeps the tile
         const shared: ?usize = if (ex.shared == null) r.count() else null;
-        try o.moeRoute(pick, pairs, r.rows, tile, shared, sharedTileFor(o, rows), members, items, cap);
+        try o.moeRoute(pick, pairs, r.rows, tile, shared, if (t2) BLOCK_ROWS else sharedTileFor(o, rows), members, items, cap);
         // the launches' m: the most rows an item holds, the shared expert's whole item in a prompt pass
-        tile = itemRowsFor(o, rows, shared != null);
+        tile = if (t2) BLOCK_ROWS else itemRowsFor(o, rows, shared != null);
     }
     // beside the stack the shared pair's id is the stack's first id past its experts: zero its item, never read its row
     if (ex.shared != null) try o.moeForeignItems(items, count, ex.count);

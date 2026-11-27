@@ -15,9 +15,12 @@ typedef __bf16 bf16x16 __attribute__((ext_vector_type(16)));
 typedef float f32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
-constexpr unsigned kTileRows = 128, kTileCols = 128, kStage = 32, kPitch = 40, kFold = 128;
-constexpr unsigned kBuf = kTileRows * kPitch;          // one buffer of x or of weights, in bf16
-constexpr unsigned kArena = 4 * kBuf;                  // x and weights, double-buffered, in bf16 (40 KiB)
+#ifndef K4_ROWS
+#define K4_ROWS 16
+#endif
+constexpr unsigned kTileRows = K4_ROWS, kTileCols = 128, kStage = 32, kPitch = 40, kFold = 128;
+constexpr unsigned kXBuf = kTileRows * kPitch, kWBuf = kTileCols * kPitch;
+constexpr unsigned kArena = 2 * kXBuf + 2 * kWBuf;
 
 // Half a stage of one weight row, decoded: 16 bf16 in K order.
 struct Half {
@@ -78,7 +81,8 @@ LOOM_INLINE Acc grouped_loop(const typename Dec::Weights& w, unsigned wrow, cons
   Acc acc = {zero, zero, zero, zero, zero, zero, zero, zero};
   Acc d = acc;
   __bf16* const xs = lds;
-  __bf16* const ws = lds + 2 * kBuf;
+  __bf16* const ws = lds + 2 * kXBuf;
+  const bool xlive = xr < kTileRows;
   u32x4* const wd0 = (u32x4*)(ws + col * kPitch + half * 16);
   u32x4* const xd0 = (u32x4*)(xs + xr * kPitch + xpart * 16);
   const __bf16* const wp0 = ws + wave * 16 * kPitch;
@@ -94,26 +98,30 @@ LOOM_INLINE Acc grouped_loop(const typename Dec::Weights& w, unsigned wrow, cons
     const Half h = Dec::template decode<Half>(r0);
     wd0[0] = h.lo;
     wd0[1] = h.hi;
-    xd0[0] = x00;
-    xd0[1] = x01;
+    if (xlive) {
+      xd0[0] = x00;
+      xd0[1] = x01;
+    }
   }
   lds_barrier();
   for (unsigned g = 0; g < kFolds; g++) {
     [[loom::unroll]] for (unsigned q = 0; q < kPer; q++) {
-      const unsigned s = g * kPer + q, b = (q & 1) * kBuf, nb = kBuf - b;
+      const unsigned s = g * kPer + q, b = (q & 1) * kWBuf, nb = kWBuf - b, xb = (q & 1) * kXBuf, xnb = kXBuf - xb;
       const unsigned ahead = s + D < kStages ? s + D : kStages - 1;
       const typename Dec::Raw ra = Dec::fetch(w, wrow, ahead, half);
       const u32x4 xa0 = xsrc[4 * ahead], xa1 = xsrc[4 * ahead + 1];
-      if (q == 0) stage<NF, true, false>(acc, d, xs + b, wp0 + b);
-      if (q == 1 || q == 2) stage<NF, false, false>(acc, d, xs + b, wp0 + b);
-      if (q == 3) stage<NF, false, true>(acc, d, xs + b, wp0 + b);
+      if (q == 0) stage<NF, true, false>(acc, d, xs + xb, wp0 + b);
+      if (q == 1 || q == 2) stage<NF, false, false>(acc, d, xs + xb, wp0 + b);
+      if (q == 3) stage<NF, false, true>(acc, d, xs + xb, wp0 + b);
       const Half h = Dec::template decode<Half>(rn);
       u32x4* wd = (u32x4*)((__bf16*)wd0 + nb);
       wd[0] = h.lo;
       wd[1] = h.hi;
-      u32x4* xd = (u32x4*)((__bf16*)xd0 + nb);
-      xd[0] = xn0;
-      xd[1] = xn1;
+      if (xlive) {
+        u32x4* xd = (u32x4*)((__bf16*)xd0 + xnb);
+        xd[0] = xn0;
+        xd[1] = xn1;
+      }
       if constexpr (D == 3) {
         rn = rf;
         xn0 = xf0;
@@ -137,6 +145,9 @@ template <class Dec, unsigned K, unsigned D>
 LOOM_INLINE Acc grouped_tile(const typename Dec::Weights& w, unsigned wrow, const __bf16* xrow, unsigned rows,
                              __bf16* lds) {
   const unsigned frags = (rows + 15) / 16;
+#if K4_ROWS == 16
+  return grouped_loop<Dec, K, D, 1>(w, wrow, xrow, lds);
+#else
   if (frags >= 8) return grouped_loop<Dec, K, D, 8>(w, wrow, xrow, lds);
   if (frags == 7) return grouped_loop<Dec, K, D, 7>(w, wrow, xrow, lds);
   if (frags == 6) return grouped_loop<Dec, K, D, 6>(w, wrow, xrow, lds);
@@ -145,6 +156,7 @@ LOOM_INLINE Acc grouped_tile(const typename Dec::Weights& w, unsigned wrow, cons
   if (frags == 3) return grouped_loop<Dec, K, D, 3>(w, wrow, xrow, lds);
   if (frags == 2) return grouped_loop<Dec, K, D, 2>(w, wrow, xrow, lds);
   return grouped_loop<Dec, K, D, 1>(w, wrow, xrow, lds);
+#endif
 }
 
 }  // namespace k4
