@@ -167,7 +167,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
 
 fn router(o: Ops, r: Routed, x: Tensor, logits: u64, rows: usize) ops.Error!void {
     const d = r.experts.dims;
-    if (r.matrix and r.rows16 != 0 and o.prefill and !o.window) return o.routerLogits(x, r.rows16, logits, rows, r.rows, d);
+    if (r.matrix and r.rows16 != 0 and o.prefill and !o.window and std.c.getenv("TF_ROUTER_WMMA_OFF") == null) return o.routerLogits(x, r.rows16, logits, rows, r.rows, d);
     try o.moeRouterRows(x, r.rows32, r.rows16, logits, rows, d, r.rows);
 }
 

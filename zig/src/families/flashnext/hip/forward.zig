@@ -477,7 +477,7 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
         try hcBranch(o, m, h, branch, inject, x, layer.mhc.scale, rows);
         const mixed2 = try hcPre(o, m, layer.mhc, x, rows, inject);
         const next = if (i + 1 < m.layers.len) m.layers[i + 1].ahc.scale else m.mix.scale;
-        if (fused(o, m) and d.streams == 4 and d.hidden == 2560 and hip.moe.defers(o, m.act, layer.moe, rows)) {
+        if (std.c.getenv("TF_HC_MOE_OFF") == null and fused(o, m) and d.streams == 4 and d.hidden == 2560 and hip.moe.defers(o, m.act, layer.moe, rows)) {
             const p = try hip.moe.pending(o, m.act, layer.moe, mixed2, rows);
             try o.l.fn_hc_moe_norm(@ptrFromInt(h.ptr), @ptrFromInt(p.y), @ptrFromInt(p.wts), @ptrFromInt(p.shared), @ptrFromInt(inject.ptr), @ptrFromInt(next), @ptrFromInt(x.ptr), @intCast(rows), @intCast(p.slots), d.eps, o.stream);
             continue;

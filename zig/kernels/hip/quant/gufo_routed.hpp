@@ -165,15 +165,18 @@ extern "C" __launch_bounds__(256) __global__ void gufo_expert_gate_up(const uint
   }
 }
 
-// fp32 down sums: grid (2560 / 128, row tiles of 128, items).
+// Down sums: fp32 rows, or bf16 rows when n is negative; grid (2560 / 128, row tiles of 128, items).
 extern "C" __launch_bounds__(256) __global__ void gufo_expert_down(const uint16_t* __restrict__ x,
     const unsigned* __restrict__ words, const uint8_t* __restrict__ scales, const float* __restrict__ globals,
     const int* __restrict__ items, const int* __restrict__ members, float* __restrict__ out, int x_div, int n, int k) {
   constexpr int K = 640, N = 2560;
-  if (n != N || k != K) return;
+  const bool half = n < 0;
+  if ((half ? -n : n) != N || k != K) return;
   constexpr int kOutStride = 128 + 4, kEpiTokens = 32;
-  constexpr int kActBytes = GR_BK * 4 * GR_AST * 16, kEpiBytes = kEpiTokens * kOutStride * 4;
-  __shared__ __attribute__((aligned(16))) uint8_t lds[kActBytes > kEpiBytes ? kActBytes : kEpiBytes];
+  constexpr int kHalfStride = 128 + 8, kHalfTokens = 64;
+  constexpr int kActBytes = GR_BK * 4 * GR_AST * 16, kEpiBytes = kHalfTokens * kHalfStride * 2;
+  static_assert(kEpiBytes >= kEpiTokens * kOutStride * 4 && kEpiBytes >= kActBytes);
+  __shared__ __attribute__((aligned(16))) uint8_t lds[kEpiBytes];
   auto* s_act = reinterpret_cast<uint4*>(lds);
   GR_TILE_HEAD
   const int r_block = (int)blockIdx.x * 128;
@@ -182,6 +185,29 @@ extern "C" __launch_bounds__(256) __global__ void gufo_expert_down(const uint16_
   const uint8_t* wrow_s = scales + ((size_t)expert * N + row) * (K / 16);
   GR_ROUTED_BODY(K)
   const float gs = globals[expert] * 16384.0f;
+  if (half) {
+    uint16_t* scratch = reinterpret_cast<uint16_t*>(lds);
+    uint16_t* out16 = reinterpret_cast<uint16_t*>(out);
+    for (int part = 0; part < GR_BN / kHalfTokens; ++part) {
+      if (part * (kHalfTokens / 16) >= live_tok_tiles) break;
+      if (part > 0) __syncthreads();
+      for (int jj = 0; jj < kHalfTokens / 16; ++jj) {
+        const int j = part * (kHalfTokens / 16) + jj;
+        for (int i = 0; i < 8; ++i)
+          scratch[((jj * 16) + sub_lane) * kHalfStride + (wave_id * 16) + (2 * i) + half_id] = gr_Bf16(acc[j][i] * gs);
+      }
+      __syncthreads();
+      for (int unit = 0; unit < kHalfTokens * 16 / 256; ++unit) {
+        const int flat = (unit * 256) + tid;
+        const int tr = flat / 16, chunk = flat % 16;
+        const int t = t_local + (part * kHalfTokens) + tr;
+        if (t >= bucket_rows) continue;
+        *reinterpret_cast<uint4*>(out16 + (size_t)(unsigned)members[first + t] * N + r_block + chunk * 8) =
+            *reinterpret_cast<const uint4*>(scratch + (tr * kHalfStride) + (chunk * 8));
+      }
+    }
+    return;
+  }
   float* scratch = reinterpret_cast<float*>(lds);
   for (int part = 0; part < GR_BN / kEpiTokens; ++part) {
     if (part * (kEpiTokens / 16) >= live_tok_tiles) break;

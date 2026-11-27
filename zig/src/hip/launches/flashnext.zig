@@ -525,7 +525,7 @@ const wmma_parts = 4;
 
 /// Whether the WMMA kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims.
 fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int) bool {
-    return kernel == .auto and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
+    return kernel == .auto and std.c.getenv("TF_P1_ATTN_OFF") == null and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
 }
 
 fn sparseWith(

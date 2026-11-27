@@ -14,6 +14,7 @@ const score_budget = 64 << 20;
 /// One stream's `rows` prompt rows from `pos`, ends and blocks from `staged` if given; false where Loom does not fit.
 pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView, cap: usize, q32: u64, iq: u64, att: u64, rows: usize, pos: usize, host: *forward.Host, staged: ?mixers.Rows) !bool {
     const k = &o.l.attn;
+    if (std.c.getenv("TF_P1_ATTN_OFF") != null) return false;
     if (!o.prefill or m.act != .bf16 or !k.takes(d.heads, d.kv_heads, d.head_dim, d.index_heads, d.index_dim)) return false;
     const key_stride = d.index_top * d.index_ratio + d.index_ratio;
     const blocks_max = (pos + rows) / d.index_ratio;
