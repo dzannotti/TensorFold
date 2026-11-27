@@ -1,8 +1,8 @@
-//! A verify window's DeltaNet without a snapshot a row: the round runs from a plan, the keep replays it.
+//! A round's DeltaNet over every stream's window in two launches a layer (the CUDA family's fn_gdn_lanes_*), KEEP_LATE:
+//! the chain writes the window's end state to a spare, a whole keep swaps it in, a partial keep leaves its rows in a log.
 const std = @import("std");
 const hip = @import("hip");
 
-const pops = hip.plan_ops;
 const cache = @import("cache.zig");
 const config = @import("../config.zig");
 const forward = @import("forward.zig");
@@ -11,267 +11,236 @@ const model = @import("model.zig");
 const Ops = hip.ops.Ops;
 const Tensor = hip.ops.Tensor;
 const take = forward.take;
+const launches = hip.launches;
 
 /// Rows one window holds at most: the pending token and its drafts.
 pub const window_rows = cache.max_window;
 
-/// Slots a window's plan runs: the window, then an empty slot that stops its wave writing the state back.
-const slots = 2;
+const slots = forward.max_segs;
 
-/// Whether this model's shapes are the plan kernels': key dim 128, eight value rows a wave, gated heads.
+/// Whether this model's shapes are the lane kernels': key dim 128, gated heads, a conv of at most eight taps.
 pub fn supported(d: model.Dims, layers: usize) bool {
-    if (d.key_dim != 128) return false;
-    if (d.value_dim % 8 != 0 or d.key_heads < 1 or d.value_heads % d.key_heads != 0) return false;
+    if (d.key_dim != 128 or d.value_dim != 128) return false;
+    if (d.key_heads < 1 or d.value_heads % d.key_heads != 0) return false;
     if (d.conv < 1 or d.conv > 8) return false;
     return layers > 0;
 }
 
-/// The plan's words in four-byte units: a slot's first row, its rows, its kept rows, its descriptor pointer.
-pub const Layout = struct {
+/// TF_GDN_LATE=0: a partly kept window's rows are applied to the state at once (the intermediate step before KEEP_LATE).
+fn lateOn() bool {
+    const v = std.c.getenv("TF_GDN_LATE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The round's words in four-byte units: first and rows a slot, [pending, log first, kept, 0] a slot, then the slots'
+/// tables (five addresses a layer) behind an address a slot.
+const Layout = struct {
     first: usize,
     count: usize,
-    keep: usize,
-    ptr: usize,
-    snaps: usize,
+    ctl: usize,
+    ptrs: usize,
+    tables: usize,
     words: usize,
 
-    pub fn of(layers: usize) Layout {
-        var l: Layout = undefined;
-        l.first = 0;
-        l.count = slots;
-        l.keep = 2 * slots;
-        l.ptr = std.mem.alignForward(usize, 3 * slots, 4); // eight-byte pointers start on an even word
-        l.snaps = l.ptr + 2 * slots;
-        l.words = l.snaps + 4 * layers;
-        return l;
+    fn of(layers: usize) Layout {
+        const first = 0;
+        const count = slots;
+        const ctl = 2 * slots;
+        const ptrs = std.mem.alignForward(usize, ctl + 4 * slots, 2);
+        const tables = ptrs + 2 * slots;
+        return .{ .first = first, .count = count, .ctl = ctl, .ptrs = ptrs, .tables = tables, .words = tables + 2 * slots * 5 * layers };
     }
 
-    /// Words a slot's descriptor takes: cached positions, the last kept final row, two addresses a layer.
-    pub fn desc(layers: usize) usize {
-        return 2 * (2 + 2 * layers);
-    }
-
-    /// Where the descriptors start (eight-byte aligned).
-    fn start(layers: usize) usize {
-        return std.mem.alignForward(usize, of(layers).words, 2);
-    }
-
-    /// Every word of the plan: its control words, then a descriptor a slot.
-    pub fn total(layers: usize) usize {
-        return start(layers) + slots * desc(layers);
+    fn table(l: Layout, layers: usize, slot: usize) usize {
+        return l.tables + 2 * 5 * layers * slot;
     }
 };
 
-/// One stream's window plan: the round's words, its descriptors, and the rows its keep reads again.
-pub const Plan = struct {
-    r: *const hip.Runtime,
-    layers: usize,
-    /// Rows the buffers hold at most: a window.
-    room: usize,
-    key_heads: usize,
-    value_heads: usize,
-    key_dim: usize,
-    value_dim: usize,
-    conv: usize,
-    channels: usize,
-    kept_stride: usize,
-    samples_stride: usize,
-    /// The words and descriptors, and the device copy a round and a keep read.
+const Words = struct {
     host: hip.HostBuffer,
     dev: hip.DeviceBuffer,
-    /// A layer's k, v, gate and beta over the window's rows, section-major: what a keep replays from.
-    kept: hip.DeviceBuffer,
-    /// A layer's conv input rows over the window, section-major: where a keep takes its conv tail.
-    samples: hip.DeviceBuffer,
-    /// Rows the window last ran.
-    rows: usize = 0,
 
-    pub fn init(d: *const hip.Runtime, dims: model.Dims) !Plan {
-        if (!supported(dims, dims.layers)) return error.UnsupportedPlan;
-        var host = try hip.HostBuffer.alloc(d, 4 * Layout.total(dims.layers));
+    fn make(d: *const hip.Runtime, bytes: usize) !Words {
+        var host = try hip.HostBuffer.alloc(d, bytes);
         errdefer host.free();
-        var dev = try hip.DeviceBuffer.alloc(d, host.bytes.len);
-        errdefer dev.free();
-        const width = dims.key_heads * dims.key_dim + dims.value_heads * dims.value_dim + 2 * dims.value_heads;
-        var kept = try hip.DeviceBuffer.alloc(d, 4 * window_rows * width * dims.layers);
-        errdefer kept.free();
-        var samples = try hip.DeviceBuffer.alloc(d, 4 * window_rows * dims.convWidth() * dims.layers);
-        errdefer samples.free();
+        const dev = try hip.DeviceBuffer.alloc(d, bytes);
         @memset(host.bytes, 0);
-        return .{
-            .r = d,
-            .layers = dims.layers,
-            .room = window_rows,
-            .key_heads = dims.key_heads,
-            .value_heads = dims.value_heads,
-            .key_dim = dims.key_dim,
-            .value_dim = dims.value_dim,
-            .conv = dims.conv,
-            .channels = dims.convWidth(),
-            .kept_stride = 4 * window_rows * width,
-            .samples_stride = 4 * window_rows * dims.convWidth(),
-            .host = host,
-            .dev = dev,
-            .kept = kept,
-            .samples = samples,
-        };
+        return .{ .host = host, .dev = dev };
     }
 
-    pub fn deinit(p: *Plan) void {
-        p.samples.free();
-        p.kept.free();
-        p.dev.free();
-        p.host.free();
+    fn free(w: *Words) void {
+        w.dev.free();
+        w.host.free();
+    }
+};
+
+pub const Lanes = struct {
+    r: *const hip.Runtime,
+    layers: usize,
+    channels: usize,
+    taps: usize,
+    key_heads: usize,
+    value_heads: usize,
+    /// The round's words, and the words a flush of pending rows runs from.
+    main: Words,
+    side: Words,
+    late: bool,
+    cs: [slots]*cache.Caches = undefined,
+    n: usize = 0,
+    ids: [slots]u32 = @splat(0),
+    rows: [slots]u32 = @splat(0),
+    open: [slots]bool = @splat(false),
+    batch: bool = false,
+    dirty: bool = false,
+
+    pub fn init(d: *const hip.Runtime, dims: model.Dims) !Lanes {
+        if (!supported(dims, dims.layers)) return error.UnsupportedPlan;
+        const size = 4 * Layout.of(dims.layers).words;
+        var main = try Words.make(d, size);
+        errdefer main.free();
+        const side = try Words.make(d, size);
+        return .{ .r = d, .layers = dims.layers, .channels = dims.convWidth(), .taps = dims.conv - 1, .key_heads = dims.key_heads, .value_heads = dims.value_heads, .main = main, .side = side, .late = lateOn() };
     }
 
-    /// Device bytes a stream's plan takes, whether or not one is made: the admission counts it the same either way.
+    pub fn deinit(p: *Lanes) void {
+        p.side.free();
+        p.main.free();
+    }
+
+    /// Device bytes of the round's words.
     pub fn bytes(dims: model.Dims) usize {
-        const width = dims.key_heads * dims.key_dim + dims.value_heads * dims.value_dim + 2 * dims.value_heads;
-        const words = 4 * Layout.total(dims.layers);
-        return words + 4 * window_rows * width * dims.layers + 4 * window_rows * dims.convWidth() * dims.layers;
+        return 4 * Layout.of(dims.layers).words;
     }
 
-    pub fn layout(p: *const Plan) Layout {
+    fn layout(p: *const Lanes) Layout {
         return Layout.of(p.layers);
     }
 
-    /// A slot's descriptor words: [0] cached positions, [1] the last kept final row (0: none), then a layer's pair.
-    fn descriptor(p: *Plan, slot: usize) []u64 {
-        const at = Layout.start(p.layers) + slot * Layout.desc(p.layers);
-        return p.host.slice(u64)[at / 2 ..][0 .. Layout.desc(p.layers) / 2];
+    pub fn args(p: *const Lanes) launches.LaneArgs {
+        return p.argsOf(&p.main);
     }
 
-    fn descAt(p: *const Plan, slot: usize) u64 {
-        return p.dev.base() + 4 * (Layout.start(p.layers) + slot * Layout.desc(p.layers));
-    }
-
-    /// Linear layer `layer`'s section-major k, v, gate and beta over the window's row `at`.
-    pub fn keptOf(p: *const Plan, layer: usize, at: usize) struct { k: u64, v: u64, gate: u64, beta: u64 } {
-        const kw = p.key_heads * p.key_dim;
-        const vw = p.value_heads * p.value_dim;
-        const rows = p.rows;
-        const base = p.kept.base() + layer * p.kept_stride;
-        const k = base + 4 * at * kw;
-        const v = base + 4 * rows * kw + 4 * at * vw;
-        const gate = base + 4 * rows * (kw + vw) + 4 * at * p.value_heads;
-        return .{ .k = k, .v = v, .gate = gate, .beta = gate + 4 * rows * p.value_heads };
-    }
-
-    /// The conv samples of layer `layer` (the window's `channels` a row).
-    pub fn samplesOf(p: *const Plan, layer: usize) u64 {
-        return p.samples.base() + layer * p.samples_stride;
-    }
-
-    /// The kept rows a round and a keep read.
-    pub fn keepWords(p: *const Plan) u64 {
-        return p.dev.base() + 4 * p.layout().keep;
-    }
-
-    /// The window's words and descriptor for caches `c` over `n` rows, on the host: the copy goes up with `send`.
-    pub fn fill(p: *Plan, c: *const cache.Caches, n: usize) !void {
-        if (n == 0 or n > p.room) return error.TooManyRows;
+    fn argsOf(p: *const Lanes, w: *const Words) launches.LaneArgs {
         const l = p.layout();
-        const w = p.host.slice(u32);
-        const ptr = p.host.slice(u64);
-        const desc = p.descriptor(0);
-        for (0..p.layers) |i| {
-            // a sparse layer keeps its descriptor pair, conv samples and replay inputs zero: the kernels skip it
-            desc[2 + 2 * i ..][0..2].* = if (c.linear[i]) .{ c.linearAt(i).conv, c.linearAt(i).state } else .{ 0, 0 };
-            ptr[l.snaps / 2 + 2 * i] = if (c.linear[i]) p.samplesOf(i) else 0;
-            ptr[l.snaps / 2 + 2 * i + 1] = if (c.linear[i]) p.kept.base() + i * p.kept_stride else 0;
+        const at = w.dev.base();
+        return .{ .first = at + 4 * l.first, .count = at + 4 * l.count, .ctl = at + 4 * l.ctl, .tab = at + 4 * l.ptrs };
+    }
+
+    fn fillSlot(p: *Lanes, w: *Words, i: usize, c: *const cache.Caches, inplace: bool) void {
+        const l = p.layout();
+        const ptr = w.host.slice(u64);
+        const t = ptr[l.table(p.layers, i) / 2 ..];
+        for (0..p.layers) |li| {
+            if (!c.linear[li]) {
+                t[5 * li ..][0..5].* = @splat(0);
+                continue;
+            }
+            const live = c.linearAt(li);
+            t[5 * li ..][0..5].* = .{ live.conv, live.state, if (inplace) live.state else c.spareState(li), c.logAt(li), c.samplesAt(li) };
         }
-        // a round keeps no final row: a keep takes the conv tail and the state alone
-        desc[0] = 0;
-        desc[1] = 0;
-        @memset(p.descriptor(1), 0);
-        w[l.first] = 0;
-        w[l.count] = @intCast(n);
-        w[l.keep] = std.math.maxInt(u32);
-        ptr[l.ptr / 2] = p.descAt(0);
-        // the empty slot runs nothing and keeps nothing: the kernels stop at its zero row count
-        w[l.first + 1] = 0;
-        w[l.count + 1] = 0;
-        w[l.keep + 1] = std.math.maxInt(u32);
-        ptr[l.ptr / 2 + 1] = p.descAt(1);
-        p.rows = n;
+        ptr[l.ptrs / 2 + i] = w.dev.base() + 4 * l.table(p.layers, i);
     }
 
-    /// The words up to the device: a graph holds the copy, so its every replay sends the window's own words.
-    pub fn send(p: *Plan, s: hip.abi.Stream) !void {
-        try hip.raw.upload(p.dev, 0, p.host.bytes, s);
+    /// The round's windows: their rows, each stream's pending log rows and the buffers its chain reads and writes.
+    pub fn fill(p: *Lanes, segs: []const forward.Seg) !void {
+        const l = p.layout();
+        const w = p.main.host.slice(u32);
+        var at: u32 = 0;
+        for (segs, 0..) |g, i| {
+            const n: u32 = @intCast(g.tokens.len);
+            if (n == 0 or n > window_rows) return error.TooManyRows;
+            if (g.c.late.pending + n > cache.log_rows) return error.LogFull;
+            w[l.first + i] = at;
+            w[l.count + i] = n;
+            w[l.ctl + 4 * i ..][0..4].* = .{ g.c.late.pending, g.c.late.first, std.math.maxInt(u32), 0 };
+            p.fillSlot(&p.main, i, g.c, false);
+            p.cs[i] = g.c;
+            p.ids[i] = g.c.id;
+            p.rows[i] = n;
+            p.open[i] = true;
+            at += n;
+        }
+        p.n = segs.len;
     }
 
-    /// The window's first `n` rows kept: the conv tail from their samples, the state replayed through them.
-    pub fn keep(p: *Plan, o: Ops, n: usize) !void {
-        // a window of one row left the state and its conv tail as the round wrote them
-        if (p.rows <= 1 or n == 0) return;
-        p.host.slice(u32)[p.layout().keep] = @bitCast(@as(i32, @intCast(n)));
+    /// The words up to the device: a graph holds the copy, so its every replay sends the round's own words.
+    pub fn send(p: *Lanes, s: hip.abi.Stream) !void {
+        try hip.raw.upload(p.main.dev, 0, p.main.host.bytes, s);
+    }
+
+    /// Stream `c`'s window kept `kept` rows: its conv window moves on at the next flush, its state swaps or its rows pend.
+    pub fn keep(p: *Lanes, o: Ops, c: *cache.Caches, kept: usize) !void {
+        const slot = for (0..p.n) |i| {
+            if (p.open[i] and p.ids[i] == c.id) break i;
+        } else return error.NoWindow;
+        if (kept == 0 or kept > p.rows[slot]) return error.BadKeep;
+        p.open[slot] = false;
+        p.main.host.slice(u32)[p.layout().ctl + 4 * slot + 2] = @intCast(kept);
+        c.late.kept(kept, p.rows[slot]);
+        p.dirty = true;
+        if (!p.batch) try p.flushKeeps(o);
+    }
+
+    /// Every kept window's conv window rolled on, in one launch; without KEEP_LATE the pending rows applied at once.
+    pub fn flushKeeps(p: *Lanes, o: Ops) !void {
+        if (!p.dirty) return;
+        p.dirty = false;
+        const l = p.layout();
+        const w = p.main.host.slice(u32);
         try p.send(o.stream);
-        try pops.keep(o, p.ref(), .{
-            .keep = p.keepWords(),
-            .hidden = 0,
-            .hidden_words = 0,
-            .channels = p.channels,
-            .taps = p.conv - 1,
-            .layers = p.layers,
-        });
-        try pops.gdnReplay(o, p.keepWords(), p.ref(), p.key_heads, p.value_heads, p.key_dim, p.value_dim, p.layers);
+        try o.l.laneRoll(p.args(), p.n, p.layers, p.channels, p.taps, o.stream);
+        try hip.runtime.check(p.r.api.hipStreamSynchronize(o.stream));
+        for (0..p.n) |i| w[l.ctl + 4 * i + 2] = std.math.maxInt(u32);
+        if (p.late) return;
+        var held: [slots]*cache.Caches = undefined;
+        var count: usize = 0;
+        for (p.cs[0..p.n], p.open[0..p.n]) |c, open| {
+            if (open or c.late.pending == 0) continue;
+            held[count] = c;
+            count += 1;
+        }
+        if (count > 0) try p.flush(o, held[0..count]);
     }
 
-    /// The words as launches take them: the window's rows from its first.
-    pub fn ref(p: *const Plan) pops.Plan {
+    /// Slots of `caches` with their pending rows applied to their live states in place; the live buffer then the main one.
+    pub fn flush(p: *Lanes, o: Ops, caches: []const *cache.Caches) !void {
         const l = p.layout();
-        const at = p.dev.base();
-        return .{
-            .args = .{
-                .first = at + 4 * l.first,
-                .count = at + 4 * l.count,
-                .desc = at + 4 * l.ptr,
-                .snaps = at + 4 * l.snaps,
-            },
-            .rows = p.rows,
-            .slots = slots,
-        };
+        const w = p.side.host.slice(u32);
+        var any = false;
+        for (caches, 0..) |c, i| {
+            w[l.first + i] = 0;
+            w[l.count + i] = 0;
+            w[l.ctl + 4 * i ..][0..4].* = .{ c.late.pending, c.late.first, std.math.maxInt(u32), 0 };
+            p.fillSlot(&p.side, i, c, true);
+            any = any or c.late.pending > 0;
+        }
+        if (any) {
+            try hip.raw.upload(p.side.dev, 0, p.side.host.bytes, o.stream);
+            for (0..p.layers) |li| {
+                if (!caches[0].linear[li]) continue;
+                try o.l.laneChain(0, 0, p.argsOf(&p.side), caches.len, li, cache.log_rows, std.math.maxInt(u31), p.key_heads, p.value_heads, o.stream);
+            }
+        }
+        for (caches) |c| {
+            c.late.pending = 0;
+            c.late.first = 0;
+            if (!c.late.flip) continue;
+            for (c.linear, 0..) |is_linear, li| {
+                if (!is_linear) continue;
+                try hip.runtime.check(p.r.api.hipMemcpyDtoDAsync(
+                    @ptrFromInt(c.spareState(li)),
+                    @ptrFromInt(c.linearAt(li).state),
+                    c.layout.state_bytes,
+                    o.stream,
+                ));
+            }
+            c.late.flip = false;
+        }
+        try hip.runtime.check(p.r.api.hipStreamSynchronize(o.stream));
     }
 };
 
-/// Every cache slot's window plan: a slot's keep reads its own rows, which the next round over it has not yet written.
-pub const Slots = struct {
-    gpa: std.mem.Allocator,
-    plans: []Plan,
-
-    pub fn init(gpa: std.mem.Allocator, d: *const hip.Runtime, dims: model.Dims, streams: usize) !Slots {
-        const plans = try gpa.alloc(Plan, @max(streams, 1));
-        var made: usize = 0;
-        errdefer {
-            for (plans[0..made]) |*p| p.deinit();
-            gpa.free(plans);
-        }
-        for (plans) |*p| {
-            p.* = try Plan.init(d, dims);
-            made += 1;
-        }
-        return .{ .gpa = gpa, .plans = plans };
-    }
-
-    pub fn deinit(s: *Slots) void {
-        for (s.plans) |*p| p.deinit();
-        s.gpa.free(s.plans);
-    }
-
-    /// Cache slot `id`'s plan (null: a slot this rank never leased, so nothing can round or keep it).
-    pub fn planFor(s: *Slots, id: u32) ?*Plan {
-        if (id >= s.plans.len) return null;
-        return &s.plans[id];
-    }
-
-    /// Device bytes the slots take.
-    pub fn bytes(dims: model.Dims, streams: usize) usize {
-        return Plan.bytes(dims) * @max(streams, 1);
-    }
-};
-
-/// A window's rows through the linear attention from its plan: a stream one conv split and delta rule, the norm after.
+/// A round's windows through the linear attention: one conv front and one chain for every stream, the norm after.
 pub fn linear(
     o: Ops,
     m: *const model.Model,
@@ -283,118 +252,58 @@ pub fn linear(
     a: Tensor,
     b: Tensor,
     rows: usize,
-    s: *Slots,
+    s: *Lanes,
 ) !Tensor {
     const d = m.dims;
-    const ch = d.convWidth();
     const kw = d.key_heads * d.key_dim;
     const vw = d.value_heads * d.value_dim;
     const y = try o.arena.of(f32, rows * vw);
-    var off: usize = 0;
-    for (segs) |g| {
-        const p = s.planFor(g.c.id) orelse return error.CachesNotPlanned;
-        const n = g.tokens.len;
-        const qn = try o.arena.of(f32, n * kw);
-        const kept = p.keptOf(index, 0);
-        try pops.convSplit(
-            o,
-            forward.at(qkv, off * ch),
-            l.conv,
-            qn,
-            kept.k,
-            kept.v,
-            p.ref(),
-            index,
-            ch,
-            d.conv,
-            kw,
-            vw,
-            .{ .q = m.qk.q, .k = m.qk.k, .eps = m.qk.eps },
-            .{
-                .a = forward.at(a, off * d.value_heads),
-                .b = forward.at(b, off * d.value_heads),
-                .a_log = l.a_log,
-                .dt_bias = l.dt_bias,
-                .gate = kept.gate,
-                .beta = kept.beta,
-                .count = n * d.value_heads,
-                .heads = d.value_heads,
-            },
-        );
-        try pops.gatedDelta(
-            o,
-            qn,
-            kept.k,
-            kept.v,
-            kept.gate,
-            kept.beta,
-            y + off * vw * 4,
-            p.ref(),
-            index,
-            d.key_heads,
-            d.value_heads,
-            d.key_dim,
-            d.value_dim,
-        );
-        off += n;
-    }
+    const qn = try o.arena.of(f32, rows * kw);
+    var widest: usize = 0;
+    for (segs) |g| widest = @max(widest, g.tokens.len);
+    try o.l.laneFront(.{
+        .x = qkv.ptr,
+        .kind = @backingInt(m.act),
+        .weight = l.conv,
+        .qw = m.qk.q,
+        .kw_w = m.qk.k,
+        .eps = m.qk.eps,
+        .qn = qn,
+        .ga = a.ptr,
+        .gb = b.ptr,
+        .a_log = l.a_log,
+        .dt_bias = l.dt_bias,
+        .channels = @intCast(d.convWidth()),
+        .kernel = @intCast(d.conv),
+        .kw = @intCast(kw),
+        .vw = @intCast(vw),
+        .heads = @intCast(d.value_heads),
+        .layer = @intCast(index),
+        .log_rows = cache.log_rows,
+        .lanes = s.args(),
+    }, segs.len, widest, o.stream);
+    try o.l.laneChain(qn, y, s.args(), segs.len, index, cache.log_rows, cache.late_store, d.key_heads, d.value_heads, o.stream);
     const out = try take(o, m.act, rows * vw);
     try o.gnormOut(y, l.norm, z, out, rows * d.value_heads, d.value_dim, d.eps, d.gate);
     return o.project(out, l.out, rows, l.out.partial);
 }
 
-test "the words keep every slot's arrays and put the pointers on even words" {
-    const l = Layout.of(48);
-    try std.testing.expect(l.ptr % 2 == 0);
-    try std.testing.expect(l.snaps == l.ptr + 2 * slots);
-    try std.testing.expect(l.words == l.snaps + 4 * 48);
-    try std.testing.expect(Layout.start(48) % 2 == 0);
-    try std.testing.expectEqual(@as(usize, 2 * (2 + 2 * 48)), Layout.desc(48));
-    try std.testing.expectEqual(Layout.start(48) + slots * Layout.desc(48), Layout.total(48));
-}
-
-test "the plan path is the default: Flash Next's shapes take it, the shapes its kernels cannot take stay per-row" {
+test "the lane kernels take Flash Next's shapes and refuse the rest" {
     var c = try config.parse(std.testing.allocator, @embedFile("../fixtures/config.json"));
     defer c.deinit();
     const d = try model.Dims.of(&c, 1);
-    try std.testing.expectEqual(@as(usize, 16), d.key_heads);
-    try std.testing.expectEqual(@as(usize, 48), d.value_heads);
-    try std.testing.expectEqual(@as(usize, 4), d.conv);
-    // the shapes the plan kernels are: no variable asks for it
     try std.testing.expect(supported(d, 48));
-    // every other shape keeps the per-row snapshots
     var narrow = d;
     narrow.key_dim = 64;
     try std.testing.expect(!supported(narrow, 48));
-    var odd = d;
-    odd.value_dim = 100;
-    try std.testing.expect(!supported(odd, 48));
-    odd = d;
-    odd.value_heads = 50;
-    try std.testing.expect(!supported(odd, 48));
     var long = d;
     long.conv = 9;
     try std.testing.expect(!supported(long, 48));
     try std.testing.expect(!supported(d, 0));
 }
 
-test "one layer's kept sections sit one after another over the window's rows" {
-    const kw = 16 * 128;
-    const vw = 48 * 128;
-    const vh = 48;
-    var p: Plan = undefined;
-    p.rows = 4;
-    p.room = window_rows;
-    p.key_heads = 16;
-    p.key_dim = 128;
-    p.value_heads = vh;
-    p.value_dim = 128;
-    p.kept_stride = 4 * p.room * (kw + vw + 2 * vh);
-    p.kept = .{ .r = undefined, .ptr = @ptrFromInt(0x1000), .len = 0 };
-    const first = p.keptOf(0, 0);
-    const second = p.keptOf(0, 1);
-    try std.testing.expectEqual(first.k + 4 * kw, second.k);
-    try std.testing.expectEqual(first.k, first.v - 4 * p.rows * kw);
-    try std.testing.expectEqual(first.v, first.gate - 4 * p.rows * vw);
-    try std.testing.expectEqual(first.beta, first.gate + 4 * p.rows * vh);
+test "the words keep every slot's table on an even word" {
+    const l = Layout.of(48);
+    try std.testing.expect(l.ptrs % 2 == 0 and l.tables % 2 == 0);
+    try std.testing.expectEqual(l.tables + 2 * 5 * 48, l.table(48, 1));
 }

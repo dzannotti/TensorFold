@@ -8,6 +8,27 @@ const Dims = model.Dims;
 /// Most rows a verified window holds: the pending token and up to seven drafts (copies use the width; MTP drafts 3).
 pub const max_window = 8;
 
+/// Rows of a DeltaNet layer's pending-row log, and the pending rows past which a chain stores its state in place.
+pub const log_rows = 48;
+pub const late_store = 12;
+
+/// A stream's DeltaNet state beside its window: which buffer holds the live state, and the kept rows still in the log.
+pub const Late = struct {
+    flip: bool = false,
+    first: u32 = 0,
+    pending: u32 = 0,
+
+    /// A window of `rows` rows kept `kept` of them: whole, the spare is the state; part, the kept rows stay pending.
+    pub fn kept(l: *Late, kept_rows: usize, rows: usize) void {
+        if (kept_rows == rows) {
+            l.* = .{ .flip = !l.flip };
+        } else if (l.pending > late_store) {
+            l.first = @intCast((l.first + l.pending) % log_rows);
+            l.pending = @intCast(kept_rows);
+        } else l.pending += @intCast(kept_rows);
+    }
+};
+
 /// Where the bytes of one sparse layer's caches start, and their strides.
 pub const SparseView = struct { k: u64, v: u64, raw: u64, pooled: u64 };
 
@@ -30,6 +51,8 @@ pub const Layout = struct {
     head_dim: usize,
     index_dim: usize,
     ratio: usize,
+    log_layer: usize,
+    samples_layer: usize,
 
     pub fn of(d: Dims, kinds: []const bool, cap: usize, act: model.Kind) Layout {
         var sparse: usize = 0;
@@ -52,6 +75,8 @@ pub const Layout = struct {
             .head_dim = d.head_dim,
             .index_dim = d.index_dim,
             .ratio = d.index_ratio,
+            .log_layer = log_rows * (d.key_heads * d.key_dim + d.value_heads * d.value_dim + 2 * d.value_heads) * 4,
+            .samples_layer = max_window * d.convWidth() * 4,
         };
     }
 
@@ -85,6 +110,11 @@ pub const Layout = struct {
         return max_window * l.linear * l.linearBytes();
     }
 
+    /// Device bytes of a stream's DeltaNet spare states, pending-row logs and conv samples.
+    pub fn lateBytes(l: Layout) usize {
+        return l.linear * (l.state_bytes + l.log_layer + l.samples_layer);
+    }
+
     /// Device bytes of the n-gram conv's input over a window: the tail, then the window's rows.
     pub fn cinBytes(l: Layout) usize {
         return l.tail_bytes + max_window * (l.tail_bytes / l.tail_rows);
@@ -101,6 +131,11 @@ pub const Caches = struct {
     window: hip.DeviceBuffer,
     /// The n-gram conv's input over the last window (the tail, then its rows): a keep takes its new tail from it.
     cin: hip.DeviceBuffer,
+    /// Every DeltaNet layer's spare state, pending-row log and conv input rows of the last window.
+    spare: hip.DeviceBuffer,
+    log: hip.DeviceBuffer,
+    samples: hip.DeviceBuffer,
+    late: Late = .{},
     /// Positions kept, and complete blocks pooled in every sparse layer.
     len: usize = 0,
     pooled: usize = 0,
@@ -135,9 +170,18 @@ pub const Caches = struct {
         errdefer window.free();
         var cin = try hip.DeviceBuffer.alloc(d, layout.cinBytes());
         errdefer cin.free();
+        var spare = try hip.DeviceBuffer.alloc(d, @max(layout.linear * layout.state_bytes, 4));
+        errdefer spare.free();
+        var log = try hip.DeviceBuffer.alloc(d, @max(layout.linear * layout.log_layer, 4));
+        errdefer log.free();
+        var samples = try hip.DeviceBuffer.alloc(d, @max(layout.linear * layout.samples_layer, 4));
+        errdefer samples.free();
         return .{
             .layout = layout,
             .slot = slot,
+            .spare = spare,
+            .log = log,
+            .samples = samples,
             .linear = linear,
             .mem = mem,
             .window = window,
@@ -149,12 +193,16 @@ pub const Caches = struct {
     /// The state of fresh caches again, the memory kept: zeros, no positions, eos before any row.
     pub fn reset(c: *Caches, eos: i64) !void {
         try c.mem.fill8(0);
+        c.late = .{};
         c.len = 0;
         c.pooled = 0;
         c.history = .{ eos, eos };
     }
 
     pub fn deinit(c: *Caches, gpa: std.mem.Allocator) void {
+        c.samples.free();
+        c.log.free();
+        c.spare.free();
         c.cin.free();
         c.window.free();
         c.mem.free();
@@ -177,7 +225,26 @@ pub const Caches = struct {
     pub fn linearAt(c: *const Caches, layer: usize) LinearView {
         const l = c.layout;
         const at = c.mem.base() + l.sparse * l.sparseBytes() + c.slot[layer] * l.linearBytes();
-        return .{ .conv = at, .state = at + l.conv_bytes };
+        return .{ .conv = at, .state = if (c.late.flip) c.spareBase(layer) else at + l.conv_bytes };
+    }
+
+    fn spareBase(c: *const Caches, layer: usize) u64 {
+        return c.spare.base() + c.slot[layer] * c.layout.state_bytes;
+    }
+
+    /// The buffer a window's chain writes its end state to: the one that is not live.
+    pub fn spareState(c: *const Caches, layer: usize) u64 {
+        const l = c.layout;
+        if (c.late.flip) return c.mem.base() + l.sparse * l.sparseBytes() + c.slot[layer] * l.linearBytes() + l.conv_bytes;
+        return c.spareBase(layer);
+    }
+
+    pub fn logAt(c: *const Caches, layer: usize) u64 {
+        return c.log.base() + c.slot[layer] * c.layout.log_layer;
+    }
+
+    pub fn samplesAt(c: *const Caches, layer: usize) u64 {
+        return c.samples.base() + c.slot[layer] * c.layout.samples_layer;
     }
 
     /// Linear layer `layer`'s conv and state in a side buffer at `side` laid out as the caches past the sparse layers.
@@ -292,4 +359,19 @@ test "a window's snapshots hold eight rows at tp 4: the pending token and seven 
     const linear = 3 * 2560 * 4 + 12 * 128 * 128 * 4;
     try std.testing.expectEqual(@as(usize, 8 * 36 * linear), l.windowBytes());
     try std.testing.expectEqual(l.tail_bytes + 8 * (l.tail_bytes / l.tail_rows), l.cinBytes());
+}
+
+test "a window kept whole swaps the states; kept in part its rows stay pending, and past the store limit restart the log" {
+    var l: Late = .{};
+    l.kept(3, 3);
+    try std.testing.expect(l.flip and l.pending == 0);
+    l.kept(2, 4);
+    try std.testing.expectEqual(@as(u32, 2), l.pending);
+    l.pending = late_store + 1;
+    l.first = 40;
+    l.kept(2, 4);
+    try std.testing.expectEqual(@as(u32, (40 + late_store + 1) % log_rows), l.first);
+    try std.testing.expectEqual(@as(u32, 2), l.pending);
+    l.kept(4, 4);
+    try std.testing.expect(!l.flip and l.pending == 0 and l.first == 0);
 }

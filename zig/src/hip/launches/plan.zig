@@ -21,6 +21,32 @@ pub const PlanArgs = extern struct {
     pool: u32 = 0,
 };
 
+/// gated_delta.hip's LaneArgs: a round's DeltaNet lanes (first and rows a slot, [pending, log first, kept, 0] a slot, tables).
+pub const LaneArgs = extern struct { first: u64, count: u64, ctl: u64, tab: u64 };
+
+/// gated_delta.hip's LaneFront.
+pub const LaneFront = extern struct {
+    x: u64,
+    kind: c_int,
+    weight: u64,
+    qw: u64,
+    kw_w: u64,
+    eps: f32,
+    qn: u64,
+    ga: u64,
+    gb: u64,
+    a_log: u64,
+    dt_bias: u64,
+    channels: c_int,
+    kernel: c_int,
+    kw: c_int,
+    vw: c_int,
+    heads: c_int,
+    layer: c_int,
+    log_rows: c_int,
+    lanes: LaneArgs,
+};
+
 /// A plan's shape: `rows` rows (a bucket, padding included) over `slots` slots.
 pub const PlanRef = struct { args: PlanArgs, rows: usize, slots: usize };
 
@@ -439,4 +465,35 @@ test "a small walk splits the heads of a KV head, a wide one keeps them together
     try std.testing.expectEqual(@as(usize, 4), applyGroup(16, 2, 32, 8));
     try std.testing.expectEqual(@as(usize, 16), applyGroup(16, 256, 32, 1));
     try std.testing.expectEqual(@as(usize, 3), applyGroup(6, 16, 24, 1));
+}
+
+/// fn_gdn_lanes_front over `slots` slots whose widest window is `widest` rows.
+pub fn laneFront(l: *const Launcher, c: LaneFront, slots: usize, widest: usize, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(c);
+    const gates = cdiv(widest * @as(usize, @intCast(c.heads)), 128);
+    try l.go(l.plan.lane_front, dim(cdiv(@as(usize, @intCast(c.channels)), 128) + gates, slots, 1), dim(128, 1, 1), 0, s, &a);
+}
+
+/// fn_gdn_lanes_chain of one layer.
+pub fn laneChain(l: *const Launcher, q: u64, y: u64, t: LaneArgs, slots: usize, layer: usize, log_rows: usize, store_above: usize, key_heads: usize, value_heads: usize, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(q);
+    try a.add(y);
+    try a.add(t);
+    try a.add(@as(c_int, @intCast(layer)));
+    try a.add(@as(c_int, @intCast(log_rows)));
+    try a.add(@as(c_int, @intCast(store_above)));
+    try a.add(@as(c_int, @intCast(key_heads)));
+    try a.add(@as(c_int, @intCast(value_heads)));
+    try l.go(l.plan.lane_chain, dim(value_heads, 8, slots), dim(128, 1, 1), 0, s, &a);
+}
+
+/// fn_late_roll of every layer's conv window.
+pub fn laneRoll(l: *const Launcher, t: LaneArgs, slots: usize, layers: usize, channels: usize, taps: usize, s: S) Error!void {
+    var a: Args = .{};
+    try a.add(t);
+    try a.add(@as(c_int, @intCast(channels)));
+    try a.add(@as(c_int, @intCast(taps)));
+    try l.go(l.plan.lane_roll, dim(cdiv(channels, 256), layers, slots), dim(256, 1, 1), 0, s, &a);
 }
