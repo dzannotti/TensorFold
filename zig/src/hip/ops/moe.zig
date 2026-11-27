@@ -38,8 +38,17 @@ pub fn moeSelect(o: Ops, logits: u64, pick: u64, wts: u64, plan: ?struct { items
     try o.l.tf_moe_select(f(logits), i(pick), f(wts), if (plan) |pl| i(pl.items) else null, if (plan) |pl| i(pl.members) else null, int(capacity), int(r), int(experts), int(top_k), o.stream);
 }
 
+/// Pairs past which the plan runs over many blocks.
+pub const wide_from = 2048;
+const route_span = @import("../launches/moe.zig").route_span;
+
 /// The plan: pairs by expert in items of at most `tile` pairs, the `shared` expert's of at most `shared_tile`.
 pub fn moeRoute(o: Ops, picks: u64, pairs: usize, experts: usize, tile: usize, shared: ?usize, shared_tile: usize, members: u64, items: u64, capacity: usize) Error!void {
+    // a prompt's many pairs take the plan over many blocks: the same items and members
+    if (pairs > wide_from) {
+        const hist = try o.arena.of(i32, (pairs + route_span - 1) / route_span * experts);
+        return o.l.tf_moe_route_wide(@ptrFromInt(picks), int(pairs), int(experts), int(tile), if (shared) |e| int(e) else -1, int(shared_tile), i(members), i(items), int(capacity), i(hist), o.stream);
+    }
     try o.l.tf_moe_route(@ptrFromInt(picks), int(pairs), int(experts), int(tile), if (shared) |e| int(e) else -1, int(shared_tile), i(members), i(items), int(capacity), o.stream);
 }
 
