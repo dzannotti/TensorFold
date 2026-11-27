@@ -71,11 +71,12 @@ pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize
     return hcPreQ8(o, m, hc, x, 0, rows, inject);
 }
 
-/// Whether a prompt's streams take gufo's int8 down: off unless TF_HC_Q8=1 (99.51% Spark agreement against 99.56%).
+/// Whether a prompt's streams take gufo's int8 down: on unless TF_HC_Q8=0 (99.51% Spark agreement against 99.56%).
 pub fn q8On(o: Ops, m: *const model.Model) bool {
     if (!fused(o, m) or m.layers.len == 0 or m.layers[0].ahc.down_q8 == 0) return false;
-    const v = std.c.getenv("TF_HC_Q8") orelse return false;
-    return v[0] == '1';
+    if (std.c.getenv("TF_HC_MOE_OFF") != null) return false;
+    const v = std.c.getenv("TF_HC_Q8") orelse return true;
+    return v[0] != '0';
 }
 
 /// hcPre, the down over `xq` (the norm's tiled Q8 copy of x) when it is set.
