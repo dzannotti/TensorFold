@@ -379,14 +379,19 @@ pub const Launcher = struct {
         try l.affine.fillByteLut(r, dot2);
         l.fnx = try flashnext.Fns.load(l.mods[@backingInt(kernels.Group.flashnext)]);
         l.fp4 = try fp4local.Kernels.load(l.mods[@backingInt(kernels.Group.fp4local)], chip, l.loom, kernels.loom_manifests);
-        const sa = [3]kernels.Loom{ .sparse_attend, .idx_scores, .idx_select };
-        var sa_mods: [3]?Module = undefined;
-        var sa_docs: [3][]const u8 = undefined;
+        const sa = [4]kernels.Loom{ .sparse_attend, .sparse_merge, .idx_scores, .idx_select };
+        var sa_mods: [4]?Module = undefined;
+        var sa_docs: [4][]const u8 = undefined;
         for (sa, &sa_mods, &sa_docs) |k, *m, *d| {
             m.* = l.loom[@backingInt(k)];
             d.* = kernels.loom_manifests[@backingInt(k)];
         }
         l.attn = try loom_attention.Kernels.load(sa_mods, sa_docs);
+        // decode and verify rows must share the Loom prompt kernel's sum order (resumed == fresh)
+        if (l.attn.f != null and l.fnx.sparse_wmma == null) {
+            std.log.err("launches: the Loom attention kernels load but tf_fn_sparse_wmma12_bf16 is missing", .{});
+            return error.Invalid;
+        }
         return l;
     }
 

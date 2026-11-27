@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-// Serial replicas of the HIP reference's arithmetic (README: Sum order), one work-item an output, for checks.cxx.
+// Reference arithmetic for checks.cxx: serial replicas of the HIP indexer (README: Sum order), fp64 attention.
 #ifndef SA_ORACLE_H_
 #define SA_ORACLE_H_
 
@@ -11,7 +11,7 @@
 
 namespace sao {
 
-constexpr unsigned kHd = 256, kGroup = 12, kParts = 16, kTile = 32, kIdx = 128, kIdxHeads = 4;
+constexpr unsigned kHd = 256, kGroup = 12, kIdx = 128, kIdxHeads = 4;
 
 static loom::kernel::configuration per_item(unsigned n) { return {{(n + 255) / 256, 1, 1}, {256, 1, 1}}; }
 
@@ -130,64 +130,38 @@ void oracle_place(unsigned n, const int* taken, const int* complete, const int* 
   if ((int)b < end - nb * ratio) row[top * ratio + (int)b] = nb * ratio + (int)b;
 }
 
-// Score of query head h of row r (q scaled as the reference stages it) against key `key` of KV head g.
-LOOM_INLINE float score(const float* q, const __bf16* k, unsigned r, unsigned h, unsigned g, int key, long long cap,
-                        float scale) {
-  float s = 0.0f;
+// fp64 score of query head h of row r (q times scale in fp32, as the kernels stage it) against key `key` of KV head g.
+LOOM_INLINE double score64(const float* q, const __bf16* k, unsigned r, unsigned h, unsigned g, int key, long long cap,
+                           float scale) {
+  double s = 0.0;
   for (unsigned d = 0; d < kHd; d++)
-    s = s + (q[(r * 2 * kGroup + h) * kHd + d] * scale) * bf(k[((long long)g * cap + key) * kHd + d]);
+    s = s + (double)(q[(r * 2 * kGroup + h) * kHd + d] * scale) * (double)bf(k[((long long)g * cap + key) * kHd + d]);
   return s;
 }
 
-// out[r][h][d]: work-item (r, h, d) replays every part, tile, softmax step and the merge of the reference.
+// out[r][h][*]: work-item (r, h), the softmax attention in fp64 (three passes over the keys), rounded to fp32.
 [[loom::kernel(per_item)]]
 void oracle_attend(unsigned n, const float* q, const __bf16* k, const __bf16* v, const int* ids, const int* count,
                    const int* sparse, float* out, long long id_stride, long long cap, float scale) {
   const unsigned i = item();
   if (i >= n) return;
-  const unsigned r = i / (2 * kGroup * kHd), h = (i / kHd) % (2 * kGroup), d = i % kHd, g = h / kGroup;
+  const unsigned r = i / (2 * kGroup), h = i % (2 * kGroup), g = h / kGroup;
   const int cnt = count[r];
   const bool listed = sparse[r] != 0;
-  float po[kParts], pm[kParts], pl[kParts];
-  for (unsigned p = 0; p < kParts; p++) {
-    const int lo = (int)((long long)p * cnt / kParts), hi = (int)((long long)(p + 1) * cnt / kParts);
-    float m = -sa::bits(0x7f800000u), l = 0.0f, o = 0.0f;
-    for (int t0 = lo; t0 < hi; t0 += (int)kTile) {
-      const int tn = hi - t0 < (int)kTile ? hi - t0 : (int)kTile;
-      float sc[32], e[32];
-      int key[32];
-      float top = -sa::bits(0x7f800000u);
-      for (int j = 0; j < tn; j++) {
-        key[j] = listed ? ids[r * id_stride + t0 + j] : t0 + j;
-        sc[j] = score(q, k, r, h, g, key[j], cap, scale);
-        top = loom::scalar::maxnumf(top, sc[j]);
-      }
-      top = loom::scalar::maxnumf(top, m);
-      for (int j = 0; j < 32; j++) e[j] = j < tn ? sa::exp_exact(sc[j] - top) : 0.0f;
-      float s[32];
-      for (unsigned j = 0; j < 32; j++) s[j] = e[j];
-      for (unsigned w = 16; w > 0; w /= 2)
-        for (unsigned j = 0; j < w; j++) s[j] = s[j] + s[j + w];
-      const float sum = s[0];
-      const float f = sa::exp_exact(m - top);
-      l = l * f + sum;
-      m = top;
-      o = o * f;
-      for (int j = 0; j < tn; j++) o = o + e[j] * bf(v[((long long)g * cap + key[j]) * kHd + d]);
-    }
-    po[p] = o;
-    pm[p] = m;
-    pl[p] = l;
+  double top = -1e300, total = 0.0;
+  for (int j = 0; j < cnt; j++) {
+    const double s = score64(q, k, r, h, g, listed ? ids[r * id_stride + j] : j, cap, scale);
+    top = s > top ? s : top;
   }
-  float top = -sa::bits(0x7f800000u);
-  for (unsigned p = 0; p < kParts; p++) top = loom::scalar::maxnumf(top, pm[p]);
-  float total = 0.0f, acc = 0.0f;
-  for (unsigned p = 0; p < kParts; p++) {
-    const float w = pm[p] == -sa::bits(0x7f800000u) ? 0.0f : sa::exp_exact(pm[p] - top);
-    total = total + pl[p] * w;
-    acc = acc + po[p] * w;
+  for (int j = 0; j < cnt; j++) total = total + loom::scalar::expf(score64(q, k, r, h, g, listed ? ids[r * id_stride + j] : j, cap, scale) - top);
+  double acc[kHd];
+  for (unsigned d = 0; d < kHd; d++) acc[d] = 0.0;
+  for (int j = 0; j < cnt; j++) {
+    const int key = listed ? ids[r * id_stride + j] : j;
+    const double p = loom::scalar::expf(score64(q, k, r, h, g, key, cap, scale) - top) / total;
+    for (unsigned d = 0; d < kHd; d++) acc[d] = acc[d] + p * (double)bf(v[((long long)g * cap + key) * kHd + d]);
   }
-  out[i] = total > 0.0f ? acc / total : 0.0f;
+  for (unsigned d = 0; d < kHd; d++) out[(r * 2 * kGroup + h) * kHd + d] = cnt > 0 ? (float)acc[d] : 0.0f;
 }
 
 }  // namespace sao
