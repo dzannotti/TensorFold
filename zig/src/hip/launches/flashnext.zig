@@ -21,6 +21,7 @@ const cdiv = util.cdiv;
 
 pub const Fns = struct {
     hc_norm: Function,
+    hc_moe_norm: Function,
     hc_gates: Function,
     rms_wide: Function,
     rms_wide_waves: Function,
@@ -39,6 +40,7 @@ pub const Fns = struct {
     pub fn load(m: Module) Error!Fns {
         return .{
             .hc_norm = try m.function("tf_fn_hc_norm"),
+            .hc_moe_norm = try m.function("tf_fn_hc_moe_norm"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .rms_wide_waves = try m.function("tf_fn_rms_wide_waves"),
@@ -81,6 +83,13 @@ pub fn hcNorm(
     s: S,
 ) Error!void {
     return hcNormShares(l, h, branch, inject, h_out, x_out, scale, kind, rows, streams, dims, eps, 0, 0, s);
+}
+
+/// The MoE epilogue over bf16 slot rows `y` (rows, slots, 2560), the 4 streams' writeback and their norm in one launch.
+pub fn hcMoeNorm(l: *const Launcher, h: P, y: C, wts: CF, shared: CF, inject: C, scale: CF, x: P, rows: c_int, slots: c_int, eps: f32, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(h), ad(y), ad(wts), ad(shared), ad(inject), ad(scale), ad(x), slots, eps }) |v| try a.add(v);
+    try l.go(l.fnx.hc_moe_norm, dim(rows, 1, 1), dim(320, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.

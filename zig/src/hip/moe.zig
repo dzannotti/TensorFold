@@ -171,6 +171,35 @@ fn router(o: Ops, r: Routed, x: Tensor, logits: u64, rows: usize) ops.Error!void
     try o.moeRouterRows(x, r.rows32, r.rows16, logits, rows, d, r.rows);
 }
 
+/// A prompt's MoE left before its epilogue: the routed slots' bf16 rows, their weights and the shared expert's fp32 rows.
+pub const Pending = struct { y: u64, wts: u64, shared: u64, slots: usize };
+
+/// Whether `pending` takes `r`: a prompt, one rank, the shared expert beside the stack, bf16 rows from the down tile.
+pub fn defers(o: Ops, kind: Kind, r: Routed, rows: usize) bool {
+    return kind == .bf16 and rows > 1 and r.remap == 0 and r.experts.shared != null and r.experts.dims == 2560 and
+        @import("ops/project_fp4local.zig").halfDown(o, r.experts.down);
+}
+
+pub fn pending(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pending {
+    const ex = r.experts;
+    const slots = r.top_k + 1;
+    const size = planRows(o, r.exact, rows);
+    const cap = capacity(size * slots, r.rows);
+    const logits = try o.arena.of(f32, rows * r.rows);
+    const pick = try o.arena.of(i32, size * slots);
+    const wts = try o.arena.of(f32, size * slots);
+    const items = try o.arena.of(i32, cap * 3);
+    const members = try o.arena.of(i32, size * slots);
+    try router(o, r, x, logits, rows);
+    var oh = o;
+    oh.half_down = true;
+    const p = try expertParts(oh, kind, r, x, rows, logits, pick, wts, items, members, cap);
+    var os = o;
+    os.half_down = false;
+    const s = try sharedRun(os, ex.shared.?, x, rows, kind, ex.limit);
+    return .{ .y = p.y, .wts = wts, .shared = s, .slots = slots };
+}
+
 /// down(silu(gate) * up) of `x`'s rows at the shared expert's own widths: (rows, dims) fp32, as the combine reads it.
 fn sharedRun(o: Ops, sh: Shared, x: Tensor, rows: usize, kind: Kind, limit: f32) ops.Error!u64 {
     const width = sh.gate_up.n / 2;
@@ -199,7 +228,9 @@ pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pa
 }
 
 /// Select, plan, gate and up, the activation and down: the rows' slots before the combine.
-fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize) ops.Error!struct { y: u64 } {
+fn expertParts(down_ops: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u64, pick: u64, wts: u64, items: u64, members: u64, cap: usize) ops.Error!struct { y: u64 } {
+    var o = down_ops;
+    o.half_down = false;
     const ex = r.experts;
     const slots = r.top_k + 1;
     const pairs = rows * slots;
@@ -229,7 +260,7 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         try o.moeAct(both, t, pairs, ex.width, ex.limit);
         break :blk t;
     };
-    const y = try o.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows), expert_rows);
+    const y = try down_ops.projectRouted(act_t, ex.down, items, count, members, pairs, 1, @min(tile, rows), expert_rows);
     return .{ .y = y };
 }
 
