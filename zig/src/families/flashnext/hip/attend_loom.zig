@@ -1,4 +1,4 @@
-//! A prompt's sparse attention on the Loom kernels (launches/loom_attention.zig): hipcc's bytes, whole chunks a launch.
+//! A prompt's sparse attention on the Loom kernels (launches/loom_attention.zig): hipcc's bytes, sliced launches.
 const std = @import("std");
 const hip = @import("hip");
 const model = @import("model.zig");
@@ -9,6 +9,10 @@ const Ops = hip.ops.Ops;
 
 /// The most fp32 indexer scores a launch keeps (rows x blocks): past it the rows go in several launches.
 const score_budget = 64 << 20;
+
+/// Rows an attention launch takes: its parts scratch is rows x heads x parts x head_dim fp32.
+const attend_rows = 64;
+const parts = hip.launches.loom_attention.parts;
 
 /// One stream's `rows` prompt rows from `pos`; false, nothing launched, where the Loom kernels do not take the layer.
 pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView, cap: usize, q32: u64, iq: u64, att: u64, rows: usize, pos: usize, host: *forward.Host) !bool {
@@ -56,23 +60,34 @@ pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView
             flags = try host.put(o, std.mem.sliceAsBytes(zeros));
             ids = flags;
         }
-        try k.attend(
-            o.l.r,
-            @ptrFromInt(q32 + r0 * d.heads * d.head_dim * 4),
-            @ptrFromInt(kv.k),
-            @ptrFromInt(kv.v),
-            @ptrFromInt(ids),
-            @intCast(key_stride),
-            @ptrFromInt(count),
-            @ptrFromInt(flags),
-            @ptrFromInt(att + r0 * d.heads * d.head_dim * 4),
-            @intCast(n),
-            @intCast(d.heads),
-            @intCast(d.kv_heads),
-            @intCast(cap),
-            scale,
-            o.stream,
-        );
+        var a0: usize = 0;
+        while (a0 < n) : (a0 += attend_rows) {
+            const an = @min(attend_rows, n - a0);
+            const at = r0 + a0;
+            const inner = o.arena.mark();
+            defer o.arena.release(inner);
+            const po = try o.arena.of(f32, an * d.heads * parts * d.head_dim);
+            const pm = try o.arena.of(f32, an * d.heads * parts * 2);
+            try k.attend(
+                o.l.r,
+                @ptrFromInt(q32 + at * d.heads * d.head_dim * 4),
+                @ptrFromInt(kv.k),
+                @ptrFromInt(kv.v),
+                @ptrFromInt(if (sparse_rows) ids + a0 * key_stride * 4 else ids),
+                @intCast(key_stride),
+                @ptrFromInt(count + a0 * 4),
+                @ptrFromInt(flags + a0 * 4),
+                @ptrFromInt(po),
+                @ptrFromInt(pm),
+                @ptrFromInt(att + at * d.heads * d.head_dim * 4),
+                @intCast(an),
+                @intCast(d.heads),
+                @intCast(d.kv_heads),
+                @intCast(cap),
+                scale,
+                o.stream,
+            );
+        }
     }
     return true;
 }

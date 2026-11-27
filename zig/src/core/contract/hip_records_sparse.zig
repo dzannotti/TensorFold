@@ -34,6 +34,20 @@ pub const records = [_]Record{
     },
     sparseLanes("f16", 74, 72),
     sparseLanes("bf16", 84, 83),
+    .{
+        .launch = .{
+            .name = "flashnext tf_fn_sparse_wmma12_bf16",
+            .symbol = "tf_fn_sparse_wmma12_bf16",
+            .image = "flashnext",
+            .threads = 256,
+        },
+        .usage = .{
+            .{ .vgprs = 0, .served = false },
+            .{ .vgprs = 226, .sgprs = 36, .lds = 33536, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 226, .sgprs = 36, .lds = 33536, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 0, .served = false },
+        },
+    },
 };
 
 test "tf_fn_idx_scores carries its LDS-staged Gate 5 record and fits every served RDNA chip" {
