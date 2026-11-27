@@ -4,14 +4,15 @@ const hip = @import("hip");
 const model = @import("model.zig");
 const cache = @import("cache.zig");
 const forward = @import("forward.zig");
+const mixers = @import("mixers.zig");
 
 const Ops = hip.ops.Ops;
 
 /// The most fp32 indexer scores a launch keeps (rows x blocks): past it the rows go in several launches.
 const score_budget = 64 << 20;
 
-/// One stream's `rows` prompt rows from `pos`; false, nothing launched, where the Loom kernels do not take the layer.
-pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView, cap: usize, q32: u64, iq: u64, att: u64, rows: usize, pos: usize, host: *forward.Host) !bool {
+/// One stream's `rows` prompt rows from `pos`, ends and blocks from `staged` if given; false where Loom does not fit.
+pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView, cap: usize, q32: u64, iq: u64, att: u64, rows: usize, pos: usize, host: *forward.Host, staged: ?mixers.Rows) !bool {
     const k = &o.l.attn;
     if (!o.prefill or m.act != .bf16 or !k.takes(d.heads, d.kv_heads, d.head_dim, d.index_heads, d.index_dim)) return false;
     const key_stride = d.index_top * d.index_ratio + d.index_ratio;
@@ -34,8 +35,8 @@ pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView
             c.* = @divFloor(e.*, @as(i32, @intCast(d.index_ratio)));
             sparse_rows = sparse_rows or c.* > d.index_top;
         }
-        const dev_complete = try host.put(o, std.mem.sliceAsBytes(complete));
-        const dev_ends = try host.put(o, std.mem.sliceAsBytes(ends));
+        const dev_complete = if (staged) |st| st.complete + r0 * 4 else try host.put(o, std.mem.sliceAsBytes(complete));
+        const dev_ends = if (staged) |st| st.ends + r0 * 4 else try host.put(o, std.mem.sliceAsBytes(ends));
         var ids: u64 = 0;
         var count = dev_ends;
         var flags: u64 = 0;
