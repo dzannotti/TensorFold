@@ -278,33 +278,19 @@ pub fn send(o: Ops, host: *Host, s: Staged) !Inputs {
     };
 }
 
-/// The n-gram layer over a segment's rows (from the forward's row `row0`): h += gated + silu(conv) over `cin`.
-fn ple(
-    o: Ops,
-    m: *const model.Model,
-    host: *Host,
-    c: *cache.Caches,
-    h: Tensor,
-    call: Call,
-    cin: u64,
-    in: Inputs,
-    row0: usize,
-) !void {
+/// The n-gram rows' keys and values of every row of a forward in one product: the matrix is read once a forward.
+fn pleKv(o: Ops, m: *const model.Model, host: *Host, rows: usize, in: Inputs) !Tensor {
     const d = m.dims;
-    const rows = call.tokens.len;
     const t = host.tables;
-    const mark = o.arena.mark();
-    defer o.arena.release(mark);
-    const first = row0 * ngram.heads;
     // FP4-Local's rows arrive decoded: the staged bf16 rows are the embedding (token-major, heads in turn)
     const emb: Tensor = switch (t.store) {
-        .nvfp4 => if (m.act == .bf16) .{ .ptr = in.words + first * t.wordBytes(), .kind = .bf16 } else return error.UnsupportedNgramHeads,
+        .nvfp4 => if (m.act == .bf16) .{ .ptr = in.words, .kind = .bf16 } else return error.UnsupportedNgramHeads,
         .mlx => |r| e: {
             const e = try take(o, m.act, rows * d.ple_dim);
             try o.l.tf_embed_rows(
-                @ptrFromInt(in.words + first * t.wordBytes()),
-                @ptrFromInt(in.scales + first * t.tableBytes()),
-                @ptrFromInt(in.biases + first * t.tableBytes()),
+                @ptrFromInt(in.words),
+                @ptrFromInt(in.scales),
+                @ptrFromInt(in.biases),
                 @backingInt(Kind.bf16),
                 @ptrFromInt(in.local),
                 @intCast(rows * ngram.heads),
@@ -318,7 +304,15 @@ fn ple(
             break :e e;
         },
     };
-    const kv = try o.project(emb, m.ple.kv, rows, false);
+    return o.project(emb, m.ple.kv, rows, false);
+}
+
+/// The n-gram layer over a segment's rows, `kv` their rows of `pleKv`: h += gated + silu(conv) over `cin`.
+fn ple(o: Ops, m: *const model.Model, host: *Host, c: *cache.Caches, h: Tensor, call: Call, cin: u64, kv: Tensor) !void {
+    const d = m.dims;
+    const rows = call.tokens.len;
+    const mark = o.arena.mark();
+    defer o.arena.release(mark);
     const gated = try take(o, m.act, rows * d.wide());
     const tail = c.layout.tail_rows * d.wide() * m.act.size();
     try hip.raw.copy(.{ .r = host.d, .ptr = @ptrFromInt(cin), .len = tail }, 0, c.tail(), tail, o.stream);
@@ -411,6 +405,7 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
                     o.stream,
                 ));
             }
+            const kv = try pleKv(o, m, host, rows, in);
             var off: usize = 0;
             for (segs, cins[0..segs.len]) |g, cin| {
                 try ple(
@@ -421,8 +416,7 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
                     at(h, off * d.wide()),
                     .{ .tokens = g.tokens, .pos = g.pos, .window = window, .marks = g.marks },
                     cin,
-                    in,
-                    off,
+                    at(kv, off * m.ple.kv.n),
                 );
                 off += g.tokens.len;
             }
