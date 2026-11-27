@@ -23,14 +23,26 @@ static loom::kernel::configuration configure_down(unsigned items, unsigned row_b
   if (I * 16 < rows) {                                                   \
     [[loom::unroll]] for (unsigned e = 0; e < 8; e++) {                  \
       const unsigned r = I * 16 + 2 * e + (lane >> 4);                   \
-      if (r < rows) out[(unsigned)members[first + m0 + r] * kDnN + c] = acc.a##I[e] * g; \
+      if (r < rows) {                                                    \
+        const unsigned at = (unsigned)members[first + m0 + r] * kDnN + c; \
+        const float v = acc.a##I[e] * g;                                 \
+        if (half) ((unsigned short*)out)[at] = (unsigned short)k4_bf16_bits(v); \
+        else out[at] = v;                                                \
+      }                                                                  \
     }                                                                    \
   }
+
+LOOM_INLINE unsigned k4_bf16_bits(float v) {
+  const unsigned b = __builtin_bit_cast(unsigned, v);
+  const unsigned rn = (b + ((b >> 16) & 1u) + 0x7fffu) >> 16;
+  return v != v ? 0x7fc0u : rn;
+}
 
 [[loom::kernel(configure_down)]]
 void nvfp4_expert_down(const __bf16* x, const unsigned* words, const unsigned char* scales, const float* globals,
                        const int* items, const int* members, float* out, int x_div, int n, int k) {
-  if (n != (int)kDnN || k != (int)kDnK) return;
+  const bool half = n < 0;
+  if ((half ? -n : n) != (int)kDnN || k != (int)kDnK) return;
   LOOM_WORKGROUP __bf16 lds[k4::kArena];
   const unsigned tid = loom::kernel::workitem::id.x;
   const unsigned n0 = loom::kernel::workgroup::id.x * 128, m0 = loom::kernel::workgroup::id.y * k4::kTileRows;

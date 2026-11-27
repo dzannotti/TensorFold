@@ -36,6 +36,8 @@ pub const Ops = struct {
     prefill: bool = false,
     /// A lane round's forward: decode tiles at any row count, so a row's bits ignore the rows it shares a round with.
     window: bool = false,
+    /// The routed down writes bf16 slot rows (the fused MoE epilogue reads them).
+    half_down: bool = false,
     /// rocBLAS on this stream, for bf16 projections (null: the model has none).
     blas: ?*const @import("../blas.zig").Blas = null,
 

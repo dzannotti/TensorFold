@@ -475,6 +475,7 @@ pub const Launcher = struct {
     pub const tf_copy_cols = elementwise.tf_copy_cols;
     pub const tf_dense_rows = elementwise.tf_dense_rows;
     pub const fn_hc_norm = flashnext.hcNorm;
+    pub const fn_hc_moe_norm = flashnext.hcMoeNorm;
     pub const fn_hc_norm_shares = flashnext.hcNormShares;
     pub const fn_hc_gates = flashnext.hcGates;
     pub const fn_hc_mix = flashnext.hcMix;
