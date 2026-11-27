@@ -5,6 +5,7 @@ const cache = @import("cache.zig");
 const forward = @import("forward.zig");
 const head_mod = @import("head.zig");
 const lanes_mod = @import("lanes.zig");
+const Stop = @import("../mtp_stop.zig").Stop;
 
 const be = @import("lanes").backend;
 const Fx = lanes_mod.Fx;
@@ -15,13 +16,18 @@ const Slot = struct {
     lane: *Lane,
     hc: *cache.Caches,
     depth: usize,
-    stop_under: f32,
+    stop: Stop,
     tok: [1]u32 = undefined,
     row_at: usize = 0,
     row_n: usize = 0,
     chained: usize = 0,
     chain: u64 = 0,
 };
+
+/// A chain's stop rule: the policy's (--mtp-confidence) past the first round; a prompt's first chain takes all.
+fn stopFor(e: anytype, r: be.DraftRequest) Stop {
+    return .{ .c = if (r.rows != null) e.o.policy.mtp.confidence else 0 };
+}
 
 /// The head absorbs each stream's kept rows (residual streams and the token after each), then chains its drafts.
 pub fn draft(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
@@ -61,17 +67,18 @@ fn serial(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
         var mixed = forward.at(out.mixed, (follow.len - 1) * m.dims.hidden);
         var streams = out.streams.ptr + (follow.len - 1) * row_bytes;
         const depth = @min(r.depth, lanes_mod.max_depth);
-        // a chain past the first round ends after a draft the head gives under the confidence (--mtp-confidence)
-        const stop_under: f32 = if (r.rows != null) @floatCast(e.o.policy.mtp.confidence) else 0.0;
+        var stop = stopFor(e, r);
         var d: usize = 0;
         var chained: usize = 0;
         while (d < depth) : (d += 1) {
             var tok: [1]u32 = undefined;
             var prob: [1]f32 = undefined;
             try head_mod.draws(o, m, &e.host, e.stream, mixed, 1, f.draft_ids, &tok, &prob, false);
+            const t = stop.take(d, prob[0]);
+            if (!t.propose) break;
             lane.held[d] = tok[0];
             chained = d + 1;
-            if (d + 1 == depth or prob[0] < stop_under) break;
+            if (d + 1 == depth or !t.more) break;
             const step = [_]forward.Seg{.{ .c = hc, .tokens = &tok, .pos = lane.caches.len + d }};
             out = try head_mod.run(o, false, m, &e.host, &step, .{ .ptr = streams, .kind = m.act }, f.ones);
             mixed = out.mixed;
@@ -119,8 +126,7 @@ fn batched(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
             .lane = lane,
             .hc = hc,
             .depth = @min(r.depth, lanes_mod.max_depth),
-            // a chain past the first round ends after a draft the head gives under the confidence (--mtp-confidence)
-            .stop_under = if (r.rows != null) @floatCast(e.o.policy.mtp.confidence) else 0.0,
+            .stop = stopFor(e, r),
             .row_at = rows,
             .row_n = follow.len,
         };
@@ -175,9 +181,10 @@ fn batched(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
     var next: usize = 0;
     for (active[0..active_n]) |si| {
         const s = &slots[si];
+        const t = s.stop.take(0, probs[si]);
         s.lane.held[0] = toks[si];
         s.chained = 1;
-        if (1 < s.depth and !(probs[si] < s.stop_under)) {
+        if (1 < s.depth and t.more) {
             active[next] = si;
             next += 1;
         }
@@ -223,9 +230,11 @@ fn batched(f: *Fx, requests: []const be.DraftRequest) anyerror!void {
         next = 0;
         for (active[0..active_n], 0..) |si, a| {
             const s = &slots[si];
+            const t = s.stop.take(step, probs[a]);
+            if (!t.propose) continue;
             s.lane.held[step] = toks[a];
             s.chained = step + 1;
-            if (step + 1 < s.depth and !(probs[a] < s.stop_under)) {
+            if (step + 1 < s.depth and t.more) {
                 active[next] = si;
                 next += 1;
             }
