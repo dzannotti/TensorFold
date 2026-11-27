@@ -35,6 +35,8 @@ pub const Fns = struct {
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_lanes: [2][2]Function, // the same sums from fp16 and bf16 caches, a lane a key and several heads
     sparse_merge: Function,
+    sparse_chunks: ?Function, // gfx11: 12 heads over a bf16 cache at 256 dims, CUDA attn_chunks' order
+    sparse_chunks_merge: ?Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -56,6 +58,8 @@ pub const Fns = struct {
                 .{ try m.function("tf_fn_sparse_lanes12_f16"), try m.function("tf_fn_sparse_lanes12_bf16") },
             },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
+            .sparse_chunks = m.function("tf_fn_sparse_chunks12_bf16") catch null,
+            .sparse_chunks_merge = m.function("tf_fn_sparse_chunks_merge") catch null,
         };
     }
 };
@@ -509,6 +513,15 @@ pub fn sparseAttentionScalar(
     );
 }
 
+/// 512-key chunks tf_fn_sparse_chunks12_bf16 writes a row (parts_o holds 16 parts: room for them).
+const chunks = 5;
+
+/// Whether the chunks kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims (16 parts' room).
+fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int, parts: c_int) bool {
+    return kernel == .auto and l.fnx.sparse_chunks != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads and
+        parts == 16;
+}
+
 fn sparseWith(
     kernel: enum { auto, scalar },
     l: *const Launcher,
@@ -554,7 +567,14 @@ fn sparseWith(
         parts,
     }) |x| try a.add(x);
     const wide: usize = if (@divExact(heads, kv_heads) <= 6) 0 else 1;
-    if (kernel == .auto and (cache_kind == 1 or cache_kind == 2) and @rem(dims, 8) == 0) {
+    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims, parts)) {
+        var c: Args = .{};
+        inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(parts_o), ad(parts_ms), heads, kv_heads, dims, cap, scale }) |x| try c.add(x);
+        try l.go(l.fnx.sparse_chunks.?, dim(rows, kv_heads, chunks), dim(64, 1, 1), 0, s, &c);
+        var mg: Args = .{};
+        inline for (.{ ad(parts_o), ad(parts_ms), ad(count), ad(out), heads }) |x| try mg.add(x);
+        return l.go(l.fnx.sparse_chunks_merge.?, dim(rows, heads, 1), dim(256, 1, 1), 0, s, &mg);
+    } else if (kernel == .auto and (cache_kind == 1 or cache_kind == 2) and @rem(dims, 8) == 0) {
         var c: Args = .{};
         inline for (.{
             ad(q),

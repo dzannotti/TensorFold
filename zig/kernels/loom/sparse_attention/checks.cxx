@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: MIT
 
-// loom-test / loom-benchmark cases: every kernel byte-equal to the serial replica of the HIP reference (oracle.h).
+// loom-test / loom-benchmark cases: the indexer byte-equal to its serial replica, attention within its bound of fp64
+// and byte-equal across a row split and a repeat (oracle.h).
 #include <loomcxx/check.h>
 #include <loomcxx/kernel.h>
 
 #include "attend.cxx"
+#include "merge.cxx"
 #include "oracle.h"
 #include "scores.cxx"
 #include "select.cxx"
+
+// Attention of NROWS rows (tensors or slices at their first row) into OUT: the parts kernel, then the merge.
+#define SA_ATTEND(Q, IDS, CNT, SP, OUT, NROWS)                                                                         \
+  {                                                                                                                     \
+    const auto po = loom::check::fill<(NROWS) * 24 * 16 * 256, float>(0.0f);                                           \
+    const auto pm = loom::check::fill<(NROWS) * 24 * 16 * 2, float>(0.0f);                                             \
+    loom::check::launch<sparse_attend>(loom::kernel::workload(2u, NROWS), Q, k, v, IDS, CNT, SP, po, pm,              \
+                                       (long long)key_stride, (long long)cap, 24, 2, 256, 0.0625f, 16);                 \
+    loom::check::launch<sparse_merge>(loom::kernel::workload(24u, NROWS), po, pm, OUT, 24, 256, 16);                 \
+  }
 
 // Flash Next prompt rows CTX - ROWS .. CTX - 1 (24 query heads, 2 KV heads, head_dim 256, indexer 4 x 128, ratio 4,
 // top 512 blocks): scores, selection and attention, each against its oracle on the previous stage's output.
@@ -37,8 +49,7 @@
                                   (int)rows, 4, 128, (int)nb, 512);                                                     \
   loom::check::launch<idx_select>(loom::kernel::workload(rows), scores, complete, ends, ids, count, sparse,             \
                                   (long long)nb, (long long)key_stride, 512, 4);                                        \
-  loom::check::launch<sparse_attend>(loom::kernel::workload(2u, rows), q, k, v, ids, count, sparse, out,                \
-                                     (long long)key_stride, (long long)cap, 24, 2, 256, 0.0625f, 16);
+  SA_ATTEND(q, ids, count, sparse, out, rows)
 
 #define SA_CASE(NAME, CTX, ROWS, SEED)                                                                                \
   LOOM_CHECK_CASE(NAME) {                                                                                               \
@@ -54,22 +65,29 @@
     loom::check::launch<sao::oracle_take>(loom::kernel::workload(nscore), nscore, scores, complete, taken, nb, 512);    \
     loom::check::launch<sao::oracle_place>(loom::kernel::workload(nscore), nscore, taken, complete, ends, want_ids,     \
                                            want_count, want_sparse, nb, key_stride, 512, 4);                            \
-    loom::check::launch<sao::oracle_attend>(loom::kernel::workload(nq), nq, q, k, v, ids, count, sparse, want,          \
-                                            (long long)key_stride, (long long)cap, 0.0625f);                            \
+    loom::check::launch<sao::oracle_attend>(loom::kernel::workload(rows * 24), rows * 24, q, k, v, ids, count, sparse, \
+                                            want, (long long)key_stride, (long long)cap, 0.0625f);                       \
+    constexpr unsigned cut = (rows + 1) / 3;                                                                            \
+    const auto split = loom::check::fill<nq, float>(0.0f);                                                              \
+    SA_ATTEND(q, ids, count, sparse, split, cut)                                                                        \
+    SA_ATTEND(loom::check::slice(q, cut * 24 * 256, (rows - cut) * 24 * 256),                                           \
+              loom::check::slice(ids, cut * key_stride, (rows - cut) * key_stride), loom::check::slice(count, cut, rows - cut), \
+              loom::check::slice(sparse, cut, rows - cut), loom::check::slice(split, cut * 24 * 256, (rows - cut) * 24 * 256), \
+              rows - cut)                                                                                               \
     loom::check::expect_bitwise(scores, want_scores);                                                                   \
     loom::check::expect_bitwise(ids, want_ids);                                                                         \
     loom::check::expect_bitwise(count, want_count);                                                                     \
     loom::check::expect_bitwise(sparse, want_sparse);                                                                   \
-    loom::check::expect_bitwise(out, want);                                                                             \
+    loom::check::expect_approximate(out, want, 1e-4, 1e-4);                                                             \
+    loom::check::expect_bitwise(split, out);                                                                            \
   }
 
-// Timed cases: the three kernels on TensorFold's 64-row prompt slice; one more attention launch must repeat its bytes.
+// Timed cases: the four kernels on TensorFold's 64-row prompt slice; one more attention launch must repeat its bytes.
 #define SA_BENCH_CASE(NAME, CTX, ROWS)                                                                                \
   LOOM_CHECK_CASE(NAME) {                                                                                               \
     SA_INPUTS(CTX, ROWS, 7)                                                                                             \
     const auto again = loom::check::fill<nq, float>(0.0f);                                                              \
-    loom::check::launch<sparse_attend>(loom::kernel::workload(2u, rows), q, k, v, ids, count, sparse, again,            \
-                                       (long long)key_stride, (long long)cap, 24, 2, 256, 0.0625f, 16);                 \
+    SA_ATTEND(q, ids, count, sparse, again, rows)                                                                       \
     loom::check::expect_bitwise(again, out);                                                                            \
   }
 
