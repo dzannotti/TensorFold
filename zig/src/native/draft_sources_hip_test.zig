@@ -41,6 +41,7 @@ test "draft sources: HIP Flash Next checkpoint head and explicit zero" {
     var e: f.engine.Engine = undefined;
     var b: f.lanes.Fx = undefined;
     b.e = &e;
+    b.costs = .{};
     b.streams = 4;
     b.drafts = 3;
     e.weights.model.mtp = null;
@@ -49,4 +50,13 @@ test "draft sources: HIP Flash Next checkpoint head and explicit zero" {
     try check(b.facts(), null, true, true);
     b.drafts = 0;
     try check(b.facts(), null, true, false);
+    // the lone windows timed at load reach the lane core's facts
+    b.drafts = 3;
+    b.costs.window[0] = .{ .width = 1, .ms = 40 };
+    b.costs.windows = 1;
+    b.costs.step_ms = 1.5;
+    const timed = b.facts();
+    try check(timed, null, true, true);
+    try @import("std").testing.expectEqual(@as(usize, 1), timed.window_costs.len);
+    try @import("std").testing.expectEqual(@as(f64, 1.5), timed.mtp_step_ms);
 }
