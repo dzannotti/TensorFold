@@ -25,7 +25,7 @@ pub fn rowsOf(p: Projection, from: u32, n: u32) !Projection {
     const at: u64 = from;
     out.handle = switch (p.handle) {
         .mxfp8 => |m| .{ .mxfp8 = .{ .codes = m.codes + at * p.k, .scales = m.scales + at * (p.k / quant.mxfp8_format.block) } },
-        .dense => |d| .{ .dense = .{ .weight = d.weight + at * p.k * d.dtype.size(), .dtype = d.dtype } },
+        .dense => |d| .{ .dense = .{ .weight = d.weight + at * p.k * d.dtype.size(), .dtype = d.dtype, .fold = d.fold } },
         else => return error.UnexpectedTensor,
     };
     return out;
@@ -64,8 +64,11 @@ const Loader = struct {
         return std.fmt.allocPrint(l.a, "{s}.{s}", .{ stem, suffix });
     }
 
+    /// Uploaded; a bf16 matrix is marked FP4-Local's, so its products take the FP4-Local tiles.
     fn put(l: *const Loader, h: Host) !Projection {
-        return quant.view(try quant.upload(l.up.uploader(), h), false);
+        var p = try quant.view(try quant.upload(l.up.uploader(), h), false);
+        if (p.handle == .dense and p.handle.dense.dtype == .bf16) p.handle.dense.fold = true;
+        return p;
     }
 
     fn tensor(l: *const Loader, t: Tensor) !u64 {

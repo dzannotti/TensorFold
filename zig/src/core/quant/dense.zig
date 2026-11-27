@@ -79,8 +79,8 @@ pub fn upload(u: types.Uploader, h: Host) !Device {
     return .{ .weight = try u.tensor(h.weight) };
 }
 
-/// What the kernels read: the weight's address and its element type (fp32, or BF16 / FP16 from `readStored`).
-pub const Matrix = struct { weight: u64, dtype: types.DType = .f32 };
+/// The weight address and element type (f32, or BF16/FP16 from `readStored`); `fold`: FP4-Local's tiles take it.
+pub const Matrix = struct { weight: u64, dtype: types.DType = .f32, fold: bool = false };
 
 pub const View = struct { n: u32, k: u32, matrix: Matrix };
 

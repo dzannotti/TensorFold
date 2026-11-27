@@ -8,6 +8,7 @@ const affine_launch = @import("../launches/affine.zig");
 pub const DenseTile = @import("../launches/dense.zig").Tile;
 const registry = @import("core").registry;
 const Ops = @import("ops.zig").Ops;
+const fp4l = @import("project_fp4local.zig");
 const counting = @import("../launches/util.zig").counting;
 const Error = t.Error;
 const Tensor = t.Tensor;
@@ -31,6 +32,7 @@ fn affineOf(proj: Projection, h: mlx.Matrix) Affine {
 
 /// matmul(x, proj) for a projection of any format: fp32 when `f32_out`, else x's kind (the MLX rules of `affine`).
 pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Error!Tensor {
+    if (fp4l.weightsOf(proj, false)) |w| return fp4l.project(o, x, w, m, f32_out);
     switch (proj.handle) {
         .mlx => |h| return affine(o, x, affineOf(proj, h), m, f32_out),
         .dense => |h| switch (h.dtype) {
@@ -67,9 +69,9 @@ pub fn project(o: Ops, x: Tensor, proj: Projection, m: usize, f32_out: bool) Err
     }
 }
 
-/// FP4-Local's NVFP4 and MXFP8 projections are loaded, but no kernel reads them yet: refused here, nothing runs.
+/// An FP4-Local projection where FP4-Local's kernels have no product of it: refused by name, nothing runs.
 fn noKernels(proj: Projection) Error {
-    std.log.err("no FP4-Local kernels yet: the {t} projection ({d} x {d}) has no HIP product", .{ proj.format(), proj.n, proj.k });
+    std.log.err("no FP4-Local kernel takes this use of the {t} projection ({d} x {d})", .{ proj.format(), proj.n, proj.k });
     return error.NoFp4LocalKernels;
 }
 
@@ -89,6 +91,11 @@ pub fn projectSilu(o: Ops, x: Tensor, proj: Projection, m: usize, act: Tensor) E
 pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: []Tensor) Error!bool {
     var ws: [4]Affine = undefined;
     if (ps.len > ws.len) return false;
+    if (fp4l.weightsOf(ps[0], false) != null) {
+        var fw: [4]fp4l.Weights = undefined;
+        for (ps, fw[0..ps.len]) |pr, *w| w.* = fp4l.weightsOf(pr, false) orelse return false;
+        return fp4l.group(o, x, fw[0..ps.len], m, outs);
+    }
     for (ps, ws[0..ps.len]) |pr, *w| switch (pr.handle) {
         .mlx => |h| w.* = affineOf(pr, h),
         .dense, .bf16, .nvfp4, .mxfp8 => return false,
@@ -100,8 +107,8 @@ pub fn projectGroup(o: Ops, x: Tensor, ps: []const Projection, m: usize, outs: [
 pub fn projectRoutedAct(o: Ops, x: Tensor, proj: Projection, items: u64, count: usize, members: u64, pairs: usize, x_div: usize, rows: usize, limit: f32) Error!?Tensor {
     switch (proj.handle) {
         .mlx => |h| return affineRoutedAct(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, limit),
-        .dense, .bf16 => return null,
-        .nvfp4, .mxfp8 => return noKernels(proj),
+        .dense, .bf16, .mxfp8 => return null,
+        .nvfp4 => return fp4l.routedAct(o, x, fp4l.weightsOf(proj, true).?, items, count, members, pairs, x_div, rows, limit),
     }
 }
 
@@ -240,7 +247,8 @@ pub fn projectRouted(o: Ops, x: Tensor, proj: Projection, items: u64, count: usi
     switch (proj.handle) {
         .mlx => |h| return affineRouted(o, x, affineOf(proj, h), items, count, members, pairs, x_div, rows, expert_rows),
         .dense, .bf16 => return error.BadShape,
-        .nvfp4, .mxfp8 => return noKernels(proj),
+        .nvfp4 => return fp4l.routed(o, x, fp4l.weightsOf(proj, true).?, items, count, members, pairs, x_div, rows, expert_rows),
+        .mxfp8 => return noKernels(proj),
     }
 }
 
@@ -428,4 +436,8 @@ fn kindOf(dtype: quant.DType) Error!t.Kind {
         .f16 => .f16,
         else => error.BadShape,
     };
+}
+
+test {
+    _ = fp4l;
 }
