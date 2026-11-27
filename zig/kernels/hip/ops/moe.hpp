@@ -6,6 +6,62 @@
 
 namespace {
 
+// Each expert's start (the counts' exclusive sums) and its tiles' end (inclusive sums of ceil(count / cut)), over
+// the block's threads: a thread's run of experts, then the block's scan of two ints a thread in `scan`.
+template <class Cut>
+__device__ void route_ranges(const int* counts, int experts, Cut cut, int* starts, int* ends, int* scan) {
+    const int t = threadIdx.x;
+    int* scan_c = scan;
+    int* scan_n = scan_c + blockDim.x;
+    const int per = (experts + blockDim.x - 1) / blockDim.x;
+    const int lo = min(experts, t * per), hi = min(experts, lo + per);
+    int own_c = 0, own_n = 0;
+    for (int e = lo; e < hi; ++e) {
+        own_c += counts[e];
+        own_n += (counts[e] + cut(e) - 1) / cut(e);
+    }
+    scan_c[t] = own_c;
+    scan_n[t] = own_n;
+    __syncthreads();
+    for (int off = 1; off < static_cast<int>(blockDim.x); off <<= 1) {
+        const int vc = t >= off ? scan_c[t - off] : 0, vn = t >= off ? scan_n[t - off] : 0;
+        __syncthreads();
+        scan_c[t] += vc;
+        scan_n[t] += vn;
+        __syncthreads();
+    }
+    int start = scan_c[t] - own_c, end = scan_n[t] - own_n;
+    for (int e = lo; e < hi; ++e) {
+        starts[e] = start;
+        start += counts[e];
+        end += (counts[e] + cut(e) - 1) / cut(e);
+        ends[e] = end;
+    }
+}
+
+// The plan's items over `ends`: item slot -> its expert, first member and pairs (0 past the last tile).
+template <class Cut>
+__device__ void route_items(const int* counts, const int* starts, const int* ends, int experts, Cut cut, int* items,
+                            int capacity) {
+    const int t = threadIdx.x;
+    for (int slot = t; slot < capacity; slot += blockDim.x) {
+        int lo = 0, hi = experts;
+        while (lo < hi) {                       // searchsorted(ends, slot, right=True)
+            int mid = (lo + hi) / 2;
+            if (ends[mid] <= slot) lo = mid + 1;
+            else hi = mid;
+        }
+        int e = lo < experts - 1 ? lo : experts - 1;
+        const int te = cut(e);
+        int reps = (counts[e] + te - 1) / te;
+        int within = slot - (ends[e] - reps);
+        int count = counts[e] - within * te;
+        items[slot * 3] = e;
+        items[slot * 3 + 1] = starts[e] + within * te;
+        items[slot * 3 + 2] = count < 0 ? 0 : (count > te ? te : count);
+    }
+}
+
 // Stable-sorts the pairs by expert into members and cuts items of at most `tile` pairs, the `shared_expert`'s of at
 // most `shared_tile` (-1: none); one block, counted per segment.
 extern "C" __global__ void tf_moe_route(const int* picks, int pairs, int experts, int tile, int shared_expert,
@@ -36,33 +92,7 @@ extern "C" __global__ void tf_moe_route(const int* picks, int pairs, int experts
         counts[e] = run;
     }
     __syncthreads();
-    // starts: the counts' exclusive sums; ends: the tiles' inclusive sums; a thread's experts, then the block's scan
-    int* scan_c = reinterpret_cast<int*>(seg + segs * experts + (segs * experts) % 2);
-    int* scan_n = scan_c + blockDim.x;
-    const int per = (experts + blockDim.x - 1) / blockDim.x;
-    const int lo = min(experts, t * per), hi = min(experts, lo + per);
-    int own_c = 0, own_n = 0;
-    for (int e = lo; e < hi; ++e) {
-        own_c += counts[e];
-        own_n += (counts[e] + cut(e) - 1) / cut(e);
-    }
-    scan_c[t] = own_c;
-    scan_n[t] = own_n;
-    __syncthreads();
-    for (int off = 1; off < static_cast<int>(blockDim.x); off <<= 1) {
-        const int vc = t >= off ? scan_c[t - off] : 0, vn = t >= off ? scan_n[t - off] : 0;
-        __syncthreads();
-        scan_c[t] += vc;
-        scan_n[t] += vn;
-        __syncthreads();
-    }
-    int start = scan_c[t] - own_c, end = scan_n[t] - own_n;
-    for (int e = lo; e < hi; ++e) {
-        starts[e] = start;
-        start += counts[e];
-        end += (counts[e] + cut(e) - 1) / cut(e);
-        ends[e] = end;
-    }
+    route_ranges(counts, experts, cut, starts, ends, reinterpret_cast<int*>(seg + segs * experts + (segs * experts) % 2));
     __syncthreads();
     if (t < segs) {
         for (int p = t * span; p < pairs && p < (t + 1) * span; ++p) {
@@ -71,22 +101,7 @@ extern "C" __global__ void tf_moe_route(const int* picks, int pairs, int experts
             seg[t * experts + e] += 1;
         }
     }
-    for (int slot = t; slot < capacity; slot += blockDim.x) {
-        int lo = 0, hi = experts;
-        while (lo < hi) {                       // searchsorted(ends, slot, right=True)
-            int mid = (lo + hi) / 2;
-            if (ends[mid] <= slot) lo = mid + 1;
-            else hi = mid;
-        }
-        int e = lo < experts - 1 ? lo : experts - 1;
-        const int te = cut(e);
-        int reps = (counts[e] + te - 1) / te;
-        int within = slot - (ends[e] - reps);
-        int count = counts[e] - within * te;
-        items[slot * 3] = e;
-        items[slot * 3 + 1] = starts[e] + within * te;
-        items[slot * 3 + 2] = count < 0 ? 0 : (count > te ? te : count);
-    }
+    route_items(counts, starts, ends, experts, cut, items, capacity);
 }
 
 // moe_router_kernel's logits with a wave's expert row read once for 8 token rows; each logit keeps its bits.
