@@ -37,6 +37,7 @@ pub fn run(a: std.mem.Allocator, _: std.Io, _: Profile) anyerror!g.Tally {
     try loom(a, &r, s, &l, &t);
     try experts(a, &r, s, &l, &t);
     try dense(a, &r, s, &l, &t);
+    try @import("contract_hc_readout.zig").check(a, &r, s, &l, &t);
     return t;
 }
 

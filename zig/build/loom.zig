@@ -12,6 +12,7 @@ pub const Kernel = struct { name: []const u8, dir: []const u8, cxx: ?[]const u8 
 const k4_headers: []const []const u8 = &.{ "grouped_tile.h", "nvfp4_decode.h", "swiglu_exact.h" };
 const sa_headers: []const []const u8 = &.{ "lanes_asm.h", "exp_exact.h" };
 const dg_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h" };
+const hc_headers: []const []const u8 = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h" };
 
 /// The kernels in zig/src/hip/kernels.zig's Loom order.
 pub const kernels = [_]Kernel{
@@ -24,6 +25,10 @@ pub const kernels = [_]Kernel{
     .{ .name = "bf16_gemm_128x128", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
     .{ .name = "bf16_gemm_128x256", .dir = "dense_prompt_gemm", .cxx = "bf16_gemm.cxx", .inputs = dg_headers },
     .{ .name = "gdn_recur", .dir = "gdn_prompt", .cxx = "gdn_recur.cxx", .inputs = &.{"recur.h"} },
+    .{ .name = "hc_norm", .dir = "dense_prompt_gemm", .cxx = "hc_norm.cxx", .inputs = hc_headers },
+    .{ .name = "hc_down_wide", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
+    .{ .name = "hc_down_narrow", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
+    .{ .name = "hc_up_mix", .dir = "dense_prompt_gemm", .cxx = "hc_readout.cxx", .inputs = hc_headers },
 };
 
 /// A directory's loom-test module: gen_tests.py's output (with gen.py's module as its library), or C++ checks.
@@ -35,6 +40,7 @@ const checks = [_]Checks{
     .{ .dir = "sparse_attention", .cxx = "checks.cxx", .inputs = &.{ "lanes_asm.h", "exp_exact.h", "oracle.h", "attend.cxx", "scores.cxx", "select.cxx" } },
     .{ .dir = "dense_prompt_gemm", .cxx = "checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "bf16_gemm.cxx" } },
     .{ .dir = "gdn_prompt", .cxx = "checks.cxx", .inputs = &.{ "recur.h", "oracle.h", "gdn_recur.cxx" } },
+    .{ .dir = "dense_prompt_gemm", .cxx = "hc_checks.cxx", .inputs = &.{ "gemm_tile.h", "bf16_rows.h", "hc_exact.h", "hc_tiles.h", "hc_norm.cxx", "hc_readout.cxx" } },
 };
 
 /// The images' declarations of a build without Loom kernels.
