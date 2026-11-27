@@ -294,7 +294,9 @@ pub fn load(gpa: Allocator, d: *const hip.Runtime, ck: *Checkpoint, c: *const co
         .ple = ple orelse return error.NoPleLayer,
     };
     if (c.mtp.layers > 0) {
-        const draft_rows = try quant.sliceRows(l.a, head, try loader.draftSpans(l.a));
+        const bf16_rows = try quant.sliceRows(l.a, head, try loader.draftSpans(l.a));
+        const affine = @import("draft_affine.zig");
+        const draft_rows = if (try affine.mode() == .affine4) try affine.affine4(l.a, bf16_rows) else bf16_rows;
         const nm = try loader.mtpNames(l.a, mtp_root);
         w.model.mtp = .{
             .e_norm = try l.scale(nm.norm_embedding),

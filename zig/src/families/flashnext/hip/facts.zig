@@ -36,6 +36,28 @@ pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) l
     };
 }
 
+/// `m` with its lone windows' and head step's timed costs: a lone stream's depth rule weighs drafts by time.
+pub fn timed(m: lanes.Model, windows: []const lanes.config.Cost, step_ms: f64) lanes.Model {
+    var out = m;
+    out.window_costs = windows;
+    // shared rounds are untimed: a lone window's ms would price every stream's extra rows as one stream's
+    out.window_costs_lone = true;
+    out.mtp_step_ms = step_ms;
+    return out;
+}
+
+test "timed windows give the depth rule its forward costs; untimed it keeps the fallback by first-draft rate" {
+    const a = std.testing.allocator;
+    const windows = [_]lanes.config.Cost{ .{ .width = 1, .ms = 40 }, .{ .width = 2, .ms = 45 }, .{ .width = 3, .ms = 50 } };
+    var cfg = try lanes.Config.init(a, timed(factsFor(cache.max_window, 1, true, 7), &windows, 1.5), cache.max_window, cache.max_window - 1);
+    defer cfg.deinit(a);
+    try std.testing.expect(!cfg.family_costs.empty());
+    try std.testing.expectEqual(@as(f64, 1.5), cfg.mtp_step_ms);
+    var plain = try lanes.Config.init(a, factsFor(cache.max_window, 1, true, 7), cache.max_window, cache.max_window - 1);
+    defer plain.deinit(a);
+    try std.testing.expect(plain.family_costs.empty());
+}
+
 test "the shared round's copy window: the lane core takes three copies, a lone stream the whole window" {
     const a = std.testing.allocator;
     var cfg = try lanes.Config.init(a, factsFor(cache.max_window, 2, true, 3), cache.max_window, cache.max_window - 1);
