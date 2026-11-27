@@ -7,7 +7,7 @@ Prompt-length products `y = x . W^T` with bf16 activations and fp32 sums, writte
 
 | file | job |
 |---|---|
-| `gemm_tile.h` | generic WMMA tile: geometry, LDS staging two stages ahead, the fold order, any chunk decoder |
+| `gemm_tile.h` | generic WMMA tile: geometry, LDS staging one stage ahead, the fold order, any chunk decoder |
 | `bf16_rows.h` | bf16 weights as the tile's decoder (16-byte chunks staged as they are) |
 | `bf16_gemm.cxx` | `bf16_gemm_128x128`, `bf16_gemm_128x256`: fp32 out |
 | `checks.cxx` | `LOOM_CHECK_CASE` / `LOOM_CHECK_BENCHMARK`: fp32 oracle, tile and cut byte identity, Flash Next shapes |
@@ -25,7 +25,7 @@ Prompt-length products `y = x . W^T` with bf16 activations and fp32 sums, writte
 `Geometry<WR, WC, NT>`: WR x WC waves; a wave owns 32 rows by 16 NT columns (2 x NT 16x16 fragments), so a block
 is 32 WR rows by 16 NT WC columns. A stage is 32 inputs of every block row of x and of weights, in LDS with rows
 40 inputs apart (16-byte reads of 16 rows land on distinct banks), double-buffered. Each work-item stages fixed
-16-byte chunks; a chunk is fetched two stages ahead, held in registers, and stored once the stage before it is
+16-byte chunks; a chunk is fetched one stage ahead into registers and stored once the stage before it is
 read, with one barrier a stage. Rows past `m` and columns past `n` read a live row, and their sums are never
 stored. A wave whose row fragments are all past `m` only stages. The weight decoder (`Dec`) turns a fetched chunk
 into 8 exact bf16 inputs; a GGUF or other format plugs in there (scales not exact in bf16 belong outside the
