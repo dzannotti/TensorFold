@@ -152,3 +152,37 @@ pub fn tf_moe_route(l: *const Launcher, picks: CI, pairs: c_int, experts: c_int,
     const seg_bytes = std.mem.alignForward(usize, segs * ex * 2, 4);
     try l.go(l.op.moe_route, dim(1, 1, 1), dim(256, 1, 1), @intCast(3 * ex * 4 + seg_bytes + 2 * 256 * 4), s, &a);
 }
+
+/// Pairs a span of the wide plan covers (moe_route_wide.hpp kRouteSpan).
+pub const route_span = 512;
+
+/// tf_moe_route's bytes over many blocks; `hist` holds ceil(pairs / route_span) x experts ints.
+pub fn tf_moe_route_wide(l: *const Launcher, picks: CI, pairs: c_int, experts: c_int, tile: c_int, shared: c_int, shared_tile: c_int, members: I, items: I, capacity: c_int, hist: I, s: S) Error!void {
+    if (experts > 1024 or pairs < 1) return invalid("moe_route_wide");
+    const spans: c_int = @intCast(cdiv(pairs, route_span));
+    const ex: usize = @intCast(experts);
+    var a: Args = .{};
+    try a.add(ad(picks));
+    try a.add(pairs);
+    try a.add(experts);
+    try a.add(ad(hist));
+    try l.go(l.op.moe_route_wide[0], dim(spans, 1, 1), dim(256, 1, 1), @intCast(ex * 4), s, &a);
+    var b: Args = .{};
+    try b.add(ad(hist));
+    try b.add(spans);
+    try b.add(experts);
+    try b.add(tile);
+    try b.add(shared);
+    try b.add(shared_tile);
+    try b.add(ad(items));
+    try b.add(capacity);
+    // counts, starts and ends, then the block's scan of two ints a thread
+    try l.go(l.op.moe_route_wide[1], dim(1, 1, 1), dim(1024, 1, 1), @intCast(3 * ex * 4 + 2 * 1024 * 4), s, &b);
+    var c: Args = .{};
+    try c.add(ad(picks));
+    try c.add(pairs);
+    try c.add(experts);
+    try c.add(ad(hist));
+    try c.add(ad(members));
+    try l.go(l.op.moe_route_wide[2], dim(spans, 1, 1), dim(256, 1, 1), 0, s, &c);
+}

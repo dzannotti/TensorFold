@@ -10,6 +10,7 @@
 #include "rope.hpp"
 #include "norms.hpp"
 #include "moe.hpp"
+#include "moe_route_wide.hpp"
 #include "nemotron_moe.hpp"
 #include "draw.hpp"
 #include "tp.hpp"
