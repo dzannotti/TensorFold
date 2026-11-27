@@ -63,6 +63,7 @@ pub fn project(o: Ops, x: Tensor, w: Weights, m: usize, f32_out: bool) Error!Ten
 fn run(o: Ops, fmt: fp4.Format, a: fp4.Arg, items: c_int, expert_rows: c_int) Error!void {
     const k = &o.l.fp4;
     if (o.prefill) return k.promptGo(o.l.r, fmt, a, items, expert_rows, o.stream);
+    if (o.window and fmt == .nvfp4 and a.route.items != 0 and a.global_layout == .expert and a.m >= 12) return k.expertsGo(o.l.r, a, items, false, 0, o.stream);
     return k.streamGo(o.l.r, fmt, a, .{}, items, o.stream);
 }
 

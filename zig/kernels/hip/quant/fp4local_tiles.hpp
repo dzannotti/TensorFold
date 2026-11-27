@@ -14,6 +14,7 @@
 #include "tiles/matrix_gemm.hpp"
 #include "tiles/matrix_item.hpp"
 #include "tiles/matrix_pair.hpp"
+#include "tiles/wmma_experts.hpp"
 #include "tiles/stream.hpp"
 
 namespace tf {
@@ -52,6 +53,19 @@ template <int F>
 __global__ void __launch_bounds__(256) fp4l_item(Affine a) {
     a.route.few = 0;
     wmma_item_tile<Fp4LocalDecoder<F>, BF16Act, WmmaBF16, GemmOut<WmmaBF16>, 4, Fp4LocalNoFew>(a);
+}
+
+// A decode round's routed item of up to 16 pairs: one 16-row WMMA tile, the expert's weights read once an item.
+template <int F>
+__global__ void __launch_bounds__(256) fp4l_item16(Affine a) {
+    a.route.few = 0;
+    wmma_item_tile<Fp4LocalDecoder<F>, BF16Act, WmmaBF16, GemmOut<WmmaBF16>, 1, Fp4LocalNoFew>(a);
+}
+
+// A decode round's routed experts on one wave a (item, 16 columns): plain sums, or silu(gate) x up of a (gate | up) stack.
+template <bool PAIR>
+__global__ void __launch_bounds__(32 * kExpertWaves) fp4l_experts(Affine a, float limit) {
+    wmma_experts_tile<PAIR>(a, limit);
 }
 
 // A routed (gate | up) prompt product with silu(gate) x up in the epilogue: act (pairs, n / 2) in a.out16.

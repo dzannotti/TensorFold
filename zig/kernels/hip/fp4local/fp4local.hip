@@ -28,6 +28,9 @@ template __global__ void fp4l_wmma<0>(Affine);
 template __global__ void fp4l_wmma<1>(Affine);
 template __global__ void fp4l_wmma<2>(Affine);
 template __global__ void fp4l_item<0>(Affine);
+template __global__ void fp4l_item16<0>(Affine);
+template __global__ void fp4l_experts<false>(Affine, float);
+template __global__ void fp4l_experts<true>(Affine, float);
 template __global__ void fp4l_pair<0>(Affine, float);
 template __global__ void fp4l_pair<1>(Affine, float);
 

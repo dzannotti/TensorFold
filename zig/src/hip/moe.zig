@@ -50,6 +50,12 @@ const LANE_ROWS = 8;
 const BLOCK_ROWS = 128;
 const BLOCK_FROM = 64;
 const TILE = 16;
+/// A decode round's NVFP4 items: the item tile's 16 rows hold an expert's pairs, its weights read once.
+const NVFP4_LANE_ROWS = 16;
+
+fn laneRows(ex: Experts, o: Ops) usize {
+    return if (o.window and ex.fused.handle == .nvfp4) NVFP4_LANE_ROWS else LANE_ROWS;
+}
 
 /// MoEBuffers' size for `rows` rows: the next power of two from 16.
 pub fn bucket(rows: usize) usize {
@@ -64,7 +70,11 @@ pub fn planRows(o: Ops, exact: bool, rows: usize) usize {
 
 /// max_items(pairs, experts, min(TILE, LANE_ROWS)): an item a used expert plus one a tile of pairs past its first.
 pub fn capacity(pairs: usize, experts: usize) usize {
-    return @min(pairs, experts) + pairs / @min(TILE, LANE_ROWS);
+    return capacityOf(pairs, experts, LANE_ROWS);
+}
+
+fn capacityOf(pairs: usize, experts: usize, lane: usize) usize {
+    return @min(pairs, experts) + pairs / @min(TILE, lane);
 }
 
 /// The fewest rows a prompt pass cuts at the GEMM tile on this build's card: its tuning table's, else BLOCK_FROM.
@@ -117,7 +127,7 @@ pub fn run(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, prefill: bool)
     const slots = r.top_k + 1;
     const size = planRows(o, r.exact, rows);
     const pairs = rows * slots;
-    const cap = capacity(size * slots, r.rows);
+    const cap = capacityOf(size * slots, r.rows, laneRows(r.experts, o));
     const logits = try o.arena.of(f32, rows * r.rows);
     const pick = try o.arena.of(i32, size * slots);
     const wts = try o.arena.of(f32, size * slots);
@@ -179,7 +189,7 @@ pub fn parts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize) ops.Error!Pa
     std.debug.assert(r.experts.shared == null);
     const slots = r.top_k + 1;
     const size = planRows(o, r.exact, rows);
-    const cap = capacity(size * slots, r.rows);
+    const cap = capacityOf(size * slots, r.rows, laneRows(r.experts, o));
     const logits = try o.arena.of(f32, rows * r.rows);
     const pick = try o.arena.of(i32, size * slots);
     const wts = try o.arena.of(f32, size * slots);
@@ -203,12 +213,12 @@ fn expertParts(o: Ops, kind: Kind, r: Routed, x: Tensor, rows: usize, logits: u6
         count = slots;
     } else {
         try o.moeSelect(logits, pick, wts, null, 0, rows, r.count(), r.top_k);
-        tile = tileFor(o, rows);
+        tile = @max(tileFor(o, rows), if (o.window) laneRows(ex, o) else 0);
         // the stacked shared expert is the last id; beside the stack its items are zeroed below, so it keeps the tile
         const shared: ?usize = if (ex.shared == null) r.count() else null;
         try o.moeRoute(pick, pairs, r.rows, tile, shared, sharedTileFor(o, rows), members, items, cap);
         // the launches' m: the most rows an item holds, the shared expert's whole item in a prompt pass
-        tile = itemRowsFor(o, rows, shared != null);
+        tile = @max(itemRowsFor(o, rows, shared != null), if (o.window) laneRows(ex, o) else 0);
     }
     // beside the stack the shared pair's id is the stack's first id past its experts: zero its item, never read its row
     if (ex.shared != null) try o.moeForeignItems(items, count, ex.count);

@@ -37,7 +37,7 @@ const cases = [_]Case{
     .{ .name = "bf16 hc up", .fmt = .bf16, .n = 10240, .k = 320 },
     .{ .name = "bf16 router", .fmt = .bf16, .n = 512, .k = 2560 },
 };
-const decode_rows = [_]usize{ 1, 2, 4, 8 };
+const decode_rows = [_]usize{ 1, 2, 4, 8, 12, 16, 20, 32, 64 };
 
 /// Weight bytes of one (n, k) projection in its format.
 fn weightBytes(fmt: fp4.Format, n: usize, k: usize) usize {
@@ -82,6 +82,11 @@ const Sampler = struct {
 /// A plan of `pairs` = rows x top_k pairs over the experts: random experts, grouped by expert in items.
 const Plan = struct { items: []i32, members: []i32, count: usize, most: usize };
 
+fn hot() u64 {
+    const v = std.c.getenv("FP4L_HOT") orelse return experts;
+    return std.fmt.parseInt(u64, std.mem.span(v), 10) catch experts;
+}
+
 fn plan(rng: *rig.Rng, rows: usize) !Plan {
     const pairs = rows * top_k;
     const expert = try gpa.alloc(u32, pairs);
@@ -91,7 +96,7 @@ fn plan(rng: *rig.Rng, rows: usize) !Plan {
         for (0..top_k) |s| {
             var e: u32 = undefined;
             while (true) {
-                e = @intCast(rng.next() % experts);
+                e = @intCast(rng.next() % hot());
                 if (std.mem.indexOfScalar(u32, picked[0..s], e) == null) break;
             }
             picked[s] = e;
@@ -136,7 +141,9 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
     defer start.deinit();
     var end = try Event.init(&t.r, true);
     defer end.deinit();
+    const only = std.c.getenv("FP4L_ONLY");
     for (cases) |cs| for ([_]bool{ false, true }) |prompt| {
+        if (only) |o| if (std.mem.indexOf(u8, cs.name, std.mem.span(o)) == null or prompt) continue;
         const routed = cs.kind != .plain;
         const one = weightBytes(cs.fmt, cs.n, cs.k);
         const stack: usize = if (routed) experts else 1;
@@ -232,6 +239,7 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
                 fn go(r: *Rig, k: *const fp4.Kernels, c: Case, arg0: fp4.Arg, it: c_int, er: c_int, pr: bool, tile: bool) !void {
                     var arg = arg0;
                     const s = r.stream.handle;
+                    if (!pr and tile and c.kind != .plain and c.fmt == .nvfp4) return k.expertsGo(r.on.r, arg, it, c.kind == .pair, 0, s);
                     const stream = if (tile) &fp4.Kernels.tileGo else &fp4.Kernels.streamGo;
                     if (pr and c.kind == .pair) {
                         if (!tile and k.experts.takesGateUp(arg, 0)) return k.experts.gateUpGo(r.on.r, arg, it, s);
@@ -257,10 +265,10 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
             }.go;
             // twice where a Loom kernel may serve it: as served, then on the hipcc tiles alone
             const both = (cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null) or (cs.fmt == .nvfp4 and prompt and kn.experts.f != null) or
-                (cs.fmt == .bf16 and prompt and kn.dense.f != null);
+                (cs.fmt == .bf16 and prompt and kn.dense.f != null) or (cs.fmt == .nvfp4 and cs.kind != .plain and !prompt);
             for (0..if (both) 2 else 1) |pass| {
                 const tile = pass == 1;
-                const who: []const u8 = if (!both) "" else if (tile) " [hipcc]" else " [served]";
+                const who: []const u8 = if (!both) "" else if (cs.kind != .plain and !prompt) (if (tile) " [wmma]" else " [stream]") else if (tile) " [hipcc]" else " [served]";
                 for (args, its) |a, it| try launch(t, &kn, cs, a, it, expert_rows, prompt, tile);
                 try t.stream.synchronize();
                 try start.record(t.stream);

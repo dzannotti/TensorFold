@@ -55,6 +55,8 @@ pub const Kernels = struct {
     stream: [3][rows_of.len][cbs.len][2]?Function,
     wmma: [3]Function,
     item: Function,
+    item16: Function,
+    waves: [2]Function,
     /// The (gate | up) prompt tile with silu(gate) x up in its epilogue: NVFP4 and MXFP8.
     pair: [2]Function,
     caps: Caps,
@@ -77,7 +79,7 @@ pub const Kernels = struct {
         const d1 = @backingInt(kernels.Loom.bf16_gemm_128x256);
         const dense = try bf16_gemm.Kernels.load(.{ loom[d0], loom[d1] }, .{ manifests[d0], manifests[d1] });
         @setEvalBranchQuota(100_000);
-        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
+        var k: Kernels = .{ .stream = @splat(@splat(@splat(@splat(null)))), .wmma = undefined, .item = undefined, .item16 = undefined, .waves = undefined, .pair = undefined, .caps = caps, .matrix = caps.matrix == .wmma11, .gemv = try mxfp8_gemv.Kernels.load(loom[gemv], manifests[gemv]), .experts = experts, .dense = dense };
         inline for (0..3) |f| {
             const words = (Format.chunkWords(@fromBackingInt(@intCast(f))));
             inline for (rows_of, 0..) |rows, ri| inline for (cbs, 0..) |cb, ci| inline for (0..2) |pair| {
@@ -90,6 +92,8 @@ pub const Kernels = struct {
             k.wmma[f] = try m.function(std.fmt.comptimePrint("_ZN2tf4rocm9fp4l_wmmaILi{d}EEEvNS0_6AffineE", .{f}));
         }
         k.item = try m.function("_ZN2tf4rocm9fp4l_itemILi0EEEvNS0_6AffineE");
+        k.item16 = try m.function("_ZN2tf4rocm11fp4l_item16ILi0EEEvNS0_6AffineE");
+        k.waves = .{ try m.function("_ZN2tf4rocm12fp4l_expertsILb0EEEvNS0_6AffineEf"), try m.function("_ZN2tf4rocm12fp4l_expertsILb1EEEvNS0_6AffineEf") };
         k.pair = .{ try m.function("_ZN2tf4rocm9fp4l_pairILi0EEEvNS0_6AffineEf"), try m.function("_ZN2tf4rocm9fp4l_pairILi1EEEvNS0_6AffineEf") };
         return k;
     }
@@ -189,6 +193,26 @@ pub const Kernels = struct {
         try args.add(@as(c_int, p.lpc_log2));
         const grid = stream_layout.grid(true, blocks, @intCast(util.cdiv(a.m, @as(usize, @intCast(p.rows)))), items);
         try go(r, p.f, grid, 32 * affine.stream_waves, s, &args);
+    }
+
+    /// A decode round's routed items of up to 16 pairs on one 16-row matrix tile: each expert read once an item.
+    pub fn itemGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, s: abi.Stream) Error!void {
+        if (!k.matrix) return refuse("the FP4-Local item tile needs gfx11's matrix cores");
+        if (a.m < 1 or a.m > 16 or a.n < 1 or @rem(a.k, 128) != 0 or a.x % 16 != 0 or a.route.items == 0) return refuse("item shape");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try go(r, k.item16, util.dim(util.cdiv(a.n, 128), 1, items), 256, s, &args);
+    }
+
+    /// A decode round's routed experts, one wave a (item, 16 columns), the expert read once an item; `pair`: silu(gate) x up.
+    pub fn expertsGo(k: *const Kernels, r: *const runtime.Runtime, a: Arg, items: c_int, pair: bool, limit: f32, s: abi.Stream) Error!void {
+        if (!k.matrix) return refuse("the FP4-Local expert tile needs gfx11's matrix cores");
+        if (a.m < 1 or @rem(a.k, 128) != 0 or a.x % 16 != 0 or a.route.items == 0 or @rem(a.n, 32) != 0 or (pair and a.out16 == 0)) return refuse("experts shape");
+        var args: hl.Args = .{};
+        try args.add(a);
+        try args.add(limit);
+        const tiles = util.cdiv(if (pair) @divExact(a.n, 2) else a.n, 16);
+        try go(r, k.waves[@intFromBool(pair)], util.dim(util.cdiv(tiles, 4), 1, items), 128, s, &args);
     }
 
     /// The prompt tile over `a` (or every item of a plan): 128 x 128 blocks, or the 64-row item tile for small items.
