@@ -52,6 +52,7 @@ pub const dsv41 = @import("launches/dsv41.zig");
 pub const fp4local = @import("launches/fp4local.zig");
 pub const mxfp8_gemv = @import("launches/mxfp8_gemv.zig");
 pub const nvfp4_experts = @import("launches/nvfp4_experts.zig");
+pub const bf16_gemm = @import("launches/bf16_gemm.zig");
 pub const loom_attention = @import("launches/loom_attention.zig");
 
 pub const ConvArgs = conv.ConvArgs;

@@ -22,6 +22,14 @@ pub const Tile = enum {
     /// The Loom grouped-expert kernels (launches/nvfp4_experts.zig): gate|up with SwiGLU, and down.
     loom_gate_up,
     loom_down,
+    /// The Loom dense bf16 GEMMs (launches/bf16_gemm.zig), each block tile.
+    loom_bf16_128x128,
+    loom_bf16_128x256,
+
+    /// A Loom dense bf16 GEMM tile.
+    pub fn dense(t: Tile) bool {
+        return t == .loom_bf16_128x128 or t == .loom_bf16_128x256;
+    }
 
     /// The tile writes silu(gate) x up activations (pairs, n / 2) in bf16.
     pub fn act(t: Tile) bool {
@@ -41,6 +49,18 @@ pub const loom_registrations = [_]Reg{
     } },
     .{ .name = "loom nvfp4_expert_down (NVFP4 routed plan, fp32 out)", .fmt = .nvfp4, .tile = .loom_down, .routed = true, .served = &.{
         .{ .rows = 90, .n = 2560, .k = 640 }, .{ .rows = 40, .n = 2560, .k = 640 }, .{ .rows = 7, .n = 2560, .k = 640 }, .{ .rows = 300, .n = 2560, .k = 640 },
+    } },
+};
+
+/// The Loom dense bf16 GEMMs at Flash Next's hyper-connection shapes (down with and without inject rows, up).
+pub const dense_registrations = [_]Reg{
+    .{ .name = "loom bf16_gemm_128x128 (BF16, fp32 out)", .fmt = .bf16, .tile = .loom_bf16_128x128, .served = &.{
+        .{ .rows = 300, .n = 324, .k = 10240 }, .{ .rows = 129, .n = 10240, .k = 320 }, .{ .rows = 1, .n = 320, .k = 10240 },
+        .{ .rows = 200, .n = 10240, .k = 320 },
+    } },
+    .{ .name = "loom bf16_gemm_128x256 (BF16, fp32 out)", .fmt = .bf16, .tile = .loom_bf16_128x256, .served = &.{
+        .{ .rows = 300, .n = 324, .k = 10240 }, .{ .rows = 129, .n = 320, .k = 10240 }, .{ .rows = 7, .n = 324, .k = 10240 },
+        .{ .rows = 65, .n = 10240, .k = 320 },
     } },
 };
 
@@ -133,7 +153,7 @@ pub const Case = struct {
                 .depth = if (prompt) depthPrompt else depthStream,
                 .ops = if (self.reg.fmt == .nvfp4) 1 else 0,
                 .out = if (pair) .bf16 else .f32,
-                .replaces = if (self.reg.tile == .item or self.reg.tile == .loom_down) "fp4l_wmma" else if (pair) "fp4l_wmma then moe_act" else null,
+                .replaces = if (self.reg.tile == .item or self.reg.tile == .loom_down or self.reg.tile.dense()) "fp4l_wmma" else if (pair) "fp4l_wmma then moe_act" else null,
                 .served = self.reg.served,
                 .tiles = if (prompt)
                     .{ .{ .size = if (self.reg.tile == .item) 64 else 128 }, .{ .size = 128 }, .{} }
@@ -159,6 +179,7 @@ pub const Case = struct {
         const ex = hip.launches.nvfp4_experts;
         if (self.reg.tile == .loom_gate_up and (shape.n != 2 * ex.gate_up.n or shape.k != ex.gate_up.k)) return false;
         if (self.reg.tile == .loom_down and (shape.n != ex.down.n or shape.k != ex.down.k)) return false;
+        if (self.reg.tile.dense() and shape.k % 64 != 0) return false;
         self.rig.reset();
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
@@ -276,6 +297,8 @@ pub const Case = struct {
             .pair => try f.pairGo(r, self.reg.fmt, arg, self.items, 0, s),
             .loom_gate_up => try f.experts.gateUpGo(r, arg, self.items, s),
             .loom_down => try f.experts.downGo(r, arg, self.items, s),
+            .loom_bf16_128x128 => try f.dense.go(r, .t128x128, arg, s),
+            .loom_bf16_128x256 => try f.dense.go(r, .t128x256, arg, s),
         }
         try self.rig.s.synchronize();
     }

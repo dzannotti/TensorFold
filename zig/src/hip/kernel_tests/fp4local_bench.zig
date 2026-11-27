@@ -33,6 +33,7 @@ const cases = [_]Case{
     .{ .name = "nvfp4 down routed", .fmt = .nvfp4, .n = 2560, .k = 640, .kind = .routed },
     .{ .name = "bf16 lm_head", .fmt = .bf16, .n = 248320, .k = 2560 },
     .{ .name = "bf16 hc down", .fmt = .bf16, .n = 320, .k = 10240 },
+    .{ .name = "bf16 hc down+inject", .fmt = .bf16, .n = 324, .k = 10240 },
     .{ .name = "bf16 hc up", .fmt = .bf16, .n = 10240, .k = 320 },
     .{ .name = "bf16 router", .fmt = .bf16, .n = 512, .k = 2560 },
 };
@@ -255,7 +256,8 @@ test "hip-fp4local-bench: FP4-Local's products at the checkpoint's shapes, roofl
                 }
             }.go;
             // twice where a Loom kernel may serve it: as served, then on the hipcc tiles alone
-            const both = (cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null) or (cs.fmt == .nvfp4 and prompt and kn.experts.f != null);
+            const both = (cs.fmt == .mxfp8 and !prompt and kn.gemv.f != null) or (cs.fmt == .nvfp4 and prompt and kn.experts.f != null) or
+                (cs.fmt == .bf16 and prompt and kn.dense.f != null);
             for (0..if (both) 2 else 1) |pass| {
                 const tile = pass == 1;
                 const who: []const u8 = if (!both) "" else if (tile) " [hipcc]" else " [served]";
