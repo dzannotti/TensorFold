@@ -17,6 +17,10 @@ pub const fp8 = @import("fp8.zig");
 pub const nvfp4 = @import("nvfp4.zig");
 /// AutoGPTQ v1 weights (4-bit symmetric groups of 128) and their fp64 reference; host only, as `fp8`.
 pub const gptq = @import("gptq.zig");
+/// gfx1151 FP4-Local's baked NVFP4 and MXFP8 layouts and the decode their kernels compute; host only, as `fp8`.
+pub const nvfp4_format = @import("nvfp4_format.zig");
+pub const mxfp8_format = @import("mxfp8_format.zig");
+pub const fp4local_decode = @import("fp4local_decode.zig");
 pub const widen = @import("widen.zig");
 
 const Allocator = std.mem.Allocator;
@@ -235,5 +239,8 @@ test {
     _ = experts;
     _ = fp8;
     _ = nvfp4;
+    _ = nvfp4_format;
+    _ = mxfp8_format;
+    _ = fp4local_decode;
     _ = widen;
 }
