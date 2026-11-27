@@ -8,6 +8,11 @@ const mixers = @import("mixers.zig");
 
 const Ops = hip.ops.Ops;
 
+/// The fewest rows of a launch that take gufo's cohort kernel: below it the per-row kernels are faster.
+const gufo_rows = 64;
+/// tf_fn_idx_mask's most mask words a row.
+const gufo_mask_words = 4096;
+
 /// The most fp32 indexer scores a launch keeps (rows x blocks): past it the rows go in several launches.
 const score_budget = 64 << 20;
 
@@ -56,6 +61,25 @@ pub fn attend(o: Ops, m: *const model.Model, d: model.Dims, kv: cache.SparseView
             @memset(zeros, 0);
             flags = try host.put(o, std.mem.sliceAsBytes(zeros));
             ids = flags;
+        }
+        const words = ((pos + r0 + n + d.index_ratio - 1) / d.index_ratio + 31) / 32;
+        if (n >= gufo_rows and d.kv_heads == 2 and d.index_ratio == 4 and words <= gufo_mask_words) {
+            const mask = try o.arena.of(u32, n * words);
+            try o.l.fn_idx_mask(@ptrFromInt(ids), @intCast(key_stride), @ptrFromInt(count), @ptrFromInt(flags), @ptrFromInt(dev_complete), mask, @intCast(words), @intCast(d.index_ratio), @intCast(n), o.stream);
+            try o.l.fn_gufo_attention(
+                @ptrFromInt(q32 + r0 * d.heads * d.head_dim * 4),
+                @ptrFromInt(kv.k),
+                @ptrFromInt(kv.v),
+                mask,
+                @intCast(words),
+                @ptrFromInt(att + r0 * d.heads * d.head_dim * 4),
+                @intCast(pos + r0),
+                @intCast(n),
+                @intCast(d.kv_heads),
+                @intCast(cap),
+                o.stream,
+            );
+            continue;
         }
         try k.attend(
             o.l.r,

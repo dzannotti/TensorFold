@@ -28,6 +28,8 @@ template __global__ void fp4l_wmma<0>(Affine);
 template __global__ void fp4l_wmma<1>(Affine);
 template __global__ void fp4l_wmma<2>(Affine);
 template __global__ void fp4l_item<0>(Affine);
+template __global__ void gufo::DenseF16GEMMKernel<256, 128, 2, 8, 1>(Affine);
+template __global__ void gufo::DenseF16GEMMKernel<256, 128, 2, 8, 1, 5>(Affine);
 template __global__ void fp4l_pair<0>(Affine, float);
 template __global__ void fp4l_pair<1>(Affine, float);
 

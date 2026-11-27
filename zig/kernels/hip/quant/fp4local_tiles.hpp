@@ -7,6 +7,7 @@
 
 #include "quant/act.hpp"
 #include "quant/bf16_fold_decoder.hpp"
+#include "quant/gufo_dense_tile.hpp"
 #include "quant/mlx_tiles.hpp"
 #include "quant/mxfp8_decoder.hpp"
 #include "quant/nvfp4_decoder.hpp"

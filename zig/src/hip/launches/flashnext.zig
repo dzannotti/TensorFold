@@ -35,6 +35,8 @@ pub const Fns = struct {
     sparse_parts: [2]Function, // groups of up to 6 and up to 12 query heads
     sparse_lanes: [2][2]Function, // the same sums from fp16 and bf16 caches, a lane a key and several heads
     sparse_merge: Function,
+    gufo_attn: Function,
+    idx_mask: Function,
 
     pub fn load(m: Module) Error!Fns {
         return .{
@@ -56,6 +58,8 @@ pub const Fns = struct {
                 .{ try m.function("tf_fn_sparse_lanes12_f16"), try m.function("tf_fn_sparse_lanes12_bf16") },
             },
             .sparse_merge = try m.function("tf_fn_sparse_merge"),
+            .gufo_attn = try m.function("_ZN9gufo_attn25WmmaCausalAttentionKernelILj4ELj16ELb1EEEvPKfS2_PKtS4_PKjjPfjjjm"),
+            .idx_mask = try m.function("tf_fn_idx_mask"),
         };
     }
 };
@@ -411,6 +415,23 @@ pub fn idxSelect(
         ratio,
     }) |v| try a.add(v);
     try l.go(l.fnx.idx_select, dim(rows, 1, 1), dim(1024, 1, 1), 0, s, &a);
+}
+
+/// The most mask words a row (tf_fn_idx_mask's LDS): 524,288 visible tokens.
+pub const gufo_mask_words = 4096;
+
+/// Each row's selection as one bit a block (tf_fn_idx_mask), from tf_fn_idx_select's lists.
+pub fn idxMask(l: *const Launcher, ids: CI, id_stride: i64, count: CI, sparse: CI, complete: CI, mask: u64, words: c_uint, ratio: c_int, rows: c_int, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(ids), id_stride, ad(count), ad(sparse), ad(complete), mask, words, ratio }) |v| try a.add(v);
+    try l.go(l.fnx.idx_mask, dim(rows, 1, 1), dim(256, 1, 1), 0, s, &a);
+}
+
+/// gufo's prompt attention: `rows` rows from position `start` in groups of four over the union of their masked blocks.
+pub fn gufoAttention(l: *const Launcher, q: CF, k: C, v: C, mask: u64, words: c_uint, out: F, start: c_uint, rows: c_uint, kv_heads: c_int, cap: u64, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(q), @as(u64, 0), ad(k), ad(v), mask, words, ad(out), start, rows, @as(c_uint, 0), cap }) |x| try a.add(x);
+    try l.go(l.fnx.gufo_attn, dim(cdiv(rows, 4), kv_heads, 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// Attention of each row's heads over its listed keys (or its first count[r] keys) in `parts` parts, then merged.
