@@ -6,6 +6,7 @@ const core = @import("core");
 const hc = @import("cuda_hc.zig");
 const qmm = @import("cuda_qmm.zig");
 const gdn = @import("cuda_gdn.zig");
+const stored_names = @import("names_modelopt.zig");
 
 pub const layers_n: usize = 48;
 pub const linear_n: usize = 36;
@@ -260,19 +261,7 @@ pub const Store = struct {
 
     pub fn resolveKey(self: *const Store, requested: []const u8, buf: []u8) ![]const u8 {
         const wm = self.parsed.value.object.get("weight_map") orelse return error.MissingTensor;
-        if (wm.object.contains(requested)) return requested;
-        const aliases = .{
-            .{ "language_model.model.", "model.language_model." },
-            .{ "language_model.lm_head.", "lm_head." },
-            .{ "language_model.mtp.", "mtp." },
-        };
-        inline for (aliases) |pair| {
-            if (std.mem.startsWith(u8, requested, pair[0])) {
-                const name = try std.fmt.bufPrint(buf, "{s}{s}", .{ pair[1], requested[pair[0].len..] });
-                if (wm.object.contains(name)) return name;
-            }
-        }
-        return error.MissingTensor;
+        return stored_names.resolve(wm.object, requested, buf);
     }
 
     fn shard(self: *Store, key: []const u8) ![]const u8 {
@@ -586,6 +575,7 @@ pub fn stitch(gpa: std.mem.Allocator, store: *Store, prefix: []const u8, names: 
 
 test {
     _ = @import("cuda_prompt_wt_test.zig");
+    _ = stored_names;
 }
 
 test "Flash Next load cache: a mixed PLE shard keeps its runtime pages" {

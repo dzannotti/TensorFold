@@ -4,10 +4,10 @@ const core = @import("core");
 const cuda = @import("cuda");
 const experts = @import("cuda_modelopt_experts.zig");
 const ex = cuda.experts.Nvfp4Experts;
-const slice = core.nvfp4_slice;
+const nvfp4 = @import("nvfp4_read.zig");
 
 pub const default_threads = 8;
-pub const max_threads = 32;
+pub const max_threads = nvfp4.max_threads;
 
 /// Pinned bytes a load stages at most, a whole number of experts' words at a time.
 pub const staging_bytes: usize = 192 << 20;
@@ -24,8 +24,7 @@ pub fn configured() !usize {
     return parseThreads(if (std.c.getenv("TF_FLASHNEXT_LOAD_THREADS")) |v| std.mem.span(v) else null);
 }
 
-/// A projection's borrowed planes: FP4 codes, plain E4M3 scales or the CSF planes, the global and its bytes.
-pub const View = struct { codes: []const u8, scales: []const u8 = &.{}, fixed: []const u8 = &.{}, exceptions: []const u8 = &.{}, global: f32, global_bytes: []const u8 = &.{} };
+pub const View = nvfp4.View;
 
 /// Readers a direct load gathers each chunk's planes with (the NVMe's O_DIRECT rate holds from 4 streams).
 const direct_readers = 4;
@@ -59,123 +58,9 @@ fn Marker(comptime S: type) type {
     };
 }
 
-/// The store as slice.stored reads it, every tensor's pages read ahead (this loader copies all of each).
-fn Ahead(comptime S: type) type {
-    return struct {
-        store: S,
-
-        pub fn get(self: @This(), name: []const u8) !core.safetensors.Tensor {
-            return self.store.holdAhead(name);
-        }
-
-        pub fn has(self: @This(), name: []const u8) bool {
-            return self.store.has(name);
-        }
-    };
-}
-
-/// The store as slice.stored reads it, no pages read ahead (a direct load reads the planes past the page cache).
-fn Direct(comptime S: type) type {
-    return struct {
-        store: S,
-
-        pub fn get(self: @This(), name: []const u8) !core.safetensors.Tensor {
-            return self.store.hold(name);
-        }
-
-        pub fn has(self: @This(), name: []const u8) bool {
-            return self.store.has(name);
-        }
-    };
-}
-
-/// A projection read and refused as loadShape's loop reads it; `direct` reads no plane bytes (gathered, then checked).
-fn viewOf(store: anytype, name: []const u8, n: usize, k: usize, comptime direct: bool) !View {
-    var buf: [512]u8 = undefined;
-    const w = try store.hold(try std.fmt.bufPrint(&buf, "{s}.weight", .{name}));
-    if (!w.is(.u8, &.{ n, k / 2 })) return error.UnexpectedTensor;
-    const source = try slice.stored(if (direct) Direct(@TypeOf(store)){ .store = store } else Ahead(@TypeOf(store)){ .store = store }, name);
-    // direct: the CSF planes are checked on their gathered bytes, as scalesOf decodes them before packing
-    _ = try if (direct) slice.shapes(source) else slice.dimensions(source);
-    if (source.global.bytes.len < 4) return error.UnexpectedTensor;
-    var v: View = switch (source.scales) {
-        .plain => |s| .{ .codes = source.weight.bytes, .scales = s.bytes, .global = 0 },
-        .csf => |s| .{ .codes = source.weight.bytes, .fixed = s.fixed.bytes, .exceptions = s.exceptions.bytes, .global = 0 },
-    };
-    v.global_bytes = source.global.bytes[0..4];
-    if (!direct) try globalOf(&v);
-    return v;
-}
-
-/// The view's global from its bytes, refused unless finite and positive.
-fn globalOf(v: *View) !void {
-    const global: f32 = @bitCast(std.mem.readInt(u32, v.global_bytes[0..4], .little));
-    if (!std.math.isFinite(global) or global <= 0) return error.UnsupportedQuantization;
-    v.global = global;
-}
-
-/// A view's row-major E4M3 scales [n, k/16]: the plain plane, or its CSF planes decoded whole as slice.slice does.
-fn scalesOf(v: View, n: usize, k: usize, buf: []u8) ![]const u8 {
-    if (v.scales.len > 0) return v.scales;
-    const plane = try core.nvfp4_csf.Plane.init(n, k / 16, v.fixed, v.exceptions);
-    try plane.decode(buf[0 .. n * (k / 16)], 0, n, 0, k / 16);
-    return buf[0 .. n * (k / 16)];
-}
-
-/// Experts [lo, hi) of `views` (gate, up, down each) packed as loadShape's loop packs them, into `up` and `down`.
-const Work = struct {
-    views: []const View,
-    up: []u32,
-    down: []u32,
-    width: usize,
-    dims: usize,
-    lo: usize,
-    hi: usize,
-    failed: ?(error{OutOfMemory} || core.nvfp4_csf.Error) = null,
-
-    fn run(w: *Work) void {
-        w.pack() catch |err| {
-            w.failed = err;
-        };
-    }
-
-    fn pack(w: *Work) !void {
-        const count = w.views.len / 3;
-        const up_words = w.up.len / count;
-        const down_words = w.down.len / count;
-        const each = @max(w.width * (w.dims / 16), w.dims * (w.width / 16));
-        const bufs = try std.heap.page_allocator.alloc(u8, 3 * each);
-        defer std.heap.page_allocator.free(bufs);
-        for (w.lo..w.hi) |i| {
-            const g = w.views[3 * i];
-            const u = w.views[3 * i + 1];
-            const o = w.views[3 * i + 2];
-            const gs = try scalesOf(g, w.width, w.dims, bufs[0..each]);
-            const us = try scalesOf(u, w.width, w.dims, bufs[each..][0..each]);
-            const os = try scalesOf(o, w.dims, w.width, bufs[2 * each ..][0..each]);
-            ex.packGateUp(w.up[i * up_words ..][0..up_words], .{ g.codes, gs }, .{ u.codes, us }, w.width, w.dims);
-            ex.packOne(w.down[i * down_words ..][0..down_words], o.codes, os, w.dims, w.width);
-        }
-    }
-};
-
-/// Every expert's gate / up and down words, split over `n` threads; a thread that cannot start leaves its part here.
+/// Every expert's gate / up and down words in the CUDA kernels' layout, split over `n` threads.
 pub fn pack(views: []const View, up: []u32, down: []u32, width: usize, dims: usize, n: usize) !void {
-    const count = views.len / 3;
-    if (count == 0 or views.len != 3 * count or up.len % count != 0 or down.len % count != 0) return error.UnexpectedTensor;
-    const t_n = @max(1, @min(n, max_threads, count));
-    const per = (count + t_n - 1) / t_n;
-    var works: [max_threads]Work = undefined;
-    var handles: [max_threads]?std.Thread = @splat(null);
-    for (0..t_n) |t| {
-        works[t] = .{ .views = views, .up = up, .down = down, .width = width, .dims = dims, .lo = @min(count, t * per), .hi = @min(count, (t + 1) * per) };
-        handles[t] = std.Thread.spawn(.{}, Work.run, .{&works[t]}) catch blk: {
-            works[t].run();
-            break :blk null;
-        };
-    }
-    for (handles[0..t_n]) |h| if (h) |th| th.join();
-    for (works[0..t_n]) |w| if (w.failed) |err| return err;
+    return nvfp4.pack(ex, views, up, down, width, dims, n);
 }
 
 /// A layer's planes borrowed with their pages read ahead, then packed on `n` threads a chunk of experts at a time.
@@ -204,9 +89,9 @@ pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pre
     defer store.release();
     var buf: [512]u8 = undefined;
     for (0..count) |i| {
-        views[3 * i] = try viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.gate_proj", .{ prefix, i }), width, dims, direct);
-        views[3 * i + 1] = try viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.up_proj", .{ prefix, i }), width, dims, direct);
-        views[3 * i + 2] = try viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.down_proj", .{ prefix, i }), dims, width, direct);
+        views[3 * i] = try nvfp4.viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.gate_proj", .{ prefix, i }), width, dims, direct);
+        views[3 * i + 1] = try nvfp4.viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.up_proj", .{ prefix, i }), width, dims, direct);
+        views[3 * i + 2] = try nvfp4.viewOf(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.down_proj", .{ prefix, i }), dims, width, direct);
     }
     // two arenas: chunk k packs from one while chunk k + 1 is gathered into the other
     var pair = core.direct_gather.Pair.init(a, direct_readers);
@@ -222,7 +107,7 @@ pub fn loadMode(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pre
         // every global first (a 4-byte read each, joined where they sit together), checked as viewOf checks them
         for (views, 0..) |*v, j| ptrs[j] = &v.global_bytes;
         if (sources) |src| try pair.read(src, ptrs[0..view_count]);
-        for (views) |*v| try globalOf(v);
+        for (views) |*v| try nvfp4.globalOf(v);
     }
     var up = try cuda.DeviceBuffer.alloc(d, up_total);
     errdefer up.free();
@@ -286,4 +171,5 @@ test "Flash Next expert loader: TF_FLASHNEXT_LOAD_THREADS takes 1 to 32 and refu
 
 test {
     _ = @import("cuda_modelopt_threads_test.zig");
+    _ = @import("nvfp4_read.zig");
 }

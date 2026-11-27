@@ -13,18 +13,15 @@ test "the n-gram tables, the draft head and the vision tower stay off the device
     try std.testing.expect(!hostOnly("language_model.lm_head.weight"));
 }
 
-test "canonical checkpoint aliases preserve exact stored namespace and prefer a direct key" {
+test "the store resolves an exported name through its weight_map, and exported host names stay off the device" {
     const a = std.testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, a,
-        \\{"weight_map":{"model.language_model.layers.0.x.weight":"a","lm_head.weight":"b","mtp.x":"c","language_model.model.direct":"d","model.language_model.direct":"e"}}
+        \\{"weight_map":{"model.language_model.layers.0.x.weight":"a"}}
     , .{});
     var store: Store = .{ .gpa = a, .io = std.testing.io, .dir = "", .parsed = parsed };
     defer store.deinit();
     var buf: [512]u8 = undefined;
     try std.testing.expectEqualStrings("model.language_model.layers.0.x.weight", try store.resolveKey("language_model.model.layers.0.x.weight", &buf));
-    try std.testing.expectEqualStrings("lm_head.weight", try store.resolveKey("language_model.lm_head.weight", &buf));
-    try std.testing.expectEqualStrings("mtp.x", try store.resolveKey("language_model.mtp.x", &buf));
-    try std.testing.expectEqualStrings("language_model.model.direct", try store.resolveKey("language_model.model.direct", &buf));
     try std.testing.expectError(error.MissingTensor, store.resolveKey("language_model.model.missing", &buf));
     try std.testing.expect(hostOnly("model.visual.weight"));
     try std.testing.expect(hostOnly("mtp.layers.0.weight"));

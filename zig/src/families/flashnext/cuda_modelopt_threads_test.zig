@@ -49,15 +49,6 @@ test "Flash Next expert loader: experts packed on threads give the one-expert lo
     }
 }
 
-test "Flash Next expert loader: a pack without whole experts or with uneven buffers is refused" {
-    const views: [6]threads.View = @splat(.{ .codes = &.{}, .global = 1.0 });
-    var up: [7]u32 = undefined;
-    var down: [4]u32 = undefined;
-    try std.testing.expectError(error.UnexpectedTensor, threads.pack(views[0..0], &up, &down, width, dims, 2));
-    try std.testing.expectError(error.UnexpectedTensor, threads.pack(views[0..2], &up, &down, width, dims, 2));
-    try std.testing.expectError(error.UnexpectedTensor, threads.pack(views[0..6], &up, &down, width, dims, 2));
-}
-
 // ---- the whole loader over a synthetic checkpoint, on a counting fake driver -------------------------------------
 
 const fx = @import("cuda_modelopt_threads_fixture.zig");

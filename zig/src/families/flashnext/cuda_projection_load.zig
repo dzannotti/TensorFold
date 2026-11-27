@@ -4,69 +4,10 @@ const cuda = @import("cuda");
 const core = @import("core");
 const wt = @import("cuda_prompt_wt.zig");
 const projection = @import("cuda_projection.zig");
-const Cut = @import("cuda_modelopt_experts.zig").Cut;
+const mxfp8 = @import("mxfp8_read.zig");
+const Cut = mxfp8.Cut;
 
-pub const Micro = struct {
-    n: usize,
-    k: usize,
-    codes: []u8,
-    scales: []u8,
-
-    pub fn deinit(self: *Micro, a: std.mem.Allocator) void {
-        a.free(self.codes);
-        a.free(self.scales);
-        self.* = undefined;
-    }
-};
-
-/// Own each plane before the store advances to a possibly different mapped shard.
-pub fn readMicro(a: std.mem.Allocator, store: anytype, prefix: []const u8) !Micro {
-    var buf: [512]u8 = undefined;
-    const w = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}));
-    if (w.dtype != .f8_e4m3 or w.rank != 2 or w.dim(0) == 0 or w.dim(1) == 0 or w.dim(1) % 64 != 0)
-        return error.UnexpectedTensor;
-    const n = w.dim(0);
-    const k = w.dim(1);
-    const count = try std.math.mul(usize, n, k);
-    if (w.bytes.len != count) return error.UnexpectedTensor;
-    const codes = try a.dupe(u8, w.bytes);
-    errdefer a.free(codes);
-    const s = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{prefix}));
-    if (!s.is(.u8, &.{ n, k / 32 }) or s.bytes.len != count / 32) return error.UnexpectedTensor;
-    return .{ .n = n, .k = k, .codes = codes, .scales = try a.dupe(u8, s.bytes) };
-}
-
-/// Concatenate output rows of compatible projections without converting or recalibrating either plane.
-pub fn readStitched(a: std.mem.Allocator, store: anytype, prefix: []const u8, names: []const []const u8) !Micro {
-    if (names.len == 0 or names.len > 6) return error.UnexpectedTensor;
-    var parts: [6]Micro = undefined;
-    var held: usize = 0;
-    defer for (parts[0..held]) |*part| part.deinit(a);
-    var n: usize = 0;
-    var k: usize = 0;
-    var buf: [512]u8 = undefined;
-    for (names) |name| {
-        parts[held] = try readMicro(a, store, try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, name }));
-        held += 1;
-        const part = parts[held - 1];
-        if (k != 0 and k != part.k) return error.UnexpectedTensor;
-        k = part.k;
-        n = try std.math.add(usize, n, part.n);
-    }
-    const count = try std.math.mul(usize, n, k);
-    const codes = try a.alloc(u8, count);
-    errdefer a.free(codes);
-    const scales = try a.alloc(u8, count / 32);
-    var row: usize = 0;
-    for (parts[0..held]) |part| {
-        @memcpy(codes[row * k ..][0..part.codes.len], part.codes);
-        @memcpy(scales[row * (k / 32) ..][0..part.scales.len], part.scales);
-        row += part.n;
-    }
-    return .{ .n = n, .k = k, .codes = codes, .scales = scales };
-}
-
-fn uploadMicro(a: std.mem.Allocator, d: *const cuda.Driver, value: Micro) !wt.Q4 {
+fn uploadMicro(a: std.mem.Allocator, d: *const cuda.Driver, value: mxfp8.Micro) !wt.Q4 {
     return projection.mxfp8(a, d, .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ value.n, value.k, 1, 1, 1 }, .bytes = value.codes }, .{ .dtype = .u8, .rank = 2, .shape = .{ value.n, value.k / 32, 1, 1, 1 }, .bytes = value.scales });
 }
 
@@ -79,7 +20,7 @@ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []c
             return projection.dense(a, d, t);
         },
         .f8_e4m3 => {
-            var value = try readMicro(a, store, prefix);
+            var value = try mxfp8.readMicro(a, store, prefix);
             defer value.deinit(a);
             if (value.n != n or value.k != k) return error.UnexpectedTensor;
             return uploadMicro(a, d, value);
@@ -102,7 +43,7 @@ pub fn loadStitched(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, pre
     var buf: [512]u8 = undefined;
     const first = try store.tensor(try std.fmt.bufPrint(&buf, "{s}{s}.weight", .{ prefix, names[0] }));
     if (first.dtype == .f8_e4m3) {
-        var value = try readStitched(a, store, prefix, names);
+        var value = try mxfp8.readStitched(a, store, prefix, names);
         defer value.deinit(a);
         if (value.n != n or value.k != k) return error.UnexpectedTensor;
         return uploadMicro(a, d, value);
@@ -130,6 +71,9 @@ pub fn loadStitched(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, pre
     if (planes.w.len != n * (k / 8) * 4) return error.UnexpectedTensor;
     return wt.uploadQ4(a, d, planes.w, planes.s, planes.b, n, k / 8);
 }
+
+pub const Ranges = mxfp8.Ranges;
+pub const copyRanges = mxfp8.copyRanges;
 
 /// What a rank's cut of a projection keeps: output rows, or each row's input columns.
 pub const Axis = enum { rows, cols };
@@ -168,42 +112,6 @@ pub fn loadCut(a: std.mem.Allocator, d: *const cuda.Driver, store: anytype, pref
     return value;
 }
 
-/// Up to four [from, to) output-row ranges kept of one stitched part, copied in order.
-pub const Ranges = struct {
-    cuts: [4]Cut = undefined,
-    len: usize = 0,
-
-    pub fn of(cuts: []const Cut) Ranges {
-        std.debug.assert(cuts.len <= 4);
-        var out: Ranges = .{ .len = cuts.len };
-        @memcpy(out.cuts[0..cuts.len], cuts);
-        return out;
-    }
-
-    pub fn items(self: *const Ranges) []const Cut {
-        return self.cuts[0..self.len];
-    }
-
-    pub fn rows(self: Ranges) usize {
-        var n: usize = 0;
-        for (self.items()) |c| n += c.width();
-        return n;
-    }
-};
-
-/// Copy `kept` rows of a row-major `src` into the front of `dst`, in order; returns the bytes written.
-pub fn copyRanges(dst: []u8, src: []const u8, row_bytes: usize, kept: Ranges) !usize {
-    var at: usize = 0;
-    for (kept.items()) |c| {
-        if (c.from >= c.to or try std.math.mul(usize, c.to, row_bytes) > src.len) return error.UnexpectedTensor;
-        const len = c.width() * row_bytes;
-        if (len > dst.len - at) return error.UnexpectedTensor;
-        @memcpy(dst[at..][0..len], src[c.from * row_bytes ..][0..len]);
-        at += len;
-    }
-    return at;
-}
-
 /// One rank's BF16 [n, k] rows of a stitched projection: each part's ranges in order, copied before the store moves on.
 pub fn stitchCut(a: std.mem.Allocator, store: anytype, prefix: []const u8, parts: []const []const u8, ranges: []const Ranges, n: usize, k: usize) ![]u8 {
     if (parts.len == 0 or parts.len != ranges.len) return error.UnexpectedTensor;
@@ -235,4 +143,5 @@ pub fn loadStitchedCut(a: std.mem.Allocator, d: *const cuda.Driver, store: anyty
 
 test {
     _ = @import("cuda_projection_load_test.zig");
+    _ = @import("mxfp8_read.zig");
 }
