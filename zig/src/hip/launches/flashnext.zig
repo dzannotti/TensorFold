@@ -511,13 +511,12 @@ pub fn sparseAttentionScalar(
     );
 }
 
-/// Parts a block of tf_fn_sparse_wmma12_bf16 computes, a wave pair each.
-const wmma_block_parts = 4;
+/// Waves a block of tf_fn_sparse_wmma12_bf16 runs, a part each.
+const wmma_parts = 4;
 
-/// Whether the WMMA kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims in 16 parts.
-fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int, parts: c_int) bool {
-    return kernel == .auto and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads and
-        parts == 16;
+/// Whether the WMMA kernel takes the launch: on gfx11, 12 heads a kv head over a bf16 cache at 256 dims.
+fn wmmaTakes(l: *const Launcher, kernel: anytype, cache_kind: c_int, heads: c_int, kv_heads: c_int, dims: c_int) bool {
+    return kernel == .auto and l.fnx.sparse_wmma != null and cache_kind == 2 and dims == 256 and heads == 12 * kv_heads;
 }
 
 fn sparseWith(
@@ -565,10 +564,10 @@ fn sparseWith(
         parts,
     }) |x| try a.add(x);
     const wide: usize = if (@divExact(heads, kv_heads) <= 6) 0 else 1;
-    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims, parts)) {
+    if (wmmaTakes(l, kernel, cache_kind, heads, kv_heads, dims)) {
         var c: Args = .{};
-        inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(parts_o), ad(parts_ms), heads, kv_heads, dims, cap, scale, parts }) |x| try c.add(x);
-        try l.go(l.fnx.sparse_wmma.?, dim(kv_heads, rows, @divExact(parts, wmma_block_parts)), dim(64 * wmma_block_parts, 1, 1), 0, s, &c);
+        inline for (.{ ad(q), ad(k), ad(v), ad(ids), id_stride, ad(count), ad(sparse), ad(out), heads, kv_heads, dims, cap, scale }) |x| try c.add(x);
+        return l.go(l.fnx.sparse_wmma.?, dim(kv_heads, rows, 1), dim(32 * wmma_parts, 1, 1), 0, s, &c);
     } else if (kernel == .auto and (cache_kind == 1 or cache_kind == 2) and @rem(dims, 8) == 0) {
         var c: Args = .{};
         inline for (.{

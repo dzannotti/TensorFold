@@ -21,7 +21,7 @@ test "sparse attention: the lanes kernel gives the scalar kernel's bits at every
         .{ .heads = 12, .kv_heads = 1, .dims = 128, .parts = 5 },
     };
     for ([_]c_int{ 2, 1 }) |kind| for (shapes, 0..) |s, i| {
-        const wmma = t.on.fnx.sparse_wmma != null and kind == 2 and s.dims == 256 and s.heads == 12 * s.kv_heads and s.parts == 16;
+        const wmma = t.on.fnx.sparse_wmma != null and kind == 2 and s.dims == 256 and s.heads == 12 * s.kv_heads;
         if (!wmma) try same(t, s, kind, 0x5A11 + i);
     };
 }

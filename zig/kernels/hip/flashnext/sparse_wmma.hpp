@@ -3,7 +3,8 @@
 #include "../ops/common.hpp"
 #include "common/arch.hpp"
 
-// sparse_parts on gfx11 WMMA, 12 heads, bf16 cache, 256 dims: the order of zig/kernels/loom/sparse_attention/README.md.
+// Sparse attention on gfx11 WMMA, 12 heads, bf16 cache, 256 dims: zig/kernels/loom/sparse_attention's sparse_attend,
+// byte for byte (README.md, Sum order), for decode, verify and staged prompt rows.
 
 namespace {
 
@@ -14,7 +15,7 @@ typedef float sw_f32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned sw_u32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned sw_u32x4 __attribute__((ext_vector_type(4)));
 
-constexpr int kSwGroup = 12, kSwDims = 256, kSwTile = 16, kSwParts = 16, kSwBlockParts = 4;
+constexpr int kSwGroup = 12, kSwDims = 256, kSwTile = 32, kSwParts = 4, kSwNTiles = kSwDims / 16;
 constexpr int kSwQPitch = kSwDims + 8;
 
 __device__ __forceinline__ sw_f32x8 sw_mma(sw_u32x8 a, sw_u32x8 b, sw_f32x8 c) {
@@ -52,159 +53,190 @@ __device__ __forceinline__ float sw_exp(float x) {
     return (p * a) * b;
 }
 
+// Head 2e + half's copy of a value lane = head holds.
+__device__ __forceinline__ sw_f32x8 sw_heads(float x, int half) {
+    sw_f32x8 r;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) r[e] = __shfl(x, 2 * e + half, 32);
+    return r;
+}
 
-// Block (g, r, z), wave pair i: part z * kSwBlockParts + i of row r's keys for kv head g, wave side s of the pair
-// owning dims [128 s, 128 s + 128); writes the part's o, m and l for tf_fn_sparse_merge.
+struct SwWeights {
+    float a, b, m, l;
+};
+
+// CUDA's fn_attn_merge step: a part (m, l) folded into the running (mm, ll).
+__device__ __forceinline__ SwWeights sw_weights(float mm, float ll, float m, float l) {
+    const bool active = l > 0.0f;
+    const float next = active ? fmaxf(mm, m) : mm;
+    const float a = active ? (mm == -INFINITY ? 0.0f : sw_exp(mm - next)) : 1.0f;
+    const float b = active ? sw_exp(m - next) : 0.0f;
+    return {a, b, next, __builtin_fmaf(l, b, ll * a)};
+}
+
+// Block (g, r), wave p: part p = [p n / 4, (p + 1) n / 4) of row r's keys for kv head g in 32-key tiles; the parts
+// merged in order in LDS by wave 0, out = bf16(o / l) kept as fp32.
 __device__ void sparse_wmma(const float* q, const uint16_t* k16, const uint16_t* v16, const int* ids, long long id_stride,
-                            const int* count, const int* sparse, float* parts_o, float* parts_ms, int heads,
-                            long long cap, float scale) {
-    __shared__ __attribute__((aligned(16))) uint16_t qp[1][16][kSwQPitch];
-    __shared__ __attribute__((aligned(16))) uint32_t slots[2 * kSwBlockParts][256];
+                            const int* count, const int* sparse, float* out, int heads, long long cap, float scale) {
+    __shared__ __attribute__((aligned(16))) uint32_t arena[16 * kSwQPitch / 2 + kSwParts * 256];
+    uint16_t* const qp = reinterpret_cast<uint16_t*>(arena);
+    float* const sc = reinterpret_cast<float*>(arena);
+    constexpr int lo_at = 0, hi_at = kSwNTiles * 32 * 4, ms_at = hi_at + kSwNTiles * 32 * 2;
     const int g = blockIdx.x, r = blockIdx.y;
-    const int t = threadIdx.x, lane = t & 31, wave = t >> 5, col = lane & 15, half = lane >> 4, side = wave & 1;
-    const int part = blockIdx.z * kSwBlockParts + (wave >> 1);
+    const int t = threadIdx.x, lane = t & 31, part = t >> 5, col = lane & 15, half = lane >> 4;
     const int n = count[r];
     const bool listed = ids != nullptr && sparse != nullptr && sparse[r] != 0;
-    const int lo = static_cast<int>(static_cast<long long>(part) * n / kSwParts);
-    const int hi = static_cast<int>(static_cast<long long>(part + 1) * n / kSwParts);
-    const long long head_base = static_cast<long long>(g) * cap * kSwDims;
-    const float* qrow = q + (static_cast<long long>(r) * heads + g * kSwGroup) * kSwDims;
-    for (int i = t; i < 16 * kSwDims; i += 2 * kSwBlockParts * 32) {
+    const int* const idr = listed ? ids + r * id_stride : nullptr;
+    const long long base = static_cast<long long>(g) * cap;
+    const long long qrow = static_cast<long long>(r) * heads + g * kSwGroup;
+    for (int i = t; i < 16 * kSwDims; i += 32 * kSwParts) {
         const int h = i / kSwDims, d = i % kSwDims;
-        qp[0][h][d] = h < kSwGroup ? float_to_bf16(qrow[h * kSwDims + d]) : 0;
+        qp[h * kSwQPitch + d] = h < kSwGroup ? float_to_bf16(q[qrow * kSwDims + h * kSwDims + d]) : 0;
     }
     __syncthreads();
+    uint16_t* const tw = reinterpret_cast<uint16_t*>(arena + 16 * kSwQPitch / 2 + part * 256);
+    const uint16_t* const qc = qp + col * kSwQPitch;
     const sw_f32x8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
     float m = -INFINITY, l = 0.f;
-    sw_f32x8 o[8];
+    sw_f32x8 o[kSwNTiles];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) o[i] = zero;
-    uint32_t* const mine = slots[wave];
-    const uint32_t* const other = slots[wave ^ 1];
-    uint16_t* const tw = reinterpret_cast<uint16_t*>(mine);
-    const uint16_t* const qh = &qp[0][col][side * (kSwDims / 2)];
-    // every wave runs the longest part's tile count: the barriers stay block-uniform; extra tiles do nothing
-    const int iters = ((n + kSwParts - 1) / kSwParts + kSwTile - 1) / kSwTile;
-    for (int it = 0; it < iters; ++it) {
-        const int t0 = lo + it * kSwTile;
-        const int tn = min(kSwTile, hi - t0);
-        const bool live = col < tn;
-        long long key = 0;
-        sw_f32x8 x = zero;
-        if (tn > 0) {
-            const int at = t0 + (live ? col : 0);
-            key = listed ? ids[r * id_stride + at] : at;
-            // the side's 8 chunks as one chain from +0
-            const uint16_t* kh = k16 + head_base + key * kSwDims + side * (kSwDims / 2);
+    for (int j = 0; j < kSwNTiles; ++j) o[j] = zero;
+    const int lo = static_cast<int>(static_cast<long long>(part) * n / kSwParts);
+    const int hi = static_cast<int>(static_cast<long long>(part + 1) * n / kSwParts);
+    for (int t0 = lo; t0 < hi; t0 += kSwTile) {
+        const int tn = min(kSwTile, hi - t0), last = t0 + tn - 1;
+        const int i0 = min(t0 + col, last), i1 = min(t0 + 16 + col, last);
+        const long long key0 = base + (listed ? idr[i0] : i0), key1 = base + (listed ? idr[i1] : i1);
+        const uint16_t* const k0 = k16 + key0 * kSwDims;
+        const uint16_t* const k1 = k16 + key1 * kSwDims;
+        sw_f32x8 s0 = zero, s1 = zero;
 #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                sw_u32x8 a = sw_frag(kh + c * 16);
-                if (!live) a = sw_u32x8{0, 0, 0, 0, 0, 0, 0, 0};
-                x = sw_mma(a, sw_frag(qh + c * 16), x);
-            }
+        for (int c = 0; c < kSwNTiles; ++c) {
+            const sw_u32x8 b = sw_frag(qc + 16 * c);
+            s0 = sw_mma(sw_frag(k0 + 16 * c), b, s0);
+            s1 = sw_mma(sw_frag(k1 + 16 * c), b, s1);
         }
-        *reinterpret_cast<sw_f32x8*>(mine + lane * 8) = x;
-        __syncthreads();
-        sw_u32x8 pb;
-        sw_f32x8 fe;
-        if (tn > 0) {
-            const sw_f32x8 y = *reinterpret_cast<const sw_f32x8*>(other + lane * 8);
-            const sw_f32x8 s = (side ? y + x : x + y) * scale;
-            // lane: head col; element e: key 2e + half
-            float top = -INFINITY;
+        sw_f32x8 x0, x1;
+        float tm = -INFINITY;
 #pragma unroll
-            for (int e = 0; e < 8; ++e)
-                if (2 * e + half < tn) top = fmaxf(top, s[e]);
-            top = fmaxf(top, __shfl_xor(top, 16, 32));
-            top = fmaxf(top, m);
-            sw_f32x8 p;
+        for (int e = 0; e < 8; ++e) {
+            x0[e] = 2 * e + half < tn ? s0[e] * scale : -INFINITY;
+            x1[e] = 16 + 2 * e + half < tn ? s1[e] * scale : -INFINITY;
+            tm = fmaxf(tm, fmaxf(x0[e], x1[e]));
+        }
+        tm = fmaxf(tm, __shfl_xor(tm, 16, 32));
+        const bool active = tm != -INFINITY;
+        const float next = active ? fmaxf(m, tm) : m;
+        const float alpha = active ? (m == -INFINITY ? 0.0f : sw_exp(m - next)) : 1.0f;
+        sw_f32x8 p0, p1;
 #pragma unroll
-            for (int e = 0; e < 8; ++e) p[e] = 2 * e + half < tn && col < kSwGroup ? sw_exp(s[e] - top) : 0.f;
-            float sum = p[0];
+        for (int e = 0; e < 8; ++e) {
+            p0[e] = x0[e] == -INFINITY ? 0.0f : sw_exp(x0[e] - next);
+            p1[e] = x1[e] == -INFINITY ? 0.0f : sw_exp(x1[e] - next);
+        }
+        float sum = 0.0f;
 #pragma unroll
-            for (int e = 1; e < 8; ++e) sum += p[e];
-            sum += __shfl_xor(sum, 16, 32);
-            const float f = sw_exp(m - top);
-            l = l * f + sum;
-            m = top;
+        for (int e = 0; e < 8; ++e) sum = sum + p0[e];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) sum = sum + p1[e];
+        sum = sum + __shfl_xor(sum, 16, 32);
+        l = __builtin_fmaf(l, alpha, sum);
+        m = next;
+        sw_u32x8 a0, a1;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float y0 = __shfl_xor(p0[e], 16, 32), y1 = __shfl_xor(p1[e], 16, 32);
+            a0[e] = (static_cast<uint32_t>(float_to_bf16(half ? p0[e] : y0)) << 16) | float_to_bf16(half ? y0 : p0[e]);
+            a1[e] = (static_cast<uint32_t>(float_to_bf16(half ? p1[e] : y1)) << 16) | float_to_bf16(half ? y1 : p1[e]);
+        }
+        const sw_f32x8 fe = sw_heads(alpha, half);
+        // values: lanes of half h stage fragment h's 16 keys of N tile j (element (dim d, key c) at
+        // (h * 16 + d) * 16 + (c ^ 8 (d & 1))), read back as one dim's 16 keys; o = mma(p1, v1, mma(p0, v0, o f))
+        const uint16_t* const vrow = v16 + (half ? key1 : key0) * kSwDims;
+        uint16_t* const th = tw + half * 256;
+#pragma unroll
+        for (int j = 0; j < kSwNTiles; ++j) {
+            const sw_u32x8 w = sw_frag(vrow + 16 * j);
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                fe[e] = __shfl(f, 2 * e + half, 32);
-                const float oth = __shfl_xor(p[e], 16, 32);
-                const uint32_t x0 = float_to_bf16(half ? oth : p[e]), x1 = float_to_bf16(half ? p[e] : oth);
-                pb[e] = (x1 << 16) | x0;
+                th[(2 * e) * 16 + col] = static_cast<uint16_t>(w[e]);
+                th[(2 * e + 1) * 16 + (col ^ 8)] = static_cast<uint16_t>(w[e] >> 16);
             }
-        }
-        __syncthreads();
-        if (tn > 0) {
-            // values: lanes of half h stage N tile 2j + h of key col (element (dim d, key c) of staged tile b at
-            // (b * 16 + d) * 16 + (c ^ 8 (d & 1))), read back as one dim's 16 keys; o = mma(bf16 p, v, o f)
-            const uint16_t* vh = v16 + head_base + key * kSwDims + side * (kSwDims / 2) + half * 16;
+            __builtin_amdgcn_wave_barrier();
+            sw_u32x8 bv[2];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                sw_u32x8 w = sw_frag(vh + 32 * j);
-                if (!live) w = sw_u32x8{0, 0, 0, 0, 0, 0, 0, 0};
-                uint16_t* const th = tw + half * 256;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    th[(2 * e) * 16 + col] = static_cast<uint16_t>(w[e]);
-                    th[(2 * e + 1) * 16 + (col ^ 8)] = static_cast<uint16_t>(w[e] >> 16);
-                }
-                __builtin_amdgcn_wave_barrier();
-#pragma unroll
-                for (int b = 0; b < 2; ++b) {
-                    const uint16_t* row = tw + (b * 16 + col) * 16;
-                    const int sw = (col & 1) * 8;
-                    const sw_u32x8 bv = sw_join(*reinterpret_cast<const sw_u32x4*>(row + sw),
-                                                *reinterpret_cast<const sw_u32x4*>(row + (8 ^ sw)));
-                    o[2 * j + b] = sw_mma(pb, bv, o[2 * j + b] * fe);
-                }
-                __builtin_amdgcn_wave_barrier();
+            for (int b = 0; b < 2; ++b) {
+                const uint16_t* row = tw + (b * 16 + col) * 16;
+                const int sw = (col & 1) * 8;
+                bv[b] = sw_join(*reinterpret_cast<const sw_u32x4*>(row + sw), *reinterpret_cast<const sw_u32x4*>(row + (8 ^ sw)));
             }
+            o[j] = sw_mma(a1, bv[1], sw_mma(a0, bv[0], o[j] * fe));
+            __builtin_amdgcn_wave_barrier();
         }
     }
-    const long long row0 = (static_cast<long long>(r) * heads + g * kSwGroup) * kSwParts + part;
+    __syncthreads();
+    float mm = -INFINITY, ll = 0.0f;
+    sw_f32x8 oo[kSwNTiles];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        const int h = 2 * e + half;
-        if (h >= kSwGroup) continue;
+    for (int j = 0; j < kSwNTiles; ++j) oo[j] = zero;
+    for (int p = 0; p < kSwParts; ++p) {
+        if (p > 0) {
+            if (part == p) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-            parts_o[(row0 + h * kSwParts) * kSwDims + side * (kSwDims / 2) + i * 16 + col] = o[i][e];
+                for (int j = 0; j < kSwNTiles; ++j) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) sc[lo_at + (j * 32 + lane) * 4 + e] = o[j][e];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) sc[hi_at + (j * 32 + lane) * 2 + e] = o[j][4 + e];
+                }
+                if (half == 0) {
+                    sc[ms_at + col * 2] = m;
+                    sc[ms_at + col * 2 + 1] = l;
+                }
+            }
+            __syncthreads();
+        }
+        if (part == 0) {
+            const float pm = p > 0 ? sc[ms_at + col * 2] : m, pl = p > 0 ? sc[ms_at + col * 2 + 1] : l;
+            const SwWeights w = sw_weights(mm, ll, pm, pl);
+            const sw_f32x8 a = sw_heads(w.a, half), b = sw_heads(w.b, half);
+            mm = w.m;
+            ll = w.l;
+#pragma unroll
+            for (int j = 0; j < kSwNTiles; ++j) {
+                sw_f32x8 x = o[j];
+                if (p > 0) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) x[e] = sc[lo_at + (j * 32 + lane) * 4 + e];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) x[4 + e] = sc[hi_at + (j * 32 + lane) * 2 + e];
+                    x[6] = 0.0f;
+                    x[7] = 0.0f;
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) oo[j][e] = __builtin_fmaf(x[e], b[e], oo[j][e] * a[e]);
+            }
+        }
+        if (p > 0) __syncthreads();
     }
-    if (side == 0 && half == 0 && col < kSwGroup) {
-        parts_ms[(row0 + col * kSwParts) * 2] = m;
-        parts_ms[(row0 + col * kSwParts) * 2 + 1] = l;
+    if (part == 0) {
+        const sw_f32x8 lh = sw_heads(ll, half);
+#pragma unroll
+        for (int j = 0; j < kSwNTiles; ++j)
+#pragma unroll
+            for (int e = 0; e < 6; ++e)
+                out[(qrow + 2 * e + half) * kSwDims + 16 * j + col] =
+                    lh[e] > 0.0f ? bf16_to_float(float_to_bf16(oo[j][e] / lh[e])) : 0.0f;
     }
 }
 
-extern "C" __global__ void __launch_bounds__(2 * kSwBlockParts * 32)
+extern "C" __global__ void __launch_bounds__(32 * kSwParts)
 tf_fn_sparse_wmma12_bf16(const float* q, const void* k, const void* v, const int* ids, long long id_stride,
-                         const int* count, const int* sparse, float* parts_o, float* parts_ms, int heads, int kv_heads,
-                         int dims, long long cap, float scale, int parts) {
-    if (dims != kSwDims || heads != kv_heads * kSwGroup || parts != kSwParts) return;
-    sparse_wmma(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count, sparse,
-                parts_o, parts_ms, heads, cap, scale);
-}
-
-// Block (h, r), a thread a dim: the parts of head h of row r in part order, w_p = tf_exp(m_p - max m), out =
-// bf16(acc / total) kept as fp32.
-extern "C" __global__ void tf_fn_sparse_wmma_merge(const float* parts_o, const float* parts_ms, float* out, int heads,
-                                                   int dims, int parts) {
-    const int h = blockIdx.x, r = blockIdx.y;
-    const long long at = (static_cast<long long>(r) * heads + h) * parts;
-    float top = -INFINITY;
-    for (int p = 0; p < parts; ++p) top = fmaxf(top, parts_ms[(at + p) * 2]);
-    for (int d = threadIdx.x; d < dims; d += blockDim.x) {
-        float total = 0.f, acc = 0.f;
-        for (int p = 0; p < parts; ++p) {
-            const float mp = parts_ms[(at + p) * 2];
-            const float w = mp == -INFINITY ? 0.f : sw_exp(mp - top);
-            total += parts_ms[(at + p) * 2 + 1] * w;
-            acc += parts_o[(at + p) * dims + d] * w;
-        }
-        out[(static_cast<long long>(r) * heads + h) * dims + d] = total > 0.f ? bf16_to_float(float_to_bf16(acc / total)) : 0.f;
-    }
+                         const int* count, const int* sparse, float* out, int heads, int kv_heads, int dims,
+                         long long cap, float scale) {
+    if (dims != kSwDims || heads != kv_heads * kSwGroup) return;
+    sparse_wmma(q, static_cast<const uint16_t*>(k), static_cast<const uint16_t*>(v), ids, id_stride, count, sparse, out,
+                heads, cap, scale);
 }
 
 #endif

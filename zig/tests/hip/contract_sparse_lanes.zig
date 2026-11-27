@@ -27,8 +27,8 @@ const names = [2][]const u8{
 const rule = "a NaN a row did not select never reaches it; a selected value reaches its dim, a selected key the head";
 const why = "the scalar kernel's fp32 sums in its order: a row's keys in 32-key tiles, a dim at a time";
 
-const wmma_name = "hip tf_fn_sparse_wmma12_bf16 and tf_fn_sparse_merge";
-const wmma_why = "exact bf16-part products on WMMA: per 16-dim chunk sums added in order, a mid/lo chain, parts merged in order";
+const wmma_name = "hip tf_fn_sparse_wmma12_bf16";
+const wmma_why = "CUDA's math on WMMA: bf16 q, one score chain, bf16 p into PV, 4 parts of 32-key tiles merged in order, bf16 out";
 
 /// The WMMA kernel's prompt and decode shapes: 12 query heads a kv head.
 const wmma_served = [_]c.Shape{
@@ -115,7 +115,7 @@ pub const SparseLanes = struct {
             return .{ .spec = sp, .ctx = self, .vt = &vt };
         }
         var sp = spec(self.k);
-        sp.name = "loom sparse_attend and sparse_merge";
+        sp.name = "loom sparse_attend";
         sp.replaces = wmma_name;
         sp.served = &loom_served;
         return .{ .spec = sp, .ctx = self, .vt = &vt };
@@ -228,7 +228,7 @@ pub const SparseLanes = struct {
         const d = self.dev;
         if (self.loom) {
             const kv: c_int = @intCast(s.n / self.group);
-            try self.l.attn.attend(self.l.r, @ptrFromInt(d[0]), @ptrFromInt(d[1]), @ptrFromInt(d[2]), @ptrFromInt(d[3]), stride, @ptrFromInt(d[4]), @ptrFromInt(d[5]), @ptrFromInt(d[7]), @ptrFromInt(d[8]), @ptrFromInt(self.out), @intCast(s.rows), @intCast(s.n), kv, @intCast(s.k), scale, self.rig.s.handle);
+            try self.l.attn.attend(self.l.r, @ptrFromInt(d[0]), @ptrFromInt(d[1]), @ptrFromInt(d[2]), @ptrFromInt(d[3]), stride, @ptrFromInt(d[4]), @ptrFromInt(d[5]), @ptrFromInt(self.out), @intCast(s.rows), @intCast(s.n), kv, @intCast(s.k), scale, self.rig.s.handle);
             return self.rig.s.synchronize();
         }
         try self.l.fn_sparse_attention(

@@ -17,27 +17,25 @@ const I = util.I;
 const S = util.S;
 const ad = util.ad;
 
-/// The compiled shapes (README: Geometry): 12 query heads a KV head, 256 dims, 16 parts; indexer 4 heads of 128 dims.
+/// The compiled shapes (README: Geometry): 12 query heads a KV head, 256 dims, 4 parts; indexer 4 heads of 128 dims.
 pub const group = 12;
 pub const dims = 256;
-pub const parts = 16;
+pub const parts = 4;
 pub const index_heads = 4;
 pub const index_dims = 128;
 
-const Kind = enum { attend, merge, scores, select };
-const symbols = [4][:0]const u8{ "sparse_attend", "sparse_merge", "idx_scores", "idx_select" };
+const Kind = enum { attend, scores, select };
+const symbols = [3][:0]const u8{ "sparse_attend", "idx_scores", "idx_select" };
 /// Parameters, buffers and constant bytes of each launch, and its work-items.
-const interfaces = [4][4]u32{ .{ 15, 8, 36, 256 }, .{ 6, 3, 12, 256 }, .{ 10, 4, 28, 256 }, .{ 10, 6, 24, 256 } };
-/// Parts a workgroup of sparse_attend computes (README: Geometry).
-const block_parts = 4;
+const interfaces = [3][4]u32{ .{ 14, 7, 36, 128 }, .{ 10, 4, 28, 256 }, .{ 10, 6, 24, 256 } };
 
 pub const Kernels = struct {
-    /// attend, merge, scores, select; null in a build without Loom kernels.
-    f: ?[4]Function = null,
+    /// attend, scores, select; null in a build without Loom kernels.
+    f: ?[3]Function = null,
 
     /// The functions of their Loom images, after each manifest shows the interface the launches pack.
-    pub fn load(mods: [4]?Module, manifests: [4][]const u8) Error!Kernels {
-        var f: [4]Function = undefined;
+    pub fn load(mods: [3]?Module, manifests: [3][]const u8) Error!Kernels {
+        var f: [3]Function = undefined;
         for (mods, manifests, 0..) |m, doc, i| {
             const mod = m orelse return .{};
             if (try problem(doc, i)) |why| {
@@ -70,14 +68,11 @@ pub const Kernels = struct {
         return k.go(r, .select, util.dim(rows, 1, 1), s, &a);
     }
 
-    /// Each row's heads over its listed (or first count[r]) keys: parts into parts_o, parts_ms, then merged to out.
-    pub fn attend(k: *const Kernels, r: *const runtime.Runtime, q: CF, kc: C, vc: C, ids: CI, id_stride: i64, count: CI, sparse: CI, parts_o: F, parts_ms: F, out: F, rows: c_int, heads: c_int, kv_heads: c_int, cap: i64, scale: f32, s: S) Error!void {
+    /// Each row's heads over its listed (or first count[r]) keys: tf_fn_sparse_lanes12_bf16 and merge in one launch.
+    pub fn attend(k: *const Kernels, r: *const runtime.Runtime, q: CF, kc: C, vc: C, ids: CI, id_stride: i64, count: CI, sparse: CI, out: F, rows: c_int, heads: c_int, kv_heads: c_int, cap: i64, scale: f32, s: S) Error!void {
         var a: hl.Args = .{};
-        inline for (.{ ad(q), ad(kc), ad(vc), ad(ids), ad(count), ad(sparse), ad(parts_o), ad(parts_ms), id_stride, cap, heads, kv_heads, @as(c_int, dims), scale, @as(c_int, parts) }) |v| try a.add(v);
-        try k.go(r, .attend, util.dim(kv_heads, rows, parts / block_parts), s, &a);
-        var b: hl.Args = .{};
-        inline for (.{ ad(parts_o), ad(parts_ms), ad(out), heads, @as(c_int, dims), @as(c_int, parts) }) |v| try b.add(v);
-        return k.go(r, .merge, util.dim(heads, rows, 1), s, &b);
+        inline for (.{ ad(q), ad(kc), ad(vc), ad(ids), ad(count), ad(sparse), ad(out), id_stride, cap, heads, kv_heads, @as(c_int, dims), scale, @as(c_int, parts) }) |v| try a.add(v);
+        return k.go(r, .attend, util.dim(kv_heads, rows, 1), s, &a);
     }
 
     fn go(k: *const Kernels, r: *const runtime.Runtime, which: Kind, grid: hl.Dim3, s: S, a: *hl.Args) Error!void {
@@ -114,7 +109,7 @@ const Manifest = struct {
 
 test "the manifest check takes each kernel's interface and names what differs" {
     const fmt = "{{\"functions\":[{{\"name\":\"idx_select\",\"interface\":{{\"parameter_count\":10,\"binding_count\":6,\"constant_byte_length\":{d}}},\"execution\":{{\"workgroup_size\":[256,1,1]}}}}]}}";
-    try std.testing.expect(try problem(std.fmt.comptimePrint(fmt, .{24}), 3) == null);
-    try std.testing.expectEqualStrings("the kernel's arguments", (try problem(std.fmt.comptimePrint(fmt, .{20}), 3)).?);
+    try std.testing.expect(try problem(std.fmt.comptimePrint(fmt, .{24}), 2) == null);
+    try std.testing.expectEqualStrings("the kernel's arguments", (try problem(std.fmt.comptimePrint(fmt, .{20}), 2)).?);
     try std.testing.expectEqualStrings("the kernel is missing", (try problem(std.fmt.comptimePrint(fmt, .{24}), 0)).?);
 }

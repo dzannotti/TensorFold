@@ -1,7 +1,7 @@
 //! Gate 5's records of the Loom kernels (zig/kernels/loom): gfx1151 only, -Dloom-target's chip.
 const Record = @import("hip_records.zig").Record;
 
-pub const records = [36]Record{
+pub const records = [35]Record{
     .{
         .launch = .{ .name = "Loom mxfp8 gemv r1 k2560 l16 s1 c1 w4 g5 p1 x4", .symbol = "mxfp8_gemv_r1_k2560_l16_s1_c1_w4_g5_p1_x4", .image = "loom_mxfp8_gemv", .threads = 128 },
         .usage = .{
@@ -273,20 +273,11 @@ pub const records = [36]Record{
         },
     },
     .{
-        .launch = .{ .name = "Loom sparse attend", .symbol = "sparse_attend", .image = "loom_sparse_attend", .threads = 256 },
+        .launch = .{ .name = "Loom sparse attend", .symbol = "sparse_attend", .image = "loom_sparse_attend", .threads = 512 },
         .usage = .{
             .{ .vgprs = 0, .served = false },
             .{ .vgprs = 0, .served = false },
-            .{ .vgprs = 172, .sgprs = 92, .lds = 33536, .private = 0, .bound = 256, .wave = 32 },
-            .{ .vgprs = 0, .served = false },
-        },
-    },
-    .{
-        .launch = .{ .name = "Loom sparse merge", .symbol = "sparse_merge", .image = "loom_sparse_merge", .threads = 256 },
-        .usage = .{
-            .{ .vgprs = 0, .served = false },
-            .{ .vgprs = 0, .served = false },
-            .{ .vgprs = 21, .sgprs = 24, .lds = 0, .private = 0, .bound = 256, .wave = 32 },
+            .{ .vgprs = 192, .sgprs = 34, .lds = 34304, .private = 0, .bound = 512, .wave = 32 },
             .{ .vgprs = 0, .served = false },
         },
     },

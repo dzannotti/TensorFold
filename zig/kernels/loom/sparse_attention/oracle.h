@@ -130,6 +130,19 @@ void oracle_place(unsigned n, const int* taken, const int* complete, const int* 
   if ((int)b < end - nb * ratio) row[top * ratio + (int)b] = nb * ratio + (int)b;
 }
 
+// e^x in fp64 for x <= 0: x = k ln2 + r with |r| <= ln2 / 2, a degree-13 Taylor polynomial in r, then 2^k (0 below -700).
+LOOM_INLINE double exp64(double x) {
+  const double kd = (double)(long long)(x * 1.4426950408889634 + (x < 0.0 ? -0.5 : 0.5));
+  const double r = x - kd * 0.6931471805599453;
+  double p = 1.0 / 6227020800.0;
+  const double c[13] = {1.0 / 479001600.0, 1.0 / 39916800.0, 1.0 / 3628800.0, 1.0 / 362880.0, 1.0 / 40320.0,
+                        1.0 / 5040.0, 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0};
+  for (unsigned i = 0; i < 13; i++) p = p * r + c[i];
+  const long long e = (long long)kd + 1023;
+  const double two_k = __builtin_bit_cast(double, (unsigned long long)(e > 0 ? e : 0) << 52);
+  return x < -700.0 ? 0.0 : p * two_k;
+}
+
 // fp64 score of query head h of row r (q times scale in fp32, as the kernels stage it) against key `key` of KV head g.
 LOOM_INLINE double score64(const float* q, const __bf16* k, unsigned r, unsigned h, unsigned g, int key, long long cap,
                            float scale) {
@@ -153,12 +166,12 @@ void oracle_attend(unsigned n, const float* q, const __bf16* k, const __bf16* v,
     const double s = score64(q, k, r, h, g, listed ? ids[r * id_stride + j] : j, cap, scale);
     top = s > top ? s : top;
   }
-  for (int j = 0; j < cnt; j++) total = total + loom::scalar::expf(score64(q, k, r, h, g, listed ? ids[r * id_stride + j] : j, cap, scale) - top);
+  for (int j = 0; j < cnt; j++) total = total + exp64(score64(q, k, r, h, g, listed ? ids[r * id_stride + j] : j, cap, scale) - top);
   double acc[kHd];
   for (unsigned d = 0; d < kHd; d++) acc[d] = 0.0;
   for (int j = 0; j < cnt; j++) {
     const int key = listed ? ids[r * id_stride + j] : j;
-    const double p = loom::scalar::expf(score64(q, k, r, h, g, key, cap, scale) - top) / total;
+    const double p = exp64(score64(q, k, r, h, g, key, cap, scale) - top) / total;
     for (unsigned d = 0; d < kHd; d++) acc[d] = acc[d] + p * (double)bf(v[((long long)g * cap + key) * kHd + d]);
   }
   for (unsigned d = 0; d < kHd; d++) out[(r * 2 * kGroup + h) * kHd + d] = cnt > 0 ? (float)acc[d] : 0.0f;

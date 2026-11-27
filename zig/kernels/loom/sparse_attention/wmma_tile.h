@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-// gfx11 bf16 WMMA pieces of the attention core: carriers, bf16 rounding, score/value halves, softmax (README.md).
+// gfx11 bf16 WMMA pieces of the attention core: carriers, bf16 rounding, tf_exp, a 32-key tile, the part merge (README.md).
 #ifndef SA_WMMA_TILE_H_
 #define SA_WMMA_TILE_H_
 
@@ -8,22 +8,27 @@
 #include <loomcxx/kernel.h>
 #include <loomcxx/scalar.h>
 
-
 namespace sa {
 
-static LOOM_INLINE float bits(unsigned u) { return __builtin_bit_cast(float, u); }
-static LOOM_INLINE float neg_inf() { return bits(0xff800000u); }
+static LOOM_INLINE float f32_bits(unsigned u) { return __builtin_bit_cast(float, u); }
+static LOOM_INLINE float neg_inf() { return f32_bits(0xff800000u); }
 
 namespace fr = loom::vector::fragment;
 
 typedef __bf16 bf16x16 __attribute__((ext_vector_type(16)));
 typedef float f32x8 __attribute__((ext_vector_type(8)));
+typedef float f32x4 __attribute__((ext_vector_type(4)));
+typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
-constexpr unsigned kDims = 256, kGroup = 12, kParts = 16, kTile = 16, kChunks = kDims / 16, kHalfTiles = kChunks / 2;
-// q parts [3][16 heads][kQPitch] bf16; a wave's slot: its score half, then its staged values (two 16 x 16 tiles)
-constexpr unsigned kQPitch = kDims + 8, kQWords = 16 * kQPitch / 2, kSlotWords = 256;
+constexpr unsigned kDims = 256, kGroup = 12, kTile = 32, kParts = 4, kNTiles = kDims / 16;
+// LDS words: q as bf16 [16 heads][kQPitch], then a wave's two value slots (two 16 x 16 bf16 tiles each); the merge reuses them
+constexpr unsigned kQPitch = kDims + 8, kQWords = 16 * kQPitch / 2, kSlotWords = 512;
+constexpr unsigned kArenaWords = kQWords + kParts * kSlotWords;
+// merge scratch: elements 0..3 [16 tiles][32 lanes][4], elements 4..5 [16][32][2], then m and l of 16 heads
+constexpr unsigned kMergeLo = 0, kMergeHi = kNTiles * 32 * 4, kMergeMs = kMergeHi + kNTiles * 32 * 2;
+static_assert(kMergeMs + 32 <= kArenaWords, "merge scratch fits the arena");
 
 static LOOM_INLINE void lds_barrier() {
   using loom::atomic::ordering, loom::atomic::scope;
@@ -37,7 +42,6 @@ static LOOM_INLINE void wave_fence() {
 
 static LOOM_INLINE u32x8 join(u32x4 a, u32x4 b) { return {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w}; }
 
-// 16 bf16 at p (16-byte aligned) as one carrier.
 static LOOM_INLINE u32x8 frag(const unsigned short* p) { return *(const u32x8*)p; }
 
 // v_wmma_f32_16x16x16_bf16: lane l holds a's row l % 16, b's column l % 16; d's element e is row 2e + l / 16.
@@ -48,46 +52,62 @@ static LOOM_INLINE f32x8 mma(u32x8 a, u32x8 b, f32x8 c) {
                            fr::attach<fr::role::init>(c, sh));
 }
 
-static LOOM_INLINE unsigned top16(float x) { return __builtin_bit_cast(unsigned, x) & 0xffff0000u; }
-
 // fp32 to bf16, round to nearest even, NaN to 0x7fc0 (TensorFold's float_to_bf16, CUDA's __float2bfloat16_rn).
-static LOOM_INLINE unsigned short to_bf16(float f) {
+static LOOM_INLINE unsigned to_bf16(float f) {
   const unsigned u = __builtin_bit_cast(unsigned, f);
-  return f != f ? (unsigned short)0x7fc0 : (unsigned short)((u + (((u >> 16) & 1u) + 0x7fffu)) >> 16);
+  const unsigned r = (u + (((u >> 16) & 1u) + 0x7fffu)) >> 16;
+  return f != f ? 0x7fc0u : r;
 }
 
-// CUDA's tf_exp: x = j ln2 + f, a degree-7 Taylor polynomial in f, then 2^j in two exact factors.
-static LOOM_INLINE float tf_exp(float x) {
+// CUDA's tf_exp before its range guards: x = j ln2 + f, a degree-7 Taylor polynomial in f, then 2^j in two exact factors.
+static LOOM_INLINE float exp_core(float x) {
   using loom::scalar::fmaf;
-  const float j = fmaf(x, bits(0x3fb8aa3bu), bits(0x4b400000u)) - bits(0x4b400000u);
-  float f = fmaf(j, bits(0xbf317200u), x);
-  f = fmaf(j, bits(0xb5bfbe8eu), f);
-  float p = bits(0x39500d01u);
-  p = fmaf(p, f, bits(0x3ab60b61u));
-  p = fmaf(p, f, bits(0x3c088889u));
-  p = fmaf(p, f, bits(0x3d2aaaabu));
-  p = fmaf(p, f, bits(0x3e2aaaabu));
+  const float j = fmaf(x, f32_bits(0x3fb8aa3bu), f32_bits(0x4b400000u)) - f32_bits(0x4b400000u);
+  float f = fmaf(j, f32_bits(0xbf317200u), x);
+  f = fmaf(j, f32_bits(0xb5bfbe8eu), f);
+  float p = f32_bits(0x39500d01u);
+  p = fmaf(p, f, f32_bits(0x3ab60b61u));
+  p = fmaf(p, f, f32_bits(0x3c088889u));
+  p = fmaf(p, f, f32_bits(0x3d2aaaabu));
+  p = fmaf(p, f, f32_bits(0x3e2aaaabu));
   p = fmaf(p, f, 0.5f);
   p = fmaf(p, f, 1.0f);
   p = fmaf(p, f, 1.0f);
   const int i = (int)j;
-  const float a = bits(i > 0 ? 0x7f000000u : 0x02000000u);
-  const float b = bits(i > 0 ? (unsigned)i << 23 : (unsigned)(i + 250) << 23);
-  const float r = (p * a) * b;
-  return x != x ? x : (x > 104.0f ? bits(0x7f800000u) : (x < -104.0f ? 0.0f : r));
+  const float a = f32_bits(i > 0 ? 0x7f000000u : 0x02000000u);
+  const float b = f32_bits(i > 0 ? (unsigned)i << 23 : (unsigned)(i + 250) << 23);
+  return (p * a) * b;
+}
+
+// tf_exp(x) for x <= 0 or -inf (x - max in the softmax and the merge): its only live guard is 0 below -104.
+static LOOM_INLINE float exp_neg(float x) {
+  const float r = exp_core(x);
+  return x < -104.0f ? 0.0f : r;
 }
 
 static LOOM_INLINE float xor16(float x) { return loom::kernel::subgroup::shuffle_xor(x, 16u, 32).value; }
+static LOOM_INLINE float bcast(float x, unsigned lane) { return loom::kernel::subgroup::broadcast(x, lane); }
+
+// Head 2e + half's copy of a per-head value held by lane = head.
+static LOOM_INLINE float per_head(float x, unsigned e, unsigned half) {
+  const float a = bcast(x, 2 * e), b = bcast(x, 2 * e + 1);
+  return half ? b : a;
+}
+
+static LOOM_INLINE f32x8 heads8(float x, unsigned half) {
+  return {per_head(x, 0, half), per_head(x, 1, half), per_head(x, 2, half), per_head(x, 3, half),
+          per_head(x, 4, half), per_head(x, 5, half), per_head(x, 6, half), per_head(x, 7, half)};
+}
 
 // Row `qrow` (12 heads x 256 fp32) rounded to bf16 as qp[head][dim]; heads 12..15 are +0.
 static LOOM_INLINE void stage_q(unsigned short* qp, const float* qrow, unsigned tid, unsigned threads) {
   for (unsigned i = tid; i < 16 * kDims; i += threads) {
     const unsigned h = i / kDims, d = i % kDims;
-    qp[h * kQPitch + d] = h < kGroup ? to_bf16(qrow[h * kDims + d]) : (unsigned short)0;
+    qp[h * kQPitch + d] = h < kGroup ? (unsigned short)to_bf16(qrow[h * kDims + d]) : (unsigned short)0;
   }
 }
 
-// One row's cache and key list: keys ids[i] when listed, else i.
+// One row's keys of one KV head: ids[i] when listed, else i.
 struct Rows {
   const unsigned short *k, *v;
   const int* ids;
@@ -95,111 +115,66 @@ struct Rows {
   bool listed;
 };
 
-// This lane's key of a tile (key col; a live key's row stands in past the tile's tn keys, loaded as +0).
-struct Key {
-  const unsigned short *k, *v;
-  bool live;
-};
-
-static LOOM_INLINE Key key_of(Rows rw, int t0, int tn, unsigned col) {
-  const bool live = (int)col < tn;
-  const int at = t0 + (live ? (int)col : 0);
-  const long long key = rw.listed ? rw.ids[at] : at;
-  return {rw.k + (rw.base + key) * kDims, rw.v + (rw.base + key) * kDims, live};
+static LOOM_INLINE long long key_at(Rows rw, int i) {
+  const long long listed = rw.ids[rw.listed ? i : 0];
+  return rw.base + (rw.listed ? listed : (long long)i);
 }
 
-static LOOM_INLINE u32x8 masked(u32x8 x, unsigned m) { return x & u32x8{m, m, m, m, m, m, m, m}; }
-
-// Side's half of a tile's raw scores x_s (lane: head col; element e: key 2e + half): its 8 chunks as one chain from +0.
-static LOOM_INLINE f32x8 scores_half(Key key, int tn, const unsigned short* qp, unsigned side, unsigned col) {
-  const unsigned short* const qh = qp + col * kQPitch + side * (kDims / 2);
-  const unsigned short* const kh = key.k + side * (kDims / 2);
-  const unsigned m = tn < (int)kTile && !key.live ? 0u : 0xffffffffu;
-  f32x8 x = {0, 0, 0, 0, 0, 0, 0, 0};
-  [[loom::pipeline(2)]] for (unsigned c = 0; c < kHalfTiles; c++) x = mma(masked(frag(kh + c * 16), m), frag(qh + c * 16), x);
-  return x;
-}
-
-// This lane's value rows for values_half (+0 past the tile's keys).
-struct VHalf {
-  const unsigned short* p;
-  unsigned m;
-};
-
-static LOOM_INLINE VHalf load_v(Key key, unsigned side, unsigned half, int tn) {
-  return {key.v + side * (kDims / 2) + half * 16, tn < (int)kTile && !key.live ? 0u : 0xffffffffu};
-}
-
-static LOOM_INLINE void put8(unsigned* slot, unsigned lane, f32x8 x) {
-  u32x4* p = (u32x4*)(slot + lane * 8);
-  const u32x8 b = __builtin_bit_cast(u32x8, x);
-  p[0] = u32x4{b[0], b[1], b[2], b[3]};
-  p[1] = u32x4{b[4], b[5], b[6], b[7]};
-}
-
-static LOOM_INLINE f32x8 get8(const unsigned* slot, unsigned lane) {
-  const u32x4* p = (const u32x4*)(slot + lane * 8);
-  return __builtin_bit_cast(f32x8, join(p[0], p[1]));
-}
-
-// A part's running state; o: this wave's 8 N tiles (lane: dim col of the tile; element e: head 2e + half).
-struct Part {
+// A part's running softmax state; o: N tile j's accumulator (lane: dim col of the tile; element e: head 2e + half).
+struct Acc {
   float m, l;
-  f32x8 o0, o1, o2, o3, o4, o5, o6, o7;
+  f32x8 o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14, o15;
 };
 
-static LOOM_INLINE Part start() {
+static LOOM_INLINE Acc start() {
   const f32x8 z = {0, 0, 0, 0, 0, 0, 0, 0};
-  return {-bits(0x7f800000u), 0.0f, z, z, z, z, z, z, z, z};
+  return {neg_inf(), 0.0f, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z};
 }
 
-// P rounded to bf16 as the A operand (row: head), each element's head rescale f, the part's new max and sum.
-struct Probs {
-  u32x8 pb;
-  f32x8 fe;
-  float m, l;
-};
-
-// Element e of a tile's probabilities: e^(s - top) for a key of the tile and a real head, else +0.
-static LOOM_INLINE float prob(f32x8 s, unsigned e, float top, int tn, unsigned col, unsigned half) {
-  return (int)(2 * e + half) < tn && col < kGroup ? tf_exp(s[e] - top) : 0.0f;
+// Scores of the tile's 16-key fragment s (element e: key 2e + half of the fragment) scaled, -inf past the tile's tn keys.
+static LOOM_INLINE f32x8 scaled(f32x8 s, unsigned frag0, int tn, unsigned half, float scale) {
+#define SA_X(e) ((int)(frag0 + 2 * (e) + half) < tn ? s[e] * scale : neg_inf())
+  return {SA_X(0), SA_X(1), SA_X(2), SA_X(3), SA_X(4), SA_X(5), SA_X(6), SA_X(7)};
+#undef SA_X
 }
 
-// Element e of the parts and rescale: the pair (key 2e, key 2e + 1) of head col from this lane and its partner.
-struct Elem {
-  unsigned pb;
-  float fe;
-};
-
-static LOOM_INLINE Elem elem(float pe, float f, unsigned e, unsigned half) {
-  const float f0 = loom::kernel::subgroup::broadcast(f, 2 * e), f1 = loom::kernel::subgroup::broadcast(f, 2 * e + 1);
-  const float other = xor16(pe);
-  const unsigned x0 = to_bf16(half ? other : pe), x1 = to_bf16(half ? pe : other);
-  return {(x1 << 16) | x0, half ? f1 : f0};
+static LOOM_INLINE float max8(f32x8 x, float m) {
+  using loom::scalar::maxnumf;
+  return maxnumf(maxnumf(maxnumf(maxnumf(m, x[0]), maxnumf(x[1], x[2])), maxnumf(maxnumf(x[3], x[4]), x[5])),
+                 maxnumf(x[6], x[7]));
 }
 
-// Online softmax step over a tile's scores s (keys past tn and heads past 12 give +0).
-static LOOM_INLINE Probs softmax(float m, float l, f32x8 s, int tn, unsigned col, unsigned half) {
-  float top = -bits(0x7f800000u);
-  [[loom::unroll]] for (unsigned e = 0; e < 8; e++)
-    if ((int)(2 * e + half) < tn) top = loom::scalar::maxnumf(top, s[e]);
-  top = loom::scalar::maxnumf(top, xor16(top));
-  top = loom::scalar::maxnumf(top, m);
-  const float p0 = prob(s, 0, top, tn, col, half), p1 = prob(s, 1, top, tn, col, half);
-  const float p2 = prob(s, 2, top, tn, col, half), p3 = prob(s, 3, top, tn, col, half);
-  const float p4 = prob(s, 4, top, tn, col, half), p5 = prob(s, 5, top, tn, col, half);
-  const float p6 = prob(s, 6, top, tn, col, half), p7 = prob(s, 7, top, tn, col, half);
-  float sum = ((((((p0 + p1) + p2) + p3) + p4) + p5) + p6) + p7;
-  sum = sum + xor16(sum);
-  // a tile past the part's keys leaves o, m and l as they are: f = 1, its probabilities and values are +0
-  const float f = tn > 0 ? tf_exp(m - top) : 1.0f;
-  const Elem e0 = elem(p0, f, 0, half), e1 = elem(p1, f, 1, half), e2 = elem(p2, f, 2, half), e3 = elem(p3, f, 3, half);
-  const Elem e4 = elem(p4, f, 4, half), e5 = elem(p5, f, 5, half), e6 = elem(p6, f, 6, half), e7 = elem(p7, f, 7, half);
-  return {u32x8{e0.pb, e1.pb, e2.pb, e3.pb, e4.pb, e5.pb, e6.pb, e7.pb},
-          f32x8{e0.fe, e1.fe, e2.fe, e3.fe, e4.fe, e5.fe, e6.fe, e7.fe}, tn > 0 ? top : m, tn > 0 ? l * f + sum : l};
+static LOOM_INLINE float prob(float x, float top) { return exp_neg(x - top); }
+
+static LOOM_INLINE f32x8 probs(f32x8 x, float top) {
+  return {prob(x[0], top), prob(x[1], top), prob(x[2], top), prob(x[3], top),
+          prob(x[4], top), prob(x[5], top), prob(x[6], top), prob(x[7], top)};
 }
 
-// Staged values: element (dim d, key j) of tile b at (b * 16 + d) * 16 + (j ^ 8 (d & 1)).
+static LOOM_INLINE float sum8(float s, f32x8 p) {
+  return ((((((((s + p[0]) + p[1]) + p[2]) + p[3]) + p[4]) + p[5]) + p[6]) + p[7]);
+}
+
+// p (finite, >= 0) to bf16, round to nearest even.
+static LOOM_INLINE unsigned rnd16(float f) {
+  const unsigned u = __builtin_bit_cast(unsigned, f);
+  return (u + (((u >> 16) & 1u) + 0x7fffu)) >> 16;
+}
+
+// Element e of the A operand: keys (2e, 2e + 1) of head col as bf16, from this lane and its xor-16 partner.
+static LOOM_INLINE unsigned pair(float pe, unsigned half) {
+  const unsigned own = rnd16(pe);
+  const unsigned other = __builtin_bit_cast(unsigned, xor16(__builtin_bit_cast(float, own)));
+  const unsigned lo = half ? other : own, hi = half ? own : other;
+  return (hi << 16) | lo;
+}
+
+static LOOM_INLINE u32x8 operand(f32x8 p, unsigned half) {
+  return {pair(p[0], half), pair(p[1], half), pair(p[2], half), pair(p[3], half),
+          pair(p[4], half), pair(p[5], half), pair(p[6], half), pair(p[7], half)};
+}
+
+// Staged values: element (dim d, key j) of fragment b's tile at (b * 16 + d) * 16 + (j ^ 8 (d & 1)).
 static LOOM_INLINE void stage_v(unsigned short* tw, u32x8 w, unsigned col, unsigned half) {
   unsigned short* const t = tw + half * 256;
   [[loom::unroll]] for (unsigned e = 0; e < 8; e++) {
@@ -214,57 +189,178 @@ static LOOM_INLINE u32x8 staged(const unsigned short* tw, unsigned b, unsigned c
   return join(*(const u32x4*)(row + s), *(const u32x4*)(row + (8 ^ s)));
 }
 
-// One N tile: o = mma(bf16 p, v, o f).
-static LOOM_INLINE f32x8 value_tile(f32x8 o, Probs pr, u32x8 b) { return mma(pr.pb, b, o * pr.fe); }
+// The tile's probabilities as A operands and each PV element's rescale.
+struct Step {
+  u32x8 p0, p1;
+  f32x8 fe;
+};
 
-// The tile's values for side's dims: half h stages N tile 2j + h of key col; round j updates o tiles 2j, 2j + 1.
-static LOOM_INLINE Part values_half(Part st, VHalf vw, Probs pr, unsigned short* tw, unsigned col, unsigned half) {
-  stage_v(tw, masked(frag(vw.p), vw.m), col, half);
+// N tile j from this lane's prefetched 16 dims w (fragment half), staged in slot j % 2: o = mma(p1, v1, mma(p0, v0, o f)).
+static LOOM_INLINE f32x8 value_tile(f32x8 o, Step st, u32x8 w, unsigned j, unsigned short* tw, unsigned col,
+                                    unsigned half) {
+  unsigned short* const slot = tw + (j & 1) * 512;
+  stage_v(slot, w, col, half);
   wave_fence();
-  st.o0 = value_tile(st.o0, pr, staged(tw, 0, col));
-  st.o1 = value_tile(st.o1, pr, staged(tw, 1, col));
-  wave_fence();
-  stage_v(tw, masked(frag(vw.p + 32), vw.m), col, half);
-  wave_fence();
-  st.o2 = value_tile(st.o2, pr, staged(tw, 0, col));
-  st.o3 = value_tile(st.o3, pr, staged(tw, 1, col));
-  wave_fence();
-  stage_v(tw, masked(frag(vw.p + 64), vw.m), col, half);
-  wave_fence();
-  st.o4 = value_tile(st.o4, pr, staged(tw, 0, col));
-  st.o5 = value_tile(st.o5, pr, staged(tw, 1, col));
-  wave_fence();
-  stage_v(tw, masked(frag(vw.p + 96), vw.m), col, half);
-  wave_fence();
-  st.o6 = value_tile(st.o6, pr, staged(tw, 0, col));
-  st.o7 = value_tile(st.o7, pr, staged(tw, 1, col));
-  wave_fence();
-  st.m = pr.m;
-  st.l = pr.l;
-  return st;
+  o = o * st.fe;
+  o = mma(st.p0, staged(slot, 0, col), o);
+  return mma(st.p1, staged(slot, 1, col), o);
 }
 
-// A part's o into parts_o[row0 + head * kParts][dims] (this wave's 128 dims), its m and l into parts_ms.
-static LOOM_INLINE void store_part(Part st, float* parts_o, float* parts_ms, long long row0, unsigned side,
-                                   unsigned col, unsigned half) {
-  [[loom::unroll]] for (unsigned e = 0; e < 8; e++) {
-    const unsigned h = 2 * e + half;
-    if (h < kGroup) {
-      float* const o = parts_o + (row0 + h * kParts) * kDims + side * (kDims / 2) + col;
-      o[0 * 16] = st.o0[e];
-      o[1 * 16] = st.o1[e];
-      o[2 * 16] = st.o2[e];
-      o[3 * 16] = st.o3[e];
-      o[4 * 16] = st.o4[e];
-      o[5 * 16] = st.o5[e];
-      o[6 * 16] = st.o6[e];
-      o[7 * 16] = st.o7[e];
+// One tile of tn (1..32) keys from list index t0 of the part: scores, the online softmax step, the values.
+static LOOM_INLINE Acc tile(Acc a, Rows rw, int t0, int tn, const unsigned short* qp, unsigned short* tw, unsigned col,
+                            unsigned half, float scale) {
+  const int last = t0 + tn - 1;
+  const int i0 = t0 + (int)col < last ? t0 + (int)col : last, i1 = t0 + 16 + (int)col < last ? t0 + 16 + (int)col : last;
+  const long long key0 = key_at(rw, i0), key1 = key_at(rw, i1);
+  const unsigned short* const k0 = rw.k + key0 * kDims;
+  const unsigned short* const k1 = rw.k + key1 * kDims;
+  const unsigned short* const qc = qp + col * kQPitch;
+  f32x8 s0 = {0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
+  u32x8 a0 = frag(k0), a1 = frag(k1), b0 = frag(k0 + 16), b1 = frag(k1 + 16);
+  [[loom::unroll]] for (unsigned c = 0; c < kNTiles; c += 2) {
+    const u32x8 qa = frag(qc + 16 * c);
+    s0 = mma(a0, qa, s0);
+    s1 = mma(a1, qa, s1);
+    if (c + 2 < kNTiles) {
+      a0 = frag(k0 + 16 * (c + 2));
+      a1 = frag(k1 + 16 * (c + 2));
+    }
+    const u32x8 qb = frag(qc + 16 * (c + 1));
+    s0 = mma(b0, qb, s0);
+    s1 = mma(b1, qb, s1);
+    if (c + 3 < kNTiles) {
+      b0 = frag(k0 + 16 * (c + 3));
+      b1 = frag(k1 + 16 * (c + 3));
     }
   }
-  if (side == 0 && half == 0 && col < kGroup) {
-    parts_ms[(row0 + col * kParts) * 2] = st.m;
-    parts_ms[(row0 + col * kParts) * 2 + 1] = st.l;
+  const f32x8 x0 = scaled(s0, 0, tn, half, scale), x1 = scaled(s1, 16, tn, half, scale);
+  float tm = max8(x1, max8(x0, neg_inf()));
+  tm = loom::scalar::maxnumf(tm, xor16(tm));
+  const bool active = tm != neg_inf();
+  const float next = active ? loom::scalar::maxnumf(a.m, tm) : a.m;
+  const float ea = exp_neg(a.m - next);
+  const float alpha = active ? (a.m == neg_inf() ? 0.0f : ea) : 1.0f;
+  const f32x8 p0 = probs(x0, next), p1 = probs(x1, next);
+  float sum = sum8(sum8(0.0f, p0), p1);
+  sum = sum + xor16(sum);
+  const Step st = {operand(p0, half), operand(p1, half), heads8(alpha, half)};
+  const unsigned short* const vrow = rw.v + (half ? key1 : key0) * kDims;
+  a.m = next;
+  a.l = loom::scalar::fmaf(a.l, alpha, sum);
+  u32x8 w0 = frag(vrow), w1 = frag(vrow + 16), w2 = frag(vrow + 32);
+#define SA_V(j, W)                                                \
+  a.o##j = value_tile(a.o##j, st, W, j, tw, col, half);           \
+  if ((j) + 3 < kNTiles) W = frag(vrow + 16 * ((j) + 3));
+  SA_V(0, w0) SA_V(1, w1) SA_V(2, w2) SA_V(3, w0) SA_V(4, w1) SA_V(5, w2) SA_V(6, w0) SA_V(7, w1)
+  SA_V(8, w2) SA_V(9, w0) SA_V(10, w1) SA_V(11, w2) SA_V(12, w0) SA_V(13, w1) SA_V(14, w2) SA_V(15, w0)
+#undef SA_V
+  wave_fence();
+  return a;
+}
+
+// Merge weights of a part (m_k, l_k) into the running (mm, ll), CUDA's fn_attn_merge step: oo = fma(o, b, oo a).
+struct Weights {
+  float a, b, m, l;
+};
+
+static LOOM_INLINE Weights weights(float mm, float ll, float m, float l) {
+  const bool active = l > 0.0f;
+  const float next = active ? loom::scalar::maxnumf(mm, m) : mm;
+  const float ea = exp_neg(mm - next), eb = exp_neg(m - next);
+  const float a = active ? (mm == neg_inf() ? 0.0f : ea) : 1.0f;
+  const float b = active ? eb : 0.0f;
+  return {a, b, next, loom::scalar::fmaf(l, b, ll * a)};
+}
+
+// fma(o, b, oo a) per element where take, else oo unchanged.
+static LOOM_INLINE float fold1(float oo, float o, float a, float b, bool take) {
+  const float t = loom::scalar::fmaf(o, b, oo * a);
+  return take ? t : oo;
+}
+
+static LOOM_INLINE f32x8 fold(f32x8 oo, f32x8 o, f32x8 a, f32x8 b, bool take) {
+#define SA_F(e) fold1(oo[e], o[e], a[e], b[e], take)
+  return {SA_F(0), SA_F(1), SA_F(2), SA_F(3), SA_F(4), SA_F(5), SA_F(6), SA_F(7)};
+#undef SA_F
+}
+
+static LOOM_INLINE void put_tile(float* sc, unsigned j, unsigned lane, f32x8 o) {
+  *(f32x4*)(sc + kMergeLo + (j * 32 + lane) * 4) = f32x4{o[0], o[1], o[2], o[3]};
+  *(f32x2*)(sc + kMergeHi + (j * 32 + lane) * 2) = f32x2{o[4], o[5]};
+}
+
+static LOOM_INLINE f32x8 get_tile(const float* sc, unsigned j, unsigned lane) {
+  const f32x4 lo = *(const f32x4*)(sc + kMergeLo + (j * 32 + lane) * 4);
+  const f32x2 hi = *(const f32x2*)(sc + kMergeHi + (j * 32 + lane) * 2);
+  return {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, 0.0f, 0.0f};
+}
+
+static LOOM_INLINE void put_part(float* sc, Acc a, unsigned lane, unsigned col, unsigned half) {
+  put_tile(sc, 0, lane, a.o0);
+  put_tile(sc, 1, lane, a.o1);
+  put_tile(sc, 2, lane, a.o2);
+  put_tile(sc, 3, lane, a.o3);
+  put_tile(sc, 4, lane, a.o4);
+  put_tile(sc, 5, lane, a.o5);
+  put_tile(sc, 6, lane, a.o6);
+  put_tile(sc, 7, lane, a.o7);
+  put_tile(sc, 8, lane, a.o8);
+  put_tile(sc, 9, lane, a.o9);
+  put_tile(sc, 10, lane, a.o10);
+  put_tile(sc, 11, lane, a.o11);
+  put_tile(sc, 12, lane, a.o12);
+  put_tile(sc, 13, lane, a.o13);
+  put_tile(sc, 14, lane, a.o14);
+  put_tile(sc, 15, lane, a.o15);
+  if (half == 0) {
+    sc[kMergeMs + col * 2] = a.m;
+    sc[kMergeMs + col * 2 + 1] = a.l;
   }
+}
+
+// Wave 0's own part as the merge's first step from (-inf, 0, +0); other waves (take false) keep theirs.
+static LOOM_INLINE Acc merge_own(Acc own, unsigned half, bool take) {
+  const Weights w = weights(neg_inf(), 0.0f, own.m, own.l);
+  const f32x8 a = heads8(w.a, half), b = heads8(w.b, half), z = {0, 0, 0, 0, 0, 0, 0, 0};
+  const float m = own.m, l = own.l;
+  own.m = take ? w.m : m;
+  own.l = take ? w.l : l;
+#define SA_M(j) own.o##j = take ? fold(z, own.o##j, a, b, true) : own.o##j;
+  SA_M(0) SA_M(1) SA_M(2) SA_M(3) SA_M(4) SA_M(5) SA_M(6) SA_M(7)
+  SA_M(8) SA_M(9) SA_M(10) SA_M(11) SA_M(12) SA_M(13) SA_M(14) SA_M(15)
+#undef SA_M
+  return own;
+}
+
+// The next part's tiles, m and l from the merge scratch folded into the running merge (take: wave 0).
+static LOOM_INLINE Acc merge_lds(Acc acc, const float* sc, unsigned lane, unsigned half, bool take) {
+  const Weights w = weights(acc.m, acc.l, sc[kMergeMs + (lane & 15) * 2], sc[kMergeMs + (lane & 15) * 2 + 1]);
+  const f32x8 a = heads8(w.a, half), b = heads8(w.b, half);
+  const float m = acc.m, l = acc.l;
+  acc.m = take ? w.m : m;
+  acc.l = take ? w.l : l;
+#define SA_M(j) acc.o##j = fold(acc.o##j, get_tile(sc, j, lane), a, b, take);
+  SA_M(0) SA_M(1) SA_M(2) SA_M(3) SA_M(4) SA_M(5) SA_M(6) SA_M(7)
+  SA_M(8) SA_M(9) SA_M(10) SA_M(11) SA_M(12) SA_M(13) SA_M(14) SA_M(15)
+#undef SA_M
+  return acc;
+}
+
+// out[head][16 j + col] = bf16(oo / ll) kept as fp32, heads 2e + half for e < 6 (the 12 real heads).
+static LOOM_INLINE void store_tile(float* orow, unsigned j, f32x8 oo, f32x8 ll, unsigned col, unsigned half) {
+  [[loom::unroll]] for (unsigned e = 0; e < 6; e++) {
+    const float y = f32_bits(to_bf16(oo[e] / ll[e]) << 16);
+    const float x = ll[e] > 0.0f ? y : 0.0f;
+    orow[(2 * e + half) * kDims + 16 * j + col] = x;
+  }
+}
+
+static LOOM_INLINE void store_out(float* orow, Acc acc, unsigned col, unsigned half) {
+  const f32x8 ll = heads8(acc.l, half);
+#define SA_S(j) store_tile(orow, j, acc.o##j, ll, col, half);
+  SA_S(0) SA_S(1) SA_S(2) SA_S(3) SA_S(4) SA_S(5) SA_S(6) SA_S(7)
+  SA_S(8) SA_S(9) SA_S(10) SA_S(11) SA_S(12) SA_S(13) SA_S(14) SA_S(15)
+#undef SA_S
 }
 
 }  // namespace sa

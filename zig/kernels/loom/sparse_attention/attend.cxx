@@ -1,54 +1,50 @@
 // SPDX-License-Identifier: MIT
 
-// Prompt attention core (listed or first-n keys), bf16 KV, head_dim 256, 12 query heads a KV head, gfx11 bf16 WMMA:
-// `sparse_attend` writes each part's o, m and l for `sparse_merge` (merge.cxx). ABI, sum order, geometry: README.md.
+// Attention core (listed or first-n keys), bf16 KV, head_dim 256, 12 query heads a KV head, gfx11 bf16 WMMA, CUDA's
+// softmax arithmetic: a workgroup a (KV head, row), a wave a part, the parts merged in order in LDS (README.md).
 #include <loomcxx/kernel.h>
 
 #include "wmma_tile.h"
 
-constexpr unsigned kBlockParts = 4, kWaves = 2 * kBlockParts;
-
 static loom::kernel::configuration configure_attend(unsigned kv_heads, unsigned rows) {
-  return {{kv_heads, rows, sa::kParts / kBlockParts}, {32 * kWaves, 1, 1}};
+  return {{kv_heads, rows, 1}, {32 * sa::kParts, 1, 1}};
 }
 
 [[loom::kernel(configure_attend)]]
 void sparse_attend(const float* q, const __bf16* k, const __bf16* v, const int* ids, const int* count,
-                   const int* sparse, float* parts_o, float* parts_ms, long long id_stride, long long cap, int heads,
-                   int kv_heads, int dims, float scale, int parts) {
+                   const int* sparse, float* out, long long id_stride, long long cap, int heads, int kv_heads, int dims,
+                   float scale, int parts) {
   using namespace sa;
   if (dims != (int)kDims || heads != kv_heads * (int)kGroup || parts != (int)kParts) return;
-  LOOM_WORKGROUP unsigned arena[kQWords + kWaves * kSlotWords];
+  LOOM_WORKGROUP unsigned arena[kArenaWords];
   unsigned short* const qp = (unsigned short*)arena;
+  float* const sc = (float*)arena;
   const unsigned g = loom::kernel::workgroup::id.x, r = loom::kernel::workgroup::id.y;
   const unsigned tid = loom::kernel::workitem::id.x, lane = tid & 31, col = lane & 15, half = lane >> 4;
-  const unsigned wave = (unsigned)loom::kernel::subgroup::id(), side = wave & 1;
-  const unsigned part = loom::kernel::workgroup::id.z * kBlockParts + (wave >> 1);
+  const unsigned part = (unsigned)loom::kernel::subgroup::id();
   const int n = count[r];
-  const Rows rows = {(const unsigned short*)k, (const unsigned short*)v, ids + (long long)r * id_stride,
-                     (long long)g * cap, sparse[r] != 0};
-  stage_q(qp, q + ((long long)r * heads + g * kGroup) * kDims, tid, 32 * kWaves);
+  const bool listed = sparse[r] != 0;
+  const Rows rows = {(const unsigned short*)k, (const unsigned short*)v, listed ? ids + (long long)r * id_stride : count + r,
+                     (long long)g * cap, listed};
+  const long long qrow = (long long)r * heads + g * kGroup;
+  stage_q(qp, q + qrow * kDims, tid, 32 * kParts);
   lds_barrier();
 
-  Part st = start();
-  unsigned* const mine = arena + kQWords + wave * kSlotWords;
-  const unsigned* const other = arena + kQWords + (wave ^ 1) * kSlotWords;
+  unsigned short* const tw = (unsigned short*)(arena + kQWords + part * kSlotWords);
   const int lo = (int)((long long)part * n / kParts), hi = (int)((long long)(part + 1) * n / kParts);
-  // every wave runs the longest part's tile count: the barriers stay workgroup-uniform; extra tiles change nothing
-  const int iters = ((n + (int)kParts - 1) / (int)kParts + (int)kTile - 1) / (int)kTile;
-  for (int it = 0; it < iters; it++) {
-    const int t0 = lo + it * (int)kTile;
+  Acc st = start();
+  for (int t0 = lo; t0 < hi; t0 += (int)kTile) {
     const int tn = hi - t0 < (int)kTile ? hi - t0 : (int)kTile;
-    // past the part's keys (tn <= 0) the tile reads a listed key as +0 rows and changes nothing
-    const Key key = key_of(rows, t0 < hi ? t0 : (n > 0 ? n - 1 : 0), tn, col);
-    const f32x8 x = scores_half(key, tn, qp, side, col);
-    const VHalf vw = load_v(key, side, half, tn);
-    put8(mine, lane, x);
-    lds_barrier();
-    const f32x8 y = get8(other, lane);
-    const Probs pr = softmax(st.m, st.l, (side ? y + x : x + y) * scale, tn, col, half);
-    lds_barrier();
-    st = values_half(st, vw, pr, (unsigned short*)mine, col, half);
+    st = tile(st, rows, t0, tn, qp, tw, col, half, scale);
   }
-  store_part(st, parts_o, parts_ms, ((long long)r * heads + g * kGroup) * kParts + part, side, col, half);
+
+  lds_barrier();
+  st = merge_own(st, half, part == 0);
+  for (unsigned p = 1; p < kParts; p++) {
+    if (part == p) put_part(sc, st, lane, col, half);
+    lds_barrier();
+    st = merge_lds(st, sc, lane, half, part == 0);
+    lds_barrier();
+  }
+  if (part == 0) store_out(out + qrow * kDims, st, col, half);
 }
