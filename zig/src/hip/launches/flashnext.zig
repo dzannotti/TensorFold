@@ -22,6 +22,7 @@ const cdiv = util.cdiv;
 pub const Fns = struct {
     hc_norm: Function,
     hc_moe_norm: Function,
+    hc_down_q8: Function,
     hc_gates: Function,
     rms_wide: Function,
     rms_wide_waves: Function,
@@ -44,6 +45,7 @@ pub const Fns = struct {
         return .{
             .hc_norm = try m.function("tf_fn_hc_norm"),
             .hc_moe_norm = try m.function("tf_fn_hc_moe_norm"),
+            .hc_down_q8 = try m.function("tf_fn_hc_down_q8"),
             .hc_gates = try m.function("tf_fn_hc_gates"),
             .rms_wide = try m.function("tf_fn_rms_wide"),
             .rms_wide_waves = try m.function("tf_fn_rms_wide_waves"),
@@ -92,10 +94,17 @@ pub fn hcNorm(
 }
 
 /// The MoE epilogue over bf16 slot rows `y` (rows, slots, 2560), the 4 streams' writeback and their norm in one launch.
-pub fn hcMoeNorm(l: *const Launcher, h: P, y: C, wts: CF, shared: CF, inject: C, scale: CF, x: P, rows: c_int, slots: c_int, eps: f32, s: S) Error!void {
+pub fn hcMoeNorm(l: *const Launcher, h: P, y: C, wts: CF, shared: CF, inject: C, scale: CF, x: P, rows: c_int, slots: c_int, eps: f32, branch: C, xq: P, prior: C, prior_inject: C, hold: bool, s: S) Error!void {
     var a: Args = .{};
-    inline for (.{ ad(h), ad(y), ad(wts), ad(shared), ad(inject), ad(scale), ad(x), slots, eps }) |v| try a.add(v);
+    inline for (.{ ad(h), ad(y), ad(wts), ad(shared), ad(inject), ad(scale), ad(x), slots, eps, ad(branch), ad(xq), ad(prior), ad(prior_inject), @as(c_int, @intFromBool(hold)) }) |v| try a.add(v);
     try l.go(l.fnx.hc_moe_norm, dim(rows, 1, 1), dim(320, 1, 1), 0, s, &a);
+}
+
+/// The down projection on int8 WMMA: Q8_0 rows `wq` (n, k), the norm's tiled Q8 copy `xq`; act (rows, low), inject (rows, 4).
+pub fn hcDownQ8(l: *const Launcher, wq: C, xq: C, act: P, inject: P, rows: c_int, n: c_int, k: c_int, low: c_int, s: S) Error!void {
+    var a: Args = .{};
+    inline for (.{ ad(wq), ad(xq), ad(act), @as(usize, @intCast(rows)), @as(usize, @intCast(n)), @as(usize, @intCast(k)), ad(inject), low }) |v| try a.add(v);
+    try l.go(l.fnx.hc_down_q8, dim(cdiv(rows, 128), cdiv(n, 64), 1), dim(256, 1, 1), 0, s, &a);
 }
 
 /// hcNorm with the branch as `world` fp32 shares `stride` values apart (a tensor-parallel gather), summed in order.

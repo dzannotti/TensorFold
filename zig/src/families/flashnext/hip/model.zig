@@ -83,7 +83,13 @@ pub const Dims = struct {
 };
 
 /// A hyper-connection: its stream norm's fp32 scale (W), the down projection with the inject rows under it, the up.
-pub const Hc = struct { scale: u64, down: Projection, up: Projection };
+pub const Hc = struct {
+    scale: u64,
+    down: Projection,
+    up: Projection,
+    /// The down's rows as Q8_0 blocks (a f16 scale and 32 int8 codes a K32 block), or 0.
+    down_q8: u64 = 0,
+};
 
 pub const Linear = struct {
     qkv: Projection,

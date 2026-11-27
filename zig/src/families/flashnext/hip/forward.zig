@@ -68,7 +68,19 @@ pub const Out = struct { mixed: Tensor, streams: Tensor };
 
 /// A hyper-connection's read of the normed streams `x`: the block input, and the inject gates when `inject` is set.
 pub fn hcPre(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize, inject: ?Tensor) !Tensor {
-    if (try readout(o, m, hc, x, rows, inject)) |mixed| return mixed;
+    return hcPreQ8(o, m, hc, x, 0, rows, inject);
+}
+
+/// Whether a prompt's streams take gufo's int8 down: off unless TF_HC_Q8=1 (99.51% Spark agreement against 99.56%).
+pub fn q8On(o: Ops, m: *const model.Model) bool {
+    if (!fused(o, m) or m.layers.len == 0 or m.layers[0].ahc.down_q8 == 0) return false;
+    const v = std.c.getenv("TF_HC_Q8") orelse return false;
+    return v[0] == '1';
+}
+
+/// hcPre, the down over `xq` (the norm's tiled Q8 copy of x) when it is set.
+pub fn hcPreQ8(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, xq: u64, rows: usize, inject: ?Tensor) !Tensor {
+    if (try readout(o, m, hc, x, xq, rows, inject)) |mixed| return mixed;
     const d = m.dims;
     const z = try o.project(x, hc.down, rows, true);
     const act = try take(o, m.act, rows * d.low);
@@ -113,14 +125,16 @@ fn fused(o: Ops, m: *const model.Model) bool {
 }
 
 /// hcPre on the Loom read-out: the down with the gates, the up with the mix; null where it does not take `hc`.
-fn readout(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, rows: usize, inject: ?Tensor) !?Tensor {
+fn readout(o: Ops, m: *const model.Model, hc: model.Hc, x: Tensor, xq: u64, rows: usize, inject: ?Tensor) !?Tensor {
     const d = m.dims;
     if (!fused(o, m) or !o.l.hcr.takes(d.streams, d.hidden, d.low, hc.down.n)) return null;
     if (hc.down.k != d.wide() or hc.up.n != d.wide() or hc.up.k != d.low or (inject != null) != (hc.down.n > d.low)) return null;
     const down = bf16Rows(hc.down) orelse return null;
     const up = bf16Rows(hc.up) orelse return null;
     const act = try take(o, m.act, rows * d.low);
-    try o.l.hcr.down(o.l.r, x.ptr, down, act.ptr, if (inject) |i| i.ptr else null, rows, hc.down.n, d.low, o.stream);
+    if (xq != 0 and hc.down_q8 != 0) {
+        try o.l.fn_hc_down_q8(@ptrFromInt(hc.down_q8), @ptrFromInt(xq), @ptrFromInt(act.ptr), if (inject) |i| @ptrFromInt(i.ptr) else null, @intCast(rows), @intCast(hc.down.n), @intCast(hc.down.k), @intCast(d.low), o.stream);
+    } else try o.l.hcr.down(o.l.r, x.ptr, down, act.ptr, if (inject) |i| i.ptr else null, rows, hc.down.n, d.low, o.stream);
     const mixed = try take(o, m.act, rows * d.hidden);
     try o.l.hcr.upMix(o.l.r, act.ptr, up, x.ptr, mixed.ptr, rows, d.low, o.stream);
     return mixed;
@@ -168,6 +182,20 @@ pub fn hcNorm(
         d.eps,
         o.stream,
     );
+}
+
+/// hcNorm on the hipcc combine, which also writes the tiled Q8 copy `xq` of x; hcNorm itself without `xq`.
+fn normQ8(o: Ops, m: *const model.Model, h: Tensor, branch: ?Tensor, inject: ?Tensor, x: Tensor, xq: u64, scale: u64, rows: usize, hold: bool) !void {
+    if (xq == 0 and !hold) return hcNorm(o, m, h, branch, inject, x, scale, rows);
+    try o.l.fn_hc_moe_norm(@ptrFromInt(h.ptr), null, null, null, if (inject) |t| @ptrFromInt(t.ptr) else null, @ptrFromInt(scale), @ptrFromInt(x.ptr), @intCast(rows), 0, m.dims.eps, if (branch) |t| @ptrFromInt(t.ptr) else null, if (xq != 0) @ptrFromInt(xq) else null, null, null, hold, o.stream);
+}
+
+/// Whether a layer's first writeback waits for its MoE combine: off unless TF_HC_DEFER=1 (a tie at 4k, -0.1 s at 31.5k).
+fn holds(o: Ops, m: *const model.Model, moe: hip.moe.Routed, rows: usize) bool {
+    const d = m.dims;
+    if (!fused(o, m) or d.streams != 4 or d.hidden != 2560 or !hip.moe.defers(o, m.act, moe, rows)) return false;
+    const v = std.c.getenv("TF_HC_DEFER") orelse return false;
+    return v[0] == '1';
 }
 
 /// A forward's host inputs, laid out in one span of the staging (byte offsets into it) and sent up in one copy.
@@ -414,6 +442,7 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
     const h = try take(o, m.act, rows * d.wide());
     const x = try take(o, m.act, rows * d.wide());
     try o.embedRows(m.embed, dev_ids, rows * d.streams, h);
+    const xq: u64 = if (q8On(o, m) and d.streams == 4 and d.hidden == 2560) try o.arena.take((rows + 127) / 128 * 8 * (d.wide() / 32) * 576) else 0;
     var cins: [max_segs]u64 = undefined;
     if (segs.len > max_segs) return error.TooManyStreams;
     for (segs, cins[0..segs.len]) |g, *cin| cin.* = if (window)
@@ -455,9 +484,9 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
                 off += g.tokens.len;
             }
         }
-        if (i == 0 or i == m.ple.layer) try hcNorm(o, m, h, null, null, x, layer.ahc.scale, rows);
+        if (i == 0 or i == m.ple.layer) try normQ8(o, m, h, null, null, x, xq, layer.ahc.scale, rows, false);
         const inject = try take(o, m.act, rows * d.streams);
-        const mixed = try hcPre(o, m, layer.ahc, x, rows, inject);
+        const mixed = try hcPreQ8(o, m, layer.ahc, x, xq, rows, inject);
         const branch = switch (layer.mixer) {
             .linear => |l| try mixers.linear(o, m, l, segs, i, mixed, rows, window),
             .sparse => |s| try mixers.sparse(
@@ -474,22 +503,29 @@ pub fn run(ops: Ops, m: *const model.Model, host: *Host, segs: []const Seg, wind
                 .{ .ends = in.ends, .complete = in.complete, .bound = in.bound },
             ),
         };
-        try hcBranch(o, m, h, branch, inject, x, layer.mhc.scale, rows);
-        const mixed2 = try hcPre(o, m, layer.mhc, x, rows, inject);
+        const hold = branch.kind == .bf16 and holds(o, m, layer.moe, rows);
+        if ((xq != 0 or hold) and branch.kind == .bf16) {
+            try normQ8(o, m, h, branch, inject, x, xq, layer.mhc.scale, rows, hold);
+        } else try hcBranch(o, m, h, branch, inject, x, layer.mhc.scale, rows);
+        const inject1 = inject;
+        const inject2 = if (hold) try take(o, m.act, rows * d.streams) else inject;
+        const mixed2 = try hcPreQ8(o, m, layer.mhc, x, xq, rows, inject2);
         const next = if (i + 1 < m.layers.len) m.layers[i + 1].ahc.scale else m.mix.scale;
         if (std.c.getenv("TF_HC_MOE_OFF") == null and fused(o, m) and d.streams == 4 and d.hidden == 2560 and hip.moe.defers(o, m.act, layer.moe, rows)) {
             const p = try hip.moe.pending(o, m.act, layer.moe, mixed2, rows);
-            try o.l.fn_hc_moe_norm(@ptrFromInt(h.ptr), @ptrFromInt(p.y), @ptrFromInt(p.wts), @ptrFromInt(p.shared), @ptrFromInt(inject.ptr), @ptrFromInt(next), @ptrFromInt(x.ptr), @intCast(rows), @intCast(p.slots), d.eps, o.stream);
+            try o.l.fn_hc_moe_norm(@ptrFromInt(h.ptr), @ptrFromInt(p.y), @ptrFromInt(p.wts), @ptrFromInt(p.shared), @ptrFromInt(inject2.ptr), @ptrFromInt(next), @ptrFromInt(x.ptr), @intCast(rows), @intCast(p.slots), d.eps, null, if (xq != 0) @ptrFromInt(xq) else null, if (hold) @ptrFromInt(branch.ptr) else null, if (hold) @ptrFromInt(inject1.ptr) else null, false, o.stream);
             continue;
         }
         const y = try hip.moe.run(o, m.act, layer.moe, mixed2, rows, !window);
-        try hcBranch(o, m, h, y, inject, x, next, rows);
+        if (xq != 0 and y.kind == .bf16) {
+            try normQ8(o, m, h, y, inject2, x, xq, next, rows, false);
+        } else try hcBranch(o, m, h, y, inject2, x, next, rows);
     }
     // a window's count moves in `Engine.round`, which a replay runs too: the launches change nothing on the host
     if (!window) for (segs) |g| {
         g.c.pooled = (g.pos + g.tokens.len) / d.index_ratio;
     };
-    return .{ .mixed = try hcPre(o, m, m.mix, x, rows, null), .streams = h };
+    return .{ .mixed = try hcPreQ8(o, m, m.mix, x, xq, rows, null), .streams = h };
 }
 
 /// Streams a forward takes at once at most.
