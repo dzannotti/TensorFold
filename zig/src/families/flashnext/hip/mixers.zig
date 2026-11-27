@@ -445,7 +445,7 @@ fn attend(
     staged: ?Rows,
     graphed: bool,
 ) !void {
-    if (staged == null and !graphed and try attend_loom.attend(o, m, d, kv, cap, q32, iq, att, rows, pos, host)) return;
+    if (!graphed and try attend_loom.attend(o, m, d, kv, cap, q32, iq, att, rows, pos, host, staged)) return;
     const hd = d.head_dim;
     const di = d.index_dim;
     const kind = @backingInt(m.act);
