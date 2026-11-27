@@ -37,7 +37,7 @@ pub const Options = struct {
 pub const narrows = hip.policy.narrows;
 
 /// Bytes of the pinned staging a forward's uploads and n-gram rows go through.
-const staging_bytes = 64 << 20;
+const staging_bytes = 512 << 20;
 
 /// A round's shape: each stream's cache slot and rows; one graph serves every later round of it.
 pub const Key = struct {
