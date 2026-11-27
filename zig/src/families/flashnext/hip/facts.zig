@@ -16,7 +16,7 @@ pub fn capDrafts(asked: u8) u32 {
 const shared_copy_rows = 4;
 
 /// Most head drafts a stream chains in a shared round; a lone stream chains the policy's drafts.
-pub const shared_chain_drafts = 3;
+pub const shared_chain_drafts = 7;
 
 /// The lane core's facts of a loaded model: `drafting` names a head that drafts, `drafts` its capped chains.
 pub fn factsFor(exact_width: u32, streams: usize, drafting: bool, drafts: u32) lanes.Model {
